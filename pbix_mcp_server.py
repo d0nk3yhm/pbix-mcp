@@ -965,13 +965,16 @@ def pbix_get_theme(alias: str) -> str:
         if not os.path.isdir(theme_dir):
             return "No theme directory found."
 
-        for f in os.listdir(theme_dir):
+        themes = []
+        for f in sorted(os.listdir(theme_dir)):
             if f.endswith(".json"):
                 fp = os.path.join(theme_dir, f)
                 with open(fp, "r", encoding="utf-8") as fh:
                     theme = json.load(fh)
-                return f"Theme file: {f}\n{json.dumps(theme, indent=2, ensure_ascii=False)}"
-        return "No theme JSON files found."
+                themes.append(f"Theme file: {f}\n{json.dumps(theme, indent=2, ensure_ascii=False)}")
+        if not themes:
+            return "No theme JSON files found."
+        return "\n\n".join(themes)
     except Exception as e:
         return f"Error: {e}"
 
