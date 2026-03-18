@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 *.pyo
+*.py[cod]
 *.egg-info/
 dist/
 build/
@@ -15,3 +16,7 @@ test_samples/*.pbix
 *.tmp
 *.bak
 .claude/
+*.so
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
