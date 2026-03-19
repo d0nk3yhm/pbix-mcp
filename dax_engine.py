@@ -3,14 +3,28 @@ OpenBI — DAX Engine
 ====================
 Evaluates DAX measure expressions against VertiPaq data.
 
-Supports:
-- Aggregation: SUM, AVERAGE, COUNT, COUNTROWS, MIN, MAX, DISTINCTCOUNT
-- Iteration: SUMX, MAXX, FILTER
-- Math: DIVIDE, ABS, ROUND, INT
-- Logic: IF, SWITCH, AND, OR, NOT, ISBLANK
-- Time Intelligence: DATEADD, SAMEPERIODLASTYEAR, CALCULATE with date filters
-- Filter: CALCULATE, REMOVEFILTERS, ALL, ALLSELECTED, VALUES, FILTER
-- Text: CONCATENATE, FORMAT, SELECTEDVALUE
+Supports 150+ DAX functions:
+- Aggregation: SUM, AVERAGE, COUNT, COUNTROWS, MIN, MAX, DISTINCTCOUNT, PRODUCT, MEDIAN
+- Iteration: SUMX, MAXX, MINX, AVERAGEX, COUNTX, COUNTAX, COUNTBLANK
+- Table: TOPN, ADDCOLUMNS, SUMMARIZE, SUMMARIZECOLUMNS, SELECTCOLUMNS, DISTINCT,
+         UNION, EXCEPT, INTERSECT, CROSSJOIN, DATATABLE, ROW, TREATAS, GENERATE, GENERATEALL
+- Filter: CALCULATE, REMOVEFILTERS, ALL, ALLEXCEPT, ALLSELECTED, KEEPFILTERS,
+          VALUES, FILTER, HASONEVALUE, HASONEFILTER, ISFILTERED, ISCROSSFILTERED,
+          USERELATIONSHIP, EARLIER, EARLIEST
+- Time Intelligence: DATEADD, SAMEPERIODLASTYEAR, DATESYTD/MTD/QTD, TOTALYTD/MTD/QTD,
+                     PREVIOUSMONTH/QUARTER/YEAR, NEXTMONTH/QUARTER/YEAR, PARALLELPERIOD,
+                     STARTOFMONTH/QUARTER/YEAR, ENDOFMONTH/QUARTER/YEAR,
+                     OPENINGBALANCEMONTH/QUARTER/YEAR, CLOSINGBALANCEMONTH/QUARTER/YEAR,
+                     FIRSTDATE, LASTDATE, DATESBETWEEN, DATESINPERIOD, CALENDAR, CALENDARAUTO
+- Math: DIVIDE, ABS, ROUND, INT, CEILING, FLOOR, MOD, POWER, SQRT, LOG, LOG10, LN, EXP,
+        SIGN, TRUNC, EVEN, ODD, FACT, GCD, LCM, RAND, RANDBETWEEN, PI, CURRENCY, FIXED
+- Text: CONCATENATE, FORMAT, SELECTEDVALUE, LEFT, RIGHT, MID, LEN, UPPER, LOWER, PROPER,
+        TRIM, SUBSTITUTE, REPLACE, REPT, SEARCH, FIND, CONTAINSSTRING, CONTAINSSTRINGEXACT,
+        EXACT, UNICHAR, UNICODE, VALUE, COMBINEVALUES, PATHCONTAINS, PATHITEM, PATHLENGTH
+- Logic: IF, SWITCH, AND, OR, NOT, ISBLANK, BLANK, TRUE, FALSE, IFERROR, COALESCE, CONTAINS
+- Info: ISNUMBER, ISTEXT, ISNONTEXT, ISLOGICAL, ISERROR, USERNAME, USERPRINCIPALNAME,
+        LOOKUPVALUE
+- Relationship: RELATED, RELATEDTABLE, CROSSFILTER
 - Table references: table[column] syntax
 - Measure references: [MeasureName] syntax
 - VAR / RETURN: variable declarations with expression evaluation
@@ -19,9 +33,13 @@ Supports:
 
 import re
 import math
-from datetime import datetime, timedelta
-from typing import Any, Optional
+import random
+import statistics
+from datetime import datetime, timedelta, date
+from typing import Any, Optional, List
 from collections import defaultdict
+from calendar import monthrange
+from functools import reduce
 
 
 class DAXContext:
@@ -244,6 +262,7 @@ class DAXEngine:
     def __init__(self):
         self._current_var_scope = None  # Active variable scope during VAR/RETURN eval
         self._func_map = {
+            # --- Aggregation ---
             'SUM': self._fn_sum,
             'AVERAGE': self._fn_average,
             'COUNT': self._fn_count,
@@ -251,29 +270,161 @@ class DAXEngine:
             'MIN': self._fn_min,
             'MAX': self._fn_max,
             'DISTINCTCOUNT': self._fn_distinctcount,
+            'PRODUCT': self._fn_product,
+            'MEDIAN': self._fn_median,
+            # --- Iteration ---
+            'SUMX': self._fn_sumx,
+            'MAXX': self._fn_maxx,
+            'MINX': self._fn_minx,
+            'AVERAGEX': self._fn_averagex,
+            'COUNTX': self._fn_countx,
+            'COUNTAX': self._fn_countax,
+            'COUNTBLANK': self._fn_countblank,
+            # --- Math ---
             'DIVIDE': self._fn_divide,
             'ABS': self._fn_abs,
             'ROUND': self._fn_round,
             'INT': self._fn_int,
+            'CEILING': self._fn_ceiling,
+            'FLOOR': self._fn_floor,
+            'MOD': self._fn_mod,
+            'POWER': self._fn_power,
+            'SQRT': self._fn_sqrt,
+            'LOG': self._fn_log,
+            'LOG10': self._fn_log10,
+            'LN': self._fn_ln,
+            'EXP': self._fn_exp,
+            'SIGN': self._fn_sign,
+            'TRUNC': self._fn_trunc,
+            'EVEN': self._fn_even,
+            'ODD': self._fn_odd,
+            'FACT': self._fn_fact,
+            'GCD': self._fn_gcd,
+            'LCM': self._fn_lcm,
+            'RAND': self._fn_rand,
+            'RANDBETWEEN': self._fn_randbetween,
+            'PI': self._fn_pi,
+            'CURRENCY': self._fn_currency,
+            'FIXED': self._fn_fixed,
+            # --- Logic ---
             'IF': self._fn_if,
             'SWITCH': self._fn_switch,
             'AND': self._fn_and,
             'OR': self._fn_or,
             'NOT': self._fn_not,
             'ISBLANK': self._fn_isblank,
+            'BLANK': self._fn_blank,
+            'TRUE': self._fn_true,
+            'FALSE': self._fn_false,
+            'IFERROR': self._fn_iferror,
+            'COALESCE': self._fn_coalesce,
+            'CONTAINS': self._fn_contains,
+            # --- Filter ---
             'CALCULATE': self._fn_calculate,
             'REMOVEFILTERS': self._fn_removefilters,
             'ALL': self._fn_all,
-            'DATEADD': self._fn_dateadd,
-            'SAMEPERIODLASTYEAR': self._fn_sameperiodlastyear,
+            'ALLEXCEPT': self._fn_allexcept,
+            'ALLSELECTED': self._fn_allselected,
+            'KEEPFILTERS': self._fn_keepfilters,
             'VALUES': self._fn_values,
             'SELECTEDVALUE': self._fn_selectedvalue,
+            'FILTER': self._fn_filter,
+            'HASONEVALUE': self._fn_hasonevalue,
+            'HASONEFILTER': self._fn_hasonefilter,
+            'ISFILTERED': self._fn_isfiltered,
+            'ISCROSSFILTERED': self._fn_iscrossfiltered,
+            'USERELATIONSHIP': self._fn_userelationship,
+            'EARLIER': self._fn_earlier,
+            'EARLIEST': self._fn_earliest,
+            # --- Table ---
+            'TOPN': self._fn_topn,
+            'ADDCOLUMNS': self._fn_addcolumns,
+            'SUMMARIZE': self._fn_summarize,
+            'SUMMARIZECOLUMNS': self._fn_summarizecolumns,
+            'SELECTCOLUMNS': self._fn_selectcolumns,
+            'DISTINCT': self._fn_distinct,
+            'UNION': self._fn_union,
+            'EXCEPT': self._fn_except,
+            'INTERSECT': self._fn_intersect,
+            'CROSSJOIN': self._fn_crossjoin,
+            'DATATABLE': self._fn_datatable,
+            'ROW': self._fn_row,
+            'TREATAS': self._fn_treatas,
+            'GENERATE': self._fn_generate,
+            'GENERATEALL': self._fn_generateall,
+            # --- Text ---
             'FORMAT': self._fn_format,
             'CONCATENATE': self._fn_concatenate,
-            'SUMX': self._fn_sumx,
-            'MAXX': self._fn_maxx,
-            'FILTER': self._fn_filter,
-            'BLANK': self._fn_blank,
+            'LEFT': self._fn_left,
+            'RIGHT': self._fn_right,
+            'MID': self._fn_mid,
+            'LEN': self._fn_len,
+            'UPPER': self._fn_upper,
+            'LOWER': self._fn_lower,
+            'PROPER': self._fn_proper,
+            'TRIM': self._fn_trim,
+            'SUBSTITUTE': self._fn_substitute,
+            'REPLACE': self._fn_replace,
+            'REPT': self._fn_rept,
+            'SEARCH': self._fn_search,
+            'FIND': self._fn_find,
+            'CONTAINSSTRING': self._fn_containsstring,
+            'CONTAINSSTRINGEXACT': self._fn_containsstringexact,
+            'EXACT': self._fn_exact,
+            'UNICHAR': self._fn_unichar,
+            'UNICODE': self._fn_unicode,
+            'VALUE': self._fn_value,
+            'COMBINEVALUES': self._fn_combinevalues,
+            'PATHCONTAINS': self._fn_pathcontains,
+            'PATHITEM': self._fn_pathitem,
+            'PATHLENGTH': self._fn_pathlength,
+            # --- Time Intelligence ---
+            'DATEADD': self._fn_dateadd,
+            'SAMEPERIODLASTYEAR': self._fn_sameperiodlastyear,
+            'DATESYTD': self._fn_datesytd,
+            'DATESMTD': self._fn_datesmtd,
+            'DATESQTD': self._fn_datesqtd,
+            'TOTALYTD': self._fn_totalytd,
+            'TOTALMTD': self._fn_totalmtd,
+            'TOTALQTD': self._fn_totalqtd,
+            'PREVIOUSMONTH': self._fn_previousmonth,
+            'PREVIOUSQUARTER': self._fn_previousquarter,
+            'PREVIOUSYEAR': self._fn_previousyear,
+            'NEXTMONTH': self._fn_nextmonth,
+            'NEXTQUARTER': self._fn_nextquarter,
+            'NEXTYEAR': self._fn_nextyear,
+            'PARALLELPERIOD': self._fn_parallelperiod,
+            'STARTOFMONTH': self._fn_startofmonth,
+            'ENDOFMONTH': self._fn_endofmonth,
+            'STARTOFQUARTER': self._fn_startofquarter,
+            'ENDOFQUARTER': self._fn_endofquarter,
+            'STARTOFYEAR': self._fn_startofyear,
+            'ENDOFYEAR': self._fn_endofyear,
+            'OPENINGBALANCEMONTH': self._fn_openingbalancemonth,
+            'CLOSINGBALANCEMONTH': self._fn_closingbalancemonth,
+            'OPENINGBALANCEQUARTER': self._fn_openingbalancequarter,
+            'CLOSINGBALANCEQUARTER': self._fn_closingbalancequarter,
+            'OPENINGBALANCEYEAR': self._fn_openingbalanceyear,
+            'CLOSINGBALANCEYEAR': self._fn_closingbalanceyear,
+            'FIRSTDATE': self._fn_firstdate,
+            'LASTDATE': self._fn_lastdate,
+            'DATESBETWEEN': self._fn_datesbetween,
+            'DATESINPERIOD': self._fn_datesinperiod,
+            'CALENDAR': self._fn_calendar,
+            'CALENDARAUTO': self._fn_calendarauto,
+            # --- Information ---
+            'ISNUMBER': self._fn_isnumber,
+            'ISTEXT': self._fn_istext,
+            'ISNONTEXT': self._fn_isnontext,
+            'ISLOGICAL': self._fn_islogical,
+            'ISERROR': self._fn_iserror,
+            'USERNAME': self._fn_username,
+            'USERPRINCIPALNAME': self._fn_userprincipalname,
+            'LOOKUPVALUE': self._fn_lookupvalue,
+            # --- Relationship ---
+            'RELATED': self._fn_related,
+            'RELATEDTABLE': self._fn_relatedtable,
+            'CROSSFILTER': self._fn_crossfilter,
         }
 
     def evaluate_measure(self, measure_name: str, ctx: DAXContext) -> Any:
@@ -965,44 +1116,17 @@ class DAXEngine:
         parts = [str(self._eval_expr(a.strip(), ctx) or '') for a in args]
         return ''.join(parts)
 
-    def _fn_maxx(self, args_str: str, ctx: DAXContext) -> Any:
-        """MAXX(table_expr, expression) — iterate over table, return max of expression."""
-        args = self._split_args(args_str)
-        if len(args) < 2:
-            return 0
-        table_ref = self._eval_expr(args[0].strip(), ctx)
-        row_expr = args[1].strip()
-        max_val = None
-        if isinstance(table_ref, list):
-            for row_item in table_ref:
-                if isinstance(row_item, dict) and '__table__' in row_item:
-                    table_name = row_item['__table__']
-                    col_name = row_item['__column__']
-                    val = row_item['__value__']
-                    row_ctx = ctx.with_filters({f"{table_name}.{col_name}": [val]})
-                    result = self._eval_expr(row_expr, row_ctx)
-                    if isinstance(result, (int, float)):
-                        if max_val is None or result > max_val:
-                            max_val = result
-                else:
-                    result = self._eval_expr(row_expr, ctx)
-                    if isinstance(result, (int, float)):
-                        if max_val is None or result > max_val:
-                            max_val = result
-        return max_val if max_val is not None else 0
-
     def _fn_sumx(self, args_str: str, ctx: DAXContext) -> Any:
+        """SUMX(table_expression, expression) — iterate over table rows, sum expression."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return 0
-        # First arg is table expression, second is expression to evaluate per row
         table_ref = self._eval_expr(args[0].strip(), ctx)
         row_expr = args[1].strip()
         if isinstance(table_ref, list):
             total = 0
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    # Row from ALL/VALUES — create a filtered context for this row
                     table_name = row_item['__table__']
                     col_name = row_item['__column__']
                     val = row_item['__value__']
@@ -1011,7 +1135,6 @@ class DAXEngine:
                     if isinstance(result, (int, float)):
                         total += result
                 else:
-                    # Simple case: evaluate constant per row
                     result = self._eval_expr(row_expr, ctx)
                     if isinstance(result, (int, float)):
                         total += result
@@ -1019,8 +1142,7 @@ class DAXEngine:
         return 0
 
     def _fn_maxx(self, args_str: str, ctx: DAXContext) -> Any:
-        """MAXX(table_expression, expression) — iterate over table rows,
-        evaluate expression for each row, return the maximum value."""
+        """MAXX(table_expression, expression) — iterate over table rows, return max."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return 0
@@ -1030,7 +1152,6 @@ class DAXEngine:
             max_val = None
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    # Row from ALL/VALUES — create a filtered context for this row
                     table_name = row_item['__table__']
                     col_name = row_item['__column__']
                     val = row_item['__value__']
@@ -1051,16 +1172,122 @@ class DAXEngine:
             return max(values) if values else 0
         return 0
 
+    def _fn_minx(self, args_str: str, ctx: DAXContext) -> Any:
+        """MINX(table_expression, expression) — iterate over table rows, return min."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return 0
+        table_ref = self._eval_expr(args[0].strip(), ctx)
+        row_expr = args[1].strip()
+        if isinstance(table_ref, list):
+            min_val = None
+            for row_item in table_ref:
+                if isinstance(row_item, dict) and '__table__' in row_item:
+                    table_name = row_item['__table__']
+                    col_name = row_item['__column__']
+                    val = row_item['__value__']
+                    row_ctx = ctx.with_filters({f"{table_name}.{col_name}": [val]})
+                    result = self._eval_expr(row_expr, row_ctx)
+                    if isinstance(result, (int, float)):
+                        if min_val is None or result < min_val:
+                            min_val = result
+                else:
+                    result = self._eval_expr(row_expr, ctx)
+                    if isinstance(result, (int, float)):
+                        if min_val is None or result < min_val:
+                            min_val = result
+            return min_val if min_val is not None else 0
+        if isinstance(table_ref, tuple) and len(table_ref) == 2:
+            values = [v for v in ctx.get_column_data(table_ref[0], table_ref[1]) if isinstance(v, (int, float))]
+            return min(values) if values else 0
+        return 0
+
+    def _fn_averagex(self, args_str: str, ctx: DAXContext) -> Any:
+        """AVERAGEX(table_expression, expression) — iterate over table rows, average expression."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return 0
+        table_ref = self._eval_expr(args[0].strip(), ctx)
+        row_expr = args[1].strip()
+        values = []
+        if isinstance(table_ref, list):
+            for row_item in table_ref:
+                if isinstance(row_item, dict) and '__table__' in row_item:
+                    table_name = row_item['__table__']
+                    col_name = row_item['__column__']
+                    val = row_item['__value__']
+                    row_ctx = ctx.with_filters({f"{table_name}.{col_name}": [val]})
+                    result = self._eval_expr(row_expr, row_ctx)
+                    if isinstance(result, (int, float)):
+                        values.append(result)
+                else:
+                    result = self._eval_expr(row_expr, ctx)
+                    if isinstance(result, (int, float)):
+                        values.append(result)
+        return sum(values) / len(values) if values else 0
+
+    def _fn_countx(self, args_str: str, ctx: DAXContext) -> Any:
+        """COUNTX(table_expression, expression) — count non-blank numeric results per row."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return 0
+        table_ref = self._eval_expr(args[0].strip(), ctx)
+        row_expr = args[1].strip()
+        count = 0
+        if isinstance(table_ref, list):
+            for row_item in table_ref:
+                if isinstance(row_item, dict) and '__table__' in row_item:
+                    row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+                    result = self._eval_expr(row_expr, row_ctx)
+                else:
+                    result = self._eval_expr(row_expr, ctx)
+                if result is not None and result != '':
+                    count += 1
+        return count
+
+    def _fn_countax(self, args_str: str, ctx: DAXContext) -> Any:
+        """COUNTAX(table_expression, expression) — count non-blank results (like COUNTX but counts text too)."""
+        # In DAX, COUNTAX counts non-blank values of any type; functionally same as COUNTX here
+        return self._fn_countx(args_str, ctx)
+
+    def _fn_countblank(self, args_str: str, ctx: DAXContext) -> Any:
+        """COUNTBLANK(column) — count blank values in a column."""
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(ref, tuple) and len(ref) == 2:
+            values = ctx.get_column_data(ref[0], ref[1])
+            return sum(1 for v in values if v is None or v == '')
+        return 0
+
+    def _fn_product(self, args_str: str, ctx: DAXContext) -> Any:
+        """PRODUCT(column) — multiply all values in column."""
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(ref, tuple) and len(ref) == 2:
+            values = [v for v in ctx.get_column_data(ref[0], ref[1]) if isinstance(v, (int, float))]
+            if not values:
+                return 0
+            result = 1
+            for v in values:
+                result *= v
+            return result
+        return 0
+
+    def _fn_median(self, args_str: str, ctx: DAXContext) -> Any:
+        """MEDIAN(column) — return median value."""
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(ref, tuple) and len(ref) == 2:
+            values = sorted(v for v in ctx.get_column_data(ref[0], ref[1]) if isinstance(v, (int, float)))
+            if not values:
+                return 0
+            return statistics.median(values)
+        return 0
+
     def _fn_filter(self, args_str: str, ctx: DAXContext) -> Any:
-        """FILTER(table, condition) — returns filtered table rows.
-        For now supports simple table name references."""
+        """FILTER(table, condition) — returns filtered table rows."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return []
         table_ref = self._eval_expr(args[0].strip(), ctx)
-        # If table_ref is a list (from ALL/VALUES), filter it
         if isinstance(table_ref, list):
-            # For each row, evaluate condition in that row's context
             filtered = []
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
@@ -1073,6 +1300,1798 @@ class DAXEngine:
                         filtered.append(row_item)
             return filtered
         return []
+
+    # =========================================================================
+    # Table functions
+    # =========================================================================
+
+    def _fn_topn(self, args_str: str, ctx: DAXContext) -> Any:
+        """TOPN(n, table, orderBy, order) — return top N rows."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return []
+        n = self._eval_expr(args[0].strip(), ctx)
+        if not isinstance(n, (int, float)):
+            return []
+        n = int(n)
+        table_ref = self._eval_expr(args[1].strip(), ctx)
+        if not isinstance(table_ref, list):
+            return []
+
+        order_expr = args[2].strip() if len(args) > 2 else None
+        # order: 1 or ASC = ascending, 0 or DESC = descending (default DESC)
+        descending = True
+        if len(args) > 3:
+            order_val = args[3].strip().upper()
+            if order_val in ('1', 'ASC'):
+                descending = False
+
+        if order_expr:
+            # Evaluate order expression for each row and sort
+            scored = []
+            for row_item in table_ref:
+                if isinstance(row_item, dict) and '__table__' in row_item:
+                    row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+                    score = self._eval_expr(order_expr, row_ctx)
+                else:
+                    score = self._eval_expr(order_expr, ctx)
+                scored.append((row_item, score if isinstance(score, (int, float)) else 0))
+            scored.sort(key=lambda x: x[1], reverse=descending)
+            return [item for item, _ in scored[:n]]
+        else:
+            return table_ref[:n]
+
+    def _fn_addcolumns(self, args_str: str, ctx: DAXContext) -> Any:
+        """ADDCOLUMNS(table, name, expression, ...) — add computed columns to table."""
+        args = self._split_args(args_str)
+        if len(args) < 3:
+            return []
+        table_ref = self._eval_expr(args[0].strip(), ctx)
+        if not isinstance(table_ref, list):
+            return table_ref
+
+        # Parse name/expression pairs
+        extended = []
+        for row_item in table_ref:
+            new_item = dict(row_item) if isinstance(row_item, dict) else row_item
+            if isinstance(row_item, dict) and '__table__' in row_item:
+                row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+            else:
+                row_ctx = ctx
+            # Process name/expression pairs
+            i = 1
+            while i + 1 < len(args):
+                col_name = self._eval_expr(args[i].strip(), ctx)
+                col_val = self._eval_expr(args[i + 1].strip(), row_ctx)
+                if isinstance(new_item, dict):
+                    new_item[str(col_name)] = col_val
+                i += 2
+            extended.append(new_item)
+        return extended
+
+    def _fn_summarize(self, args_str: str, ctx: DAXContext) -> Any:
+        """SUMMARIZE(table, groupBy1, groupBy2, ...) — group by columns.
+        Returns list of row dicts with distinct combinations of the group-by columns."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return []
+        table_name = args[0].strip().strip("'")
+        rows = ctx.get_filtered_rows(table_name)
+        tbl = ctx.tables.get(table_name)
+        if not tbl or not rows:
+            return []
+
+        # Collect group-by column indices
+        group_cols = []
+        for i in range(1, len(args)):
+            ref = self._eval_expr(args[i].strip(), ctx)
+            if isinstance(ref, tuple) and len(ref) == 2:
+                col_idx = ctx._find_col_idx(tbl['columns'], ref[1])
+                if col_idx >= 0:
+                    group_cols.append((ref[1], col_idx))
+
+        if not group_cols:
+            return []
+
+        # Get distinct combinations
+        seen = set()
+        result = []
+        for row in rows:
+            key = tuple(row[idx] for _, idx in group_cols)
+            if key not in seen:
+                seen.add(key)
+                row_dict = {'__table__': table_name}
+                for col_name, col_idx in group_cols:
+                    row_dict[col_name] = row[col_idx]
+                # Use first group col as the iteration column
+                row_dict['__column__'] = group_cols[0][0]
+                row_dict['__value__'] = row[group_cols[0][1]]
+                result.append(row_dict)
+        return result
+
+    def _fn_summarizecolumns(self, args_str: str, ctx: DAXContext) -> Any:
+        """SUMMARIZECOLUMNS(groupBy1, ..., name, expression) — summarize with measures.
+        Simplified: treats it like SUMMARIZE for the group-by columns."""
+        args = self._split_args(args_str)
+        if not args:
+            return []
+        # Find group-by columns (column refs) vs name/expression pairs (string, expression)
+        group_refs = []
+        for arg in args:
+            ref = self._eval_expr(arg.strip(), ctx)
+            if isinstance(ref, tuple) and len(ref) == 2:
+                group_refs.append(ref)
+            else:
+                break  # Rest are name/expression pairs
+        if not group_refs:
+            return []
+        # Use first table as base
+        table_name = group_refs[0][0]
+        return self._fn_summarize(f"'{table_name}', " + ", ".join(f"'{t}'[{c}]" for t, c in group_refs), ctx)
+
+    def _fn_selectcolumns(self, args_str: str, ctx: DAXContext) -> Any:
+        """SELECTCOLUMNS(table, name, expression, ...) — select/rename columns."""
+        args = self._split_args(args_str)
+        if len(args) < 3:
+            return []
+        table_ref = self._eval_expr(args[0].strip(), ctx)
+        if not isinstance(table_ref, list):
+            return []
+        result = []
+        for row_item in table_ref:
+            if isinstance(row_item, dict) and '__table__' in row_item:
+                row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+            else:
+                row_ctx = ctx
+            new_row = {}
+            i = 1
+            first_name = None
+            first_val = None
+            while i + 1 < len(args):
+                col_name = self._eval_expr(args[i].strip(), ctx)
+                col_val = self._eval_expr(args[i + 1].strip(), row_ctx)
+                col_name_str = str(col_name) if col_name else f"col_{i}"
+                new_row[col_name_str] = col_val
+                if first_name is None:
+                    first_name = col_name_str
+                    first_val = col_val
+                i += 2
+            if isinstance(row_item, dict) and '__table__' in row_item:
+                new_row['__table__'] = row_item['__table__']
+                new_row['__column__'] = row_item['__column__']
+                new_row['__value__'] = row_item['__value__']
+            result.append(new_row)
+        return result
+
+    def _fn_distinct(self, args_str: str, ctx: DAXContext) -> Any:
+        """DISTINCT(column_or_table) — distinct values, respecting filter context."""
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(ref, tuple) and len(ref) == 2:
+            values = ctx.get_column_data(ref[0], ref[1])
+            seen = set()
+            result = []
+            for v in values:
+                key = str(v)
+                if key not in seen:
+                    seen.add(key)
+                    result.append({'__table__': ref[0], '__column__': ref[1], '__value__': v})
+            return result
+        if isinstance(ref, list):
+            # Deduplicate table rows
+            seen = set()
+            result = []
+            for item in ref:
+                if isinstance(item, dict) and '__value__' in item:
+                    key = str(item['__value__'])
+                else:
+                    key = str(item)
+                if key not in seen:
+                    seen.add(key)
+                    result.append(item)
+            return result
+        return []
+
+    def _fn_union(self, args_str: str, ctx: DAXContext) -> Any:
+        """UNION(table1, table2) — combine two tables."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return []
+        t1 = self._eval_expr(args[0].strip(), ctx)
+        t2 = self._eval_expr(args[1].strip(), ctx)
+        result = []
+        if isinstance(t1, list):
+            result.extend(t1)
+        if isinstance(t2, list):
+            result.extend(t2)
+        return result
+
+    def _fn_except(self, args_str: str, ctx: DAXContext) -> Any:
+        """EXCEPT(table1, table2) — rows in table1 not in table2."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return []
+        t1 = self._eval_expr(args[0].strip(), ctx)
+        t2 = self._eval_expr(args[1].strip(), ctx)
+        if not isinstance(t1, list):
+            return []
+        if not isinstance(t2, list):
+            return t1
+        t2_keys = set()
+        for item in t2:
+            if isinstance(item, dict) and '__value__' in item:
+                t2_keys.add(str(item['__value__']))
+            else:
+                t2_keys.add(str(item))
+        result = []
+        for item in t1:
+            if isinstance(item, dict) and '__value__' in item:
+                key = str(item['__value__'])
+            else:
+                key = str(item)
+            if key not in t2_keys:
+                result.append(item)
+        return result
+
+    def _fn_intersect(self, args_str: str, ctx: DAXContext) -> Any:
+        """INTERSECT(table1, table2) — rows in both tables."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return []
+        t1 = self._eval_expr(args[0].strip(), ctx)
+        t2 = self._eval_expr(args[1].strip(), ctx)
+        if not isinstance(t1, list) or not isinstance(t2, list):
+            return []
+        t2_keys = set()
+        for item in t2:
+            if isinstance(item, dict) and '__value__' in item:
+                t2_keys.add(str(item['__value__']))
+            else:
+                t2_keys.add(str(item))
+        result = []
+        for item in t1:
+            if isinstance(item, dict) and '__value__' in item:
+                key = str(item['__value__'])
+            else:
+                key = str(item)
+            if key in t2_keys:
+                result.append(item)
+        return result
+
+    def _fn_crossjoin(self, args_str: str, ctx: DAXContext) -> Any:
+        """CROSSJOIN(table1, table2) — cartesian product."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return []
+        t1 = self._eval_expr(args[0].strip(), ctx)
+        t2 = self._eval_expr(args[1].strip(), ctx)
+        if not isinstance(t1, list) or not isinstance(t2, list):
+            return []
+        result = []
+        for item1 in t1:
+            for item2 in t2:
+                merged = {}
+                if isinstance(item1, dict):
+                    merged.update(item1)
+                if isinstance(item2, dict):
+                    merged.update({f"_2_{k}": v for k, v in item2.items()})
+                result.append(merged)
+        return result
+
+    def _fn_datatable(self, args_str: str, ctx: DAXContext) -> Any:
+        """DATATABLE(name, type, ..., data) — create inline table.
+        Simplified: returns a list of row dicts from the provided data block."""
+        # DATATABLE is complex to parse fully; provide basic support
+        args = self._split_args(args_str)
+        if len(args) < 3:
+            return []
+        # Parse column definitions: name, type pairs
+        col_names = []
+        i = 0
+        while i + 1 < len(args):
+            name_val = self._eval_expr(args[i].strip(), ctx)
+            type_val = args[i + 1].strip().upper()
+            if type_val in ('INTEGER', 'STRING', 'BOOLEAN', 'DOUBLE', 'CURRENCY', 'DATETIME'):
+                col_names.append(str(name_val))
+                i += 2
+            else:
+                break
+        # Remaining args are data values, grouped by column count
+        data_args = args[i:]
+        rows = []
+        row = {}
+        col_idx = 0
+        for da in data_args:
+            val = self._eval_expr(da.strip(), ctx)
+            if col_idx < len(col_names):
+                row[col_names[col_idx]] = val
+            col_idx += 1
+            if col_idx >= len(col_names):
+                if col_names:
+                    row['__table__'] = '__datatable__'
+                    row['__column__'] = col_names[0]
+                    row['__value__'] = row.get(col_names[0])
+                rows.append(row)
+                row = {}
+                col_idx = 0
+        return rows
+
+    def _fn_row(self, args_str: str, ctx: DAXContext) -> Any:
+        """ROW(name, expression, ...) — single row table."""
+        args = self._split_args(args_str)
+        row = {'__table__': '__row__'}
+        i = 0
+        first_name = None
+        while i + 1 < len(args):
+            col_name = self._eval_expr(args[i].strip(), ctx)
+            col_val = self._eval_expr(args[i + 1].strip(), ctx)
+            col_name_str = str(col_name) if col_name else f"col_{i}"
+            row[col_name_str] = col_val
+            if first_name is None:
+                first_name = col_name_str
+                row['__column__'] = col_name_str
+                row['__value__'] = col_val
+            i += 2
+        return [row]
+
+    def _fn_treatas(self, args_str: str, ctx: DAXContext) -> Any:
+        """TREATAS(table, column1, column2, ...) — apply table values as filter.
+        Returns a marker for CALCULATE to process."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return []
+        table_ref = self._eval_expr(args[0].strip(), ctx)
+        # Extract target column references
+        target_cols = []
+        for i in range(1, len(args)):
+            ref = self._eval_expr(args[i].strip(), ctx)
+            if isinstance(ref, tuple) and len(ref) == 2:
+                target_cols.append(ref)
+        if isinstance(table_ref, list) and target_cols:
+            # Extract values and return as filter marker
+            values = []
+            for item in table_ref:
+                if isinstance(item, dict) and '__value__' in item:
+                    values.append(item['__value__'])
+            if values and target_cols:
+                return ('__TREATAS__', target_cols[0], values)
+        return table_ref
+
+    def _fn_generate(self, args_str: str, ctx: DAXContext) -> Any:
+        """GENERATE(table1, table2_expr) — like CROSS APPLY (inner join behavior)."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return []
+        table_ref = self._eval_expr(args[0].strip(), ctx)
+        if not isinstance(table_ref, list):
+            return []
+        result = []
+        for row_item in table_ref:
+            if isinstance(row_item, dict) and '__table__' in row_item:
+                row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+            else:
+                row_ctx = ctx
+            inner = self._eval_expr(args[1].strip(), row_ctx)
+            if isinstance(inner, list) and inner:
+                for inner_item in inner:
+                    merged = {}
+                    if isinstance(row_item, dict):
+                        merged.update(row_item)
+                    if isinstance(inner_item, dict):
+                        merged.update({f"_inner_{k}": v for k, v in inner_item.items()})
+                    result.append(merged)
+        return result
+
+    def _fn_generateall(self, args_str: str, ctx: DAXContext) -> Any:
+        """GENERATEALL(table1, table2_expr) — like CROSS APPLY (includes empty inner)."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return []
+        table_ref = self._eval_expr(args[0].strip(), ctx)
+        if not isinstance(table_ref, list):
+            return []
+        result = []
+        for row_item in table_ref:
+            if isinstance(row_item, dict) and '__table__' in row_item:
+                row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+            else:
+                row_ctx = ctx
+            inner = self._eval_expr(args[1].strip(), row_ctx)
+            if isinstance(inner, list) and inner:
+                for inner_item in inner:
+                    merged = {}
+                    if isinstance(row_item, dict):
+                        merged.update(row_item)
+                    if isinstance(inner_item, dict):
+                        merged.update({f"_inner_{k}": v for k, v in inner_item.items()})
+                    result.append(merged)
+            else:
+                # GENERATEALL keeps rows even when inner is empty
+                result.append(row_item if isinstance(row_item, dict) else {'__value__': row_item})
+        return result
+
+    # =========================================================================
+    # Filter functions
+    # =========================================================================
+
+    def _fn_allexcept(self, args_str: str, ctx: DAXContext) -> Any:
+        """ALLEXCEPT(table, column1, column2, ...) — remove all filters except on specified columns."""
+        args = self._split_args(args_str)
+        if not args:
+            return ('__ALLEXCEPT__', args_str.strip())
+        table_name = args[0].strip().strip("'")
+        # Columns to keep
+        keep_cols = set()
+        for i in range(1, len(args)):
+            ref = self._eval_expr(args[i].strip(), ctx)
+            if isinstance(ref, tuple) and len(ref) == 2:
+                keep_cols.add(f"{ref[0]}.{ref[1]}")
+
+        # When used as table expression, return all rows of table ignoring non-keep filters
+        tbl = ctx.tables.get(table_name)
+        if tbl:
+            # Build a context that only retains filters on the keep columns
+            new_filters = {k: v for k, v in ctx.filter_context.items()
+                          if k in keep_cols or not k.startswith(f"{table_name}.")}
+            new_ctx = DAXContext(ctx.tables, ctx.measures, ctx.date_table,
+                                ctx.date_column, new_filters, ctx.relationships)
+            rows = new_ctx.get_filtered_rows(table_name)
+            cols = tbl['columns']
+            if rows and len(cols) > 0:
+                result = []
+                seen = set()
+                for row in rows:
+                    key = tuple(str(row[i]) for i in range(len(cols)))
+                    if key not in seen:
+                        seen.add(key)
+                        result.append({'__table__': table_name, '__column__': cols[0], '__value__': row[0]})
+                return result
+        return ('__ALLEXCEPT__', args_str.strip())
+
+    def _fn_allselected(self, args_str: str, ctx: DAXContext) -> Any:
+        """ALLSELECTED(column_or_table) — respect only external (slicer) filters.
+        Approximation: returns all distinct values from filtered context (same as VALUES)."""
+        # NOTE: True ALLSELECTED requires distinguishing external vs internal filters,
+        # which is not tracked in this simplified engine. We approximate with VALUES behavior.
+        ref = args_str.strip()
+        col_match = re.match(r"'?([^'\[\]]+)'?\s*\[([^\]]+)\]", ref)
+        if col_match:
+            table_name = col_match.group(1).strip()
+            col_name = col_match.group(2).strip()
+            values = ctx.get_column_data(table_name, col_name)
+            unique = list(set(values))
+            return [{'__table__': table_name, '__column__': col_name, '__value__': v} for v in unique]
+        return ('__ALLSELECTED__', ref)
+
+    def _fn_keepfilters(self, args_str: str, ctx: DAXContext) -> Any:
+        """KEEPFILTERS(expression) — intersect rather than replace filter context.
+        Approximation: just evaluate the expression (KEEPFILTERS modifies CALCULATE behavior)."""
+        # NOTE: True KEEPFILTERS changes how CALCULATE applies filters (intersection vs replacement).
+        # In this simplified engine, we just evaluate the inner expression.
+        return self._eval_expr(args_str.strip(), ctx)
+
+    def _fn_hasonevalue(self, args_str: str, ctx: DAXContext) -> Any:
+        """HASONEVALUE(column) — check if exactly one distinct value in filter context."""
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(ref, tuple) and len(ref) == 2:
+            values = list(set(ctx.get_column_data(ref[0], ref[1])))
+            return len(values) == 1
+        return False
+
+    def _fn_hasonefilter(self, args_str: str, ctx: DAXContext) -> Any:
+        """HASONEFILTER(column) — check if exactly one direct filter on column."""
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(ref, tuple) and len(ref) == 2:
+            filter_key = f"{ref[0]}.{ref[1]}"
+            if filter_key in ctx.filter_context:
+                return len(ctx.filter_context[filter_key]) == 1
+        return False
+
+    def _fn_isfiltered(self, args_str: str, ctx: DAXContext) -> Any:
+        """ISFILTERED(column) — check if column has any direct filter."""
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(ref, tuple) and len(ref) == 2:
+            filter_key = f"{ref[0]}.{ref[1]}"
+            return filter_key in ctx.filter_context
+        return False
+
+    def _fn_iscrossfiltered(self, args_str: str, ctx: DAXContext) -> Any:
+        """ISCROSSFILTERED(column) — check if column is cross-filtered via relationships."""
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(ref, tuple) and len(ref) == 2:
+            # Check direct filter
+            filter_key = f"{ref[0]}.{ref[1]}"
+            if filter_key in ctx.filter_context:
+                return True
+            # Check cross-table filters
+            cross_filters = ctx._get_cross_table_filters(ref[0])
+            return len(cross_filters) > 0
+        return False
+
+    def _fn_userelationship(self, args_str: str, ctx: DAXContext) -> Any:
+        """USERELATIONSHIP(column1, column2) — activate an inactive relationship.
+        Returns a marker for CALCULATE to process."""
+        # NOTE: Full implementation would require modifying the relationship index.
+        # This returns a marker that CALCULATE can interpret.
+        return ('__USERELATIONSHIP__', args_str.strip())
+
+    def _fn_earlier(self, args_str: str, ctx: DAXContext) -> Any:
+        """EARLIER(column, n) — row context from n levels up.
+        Limitation: This engine does not maintain a row context stack.
+        Returns the current column value as an approximation."""
+        args = self._split_args(args_str)
+        ref = self._eval_expr(args[0].strip(), ctx)
+        # NOTE: EARLIER requires a row context stack which this engine doesn't maintain.
+        # We return the column reference so it can be used in comparisons.
+        return ref
+
+    def _fn_earliest(self, args_str: str, ctx: DAXContext) -> Any:
+        """EARLIEST(column) — outermost row context.
+        Limitation: Same as EARLIER — no row context stack."""
+        return self._fn_earlier(args_str, ctx)
+
+    # =========================================================================
+    # Math functions
+    # =========================================================================
+
+    def _fn_ceiling(self, args_str: str, ctx: DAXContext) -> Any:
+        """CEILING(number, significance) — round up to nearest multiple of significance."""
+        args = self._split_args(args_str)
+        val = self._eval_expr(args[0].strip(), ctx)
+        sig = self._eval_expr(args[1].strip(), ctx) if len(args) > 1 else 1
+        if isinstance(val, (int, float)) and isinstance(sig, (int, float)) and sig != 0:
+            return math.ceil(val / sig) * sig
+        return val
+
+    def _fn_floor(self, args_str: str, ctx: DAXContext) -> Any:
+        """FLOOR(number, significance) — round down to nearest multiple of significance."""
+        args = self._split_args(args_str)
+        val = self._eval_expr(args[0].strip(), ctx)
+        sig = self._eval_expr(args[1].strip(), ctx) if len(args) > 1 else 1
+        if isinstance(val, (int, float)) and isinstance(sig, (int, float)) and sig != 0:
+            return math.floor(val / sig) * sig
+        return val
+
+    def _fn_mod(self, args_str: str, ctx: DAXContext) -> Any:
+        """MOD(number, divisor) — modulo."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return None
+        val = self._eval_expr(args[0].strip(), ctx)
+        divisor = self._eval_expr(args[1].strip(), ctx)
+        if isinstance(val, (int, float)) and isinstance(divisor, (int, float)) and divisor != 0:
+            return val % divisor
+        return None
+
+    def _fn_power(self, args_str: str, ctx: DAXContext) -> Any:
+        """POWER(base, exponent) — exponentiation."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return None
+        base = self._eval_expr(args[0].strip(), ctx)
+        exp = self._eval_expr(args[1].strip(), ctx)
+        if isinstance(base, (int, float)) and isinstance(exp, (int, float)):
+            return math.pow(base, exp)
+        return None
+
+    def _fn_sqrt(self, args_str: str, ctx: DAXContext) -> Any:
+        """SQRT(number) — square root."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(val, (int, float)) and val >= 0:
+            return math.sqrt(val)
+        return None
+
+    def _fn_log(self, args_str: str, ctx: DAXContext) -> Any:
+        """LOG(number, base) — logarithm with specified base (default 10)."""
+        args = self._split_args(args_str)
+        val = self._eval_expr(args[0].strip(), ctx)
+        base = self._eval_expr(args[1].strip(), ctx) if len(args) > 1 else 10
+        if isinstance(val, (int, float)) and val > 0 and isinstance(base, (int, float)) and base > 0:
+            return math.log(val, base)
+        return None
+
+    def _fn_log10(self, args_str: str, ctx: DAXContext) -> Any:
+        """LOG10(number) — base-10 logarithm."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(val, (int, float)) and val > 0:
+            return math.log10(val)
+        return None
+
+    def _fn_ln(self, args_str: str, ctx: DAXContext) -> Any:
+        """LN(number) — natural logarithm."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(val, (int, float)) and val > 0:
+            return math.log(val)
+        return None
+
+    def _fn_exp(self, args_str: str, ctx: DAXContext) -> Any:
+        """EXP(number) — e^x."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(val, (int, float)):
+            return math.exp(val)
+        return None
+
+    def _fn_sign(self, args_str: str, ctx: DAXContext) -> Any:
+        """SIGN(number) — returns -1, 0, or 1."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(val, (int, float)):
+            if val > 0:
+                return 1
+            elif val < 0:
+                return -1
+            return 0
+        return None
+
+    def _fn_trunc(self, args_str: str, ctx: DAXContext) -> Any:
+        """TRUNC(number, digits) — truncate to specified decimal places."""
+        args = self._split_args(args_str)
+        val = self._eval_expr(args[0].strip(), ctx)
+        digits = int(self._eval_expr(args[1].strip(), ctx)) if len(args) > 1 else 0
+        if isinstance(val, (int, float)):
+            multiplier = 10 ** digits
+            return int(val * multiplier) / multiplier
+        return None
+
+    def _fn_even(self, args_str: str, ctx: DAXContext) -> Any:
+        """EVEN(number) — round up to nearest even integer."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(val, (int, float)):
+            result = math.ceil(abs(val))
+            if result % 2 != 0:
+                result += 1
+            return result if val >= 0 else -result
+        return None
+
+    def _fn_odd(self, args_str: str, ctx: DAXContext) -> Any:
+        """ODD(number) — round up to nearest odd integer."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(val, (int, float)):
+            result = math.ceil(abs(val))
+            if result % 2 == 0:
+                result += 1
+            return result if val >= 0 else -result
+        return None
+
+    def _fn_fact(self, args_str: str, ctx: DAXContext) -> Any:
+        """FACT(number) — factorial."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(val, (int, float)) and val >= 0:
+            return math.factorial(int(val))
+        return None
+
+    def _fn_gcd(self, args_str: str, ctx: DAXContext) -> Any:
+        """GCD(a, b) — greatest common divisor."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return None
+        a = self._eval_expr(args[0].strip(), ctx)
+        b = self._eval_expr(args[1].strip(), ctx)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            return math.gcd(int(a), int(b))
+        return None
+
+    def _fn_lcm(self, args_str: str, ctx: DAXContext) -> Any:
+        """LCM(a, b) — least common multiple."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return None
+        a = self._eval_expr(args[0].strip(), ctx)
+        b = self._eval_expr(args[1].strip(), ctx)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            a_int, b_int = int(a), int(b)
+            if a_int == 0 or b_int == 0:
+                return 0
+            return abs(a_int * b_int) // math.gcd(a_int, b_int)
+        return None
+
+    def _fn_rand(self, args_str: str, ctx: DAXContext) -> Any:
+        """RAND() — random number between 0 and 1."""
+        return random.random()
+
+    def _fn_randbetween(self, args_str: str, ctx: DAXContext) -> Any:
+        """RANDBETWEEN(min, max) — random integer between min and max."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return 0
+        lo = self._eval_expr(args[0].strip(), ctx)
+        hi = self._eval_expr(args[1].strip(), ctx)
+        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+            return random.randint(int(lo), int(hi))
+        return 0
+
+    def _fn_pi(self, args_str: str, ctx: DAXContext) -> Any:
+        """PI() — returns 3.14159..."""
+        return math.pi
+
+    def _fn_currency(self, args_str: str, ctx: DAXContext) -> Any:
+        """CURRENCY(value) — convert to currency (fixed-point decimal, 4 decimal places)."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(val, (int, float)):
+            return round(val, 4)
+        return 0
+
+    def _fn_fixed(self, args_str: str, ctx: DAXContext) -> Any:
+        """FIXED(number, decimals, no_commas) — format number as text with fixed decimals."""
+        args = self._split_args(args_str)
+        val = self._eval_expr(args[0].strip(), ctx)
+        decimals = int(self._eval_expr(args[1].strip(), ctx)) if len(args) > 1 else 2
+        no_commas = self._eval_expr(args[2].strip(), ctx) if len(args) > 2 else False
+        if isinstance(val, (int, float)):
+            if no_commas:
+                return f"{val:.{decimals}f}"
+            return f"{val:,.{decimals}f}"
+        return str(val)
+
+    # =========================================================================
+    # Text functions
+    # =========================================================================
+
+    def _fn_left(self, args_str: str, ctx: DAXContext) -> Any:
+        """LEFT(text, n) — leftmost n characters."""
+        args = self._split_args(args_str)
+        text = self._eval_expr(args[0].strip(), ctx)
+        n = int(self._eval_expr(args[1].strip(), ctx)) if len(args) > 1 else 1
+        if text is not None:
+            return str(text)[:n]
+        return ''
+
+    def _fn_right(self, args_str: str, ctx: DAXContext) -> Any:
+        """RIGHT(text, n) — rightmost n characters."""
+        args = self._split_args(args_str)
+        text = self._eval_expr(args[0].strip(), ctx)
+        n = int(self._eval_expr(args[1].strip(), ctx)) if len(args) > 1 else 1
+        if text is not None:
+            s = str(text)
+            return s[-n:] if n <= len(s) else s
+        return ''
+
+    def _fn_mid(self, args_str: str, ctx: DAXContext) -> Any:
+        """MID(text, start, n) — substring from start position (1-based) for n characters."""
+        args = self._split_args(args_str)
+        if len(args) < 3:
+            return ''
+        text = self._eval_expr(args[0].strip(), ctx)
+        start = int(self._eval_expr(args[1].strip(), ctx))
+        n = int(self._eval_expr(args[2].strip(), ctx))
+        if text is not None:
+            s = str(text)
+            return s[start - 1:start - 1 + n]  # DAX uses 1-based indexing
+        return ''
+
+    def _fn_len(self, args_str: str, ctx: DAXContext) -> Any:
+        """LEN(text) — length of text."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        if val is not None:
+            return len(str(val))
+        return 0
+
+    def _fn_upper(self, args_str: str, ctx: DAXContext) -> Any:
+        """UPPER(text) — convert to uppercase."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        return str(val).upper() if val is not None else ''
+
+    def _fn_lower(self, args_str: str, ctx: DAXContext) -> Any:
+        """LOWER(text) — convert to lowercase."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        return str(val).lower() if val is not None else ''
+
+    def _fn_proper(self, args_str: str, ctx: DAXContext) -> Any:
+        """PROPER(text) — capitalize first letter of each word."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        return str(val).title() if val is not None else ''
+
+    def _fn_trim(self, args_str: str, ctx: DAXContext) -> Any:
+        """TRIM(text) — remove leading/trailing spaces."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        return str(val).strip() if val is not None else ''
+
+    def _fn_substitute(self, args_str: str, ctx: DAXContext) -> Any:
+        """SUBSTITUTE(text, old, new, instance) — replace text occurrences."""
+        args = self._split_args(args_str)
+        if len(args) < 3:
+            return ''
+        text = str(self._eval_expr(args[0].strip(), ctx) or '')
+        old = str(self._eval_expr(args[1].strip(), ctx) or '')
+        new = str(self._eval_expr(args[2].strip(), ctx) or '')
+        if len(args) > 3:
+            instance = int(self._eval_expr(args[3].strip(), ctx) or 1)
+            # Replace only the nth occurrence
+            count = 0
+            result = []
+            i = 0
+            while i < len(text):
+                if text[i:i + len(old)] == old:
+                    count += 1
+                    if count == instance:
+                        result.append(new)
+                        i += len(old)
+                        continue
+                result.append(text[i])
+                i += 1
+            return ''.join(result)
+        return text.replace(old, new)
+
+    def _fn_replace(self, args_str: str, ctx: DAXContext) -> Any:
+        """REPLACE(text, start, n, new) — replace by position."""
+        args = self._split_args(args_str)
+        if len(args) < 4:
+            return ''
+        text = str(self._eval_expr(args[0].strip(), ctx) or '')
+        start = int(self._eval_expr(args[1].strip(), ctx)) - 1  # DAX is 1-based
+        n = int(self._eval_expr(args[2].strip(), ctx))
+        new = str(self._eval_expr(args[3].strip(), ctx) or '')
+        return text[:start] + new + text[start + n:]
+
+    def _fn_rept(self, args_str: str, ctx: DAXContext) -> Any:
+        """REPT(text, n) — repeat text n times."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return ''
+        text = str(self._eval_expr(args[0].strip(), ctx) or '')
+        n = int(self._eval_expr(args[1].strip(), ctx) or 0)
+        return text * max(0, n)
+
+    def _fn_search(self, args_str: str, ctx: DAXContext) -> Any:
+        """SEARCH(find, within, start) — find position (case-insensitive, 1-based). Returns -1 if not found."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return -1
+        find_text = str(self._eval_expr(args[0].strip(), ctx) or '').lower()
+        within_text = str(self._eval_expr(args[1].strip(), ctx) or '').lower()
+        start = int(self._eval_expr(args[2].strip(), ctx)) - 1 if len(args) > 2 else 0
+        pos = within_text.find(find_text, start)
+        return pos + 1 if pos >= 0 else -1  # DAX returns 1-based
+
+    def _fn_find(self, args_str: str, ctx: DAXContext) -> Any:
+        """FIND(find, within, start) — find position (case-sensitive, 1-based). Returns -1 if not found."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return -1
+        find_text = str(self._eval_expr(args[0].strip(), ctx) or '')
+        within_text = str(self._eval_expr(args[1].strip(), ctx) or '')
+        start = int(self._eval_expr(args[2].strip(), ctx)) - 1 if len(args) > 2 else 0
+        pos = within_text.find(find_text, start)
+        return pos + 1 if pos >= 0 else -1
+
+    def _fn_containsstring(self, args_str: str, ctx: DAXContext) -> Any:
+        """CONTAINSSTRING(within, find) — case-insensitive contains check."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return False
+        within = str(self._eval_expr(args[0].strip(), ctx) or '').lower()
+        find = str(self._eval_expr(args[1].strip(), ctx) or '').lower()
+        return find in within
+
+    def _fn_containsstringexact(self, args_str: str, ctx: DAXContext) -> Any:
+        """CONTAINSSTRINGEXACT(within, find) — case-sensitive contains check."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return False
+        within = str(self._eval_expr(args[0].strip(), ctx) or '')
+        find = str(self._eval_expr(args[1].strip(), ctx) or '')
+        return find in within
+
+    def _fn_exact(self, args_str: str, ctx: DAXContext) -> Any:
+        """EXACT(text1, text2) — case-sensitive string comparison."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return False
+        t1 = str(self._eval_expr(args[0].strip(), ctx) or '')
+        t2 = str(self._eval_expr(args[1].strip(), ctx) or '')
+        return t1 == t2
+
+    def _fn_unichar(self, args_str: str, ctx: DAXContext) -> Any:
+        """UNICHAR(number) — return unicode character for code point."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(val, (int, float)):
+            try:
+                return chr(int(val))
+            except (ValueError, OverflowError):
+                return ''
+        return ''
+
+    def _fn_unicode(self, args_str: str, ctx: DAXContext) -> Any:
+        """UNICODE(text) — return unicode code point of first character."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        if val is not None:
+            s = str(val)
+            if s:
+                return ord(s[0])
+        return 0
+
+    def _fn_value(self, args_str: str, ctx: DAXContext) -> Any:
+        """VALUE(text) — convert text to number."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        if val is None:
+            return 0
+        try:
+            s = str(val).replace(',', '').replace('$', '').replace('%', '').strip()
+            if '.' in s:
+                return float(s)
+            return int(s)
+        except (ValueError, TypeError):
+            return 0
+
+    def _fn_combinevalues(self, args_str: str, ctx: DAXContext) -> Any:
+        """COMBINEVALUES(delimiter, value1, value2, ...) — join values with delimiter."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return ''
+        delimiter = str(self._eval_expr(args[0].strip(), ctx) or '')
+        parts = [str(self._eval_expr(a.strip(), ctx) or '') for a in args[1:]]
+        return delimiter.join(parts)
+
+    def _fn_pathcontains(self, args_str: str, ctx: DAXContext) -> Any:
+        """PATHCONTAINS(path, item) — check if pipe-delimited path contains item."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return False
+        path = str(self._eval_expr(args[0].strip(), ctx) or '')
+        item = str(self._eval_expr(args[1].strip(), ctx) or '')
+        return item in path.split('|')
+
+    def _fn_pathitem(self, args_str: str, ctx: DAXContext) -> Any:
+        """PATHITEM(path, position, type) — get item at position in pipe-delimited path (1-based)."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return ''
+        path = str(self._eval_expr(args[0].strip(), ctx) or '')
+        pos = int(self._eval_expr(args[1].strip(), ctx) or 1)
+        parts = path.split('|')
+        if 1 <= pos <= len(parts):
+            return parts[pos - 1]
+        return ''
+
+    def _fn_pathlength(self, args_str: str, ctx: DAXContext) -> Any:
+        """PATHLENGTH(path) — count items in pipe-delimited path."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        if val is not None:
+            path = str(val)
+            if path:
+                return len(path.split('|'))
+        return 0
+
+    # =========================================================================
+    # Logical functions
+    # =========================================================================
+
+    def _fn_true(self, args_str: str, ctx: DAXContext) -> Any:
+        """TRUE() — boolean true."""
+        return True
+
+    def _fn_false(self, args_str: str, ctx: DAXContext) -> Any:
+        """FALSE() — boolean false."""
+        return False
+
+    def _fn_iferror(self, args_str: str, ctx: DAXContext) -> Any:
+        """IFERROR(expression, fallback) — return fallback if expression errors."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return None
+        try:
+            result = self._eval_expr(args[0].strip(), ctx)
+            if result is None:
+                return self._eval_expr(args[1].strip(), ctx)
+            return result
+        except Exception:
+            return self._eval_expr(args[1].strip(), ctx)
+
+    def _fn_coalesce(self, args_str: str, ctx: DAXContext) -> Any:
+        """COALESCE(value1, value2, ...) — return first non-blank value."""
+        args = self._split_args(args_str)
+        for arg in args:
+            val = self._eval_expr(arg.strip(), ctx)
+            if val is not None and val != '':
+                return val
+        return None
+
+    def _fn_contains(self, args_str: str, ctx: DAXContext) -> Any:
+        """CONTAINS(table, column, value, ...) — check if table contains a row with specified values."""
+        args = self._split_args(args_str)
+        if len(args) < 3:
+            return False
+        table_name = args[0].strip().strip("'")
+        tbl = ctx.tables.get(table_name)
+        if not tbl:
+            return False
+
+        # Parse column/value pairs
+        criteria = []
+        i = 1
+        while i + 1 < len(args):
+            ref = self._eval_expr(args[i].strip(), ctx)
+            value = self._eval_expr(args[i + 1].strip(), ctx)
+            if isinstance(ref, tuple) and len(ref) == 2:
+                col_idx = ctx._find_col_idx(tbl['columns'], ref[1])
+                if col_idx >= 0:
+                    criteria.append((col_idx, value))
+            i += 2
+
+        if not criteria:
+            return False
+
+        rows = ctx.get_filtered_rows(table_name)
+        for row in rows:
+            match = True
+            for col_idx, value in criteria:
+                if str(row[col_idx]) != str(value):
+                    match = False
+                    break
+            if match:
+                return True
+        return False
+
+    # =========================================================================
+    # Information functions
+    # =========================================================================
+
+    def _fn_isnumber(self, args_str: str, ctx: DAXContext) -> Any:
+        """ISNUMBER(value) — check if value is numeric."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        return isinstance(val, (int, float))
+
+    def _fn_istext(self, args_str: str, ctx: DAXContext) -> Any:
+        """ISTEXT(value) — check if value is text."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        return isinstance(val, str)
+
+    def _fn_isnontext(self, args_str: str, ctx: DAXContext) -> Any:
+        """ISNONTEXT(value) — check if value is not text."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        return not isinstance(val, str)
+
+    def _fn_islogical(self, args_str: str, ctx: DAXContext) -> Any:
+        """ISLOGICAL(value) — check if value is boolean."""
+        val = self._eval_expr(args_str.strip(), ctx)
+        return isinstance(val, bool)
+
+    def _fn_iserror(self, args_str: str, ctx: DAXContext) -> Any:
+        """ISERROR(value) — check if expression results in error."""
+        try:
+            val = self._eval_expr(args_str.strip(), ctx)
+            return val is None
+        except Exception:
+            return True
+
+    def _fn_username(self, args_str: str, ctx: DAXContext) -> Any:
+        """USERNAME() — returns empty string (server-side function)."""
+        return ''
+
+    def _fn_userprincipalname(self, args_str: str, ctx: DAXContext) -> Any:
+        """USERPRINCIPALNAME() — returns empty string (server-side function)."""
+        return ''
+
+    def _fn_lookupvalue(self, args_str: str, ctx: DAXContext) -> Any:
+        """LOOKUPVALUE(result_column, search_column, search_value, ...) — vlookup equivalent."""
+        args = self._split_args(args_str)
+        if len(args) < 3:
+            return None
+
+        result_ref = self._eval_expr(args[0].strip(), ctx)
+        if not isinstance(result_ref, tuple) or len(result_ref) != 2:
+            return None
+
+        table_name, result_col = result_ref
+        tbl = ctx.tables.get(table_name)
+        if not tbl:
+            return None
+
+        result_col_idx = ctx._find_col_idx(tbl['columns'], result_col)
+        if result_col_idx < 0:
+            return None
+
+        # Build search criteria: pairs of (column_ref, value)
+        criteria = []
+        i = 1
+        while i + 1 < len(args):
+            search_ref = self._eval_expr(args[i].strip(), ctx)
+            search_val = self._eval_expr(args[i + 1].strip(), ctx)
+            if isinstance(search_ref, tuple) and len(search_ref) == 2:
+                col_idx = ctx._find_col_idx(tbl['columns'], search_ref[1])
+                if col_idx >= 0:
+                    criteria.append((col_idx, search_val))
+            i += 2
+
+        if not criteria:
+            return None
+
+        # Search through all rows (ignoring filter context for lookup)
+        for row in tbl['rows']:
+            match = True
+            for col_idx, search_val in criteria:
+                if str(row[col_idx]) != str(search_val):
+                    match = False
+                    break
+            if match:
+                return row[result_col_idx]
+
+        # Return alternate value if provided
+        if len(args) > 1 + len(criteria) * 2:
+            return self._eval_expr(args[-1].strip(), ctx)
+        return None
+
+    # =========================================================================
+    # Relationship functions
+    # =========================================================================
+
+    def _fn_related(self, args_str: str, ctx: DAXContext) -> Any:
+        """RELATED(column) — follow relationship to get a value from a related table.
+        Approximation: looks up value via relationship index and current filter context."""
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if not isinstance(ref, tuple) or len(ref) != 2:
+            return None
+        target_table, target_col = ref
+        # Try to find a related value via relationships
+        tbl = ctx.tables.get(target_table)
+        if not tbl:
+            return None
+        target_col_idx = ctx._find_col_idx(tbl['columns'], target_col)
+        if target_col_idx < 0:
+            return None
+        # Get filtered rows from the target table
+        rows = ctx.get_filtered_rows(target_table)
+        if rows:
+            return rows[0][target_col_idx]
+        return None
+
+    def _fn_relatedtable(self, args_str: str, ctx: DAXContext) -> Any:
+        """RELATEDTABLE(table) — follow relationship to get filtered related table rows."""
+        table_name = args_str.strip().strip("'")
+        tbl = ctx.tables.get(table_name)
+        if not tbl:
+            return []
+        rows = ctx.get_filtered_rows(table_name)
+        cols = tbl['columns']
+        result = []
+        for row in rows:
+            row_dict = {'__table__': table_name, '__column__': cols[0] if cols else '', '__value__': row[0] if row else None}
+            for i, col in enumerate(cols):
+                row_dict[col] = row[i]
+            result.append(row_dict)
+        return result
+
+    def _fn_crossfilter(self, args_str: str, ctx: DAXContext) -> Any:
+        """CROSSFILTER(column1, column2, direction) — modify cross-filter direction.
+        Returns a marker for CALCULATE to process."""
+        # NOTE: Full implementation would modify relationship filter propagation direction.
+        return ('__CROSSFILTER__', args_str.strip())
+
+    # =========================================================================
+    # Time Intelligence functions — helpers
+    # =========================================================================
+
+    def _parse_date(self, val) -> Optional[datetime]:
+        """Try to parse a value as a date."""
+        if isinstance(val, datetime):
+            return val
+        if isinstance(val, date):
+            return datetime(val.year, val.month, val.day)
+        if isinstance(val, str):
+            for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%Y-%m-%dT%H:%M:%S',
+                        '%Y-%m-%d %H:%M:%S', '%m/%d/%Y %H:%M:%S'):
+                try:
+                    return datetime.strptime(val, fmt)
+                except ValueError:
+                    continue
+        if isinstance(val, (int, float)):
+            # Excel serial date: days since 1899-12-30
+            try:
+                return datetime(1899, 12, 30) + timedelta(days=int(val))
+            except (ValueError, OverflowError):
+                pass
+        return None
+
+    def _get_date_column_dates(self, args_str: str, ctx: DAXContext) -> tuple:
+        """Parse a date column reference and return (table_name, col_name, list_of_dates).
+        Returns (table_name, col_name, dates) where dates are datetime objects."""
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(ref, tuple) and len(ref) == 2:
+            table_name, col_name = ref
+            raw_values = ctx.get_column_data(table_name, col_name)
+            dates = []
+            for v in raw_values:
+                d = self._parse_date(v)
+                if d:
+                    dates.append(d)
+            return table_name, col_name, dates
+        return None, None, []
+
+    def _make_date_table_result(self, table_name: str, col_name: str, dates: list) -> list:
+        """Convert a list of datetime objects into the standard row-dict format."""
+        result = []
+        for d in dates:
+            result.append({
+                '__table__': table_name,
+                '__column__': col_name,
+                '__value__': d.strftime('%Y-%m-%d')
+            })
+        return result
+
+    def _get_all_date_table_dates(self, table_name: str, col_name: str, ctx: DAXContext) -> list:
+        """Get ALL dates from the date table (ignoring filter context)."""
+        tbl = ctx.tables.get(table_name)
+        if not tbl:
+            return []
+        col_idx = ctx._find_col_idx(tbl['columns'], col_name)
+        if col_idx < 0:
+            return []
+        dates = []
+        for row in tbl['rows']:
+            d = self._parse_date(row[col_idx])
+            if d:
+                dates.append(d)
+        return dates
+
+    # =========================================================================
+    # Time Intelligence functions — Date Sets
+    # =========================================================================
+
+    def _fn_datesytd(self, args_str: str, ctx: DAXContext) -> Any:
+        """DATESYTD(dates, yearEndDate) — year to date dates."""
+        args = self._split_args(args_str)
+        table_name, col_name, dates = self._get_date_column_dates(args[0].strip(), ctx)
+        if not dates:
+            return []
+        # Year end date (default Dec 31)
+        year_end_month = 12
+        year_end_day = 31
+        if len(args) > 1:
+            ye = self._eval_expr(args[1].strip(), ctx)
+            if isinstance(ye, str):
+                try:
+                    parts = ye.split('/')
+                    if len(parts) == 2:
+                        year_end_month = int(parts[0])
+                        year_end_day = int(parts[1])
+                except ValueError:
+                    pass
+
+        max_date = max(dates)
+        # YTD: from start of fiscal year to max_date
+        if year_end_month == 12 and year_end_day == 31:
+            year_start = datetime(max_date.year, 1, 1)
+        else:
+            # Fiscal year
+            if max_date.month > year_end_month or (max_date.month == year_end_month and max_date.day > year_end_day):
+                year_start = datetime(max_date.year, year_end_month, year_end_day) + timedelta(days=1)
+            else:
+                year_start = datetime(max_date.year - 1, year_end_month, year_end_day) + timedelta(days=1)
+
+        all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
+        ytd = [d for d in all_dates if year_start <= d <= max_date]
+        return self._make_date_table_result(table_name, col_name, ytd)
+
+    def _fn_datesmtd(self, args_str: str, ctx: DAXContext) -> Any:
+        """DATESMTD(dates) — month to date dates."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        max_date = max(dates)
+        month_start = datetime(max_date.year, max_date.month, 1)
+        all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
+        mtd = [d for d in all_dates if month_start <= d <= max_date]
+        return self._make_date_table_result(table_name, col_name, mtd)
+
+    def _fn_datesqtd(self, args_str: str, ctx: DAXContext) -> Any:
+        """DATESQTD(dates) — quarter to date dates."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        max_date = max(dates)
+        quarter_start_month = ((max_date.month - 1) // 3) * 3 + 1
+        quarter_start = datetime(max_date.year, quarter_start_month, 1)
+        all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
+        qtd = [d for d in all_dates if quarter_start <= d <= max_date]
+        return self._make_date_table_result(table_name, col_name, qtd)
+
+    def _fn_totalytd(self, args_str: str, ctx: DAXContext) -> Any:
+        """TOTALYTD(expression, dates, filter, yearEndDate) — year to date total."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return 0
+        expr = args[0].strip()
+        # Get YTD dates
+        ytd_dates = self._fn_datesytd(', '.join(args[1:]), ctx)
+        if not ytd_dates:
+            return self._eval_expr(expr, ctx)
+        # Apply date filter
+        if ytd_dates and isinstance(ytd_dates, list) and ytd_dates:
+            first = ytd_dates[0]
+            if isinstance(first, dict) and '__table__' in first:
+                date_values = [item['__value__'] for item in ytd_dates]
+                new_ctx = ctx.with_filters({f"{first['__table__']}.{first['__column__']}": date_values})
+                return self._eval_expr(expr, new_ctx)
+        return self._eval_expr(expr, ctx)
+
+    def _fn_totalmtd(self, args_str: str, ctx: DAXContext) -> Any:
+        """TOTALMTD(expression, dates) — month to date total."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return 0
+        expr = args[0].strip()
+        mtd_dates = self._fn_datesmtd(args[1].strip(), ctx)
+        if mtd_dates and isinstance(mtd_dates, list) and mtd_dates:
+            first = mtd_dates[0]
+            if isinstance(first, dict) and '__table__' in first:
+                date_values = [item['__value__'] for item in mtd_dates]
+                new_ctx = ctx.with_filters({f"{first['__table__']}.{first['__column__']}": date_values})
+                return self._eval_expr(expr, new_ctx)
+        return self._eval_expr(expr, ctx)
+
+    def _fn_totalqtd(self, args_str: str, ctx: DAXContext) -> Any:
+        """TOTALQTD(expression, dates) — quarter to date total."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return 0
+        expr = args[0].strip()
+        qtd_dates = self._fn_datesqtd(args[1].strip(), ctx)
+        if qtd_dates and isinstance(qtd_dates, list) and qtd_dates:
+            first = qtd_dates[0]
+            if isinstance(first, dict) and '__table__' in first:
+                date_values = [item['__value__'] for item in qtd_dates]
+                new_ctx = ctx.with_filters({f"{first['__table__']}.{first['__column__']}": date_values})
+                return self._eval_expr(expr, new_ctx)
+        return self._eval_expr(expr, ctx)
+
+    # =========================================================================
+    # Time Intelligence — Period Navigation
+    # =========================================================================
+
+    def _fn_previousmonth(self, args_str: str, ctx: DAXContext) -> Any:
+        """PREVIOUSMONTH(dates) — dates from the previous month."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        max_date = max(dates)
+        # Previous month
+        if max_date.month == 1:
+            prev_year, prev_month = max_date.year - 1, 12
+        else:
+            prev_year, prev_month = max_date.year, max_date.month - 1
+        all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
+        prev = [d for d in all_dates if d.year == prev_year and d.month == prev_month]
+        return self._make_date_table_result(table_name, col_name, prev)
+
+    def _fn_previousquarter(self, args_str: str, ctx: DAXContext) -> Any:
+        """PREVIOUSQUARTER(dates) — dates from the previous quarter."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        max_date = max(dates)
+        current_q = (max_date.month - 1) // 3 + 1
+        if current_q == 1:
+            prev_q_start = datetime(max_date.year - 1, 10, 1)
+            prev_q_end = datetime(max_date.year - 1, 12, 31)
+        else:
+            prev_q_start_month = (current_q - 2) * 3 + 1
+            prev_q_end_month = (current_q - 1) * 3
+            prev_q_start = datetime(max_date.year, prev_q_start_month, 1)
+            _, last_day = monthrange(max_date.year, prev_q_end_month)
+            prev_q_end = datetime(max_date.year, prev_q_end_month, last_day)
+        all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
+        prev = [d for d in all_dates if prev_q_start <= d <= prev_q_end]
+        return self._make_date_table_result(table_name, col_name, prev)
+
+    def _fn_previousyear(self, args_str: str, ctx: DAXContext) -> Any:
+        """PREVIOUSYEAR(dates) — dates from the previous year."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        max_date = max(dates)
+        prev_year = max_date.year - 1
+        all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
+        prev = [d for d in all_dates if d.year == prev_year]
+        return self._make_date_table_result(table_name, col_name, prev)
+
+    def _fn_nextmonth(self, args_str: str, ctx: DAXContext) -> Any:
+        """NEXTMONTH(dates) — dates from the next month."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        max_date = max(dates)
+        if max_date.month == 12:
+            next_year, next_month = max_date.year + 1, 1
+        else:
+            next_year, next_month = max_date.year, max_date.month + 1
+        all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
+        nxt = [d for d in all_dates if d.year == next_year and d.month == next_month]
+        return self._make_date_table_result(table_name, col_name, nxt)
+
+    def _fn_nextquarter(self, args_str: str, ctx: DAXContext) -> Any:
+        """NEXTQUARTER(dates) — dates from the next quarter."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        max_date = max(dates)
+        current_q = (max_date.month - 1) // 3 + 1
+        if current_q == 4:
+            nq_start = datetime(max_date.year + 1, 1, 1)
+            nq_end = datetime(max_date.year + 1, 3, 31)
+        else:
+            nq_start_month = current_q * 3 + 1
+            nq_end_month = (current_q + 1) * 3
+            nq_start = datetime(max_date.year, nq_start_month, 1)
+            _, last_day = monthrange(max_date.year, nq_end_month)
+            nq_end = datetime(max_date.year, nq_end_month, last_day)
+        all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
+        nxt = [d for d in all_dates if nq_start <= d <= nq_end]
+        return self._make_date_table_result(table_name, col_name, nxt)
+
+    def _fn_nextyear(self, args_str: str, ctx: DAXContext) -> Any:
+        """NEXTYEAR(dates) — dates from the next year."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        max_date = max(dates)
+        next_year = max_date.year + 1
+        all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
+        nxt = [d for d in all_dates if d.year == next_year]
+        return self._make_date_table_result(table_name, col_name, nxt)
+
+    def _fn_parallelperiod(self, args_str: str, ctx: DAXContext) -> Any:
+        """PARALLELPERIOD(dates, offset, interval) — shift dates by offset intervals."""
+        args = self._split_args(args_str)
+        if len(args) < 3:
+            return []
+        table_name, col_name, dates = self._get_date_column_dates(args[0].strip(), ctx)
+        if not dates:
+            return []
+        offset = self._eval_expr(args[1].strip(), ctx)
+        interval = args[2].strip().upper()
+        if not isinstance(offset, (int, float)):
+            return []
+        offset = int(offset)
+
+        all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
+        min_date = min(dates)
+        max_date = max(dates)
+
+        if interval in ('YEAR', 'YEARS'):
+            shifted = [d for d in all_dates
+                       if datetime(min_date.year + offset, min_date.month, 1) <= d <=
+                          datetime(max_date.year + offset, max_date.month,
+                                   monthrange(max_date.year + offset, max_date.month)[1])]
+        elif interval in ('QUARTER', 'QUARTERS'):
+            def shift_quarter(d, off):
+                new_month = d.month + off * 3
+                new_year = d.year + (new_month - 1) // 12
+                new_month = ((new_month - 1) % 12) + 1
+                return datetime(new_year, new_month, 1)
+            q_start = shift_quarter(datetime(min_date.year, ((min_date.month - 1) // 3) * 3 + 1, 1), offset)
+            q_end_month = q_start.month + 2
+            q_end_year = q_start.year
+            if q_end_month > 12:
+                q_end_month -= 12
+                q_end_year += 1
+            _, last_day = monthrange(q_end_year, q_end_month)
+            q_end = datetime(q_end_year, q_end_month, last_day)
+            shifted = [d for d in all_dates if q_start <= d <= q_end]
+        elif interval in ('MONTH', 'MONTHS'):
+            def shift_month(d, off):
+                new_month = d.month + off
+                new_year = d.year + (new_month - 1) // 12
+                new_month = ((new_month - 1) % 12) + 1
+                return new_year, new_month
+            sy, sm = shift_month(min_date, offset)
+            ey, em = shift_month(max_date, offset)
+            start = datetime(sy, sm, 1)
+            _, last_day = monthrange(ey, em)
+            end = datetime(ey, em, last_day)
+            shifted = [d for d in all_dates if start <= d <= end]
+        elif interval in ('DAY', 'DAYS'):
+            delta = timedelta(days=offset)
+            start = min_date + delta
+            end = max_date + delta
+            shifted = [d for d in all_dates if start <= d <= end]
+        else:
+            shifted = []
+
+        return self._make_date_table_result(table_name, col_name, shifted)
+
+    # =========================================================================
+    # Time Intelligence — Start/End of Period
+    # =========================================================================
+
+    def _fn_startofmonth(self, args_str: str, ctx: DAXContext) -> Any:
+        """STARTOFMONTH(dates) — first date of the month."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        min_date = min(dates)
+        start = datetime(min_date.year, min_date.month, 1)
+        return self._make_date_table_result(table_name, col_name, [start])
+
+    def _fn_endofmonth(self, args_str: str, ctx: DAXContext) -> Any:
+        """ENDOFMONTH(dates) — last date of the month."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        max_date = max(dates)
+        _, last_day = monthrange(max_date.year, max_date.month)
+        end = datetime(max_date.year, max_date.month, last_day)
+        return self._make_date_table_result(table_name, col_name, [end])
+
+    def _fn_startofquarter(self, args_str: str, ctx: DAXContext) -> Any:
+        """STARTOFQUARTER(dates) — first date of the quarter."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        min_date = min(dates)
+        q_start_month = ((min_date.month - 1) // 3) * 3 + 1
+        start = datetime(min_date.year, q_start_month, 1)
+        return self._make_date_table_result(table_name, col_name, [start])
+
+    def _fn_endofquarter(self, args_str: str, ctx: DAXContext) -> Any:
+        """ENDOFQUARTER(dates) — last date of the quarter."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        max_date = max(dates)
+        q_end_month = ((max_date.month - 1) // 3 + 1) * 3
+        _, last_day = monthrange(max_date.year, q_end_month)
+        end = datetime(max_date.year, q_end_month, last_day)
+        return self._make_date_table_result(table_name, col_name, [end])
+
+    def _fn_startofyear(self, args_str: str, ctx: DAXContext) -> Any:
+        """STARTOFYEAR(dates) — first date of the year."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        min_date = min(dates)
+        start = datetime(min_date.year, 1, 1)
+        return self._make_date_table_result(table_name, col_name, [start])
+
+    def _fn_endofyear(self, args_str: str, ctx: DAXContext) -> Any:
+        """ENDOFYEAR(dates) — last date of the year."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        max_date = max(dates)
+        end = datetime(max_date.year, 12, 31)
+        return self._make_date_table_result(table_name, col_name, [end])
+
+    # =========================================================================
+    # Time Intelligence — Opening/Closing Balance
+    # =========================================================================
+
+    def _fn_openingbalancemonth(self, args_str: str, ctx: DAXContext) -> Any:
+        """OPENINGBALANCEMONTH(expression, dates, filter) — evaluate at last date of previous month."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return 0
+        expr = args[0].strip()
+        table_name, col_name, dates = self._get_date_column_dates(args[1].strip(), ctx)
+        if not dates:
+            return self._eval_expr(expr, ctx)
+        min_date = min(dates)
+        # End of previous month
+        eop = datetime(min_date.year, min_date.month, 1) - timedelta(days=1)
+        new_ctx = ctx.with_filters({f"{table_name}.{col_name}": [eop.strftime('%Y-%m-%d')]})
+        return self._eval_expr(expr, new_ctx)
+
+    def _fn_closingbalancemonth(self, args_str: str, ctx: DAXContext) -> Any:
+        """CLOSINGBALANCEMONTH(expression, dates, filter) — evaluate at last date of current month."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return 0
+        expr = args[0].strip()
+        table_name, col_name, dates = self._get_date_column_dates(args[1].strip(), ctx)
+        if not dates:
+            return self._eval_expr(expr, ctx)
+        max_date = max(dates)
+        _, last_day = monthrange(max_date.year, max_date.month)
+        eom = datetime(max_date.year, max_date.month, last_day)
+        new_ctx = ctx.with_filters({f"{table_name}.{col_name}": [eom.strftime('%Y-%m-%d')]})
+        return self._eval_expr(expr, new_ctx)
+
+    def _fn_openingbalancequarter(self, args_str: str, ctx: DAXContext) -> Any:
+        """OPENINGBALANCEQUARTER(expression, dates, filter) — evaluate at last date before quarter."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return 0
+        expr = args[0].strip()
+        table_name, col_name, dates = self._get_date_column_dates(args[1].strip(), ctx)
+        if not dates:
+            return self._eval_expr(expr, ctx)
+        min_date = min(dates)
+        q_start_month = ((min_date.month - 1) // 3) * 3 + 1
+        eoq = datetime(min_date.year, q_start_month, 1) - timedelta(days=1)
+        new_ctx = ctx.with_filters({f"{table_name}.{col_name}": [eoq.strftime('%Y-%m-%d')]})
+        return self._eval_expr(expr, new_ctx)
+
+    def _fn_closingbalancequarter(self, args_str: str, ctx: DAXContext) -> Any:
+        """CLOSINGBALANCEQUARTER(expression, dates, filter) — evaluate at last date of quarter."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return 0
+        expr = args[0].strip()
+        table_name, col_name, dates = self._get_date_column_dates(args[1].strip(), ctx)
+        if not dates:
+            return self._eval_expr(expr, ctx)
+        max_date = max(dates)
+        q_end_month = ((max_date.month - 1) // 3 + 1) * 3
+        _, last_day = monthrange(max_date.year, q_end_month)
+        eoq = datetime(max_date.year, q_end_month, last_day)
+        new_ctx = ctx.with_filters({f"{table_name}.{col_name}": [eoq.strftime('%Y-%m-%d')]})
+        return self._eval_expr(expr, new_ctx)
+
+    def _fn_openingbalanceyear(self, args_str: str, ctx: DAXContext) -> Any:
+        """OPENINGBALANCEYEAR(expression, dates, filter) — evaluate at last date of previous year."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return 0
+        expr = args[0].strip()
+        table_name, col_name, dates = self._get_date_column_dates(args[1].strip(), ctx)
+        if not dates:
+            return self._eval_expr(expr, ctx)
+        min_date = min(dates)
+        eoy = datetime(min_date.year - 1, 12, 31)
+        new_ctx = ctx.with_filters({f"{table_name}.{col_name}": [eoy.strftime('%Y-%m-%d')]})
+        return self._eval_expr(expr, new_ctx)
+
+    def _fn_closingbalanceyear(self, args_str: str, ctx: DAXContext) -> Any:
+        """CLOSINGBALANCEYEAR(expression, dates, filter) — evaluate at last date of year."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return 0
+        expr = args[0].strip()
+        table_name, col_name, dates = self._get_date_column_dates(args[1].strip(), ctx)
+        if not dates:
+            return self._eval_expr(expr, ctx)
+        max_date = max(dates)
+        eoy = datetime(max_date.year, 12, 31)
+        new_ctx = ctx.with_filters({f"{table_name}.{col_name}": [eoy.strftime('%Y-%m-%d')]})
+        return self._eval_expr(expr, new_ctx)
+
+    # =========================================================================
+    # Time Intelligence — Date Range Functions
+    # =========================================================================
+
+    def _fn_firstdate(self, args_str: str, ctx: DAXContext) -> Any:
+        """FIRSTDATE(dates) — earliest date in filter context."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        earliest = min(dates)
+        return self._make_date_table_result(table_name, col_name, [earliest])
+
+    def _fn_lastdate(self, args_str: str, ctx: DAXContext) -> Any:
+        """LASTDATE(dates) — latest date in filter context."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        latest = max(dates)
+        return self._make_date_table_result(table_name, col_name, [latest])
+
+    def _fn_datesbetween(self, args_str: str, ctx: DAXContext) -> Any:
+        """DATESBETWEEN(dates, start, end) — dates between start and end."""
+        args = self._split_args(args_str)
+        if len(args) < 3:
+            return []
+        table_name, col_name, _ = self._get_date_column_dates(args[0].strip(), ctx)
+        if not table_name:
+            return []
+        start_val = self._eval_expr(args[1].strip(), ctx)
+        end_val = self._eval_expr(args[2].strip(), ctx)
+        start_date = self._parse_date(start_val)
+        end_date = self._parse_date(end_val)
+        if not start_date or not end_date:
+            return []
+        all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
+        between = [d for d in all_dates if start_date <= d <= end_date]
+        return self._make_date_table_result(table_name, col_name, between)
+
+    def _fn_datesinperiod(self, args_str: str, ctx: DAXContext) -> Any:
+        """DATESINPERIOD(dates, start, offset, interval) — dates in a period from start."""
+        args = self._split_args(args_str)
+        if len(args) < 4:
+            return []
+        table_name, col_name, _ = self._get_date_column_dates(args[0].strip(), ctx)
+        if not table_name:
+            return []
+        start_val = self._eval_expr(args[1].strip(), ctx)
+        offset = self._eval_expr(args[2].strip(), ctx)
+        interval = args[3].strip().upper()
+        start_date = self._parse_date(start_val)
+        if not start_date or not isinstance(offset, (int, float)):
+            return []
+        offset = int(offset)
+
+        if interval in ('DAY', 'DAYS'):
+            if offset >= 0:
+                end_date = start_date + timedelta(days=offset - 1)
+            else:
+                end_date = start_date
+                start_date = start_date + timedelta(days=offset + 1)
+        elif interval in ('MONTH', 'MONTHS'):
+            new_month = start_date.month + offset
+            new_year = start_date.year + (new_month - 1) // 12
+            new_month = ((new_month - 1) % 12) + 1
+            if offset >= 0:
+                _, last_day = monthrange(new_year, new_month)
+                end_date = datetime(new_year, new_month, min(start_date.day, last_day))
+            else:
+                end_date = start_date
+                _, last_day = monthrange(new_year, new_month)
+                start_date = datetime(new_year, new_month, min(start_date.day, last_day))
+        elif interval in ('QUARTER', 'QUARTERS'):
+            new_month = start_date.month + offset * 3
+            new_year = start_date.year + (new_month - 1) // 12
+            new_month = ((new_month - 1) % 12) + 1
+            if offset >= 0:
+                _, last_day = monthrange(new_year, new_month)
+                end_date = datetime(new_year, new_month, min(start_date.day, last_day))
+            else:
+                end_date = start_date
+                _, last_day = monthrange(new_year, new_month)
+                start_date = datetime(new_year, new_month, min(start_date.day, last_day))
+        elif interval in ('YEAR', 'YEARS'):
+            if offset >= 0:
+                end_date = datetime(start_date.year + offset, start_date.month, start_date.day)
+            else:
+                end_date = start_date
+                start_date = datetime(start_date.year + offset, start_date.month, start_date.day)
+        else:
+            return []
+
+        if start_date > end_date:
+            start_date, end_date = end_date, start_date
+
+        all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
+        in_period = [d for d in all_dates if start_date <= d <= end_date]
+        return self._make_date_table_result(table_name, col_name, in_period)
+
+    def _fn_calendar(self, args_str: str, ctx: DAXContext) -> Any:
+        """CALENDAR(start, end) — generate a date table between start and end."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return []
+        start_val = self._eval_expr(args[0].strip(), ctx)
+        end_val = self._eval_expr(args[1].strip(), ctx)
+        start_date = self._parse_date(start_val)
+        end_date = self._parse_date(end_val)
+        if not start_date or not end_date:
+            return []
+        result = []
+        current = start_date
+        while current <= end_date:
+            result.append({
+                '__table__': '__calendar__',
+                '__column__': 'Date',
+                '__value__': current.strftime('%Y-%m-%d')
+            })
+            current += timedelta(days=1)
+        return result
+
+    def _fn_calendarauto(self, args_str: str, ctx: DAXContext) -> Any:
+        """CALENDARAUTO() — generate a date table spanning all dates in the model.
+        Scans all date-like columns to find min/max range."""
+        min_date = None
+        max_date = None
+        for tbl_name, tbl in ctx.tables.items():
+            for i, col in enumerate(tbl['columns']):
+                for row in tbl['rows']:
+                    d = self._parse_date(row[i])
+                    if d:
+                        if min_date is None or d < min_date:
+                            min_date = d
+                        if max_date is None or d > max_date:
+                            max_date = d
+                        break  # Just check first row of each column for perf
+        if not min_date or not max_date:
+            return []
+        # Extend to full calendar years
+        start = datetime(min_date.year, 1, 1)
+        end = datetime(max_date.year, 12, 31)
+        result = []
+        current = start
+        while current <= end:
+            result.append({
+                '__table__': '__calendar__',
+                '__column__': 'Date',
+                '__value__': current.strftime('%Y-%m-%d')
+            })
+            current += timedelta(days=1)
+        return result
 
 
 # =========================================================================
