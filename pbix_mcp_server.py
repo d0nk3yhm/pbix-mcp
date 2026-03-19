@@ -2011,7 +2011,365 @@ def pbix_datamodel_list_abf_files(alias: str) -> str:
         return f"Error: {e}\n{traceback.format_exc()}"
 
 
-# ---- Section 9: MCP main ----
+# ---- Section 9: DAX Evaluation Engine ----
+
+# Cache for DAX context data per alias (tables + measures + relationships)
+_dax_cache: dict = {}
+
+def _get_dax_context(alias: str) -> dict:
+    """Build or retrieve cached DAX context (tables, measures, relationships)."""
+    if alias in _dax_cache:
+        return _dax_cache[alias]
+
+    info = _ensure_open(alias)
+    from pbixray import PBIXRay
+    model = PBIXRay(info["path"])
+
+    # Load measures
+    measures_df = model.dax_measures
+    measure_defs = {}
+    if measures_df is not None and not measures_df.empty:
+        for _, row in measures_df.iterrows():
+            measure_defs[row.get('Name', '')] = row.get('Expression', '')
+
+    # Load relationships (PBIXRay uses FromTableName/FromColumnName format)
+    rels_df = model.relationships
+    relationships = []
+    if rels_df is not None and not rels_df.empty:
+        for _, row in rels_df.iterrows():
+            relationships.append({
+                'FromTable': row.get('FromTableName', row.get('FromTable', '')),
+                'FromColumn': row.get('FromColumnName', row.get('FromColumn', '')),
+                'ToTable': row.get('ToTableName', row.get('ToTable', '')),
+                'ToColumn': row.get('ToColumnName', row.get('ToColumn', '')),
+                'IsActive': row.get('IsActive', 1),
+            })
+
+    # Load all user-facing tables
+    schema_df = model.schema
+    tables = {}
+    if schema_df is not None and not schema_df.empty:
+        table_names = schema_df['TableName'].unique()
+        for tname in table_names:
+            if tname.startswith('H$') or tname.startswith('R$'):
+                continue
+            try:
+                df = model.get_table(tname)
+                if df is not None and not df.empty:
+                    tables[tname] = {
+                        'columns': list(df.columns),
+                        'rows': df.values.tolist(),
+                    }
+            except Exception:
+                continue
+
+    # Detect date table
+    date_table = None
+    date_column = None
+    for tname, tdata in tables.items():
+        if 'date' in tname.lower():
+            if 'Date' in tdata['columns']:
+                date_table = tname
+                date_column = 'Date'
+                break
+
+    ctx = {
+        'tables': tables,
+        'measure_defs': measure_defs,
+        'date_table': date_table,
+        'date_column': date_column,
+        'relationships': relationships,
+    }
+    _dax_cache[alias] = ctx
+    return ctx
+
+
+@mcp.tool()
+def pbix_evaluate_dax(
+    alias: str,
+    measures: str,
+    filter_context: str = "",
+) -> str:
+    """Evaluate one or more DAX measures against the data model.
+
+    Uses the built-in DAX engine to compute measure values, supporting:
+    SUM, AVERAGE, DIVIDE, IF, CALCULATE, DATEADD, REMOVEFILTERS, ALL,
+    MAXX, SUMX, VAR/RETURN, and 25+ other DAX functions.
+
+    Supports relationship-based filter propagation (star-schema joins).
+
+    Args:
+        alias: The alias of the open file
+        measures: Comma-separated measure names to evaluate, e.g. "Sales,Profit Margin,Sales LY"
+        filter_context: Optional JSON filter context, e.g. '{"dim-Date.Year": [2015]}'
+    """
+    try:
+        import dax_engine
+
+        ctx = _get_dax_context(alias)
+        measure_names = [m.strip() for m in measures.split(',') if m.strip()]
+
+        fc = json.loads(filter_context) if filter_context else None
+
+        results = dax_engine.evaluate_measures_batch(
+            measure_names, ctx['tables'], ctx['measure_defs'],
+            fc, ctx['date_table'], ctx['date_column'],
+            ctx.get('relationships')
+        )
+
+        lines = [f"DAX Evaluation Results ({len(results)} measures):\n"]
+        for name, val in results.items():
+            if isinstance(val, float):
+                if abs(val) < 2 and abs(val) > 0.001:
+                    lines.append(f"  {name}: {val:.1%}")
+                elif abs(val) >= 1000:
+                    lines.append(f"  {name}: ${val:,.2f}")
+                else:
+                    lines.append(f"  {name}: {val:.4f}")
+            elif isinstance(val, int):
+                lines.append(f"  {name}: {val:,}")
+            elif val is None:
+                lines.append(f"  {name}: (null)")
+            else:
+                lines.append(f"  {name}: {val}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}\n{traceback.format_exc()}"
+
+
+@mcp.tool()
+def pbix_evaluate_dax_per_dimension(
+    alias: str,
+    measures: str,
+    dimension: str,
+    filter_context: str = "",
+    max_values: int = 20,
+) -> str:
+    """Evaluate DAX measures for each value of a dimension (e.g., Sales per State).
+
+    Iterates over unique values of a dimension column and evaluates measures
+    with that dimension value as a filter. Uses relationship-based propagation.
+
+    Args:
+        alias: The alias of the open file
+        measures: Comma-separated measure names, e.g. "Sales,Sales LY,Sales change"
+        dimension: Table.Column to iterate over, e.g. "dim-Geo.State"
+        filter_context: Optional JSON base filter, e.g. '{"dim-Date.Year": [2015]}'
+        max_values: Maximum dimension values to evaluate (default 20)
+    """
+    try:
+        import dax_engine
+
+        ctx = _get_dax_context(alias)
+        measure_names = [m.strip() for m in measures.split(',') if m.strip()]
+        base_fc = json.loads(filter_context) if filter_context else {}
+
+        parts = dimension.split('.', 1)
+        if len(parts) != 2:
+            return "Error: dimension must be 'TableName.ColumnName' format"
+        dim_table, dim_col = parts
+
+        # Get unique dimension values
+        tbl = ctx['tables'].get(dim_table)
+        if not tbl:
+            return f"Error: Table '{dim_table}' not found"
+        col_idx = next((i for i, c in enumerate(tbl['columns']) if c == dim_col), -1)
+        if col_idx < 0:
+            return f"Error: Column '{dim_col}' not found in '{dim_table}'"
+
+        unique_vals = list(set(row[col_idx] for row in tbl['rows'] if row[col_idx] is not None))
+        unique_vals.sort(key=lambda x: str(x))
+
+        lines = [f"DAX per {dimension} ({len(unique_vals)} values, showing {min(len(unique_vals), max_values)}):\n"]
+
+        # Header
+        header = f"{'Value':<25s}"
+        for m in measure_names:
+            header += f"  {m:>15s}"
+        lines.append(header)
+        lines.append("-" * len(header))
+
+        for val in unique_vals[:max_values]:
+            fc = dict(base_fc)
+            fc[dimension] = [val]
+            results = dax_engine.evaluate_measures_batch(
+                measure_names, ctx['tables'], ctx['measure_defs'],
+                fc, ctx['date_table'], ctx['date_column'],
+                ctx.get('relationships')
+            )
+
+            row_str = f"{str(val):<25s}"
+            for m in measure_names:
+                v = results.get(m)
+                if isinstance(v, float):
+                    if abs(v) < 2 and abs(v) > 0.001:
+                        row_str += f"  {v:>14.1%}"
+                    else:
+                        row_str += f"  {v:>15,.2f}"
+                elif isinstance(v, int):
+                    row_str += f"  {v:>15,}"
+                elif v is None:
+                    row_str += f"  {'(null)':>15s}"
+                else:
+                    row_str += f"  {str(v):>15s}"
+            lines.append(row_str)
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}\n{traceback.format_exc()}"
+
+
+@mcp.tool()
+def pbix_get_default_filters(alias: str, page_index: int = 0) -> str:
+    """Extract default slicer filter selections from a report page.
+
+    Reads the filter config from slicer visuals (advancedSlicerVisual, slicer)
+    to determine what the dashboard's default filtered state is.
+
+    Args:
+        alias: The alias of the open file
+        page_index: Zero-based page index (default 0)
+    """
+    try:
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            return "No layout found."
+
+        sections = layout.get("sections", [])
+        if page_index < 0 or page_index >= len(sections):
+            return f"Error: Page index {page_index} out of range"
+
+        page = sections[page_index]
+        containers = page.get("visualContainers", [])
+
+        filters = {}
+        for vc in containers:
+            config = _parse_visual_config(vc)
+            sv = config.get("singleVisual", {})
+
+            # Check for filter in objects.general
+            general_arr = sv.get("objects", {}).get("general", [])
+            for gen in general_arr:
+                filter_obj = gen.get("properties", {}).get("filter", {}).get("filter", {})
+                if not filter_obj or not filter_obj.get("Where"):
+                    continue
+
+                for where in filter_obj["Where"]:
+                    cond = where.get("Condition", {})
+                    if "In" in cond:
+                        expr = cond["In"].get("Expressions", [{}])[0]
+                        values = cond["In"].get("Values", [])
+                        source = expr.get("Column", {}).get("Expression", {}).get("SourceRef", {}).get("Source")
+                        prop = expr.get("Column", {}).get("Property")
+                        from_entry = next((f for f in filter_obj.get("From", []) if f.get("Name") == source), {})
+                        entity = from_entry.get("Entity")
+
+                        if entity and prop and values:
+                            key = f"{entity}.{prop}"
+                            vals = []
+                            for v in values:
+                                lit = v[0].get("Literal", {}).get("Value") if v else None
+                                if lit is not None:
+                                    s = str(lit)
+                                    import re as _re
+                                    num_match = _re.match(r'^(-?\d+(?:\.\d+)?)[DL]?$', s, _re.IGNORECASE)
+                                    if num_match:
+                                        vals.append(float(num_match.group(1)) if '.' in num_match.group(1) else int(num_match.group(1)))
+                                    else:
+                                        if s.startswith("'") and s.endswith("'"):
+                                            s = s[1:-1]
+                                        vals.append(s)
+                            if vals:
+                                filters[key] = vals
+
+        if not filters:
+            return "No default slicer filters found on this page."
+
+        lines = ["Default slicer filters:\n"]
+        for key, vals in filters.items():
+            lines.append(f"  {key}: {vals}")
+        lines.append(f"\nUse as filter_context in pbix_evaluate_dax:")
+        lines.append(f"  {json.dumps(filters)}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}\n{traceback.format_exc()}"
+
+
+@mcp.tool()
+def pbix_get_visual_positions(alias: str, page_index: int = 0) -> str:
+    """Get all visual positions with parent group offset resolution.
+
+    For visuals inside groups, the raw x/y coordinates are relative to the
+    parent group. This tool resolves them to absolute page coordinates.
+
+    Args:
+        alias: The alias of the open file
+        page_index: Zero-based page index
+    """
+    try:
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            return "No layout found."
+
+        sections = layout.get("sections", [])
+        if page_index < 0 or page_index >= len(sections):
+            return f"Error: Page index {page_index} out of range"
+
+        page = sections[page_index]
+        containers = page.get("visualContainers", [])
+
+        # Pass 1: build group positions map
+        group_positions = {}
+        for vc in containers:
+            config = _parse_visual_config(vc)
+            name = config.get("name", "")
+            if config.get("singleVisualGroup"):
+                group_positions[name] = {"x": vc.get("x", 0), "y": vc.get("y", 0)}
+
+        # Pass 2: resolve absolute positions
+        lines = [f"Visual positions (absolute, {len(containers)} visuals):\n"]
+        for i, vc in enumerate(containers):
+            config = _parse_visual_config(vc)
+            vtype = _get_visual_type(config)
+            x = vc.get("x", 0)
+            y = vc.get("y", 0)
+            w = vc.get("width", 0)
+            h = vc.get("height", 0)
+
+            parent_group = config.get("parentGroupName")
+            if parent_group and parent_group in group_positions:
+                x += group_positions[parent_group]["x"]
+                y += group_positions[parent_group]["y"]
+                lines.append(f"  [{i}] {vtype:<30s} at ({x:.0f},{y:.0f}) {w:.0f}x{h:.0f}  [child of group]")
+            else:
+                lines.append(f"  [{i}] {vtype:<30s} at ({x:.0f},{y:.0f}) {w:.0f}x{h:.0f}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}\n{traceback.format_exc()}"
+
+
+@mcp.tool()
+def pbix_clear_dax_cache(alias: str = "") -> str:
+    """Clear the DAX engine data cache.
+
+    Call this after modifying measures or table data to force fresh evaluation.
+
+    Args:
+        alias: Clear cache for specific alias, or all if empty
+    """
+    global _dax_cache
+    if alias:
+        _dax_cache.pop(alias, None)
+        return f"DAX cache cleared for '{alias}'"
+    else:
+        _dax_cache.clear()
+        return "DAX cache cleared for all files"
+
+
+# ---- Section 10: MCP main ----
 
 if __name__ == "__main__":
     mcp.run()
