@@ -131,7 +131,7 @@ The server communicates via stdio using the MCP JSON-RPC protocol.
 
 ## DAX Evaluation Engine
 
-The built-in DAX engine (`dax_engine.py`, 3,200+ lines) can compute any measure expression against the embedded VertiPaq data — including **SVG visual generation**. **155 DAX functions** implemented:
+The built-in DAX engine (`dax_engine.py`, 3,370+ lines) can compute any measure expression against the embedded VertiPaq data — including **SVG visual generation**. **154 DAX functions** implemented with **91.7% real-world accuracy** across 204 measures from 4 diverse dashboards:
 
 | Category | Functions |
 |----------|-----------|
@@ -297,12 +297,13 @@ python -m pytest tests/ -v
 
 | Dashboard | Measures | Success Rate | Crashes |
 |-----------|----------|-------------|---------|
-| GeoSales Dashboard | 43 | **86%** | 0 |
-| Agents Performance | 102 | **81%** | 0 |
-| Ecommerce Conversion | 33 | **82%** | 0 |
-| IT Support | 26 | **92%** | 0 |
+| GeoSales Dashboard | 43 | **93%** | 0 |
+| Agents Performance | 102 | **94%** | 0 |
+| Ecommerce Conversion | 33 | **85%** | 0 |
+| IT Support | 26 | **88%** | 0 |
+| **Total** | **204** | **91.7%** | **0** |
 
-**Zero crashes across 204 real-world measures.** Remaining None results are disconnected parameter tables (no data) and a few unsupported patterns.
+**Zero crashes across 204 real-world measures.** Remaining 17 None results are from disconnected parameter tables (calculated tables PBIXRay can't read), missing calculated date tables, and a few complex nested MAXX/FILTER patterns.
 
 ### Verified Against Power BI Desktop
 

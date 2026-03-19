@@ -2063,14 +2063,36 @@ def _get_dax_context(alias: str) -> dict:
             except Exception:
                 continue
 
-    # Detect date table
+    # Detect date table — try multiple heuristics
     date_table = None
     date_column = None
+    # Pass 1: table name contains 'date' AND has a 'Date' column
     for tname, tdata in tables.items():
         if 'date' in tname.lower():
             if 'Date' in tdata['columns']:
                 date_table = tname
                 date_column = 'Date'
+                break
+    # Pass 2: table name starts with common date-table prefixes (dimDate, DimDate, DateTable, Calendar)
+    if not date_table:
+        for tname, tdata in tables.items():
+            tlow = tname.lower().replace(' ', '').replace('-', '').replace('_', '')
+            if tlow in ('dimdate', 'datetable', 'calendar', 'datekey', 'dates'):
+                for cname in tdata['columns']:
+                    if cname.lower() == 'date':
+                        date_table = tname
+                        date_column = cname
+                        break
+                if date_table:
+                    break
+    # Pass 3: any table with a 'Date' column that also has Year/Month columns (likely a date dimension)
+    if not date_table:
+        for tname, tdata in tables.items():
+            cols_lower = [c.lower() for c in tdata['columns']]
+            if 'date' in cols_lower and ('year' in cols_lower or 'month' in cols_lower):
+                date_col_idx = cols_lower.index('date')
+                date_table = tname
+                date_column = tdata['columns'][date_col_idx]
                 break
 
     ctx = {

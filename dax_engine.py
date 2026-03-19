@@ -58,8 +58,12 @@ class DAXContext:
         """
         self.tables = tables
         self.measures = measures
-        self.date_table = date_table or 'dim-Date'
         self.date_column = date_column or 'Date'
+        # Auto-detect date table if not provided
+        if date_table:
+            self.date_table = date_table
+        else:
+            self.date_table = self._auto_detect_date_table(tables)
         self.filter_context = filter_context or {}
         self.relationships = relationships or []
         self._measure_cache = {}
@@ -75,6 +79,27 @@ class DAXContext:
                 if ft and tt and fc and tc:
                     self._rel_index[(ft, tt)] = {'from_col': fc, 'to_col': tc}
                     self._rel_index[(tt, ft)] = {'from_col': tc, 'to_col': fc}
+
+    @staticmethod
+    def _auto_detect_date_table(tables: dict) -> str:
+        """Auto-detect the date/calendar dimension table from available tables."""
+        # Pass 1: table name contains 'date' and has a 'Date' column
+        for tname, tdata in tables.items():
+            if 'date' in tname.lower() and 'Date' in tdata.get('columns', []):
+                return tname
+        # Pass 2: common date-table prefixes (dimDate, DimDate, Calendar, etc.)
+        for tname, tdata in tables.items():
+            tlow = tname.lower().replace(' ', '').replace('-', '').replace('_', '')
+            if tlow in ('dimdate', 'datetable', 'calendar', 'datekey', 'dates'):
+                for cname in tdata.get('columns', []):
+                    if cname.lower() == 'date':
+                        return tname
+        # Pass 3: any table with Date + Year/Month columns (likely a date dimension)
+        for tname, tdata in tables.items():
+            cols_lower = [c.lower() for c in tdata.get('columns', [])]
+            if 'date' in cols_lower and ('year' in cols_lower or 'month' in cols_lower):
+                return tname
+        return 'dim-Date'  # fallback default
 
     def _find_col_idx(self, cols: list, col_name: str) -> int:
         """Find column index by name, with fuzzy matching."""
@@ -585,6 +610,14 @@ class DAXEngine:
             inner = expr[1:-1]
             return self.evaluate_measure(inner, ctx)
 
+        # NOT prefix without parens: "NOT expr" or "not expr"
+        not_prefix = re.match(r'(?i)^not\s+(.+)$', expr)
+        if not_prefix:
+            inner_val = self._eval_expr(not_prefix.group(1).strip(), ctx, var_scope)
+            if inner_val is None or inner_val == 0 or inner_val == '' or inner_val is False:
+                return True
+            return False
+
         # Function call: FUNC(args)
         func_match = re.match(r'([A-Za-z_]\w*)\s*\(', expr)
         if func_match:
@@ -741,6 +774,20 @@ class DAXEngine:
             i += 1
         parts.append(''.join(current))
         return parts
+
+    def _resolve_row_result(self, result, row_item, row_ctx):
+        """Resolve a column reference result in a row iteration context.
+        If result is a (table, column) tuple, resolve it to a concrete value."""
+        if isinstance(result, tuple) and len(result) == 2:
+            if isinstance(row_item, dict) and '__table__' in row_item:
+                if result[0] == row_item['__table__'] and result[1] == row_item['__column__']:
+                    return row_item['__value__']
+            # Different column — get single value from filtered context
+            vals = list(set(row_ctx.get_column_data(result[0], result[1])))
+            if len(vals) == 1:
+                return vals[0]
+            return None
+        return result
 
     def _eval_binary(self, expr: str, ctx: DAXContext, var_scope: dict = None) -> Any:
         """Evaluate binary arithmetic: +, -, *, /"""
@@ -966,6 +1013,85 @@ class DAXEngine:
                     f"DATEADD({filter_arg[19:-1].strip()}, -1, YEAR)", new_ctx)
                 continue
 
+            # TREATAS
+            if filter_arg.upper().startswith('TREATAS'):
+                result = self._eval_expr(filter_arg, new_ctx)
+                if isinstance(result, dict) and '__treatas__' in result:
+                    extra = {}
+                    for fk, fv in result.items():
+                        if fk != '__treatas__':
+                            extra[fk] = fv
+                    if extra:
+                        new_ctx = new_ctx.with_filters(extra)
+                continue
+
+            # Time-intelligence table filters (DATESYTD, DATESMTD, DATESQTD,
+            # TOTALYTD, TOTALMTD, TOTALQTD, PREVIOUSMONTH, PREVIOUSQUARTER,
+            # PREVIOUSYEAR, PARALLELPERIOD, etc.)
+            ti_prefixes = ('DATESYTD', 'DATESMTD', 'DATESQTD', 'PREVIOUSMONTH',
+                           'PREVIOUSQUARTER', 'PREVIOUSYEAR', 'NEXTMONTH',
+                           'NEXTQUARTER', 'NEXTYEAR', 'PARALLELPERIOD',
+                           'DATESBETWEEN', 'DATESINPERIOD')
+            fa_upper = filter_arg.upper().split('(')[0].strip()
+            if fa_upper in ti_prefixes:
+                result = self._eval_expr(filter_arg, new_ctx)
+                if isinstance(result, list) and result:
+                    # Time-intelligence returns list of date-row dicts
+                    first = result[0]
+                    if isinstance(first, dict) and '__table__' in first:
+                        tbl_name = first['__table__']
+                        col_name = first['__column__']
+                        date_vals = [r['__value__'] for r in result]
+                        new_filters = dict(new_ctx.filter_context)
+                        # Remove existing date table filters
+                        keys_to_remove = [k for k in new_filters if k.startswith(f"{tbl_name}.")]
+                        for k in keys_to_remove:
+                            del new_filters[k]
+                        new_filters[f"{tbl_name}.{col_name}"] = date_vals
+                        new_ctx = DAXContext(new_ctx.tables, new_ctx.measures, new_ctx.date_table,
+                                             new_ctx.date_column, new_filters, new_ctx.relationships)
+                continue
+
+            # FILTER(table, condition) or other table-returning expressions
+            # Evaluate the filter arg — if it returns a list of row dicts,
+            # extract filter values grouped by table.column
+            result = self._eval_expr(filter_arg, new_ctx)
+            if isinstance(result, list) and result:
+                first = result[0]
+                if isinstance(first, dict) and '__table__' in first:
+                    groups = {}
+                    if '__row__' in first:
+                        # Multi-column row dict from ALL(Table) + FILTER
+                        for row_item in result:
+                            tbl_name = row_item['__table__']
+                            for col_name, val in row_item.items():
+                                if col_name.startswith('__'):
+                                    continue
+                                key = f"{tbl_name}.{col_name}"
+                                if key not in groups:
+                                    groups[key] = []
+                                groups[key].append(val)
+                    else:
+                        # Single-column row dict from ALL(Table[Col]) or VALUES
+                        for row_item in result:
+                            key = f"{row_item['__table__']}.{row_item['__column__']}"
+                            if key not in groups:
+                                groups[key] = []
+                            groups[key].append(row_item['__value__'])
+                    if groups:
+                        new_ctx = new_ctx.with_filters(groups)
+                continue
+
+            # Simple column = value filter: Table[Col] = value
+            eq_match = re.match(r"'?([^'\[\]]+)'?\s*\[([^\]]+)\]\s*=\s*(.*)", filter_arg)
+            if eq_match:
+                tbl_name = eq_match.group(1).strip()
+                col_name = eq_match.group(2).strip()
+                val = self._eval_expr(eq_match.group(3).strip(), new_ctx)
+                if val is not None:
+                    new_ctx = new_ctx.with_filters({f"{tbl_name}.{col_name}": [val]})
+                continue
+
         return self._eval_expr(base_expr, new_ctx)
 
     def _apply_dateadd_filter(self, expr: str, ctx: DAXContext) -> DAXContext:
@@ -1061,6 +1187,21 @@ class DAXEngine:
                     # Return list of {column: value} dicts for iteration
                     all_values = list(set(row[col_idx] for row in tbl['rows'] if row[col_idx] is not None))
                     return [{'__table__': table_name, '__column__': col_name, '__value__': v} for v in all_values]
+
+        # Table-level ALL: ALL('TableName') — return all rows as multi-column row dicts
+        table_name = ref.strip("'").strip()
+        tbl = ctx.tables.get(table_name)
+        if tbl and tbl.get('rows'):
+            # Return full row dicts with all columns for FILTER to iterate
+            result = []
+            cols = tbl['columns']
+            for row in tbl['rows']:
+                row_dict = {'__table__': table_name, '__row__': True}
+                for ci, col_name in enumerate(cols):
+                    row_dict[col_name] = row[ci] if ci < len(row) else None
+                result.append(row_dict)
+            return result
+
         # Fallback: marker for CALCULATE
         return ('__ALL__', ref)
 
@@ -1074,8 +1215,9 @@ class DAXEngine:
     def _fn_values(self, args_str: str, ctx: DAXContext) -> Any:
         ref = self._eval_expr(args_str.strip(), ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
-            values = ctx.get_column_data(ref[0], ref[1])
-            return list(set(values))
+            values = list(set(ctx.get_column_data(ref[0], ref[1])))
+            # Return as row-dict list so CONCATENATEX / FILTER / iterators work
+            return [{'__table__': ref[0], '__column__': ref[1], '__value__': v} for v in values]
         return []
 
     def _fn_selectedvalue(self, args_str: str, ctx: DAXContext) -> Any:
@@ -1146,6 +1288,7 @@ class DAXEngine:
                     val = row_item['__value__']
                     row_ctx = ctx.with_filters({f"{table_name}.{col_name}": [val]})
                     result = self._eval_expr(row_expr, row_ctx)
+                    result = self._resolve_row_result(result, row_item, row_ctx)
                     if isinstance(result, (int, float)):
                         total += result
                 else:
@@ -1171,6 +1314,7 @@ class DAXEngine:
                     val = row_item['__value__']
                     row_ctx = ctx.with_filters({f"{table_name}.{col_name}": [val]})
                     result = self._eval_expr(row_expr, row_ctx)
+                    result = self._resolve_row_result(result, row_item, row_ctx)
                     if isinstance(result, (int, float)):
                         if max_val is None or result > max_val:
                             max_val = result
@@ -1202,6 +1346,7 @@ class DAXEngine:
                     val = row_item['__value__']
                     row_ctx = ctx.with_filters({f"{table_name}.{col_name}": [val]})
                     result = self._eval_expr(row_expr, row_ctx)
+                    result = self._resolve_row_result(result, row_item, row_ctx)
                     if isinstance(result, (int, float)):
                         if min_val is None or result < min_val:
                             min_val = result
@@ -1232,6 +1377,7 @@ class DAXEngine:
                     val = row_item['__value__']
                     row_ctx = ctx.with_filters({f"{table_name}.{col_name}": [val]})
                     result = self._eval_expr(row_expr, row_ctx)
+                    result = self._resolve_row_result(result, row_item, row_ctx)
                     if isinstance(result, (int, float)):
                         values.append(result)
                 else:
@@ -1253,6 +1399,7 @@ class DAXEngine:
                 if isinstance(row_item, dict) and '__table__' in row_item:
                     row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
                     result = self._eval_expr(row_expr, row_ctx)
+                    result = self._resolve_row_result(result, row_item, row_ctx)
                 else:
                     result = self._eval_expr(row_expr, ctx)
                 if result is not None and result != '':
@@ -1305,13 +1452,27 @@ class DAXEngine:
             filtered = []
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    table_name = row_item['__table__']
-                    col_name = row_item['__column__']
-                    val = row_item['__value__']
-                    row_ctx = ctx.with_filters({f"{table_name}.{col_name}": [val]})
-                    cond = self._eval_expr(args[1].strip(), row_ctx)
-                    if cond:
-                        filtered.append(row_item)
+                    if '__row__' in row_item:
+                        # Multi-column row dict from ALL(Table)
+                        table_name = row_item['__table__']
+                        extra_filters = {}
+                        for col_name, val in row_item.items():
+                            if col_name.startswith('__'):
+                                continue
+                            extra_filters[f"{table_name}.{col_name}"] = [val]
+                        row_ctx = ctx.with_filters(extra_filters)
+                        cond = self._eval_expr(args[1].strip(), row_ctx)
+                        if cond:
+                            filtered.append(row_item)
+                    else:
+                        # Single-column row dict from ALL(Table[Column]) or VALUES
+                        table_name = row_item['__table__']
+                        col_name = row_item['__column__']
+                        val = row_item['__value__']
+                        row_ctx = ctx.with_filters({f"{table_name}.{col_name}": [val]})
+                        cond = self._eval_expr(args[1].strip(), row_ctx)
+                        if cond:
+                            filtered.append(row_item)
             return filtered
         return []
 
@@ -1801,11 +1962,15 @@ class DAXEngine:
         return False
 
     def _fn_isfiltered(self, args_str: str, ctx: DAXContext) -> Any:
-        """ISFILTERED(column) — check if column has any direct filter."""
+        """ISFILTERED(column_or_table) — check if column/table has any direct filter."""
         ref = self._eval_expr(args_str.strip(), ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             filter_key = f"{ref[0]}.{ref[1]}"
             return filter_key in ctx.filter_context
+        # Table-only reference (string) — check if any filter matches the table
+        if isinstance(ref, str):
+            table_name = ref.strip("'\"")
+            return any(k.split('.')[0] == table_name for k in ctx.filter_context)
         return False
 
     def _fn_iscrossfiltered(self, args_str: str, ctx: DAXContext) -> Any:
@@ -2249,6 +2414,7 @@ class DAXEngine:
                 if isinstance(row_item, dict) and '__table__' in row_item:
                     row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
                     result = self._eval_expr(row_expr, row_ctx)
+                    result = self._resolve_row_result(result, row_item, row_ctx)
                     if result is not None:
                         parts.append(str(result))
                 else:
