@@ -131,17 +131,21 @@ The server communicates via stdio using the MCP JSON-RPC protocol.
 
 ## DAX Evaluation Engine
 
-The built-in DAX engine can compute any measure expression against the embedded VertiPaq data, supporting:
+The built-in DAX engine (`dax_engine.py`, 3,100+ lines) can compute any measure expression against the embedded VertiPaq data. **153 DAX functions** implemented:
 
-**30+ DAX functions:**
-- Aggregation: `SUM`, `AVERAGE`, `COUNT`, `COUNTROWS`, `MIN`, `MAX`, `DISTINCTCOUNT`
-- Iteration: `SUMX`, `MAXX`, `FILTER`
-- Math: `DIVIDE`, `ABS`, `ROUND`, `INT`
-- Logic: `IF`, `SWITCH`, `AND`, `OR`, `NOT`, `ISBLANK`
-- Time Intelligence: `CALCULATE`, `DATEADD`, `SAMEPERIODLASTYEAR`, `REMOVEFILTERS`
-- Filter: `ALL`, `ALLSELECTED`, `VALUES`, `SELECTEDVALUE`
-- Text: `CONCATENATE`, `FORMAT`
-- Variables: `VAR` / `RETURN` blocks with scope management
+| Category | Functions |
+|----------|-----------|
+| **Aggregation** | `SUM`, `AVERAGE`, `COUNT`, `COUNTROWS`, `MIN`, `MAX`, `DISTINCTCOUNT`, `PRODUCT`, `MEDIAN`, `COUNTBLANK` |
+| **Iterators** | `SUMX`, `MAXX`, `MINX`, `AVERAGEX`, `COUNTX`, `COUNTAX`, `FILTER`, `GENERATE`, `GENERATEALL` |
+| **Table** | `TOPN`, `ADDCOLUMNS`, `SUMMARIZE`, `SUMMARIZECOLUMNS`, `SELECTCOLUMNS`, `DISTINCT`, `UNION`, `EXCEPT`, `INTERSECT`, `CROSSJOIN`, `DATATABLE`, `ROW`, `TREATAS` |
+| **Time Intelligence** | `CALCULATE`, `DATEADD`, `SAMEPERIODLASTYEAR`, `TOTALYTD/MTD/QTD`, `PREVIOUSMONTH/QUARTER/YEAR`, `NEXTMONTH/QUARTER/YEAR`, `PARALLELPERIOD`, `DATESYTD/MTD/QTD`, `STARTOF/ENDOF`, `FIRSTDATE/LASTDATE`, `DATESBETWEEN`, `DATESINPERIOD`, `CALENDAR`, `CALENDARAUTO`, `OPENING/CLOSINGBALANCE` |
+| **Filter** | `REMOVEFILTERS`, `ALL`, `ALLEXCEPT`, `ALLSELECTED`, `KEEPFILTERS`, `VALUES`, `SELECTEDVALUE`, `HASONEVALUE`, `HASONEFILTER`, `ISFILTERED`, `ISCROSSFILTERED` |
+| **Logic** | `IF`, `SWITCH`, `AND`, `OR`, `NOT`, `ISBLANK`, `IFERROR`, `COALESCE`, `CONTAINS`, `TRUE`, `FALSE` |
+| **Math** | `DIVIDE`, `ABS`, `ROUND`, `INT`, `CEILING`, `FLOOR`, `MOD`, `POWER`, `SQRT`, `LOG`, `LOG10`, `LN`, `EXP`, `SIGN`, `TRUNC`, `EVEN`, `ODD`, `FACT`, `GCD`, `LCM`, `PI`, `RAND`, `RANDBETWEEN` |
+| **Text** | `CONCATENATE`, `FORMAT`, `LEFT`, `RIGHT`, `MID`, `LEN`, `UPPER`, `LOWER`, `PROPER`, `TRIM`, `SUBSTITUTE`, `REPLACE`, `REPT`, `SEARCH`, `FIND`, `CONTAINSSTRING`, `EXACT`, `UNICHAR`, `UNICODE`, `VALUE`, `COMBINEVALUES` |
+| **Relationship** | `RELATED`, `RELATEDTABLE`, `USERELATIONSHIP`, `CROSSFILTER`, `EARLIER`, `EARLIEST` |
+| **Information** | `LOOKUPVALUE`, `ISNUMBER`, `ISTEXT`, `ISNONTEXT`, `ISLOGICAL`, `ISERROR`, `USERNAME`, `USERPRINCIPALNAME` |
+| **Variables** | `VAR` / `RETURN` blocks with full scope management |
 
 **Relationship-based filter propagation:**
 - Automatically propagates dimension filters through model relationships (star-schema)
@@ -252,13 +256,14 @@ PBIX file (ZIP)
 
 ### Modules
 
-| File | Purpose |
-|------|---------|
-| `pbix_mcp_server.py` | MCP server — 51 tools for full PBIX read/write + DAX evaluation |
-| `dax_engine.py` | DAX expression evaluator with 30+ functions and relationship propagation |
-| `datamodel_roundtrip.py` | XPress9 decompress/compress for DataModel |
-| `abf_rebuild.py` | ABF archive format — read, modify, rebuild |
-| `vertipaq_encoder.py` | VertiPaq column encoder — IDF, IDFMETA, dictionary, HIDX |
+| File | Lines | Purpose |
+|------|-------|---------|
+| `pbix_mcp_server.py` | 2,375 | MCP server — 51 tools for full PBIX read/write + DAX evaluation |
+| `dax_engine.py` | 3,122 | DAX expression evaluator — 153 functions with relationship propagation |
+| `vertipaq_encoder.py` | 1,442 | VertiPaq column encoder — IDF, IDFMETA, dictionary, HIDX |
+| `abf_rebuild.py` | 667 | ABF archive format — read, modify, rebuild |
+| `datamodel_roundtrip.py` | 219 | XPress9 decompress/compress for DataModel |
+| `tests/test_dax_engine.py` | 358 | Test suite — 55 tests covering all DAX engine functionality |
 
 ## How It Works
 
@@ -268,6 +273,26 @@ PBIX file (ZIP)
 4. **DataModel writes**: Decompress XPress9 → parse ABF → modify → rebuild ABF → recompress
 5. **VertiPaq writes**: Encode column data (dictionary + RLE/bit-packed IDF) → replace in ABF
 6. **Save**: Repack everything into a valid PBIX ZIP (SecurityBindings auto-removed)
+
+## Testing
+
+```bash
+pip install pytest
+python -m pytest tests/ -v
+```
+
+**55 tests, 100% passing** — covering:
+- Aggregation functions (SUM, AVERAGE, COUNT, DISTINCTCOUNT, MIN, MAX)
+- Computed measures (DIVIDE, IF, expressions)
+- VAR/RETURN variable scoping
+- Filter propagation via relationships (year, category, region, combined)
+- Time intelligence (DATEADD, Sales LY, Sales change)
+- Iterator functions (MAXX with ALL)
+- Expression parsing (literals, operators, precedence, concatenation)
+- Logic and math functions
+- Batch evaluation
+- Edge cases (circular references, missing measures, empty tables)
+- **Real PBIX file validation** (GeoSales Dashboard — verified against Power BI Desktop)
 
 ## Requirements
 
