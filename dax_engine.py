@@ -776,6 +776,23 @@ class DAXEngine:
         parts.append(''.join(current))
         return parts
 
+    def _make_row_context(self, row_item: dict, ctx: 'DAXContext') -> 'DAXContext':
+        """Create a filter context from a row dict, filtering on ALL columns of the row.
+        This implements the row context → filter context transition."""
+        meta_keys = {'__table__', '__column__', '__value__'}
+        table_name = row_item.get('__table__', '')
+        filters = {}
+        for k, v in row_item.items():
+            if k in meta_keys or v is None:
+                continue
+            filters[f"{table_name}.{k}"] = [v]
+        # Also add the primary column filter
+        col = row_item.get('__column__', '')
+        val = row_item.get('__value__')
+        if col and val is not None:
+            filters[f"{table_name}.{col}"] = [val]
+        return ctx.with_filters(filters)
+
     def _resolve_row_result(self, result, row_item, row_ctx):
         """Resolve a column reference result in a row iteration context.
         If result is a (table, column) tuple, resolve it to a concrete value."""
@@ -1284,10 +1301,7 @@ class DAXEngine:
             total = 0
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    table_name = row_item['__table__']
-                    col_name = row_item['__column__']
-                    val = row_item['__value__']
-                    row_ctx = ctx.with_filters({f"{table_name}.{col_name}": [val]})
+                    row_ctx = self._make_row_context(row_item, ctx)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
                     if isinstance(result, (int, float)):
@@ -1310,10 +1324,7 @@ class DAXEngine:
             max_val = None
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    table_name = row_item['__table__']
-                    col_name = row_item['__column__']
-                    val = row_item['__value__']
-                    row_ctx = ctx.with_filters({f"{table_name}.{col_name}": [val]})
+                    row_ctx = self._make_row_context(row_item, ctx)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
                     if isinstance(result, (int, float)):
