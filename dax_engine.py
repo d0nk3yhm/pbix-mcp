@@ -481,18 +481,30 @@ class DAXEngine:
         if not expr:
             return None
 
-        # Strip leading/trailing comments
+        # Strip comments: DAX supports // and -- for single-line comments
+        # Must not strip -- inside strings (e.g., SVG attributes)
         lines = expr.split('\n')
         clean_lines = []
         for line in lines:
             stripped = line.strip()
-            if stripped.startswith('//'):
+            if stripped.startswith('//') or stripped.startswith('--'):
                 continue
-            # Remove inline comments
-            comment_pos = stripped.find('//')
-            if comment_pos > 0:
-                stripped = stripped[:comment_pos].rstrip()
-            clean_lines.append(stripped)
+            # Remove inline comments (// or --) but NOT inside strings
+            in_str = False
+            result_chars = []
+            i = 0
+            while i < len(stripped):
+                ch = stripped[i]
+                if ch == '"':
+                    in_str = not in_str
+                if not in_str:
+                    if stripped[i:i+2] == '//' or stripped[i:i+2] == '--':
+                        break  # Rest of line is comment
+                result_chars.append(ch)
+                i += 1
+            stripped = ''.join(result_chars).rstrip()
+            if stripped:
+                clean_lines.append(stripped)
         expr = ' '.join(clean_lines).strip()
 
         if not expr:
@@ -547,7 +559,7 @@ class DAXEngine:
         # -----------------------------------------------------------
         # Variable reference: identifiers starting with _
         # -----------------------------------------------------------
-        if var_scope and re.match(r'^_[A-Za-z0-9_]+$', expr):
+        if var_scope and re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', expr):
             var_name = expr
             if var_name in var_scope:
                 return var_scope[var_name]
@@ -650,7 +662,7 @@ class DAXEngine:
 
             if kw == 'VAR':
                 # Parse: _name = expression
-                var_match = re.match(r'(_[A-Za-z0-9_]+)\s*=\s*(.*)', block_text, re.DOTALL)
+                var_match = re.match(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)', block_text, re.DOTALL)
                 if var_match:
                     var_name = var_match.group(1)
                     var_expr = var_match.group(2).strip()
