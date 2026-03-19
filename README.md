@@ -1,12 +1,12 @@
 # Power BI PBIX MCP Server
 
-A Model Context Protocol (MCP) server that gives AI assistants (Claude, Codex, etc.) **full read/write access to every layer** of Power BI `.pbix` and `.pbit` files.
+A Model Context Protocol (MCP) server that gives AI assistants (Claude, Codex, etc.) **full read/write access to every layer** of Power BI `.pbix` and `.pbit` files — including a **built-in DAX evaluation engine**.
 
 ## What It Does
 
-This MCP server treats PBIX files as structured containers and exposes **46 tools** for granular manipulation of every component — from report layout and visuals down to individual VertiPaq column data and DAX measure expressions.
+This MCP server treats PBIX files as structured containers and exposes **51 tools** for granular manipulation of every component — from report layout and visuals down to individual VertiPaq column data, DAX measure expressions, and **live DAX computation**.
 
-**Every single byte is accessible. Every layer is writable.**
+**Every single byte is accessible. Every layer is writable. Every measure is computable.**
 
 ### Layer Coverage
 
@@ -15,7 +15,8 @@ This MCP server treats PBIX files as structured containers and exposes **46 tool
 | ZIP Structure | ✅ | ✅ | Extract, repack, SecurityBindings auto-cleanup |
 | Report Layout | ✅ | ✅ | Pages, visuals, positions, configs |
 | Visual Properties | ✅ | ✅ | Any property via dot-path or full JSON |
-| Report Filters | ✅ | ✅ | Report-level and page-level |
+| Visual Positions | ✅ | — | Parent group offset resolution (absolute coords) |
+| Report Filters | ✅ | ✅ | Report-level, page-level, and default slicer state |
 | Settings | ✅ | ✅ | Report configuration |
 | Themes | ✅ | ✅ | Read/write theme JSON |
 | Resources & Images | ✅ | ✅ | List and replace via ABF |
@@ -26,6 +27,7 @@ This MCP server treats PBIX files as structured containers and exposes **46 tool
 | ABF Archive | ✅ | ✅ | List, extract, replace any internal file |
 | Metadata SQLite | ✅ | ✅ | Full SQL read/write access |
 | DAX Measures | ✅ | ✅ | Add, modify, remove |
+| **DAX Evaluation** | ✅ | — | **Compute any measure with filter context** |
 | Column Properties | ✅ | ✅ | Via metadata SQL |
 | Relationships | ✅ | ✅ | Via metadata SQL |
 | **VertiPaq Table Data** | ✅ | ✅ | **Read and write actual row data** |
@@ -88,12 +90,14 @@ The server communicates via stdio using the MCP JSON-RPC protocol.
 - `pbix_close` — Close file and clean up
 - `pbix_list_open` — List all open files
 
-### Report Layout (15 tools)
+### Report Layout (16 tools)
 - `pbix_get_pages` / `pbix_add_page` / `pbix_remove_page`
 - `pbix_get_page_visuals` / `pbix_get_visual_detail`
+- `pbix_get_visual_positions` — **Absolute positions with parent group resolution**
 - `pbix_set_visual_property` / `pbix_update_visual_json`
 - `pbix_get_layout_raw` / `pbix_set_layout_raw`
 - `pbix_get_filters` / `pbix_set_filters`
+- `pbix_get_default_filters` — **Extract default slicer selections**
 - `pbix_get_settings` / `pbix_set_settings`
 - `pbix_get_bookmarks` / `pbix_get_metadata`
 
@@ -109,6 +113,11 @@ The server communicates via stdio using the MCP JSON-RPC protocol.
 - `pbix_get_model_relationships` / `pbix_get_model_power_query`
 - `pbix_get_model_columns` / `pbix_get_table_data` / `pbix_list_tables`
 
+### DAX Evaluation Engine (3 tools) — NEW
+- `pbix_evaluate_dax` — **Evaluate any DAX measure with optional filter context**
+- `pbix_evaluate_dax_per_dimension` — **Evaluate measures per dimension value (e.g., Sales per State)**
+- `pbix_clear_dax_cache` — Clear cached data for fresh evaluation
+
 ### DataModel Write (13 tools)
 - `pbix_datamodel_query_metadata` — Run SQL on metadata
 - `pbix_datamodel_modify_metadata` — Execute SQL DDL/DML
@@ -120,7 +129,72 @@ The server communicates via stdio using the MCP JSON-RPC protocol.
 - `pbix_set_table_data` — **Write actual row data (VertiPaq)**
 - `pbix_update_table_rows` — Update rows inferring schema from existing table
 
-## Usage Examples
+## DAX Evaluation Engine
+
+The built-in DAX engine can compute any measure expression against the embedded VertiPaq data, supporting:
+
+**30+ DAX functions:**
+- Aggregation: `SUM`, `AVERAGE`, `COUNT`, `COUNTROWS`, `MIN`, `MAX`, `DISTINCTCOUNT`
+- Iteration: `SUMX`, `MAXX`, `FILTER`
+- Math: `DIVIDE`, `ABS`, `ROUND`, `INT`
+- Logic: `IF`, `SWITCH`, `AND`, `OR`, `NOT`, `ISBLANK`
+- Time Intelligence: `CALCULATE`, `DATEADD`, `SAMEPERIODLASTYEAR`, `REMOVEFILTERS`
+- Filter: `ALL`, `ALLSELECTED`, `VALUES`, `SELECTEDVALUE`
+- Text: `CONCATENATE`, `FORMAT`
+- Variables: `VAR` / `RETURN` blocks with scope management
+
+**Relationship-based filter propagation:**
+- Automatically propagates dimension filters through model relationships (star-schema)
+- Supports date dimension → fact table joins (Year/Month/Date filters)
+- Works with any dimension: Geography, Product, Customer, etc.
+
+### Usage Examples
+
+#### Evaluate measures with a filter
+```
+> pbix_evaluate_dax("my_report", "Sales,Profit Margin,Sales LY", '{"dim-Date.Year": [2015]}')
+
+DAX Evaluation Results (3 measures):
+  Sales: $470,532.51
+  Profit Margin: 13.1%
+  Sales LY: $484,247.50
+```
+
+#### Evaluate per dimension (e.g., Sales by State)
+```
+> pbix_evaluate_dax_per_dimension("my_report", "Sales,Sales LY", "dim-Geo.State", '{"dim-Date.Year": [2015]}', 5)
+
+DAX per dim-Geo.State (49 values, showing 5):
+
+Value                              Sales         Sales LY
+---------------------------------------------------------
+California                       88,443.84        91,303.53
+New York                         80,310.27        64,841.78
+Texas                            34,531.11        50,700.72
+```
+
+#### Get default slicer filters
+```
+> pbix_get_default_filters("my_report")
+
+Default slicer filters:
+  dim-Date.Year: [2015]
+  Trend vs. Table.Toggle: ['Bar']
+
+Use as filter_context in pbix_evaluate_dax:
+  {"dim-Date.Year": [2015], "Trend vs. Table.Toggle": ["Bar"]}
+```
+
+#### Get visual positions with group resolution
+```
+> pbix_get_visual_positions("my_report", 0)
+
+Visual positions (absolute, 33 visuals):
+  [0] cardVisual              at (1004,60) 101x322
+  [10] card                   at (1086,109) 42x14  [child of group]
+```
+
+## Other Usage Examples
 
 ### Open a file and inspect it
 
@@ -180,7 +254,8 @@ PBIX file (ZIP)
 
 | File | Purpose |
 |------|---------|
-| `pbix_mcp_server.py` | MCP server — 46 tools for full PBIX read/write |
+| `pbix_mcp_server.py` | MCP server — 51 tools for full PBIX read/write + DAX evaluation |
+| `dax_engine.py` | DAX expression evaluator with 30+ functions and relationship propagation |
 | `datamodel_roundtrip.py` | XPress9 decompress/compress for DataModel |
 | `abf_rebuild.py` | ABF archive format — read, modify, rebuild |
 | `vertipaq_encoder.py` | VertiPaq column encoder — IDF, IDFMETA, dictionary, HIDX |
@@ -189,9 +264,10 @@ PBIX file (ZIP)
 
 1. **Open**: Extracts PBIX ZIP to a temp directory
 2. **Read/Modify**: Operates on extracted components (JSON, SQLite, binary)
-3. **DataModel writes**: Decompress XPress9 → parse ABF → modify → rebuild ABF → recompress
-4. **VertiPaq writes**: Encode column data (dictionary + RLE/bit-packed IDF) → replace in ABF
-5. **Save**: Repack everything into a valid PBIX ZIP (SecurityBindings auto-removed)
+3. **DAX Evaluation**: Loads VertiPaq data via PBIXRay, evaluates expressions with relationship-based filter propagation
+4. **DataModel writes**: Decompress XPress9 → parse ABF → modify → rebuild ABF → recompress
+5. **VertiPaq writes**: Encode column data (dictionary + RLE/bit-packed IDF) → replace in ABF
+6. **Save**: Repack everything into a valid PBIX ZIP (SecurityBindings auto-removed)
 
 ## Requirements
 
