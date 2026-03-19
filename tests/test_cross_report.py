@@ -47,6 +47,14 @@ def _load_pbix(path):
             except Exception:
                 pass
 
+    # Load calculated tables from ABF metadata (DATATABLE, GENERATESERIES, etc.)
+    # These tables aren't in VertiPaq — they exist only as DAX in metadata.
+    try:
+        from calc_tables import load_calculated_tables
+        tables = load_calculated_tables(path, tables, relationships)
+    except Exception:
+        pass
+
     date_table = date_column = None
     for t in tables:
         if 'date' in t.lower() or 'calendar' in t.lower():
@@ -140,8 +148,8 @@ class TestGeoSalesDashboard:
             except Exception as e:
                 pytest.fail(f'Measure "{name}" crashed: {e}')
 
-    def test_success_rate_above_80(self, data):
-        """At least 80% of measures should return non-None values."""
+    def test_success_rate_above_90(self, data):
+        """At least 90% of measures should return non-None values."""
         tables, measures, rels, dt, dc = data
         success = 0
         for name in measures:
@@ -149,7 +157,7 @@ class TestGeoSalesDashboard:
             if r.get(name) is not None:
                 success += 1
         rate = success / len(measures)
-        assert rate >= 0.80, f'Success rate {rate:.0%} < 80%'
+        assert rate >= 0.90, f'Success rate {rate:.0%} < 90%'
 
 
 # ---------------------------------------------------------------------------
@@ -176,12 +184,12 @@ class TestAgentsPerformance:
             except Exception as e:
                 pytest.fail(f'Measure "{name}" crashed: {e}')
 
-    def test_success_rate_above_75(self, data):
+    def test_success_rate_above_90(self, data):
         tables, measures, rels, dt, dc = data
         success = sum(1 for name in measures
                       if evaluate_measures_batch([name], tables, measures, None, dt, dc, rels).get(name) is not None)
         rate = success / len(measures)
-        assert rate >= 0.75, f'Success rate {rate:.0%} < 75%'
+        assert rate >= 0.90, f'Success rate {rate:.0%} < 90%'
 
 
 # ---------------------------------------------------------------------------
@@ -208,12 +216,12 @@ class TestEcommerce:
             except Exception as e:
                 pytest.fail(f'Measure "{name}" crashed: {e}')
 
-    def test_success_rate_above_70(self, data):
+    def test_success_rate_above_80(self, data):
         tables, measures, rels, dt, dc = data
         success = sum(1 for name in measures
                       if evaluate_measures_batch([name], tables, measures, None, dt, dc, rels).get(name) is not None)
         rate = success / len(measures)
-        assert rate >= 0.70, f'Success rate {rate:.0%} < 70%'
+        assert rate >= 0.80, f'Success rate {rate:.0%} < 80%'
 
 
 # ---------------------------------------------------------------------------
@@ -240,12 +248,12 @@ class TestITSupport:
             except Exception as e:
                 pytest.fail(f'Measure "{name}" crashed: {e}')
 
-    def test_success_rate_above_85(self, data):
+    def test_success_rate_above_90(self, data):
         tables, measures, rels, dt, dc = data
         success = sum(1 for name in measures
                       if evaluate_measures_batch([name], tables, measures, None, dt, dc, rels).get(name) is not None)
         rate = success / len(measures)
-        assert rate >= 0.85, f'Success rate {rate:.0%} < 85%'
+        assert rate >= 0.90, f'Success rate {rate:.0%} < 90%'
 
 
 if __name__ == '__main__':
