@@ -375,6 +375,8 @@ class DAXEngine:
             'UNICODE': self._fn_unicode,
             'VALUE': self._fn_value,
             'COMBINEVALUES': self._fn_combinevalues,
+            'CONCATENATEX': self._fn_concatenatex,
+            'RANKX': self._fn_rankx,
             'PATHCONTAINS': self._fn_pathcontains,
             'PATHITEM': self._fn_pathitem,
             'PATHLENGTH': self._fn_pathlength,
@@ -2219,6 +2221,76 @@ class DAXEngine:
         delimiter = str(self._eval_expr(args[0].strip(), ctx) or '')
         parts = [str(self._eval_expr(a.strip(), ctx) or '') for a in args[1:]]
         return delimiter.join(parts)
+
+    def _fn_concatenatex(self, args_str: str, ctx: DAXContext) -> Any:
+        """CONCATENATEX(table, expression, delimiter) — iterate table, evaluate expression per row, join with delimiter."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return ''
+        table_ref = self._eval_expr(args[0].strip(), ctx)
+        row_expr = args[1].strip()
+        delimiter = str(self._eval_expr(args[2].strip(), ctx) or '') if len(args) > 2 else ''
+
+        parts = []
+        if isinstance(table_ref, list):
+            for row_item in table_ref:
+                if isinstance(row_item, dict) and '__table__' in row_item:
+                    row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+                    result = self._eval_expr(row_expr, row_ctx)
+                    if result is not None:
+                        parts.append(str(result))
+                else:
+                    result = self._eval_expr(row_expr, ctx)
+                    if result is not None:
+                        parts.append(str(result))
+        return delimiter.join(parts)
+
+    def _fn_rankx(self, args_str: str, ctx: DAXContext) -> Any:
+        """RANKX(table, expression, value, order, ties) — rank a value within a table's evaluated expression."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return None
+        table_ref = self._eval_expr(args[0].strip(), ctx)
+        rank_expr = args[1].strip()
+        # Value to rank (optional — defaults to the expression evaluated in current context)
+        value_expr = args[2].strip() if len(args) > 2 else None
+        order_str = args[3].strip().upper() if len(args) > 3 else 'DESC'
+        is_desc = 'DESC' in order_str
+
+        # Get the value to rank
+        if value_expr:
+            current_val = self._eval_expr(value_expr, ctx)
+        else:
+            current_val = self._eval_expr(rank_expr, ctx)
+
+        if not isinstance(current_val, (int, float)):
+            return None
+
+        # Evaluate expression for all rows in the table
+        all_vals = []
+        if isinstance(table_ref, list):
+            for row_item in table_ref:
+                if isinstance(row_item, dict) and '__table__' in row_item:
+                    row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+                    result = self._eval_expr(rank_expr, row_ctx)
+                    if isinstance(result, (int, float)):
+                        all_vals.append(result)
+
+        if not all_vals:
+            return 1
+
+        # Sort and find rank
+        if is_desc:
+            all_vals.sort(reverse=True)
+        else:
+            all_vals.sort()
+
+        # Dense ranking
+        unique_sorted = sorted(set(all_vals), reverse=is_desc)
+        for i, v in enumerate(unique_sorted):
+            if abs(v - current_val) < 0.0001:
+                return i + 1
+        return len(unique_sorted) + 1
 
     def _fn_pathcontains(self, args_str: str, ctx: DAXContext) -> Any:
         """PATHCONTAINS(path, item) — check if pipe-delimited path contains item."""
