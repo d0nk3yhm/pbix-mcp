@@ -131,12 +131,12 @@ The server communicates via stdio using the MCP JSON-RPC protocol.
 
 ## DAX Evaluation Engine
 
-The built-in DAX engine (`dax_engine.py`, 3,100+ lines) can compute any measure expression against the embedded VertiPaq data. **153 DAX functions** implemented:
+The built-in DAX engine (`dax_engine.py`, 3,200+ lines) can compute any measure expression against the embedded VertiPaq data — including **SVG visual generation**. **155 DAX functions** implemented:
 
 | Category | Functions |
 |----------|-----------|
 | **Aggregation** | `SUM`, `AVERAGE`, `COUNT`, `COUNTROWS`, `MIN`, `MAX`, `DISTINCTCOUNT`, `PRODUCT`, `MEDIAN`, `COUNTBLANK` |
-| **Iterators** | `SUMX`, `MAXX`, `MINX`, `AVERAGEX`, `COUNTX`, `COUNTAX`, `FILTER`, `GENERATE`, `GENERATEALL` |
+| **Iterators** | `SUMX`, `MAXX`, `MINX`, `AVERAGEX`, `COUNTX`, `COUNTAX`, `CONCATENATEX`, `RANKX`, `FILTER`, `GENERATE`, `GENERATEALL` |
 | **Table** | `TOPN`, `ADDCOLUMNS`, `SUMMARIZE`, `SUMMARIZECOLUMNS`, `SELECTCOLUMNS`, `DISTINCT`, `UNION`, `EXCEPT`, `INTERSECT`, `CROSSJOIN`, `DATATABLE`, `ROW`, `TREATAS` |
 | **Time Intelligence** | `CALCULATE`, `DATEADD`, `SAMEPERIODLASTYEAR`, `TOTALYTD/MTD/QTD`, `PREVIOUSMONTH/QUARTER/YEAR`, `NEXTMONTH/QUARTER/YEAR`, `PARALLELPERIOD`, `DATESYTD/MTD/QTD`, `STARTOF/ENDOF`, `FIRSTDATE/LASTDATE`, `DATESBETWEEN`, `DATESINPERIOD`, `CALENDAR`, `CALENDARAUTO`, `OPENING/CLOSINGBALANCE` |
 | **Filter** | `REMOVEFILTERS`, `ALL`, `ALLEXCEPT`, `ALLSELECTED`, `KEEPFILTERS`, `VALUES`, `SELECTEDVALUE`, `HASONEVALUE`, `HASONEFILTER`, `ISFILTERED`, `ISCROSSFILTERED` |
@@ -259,11 +259,13 @@ PBIX file (ZIP)
 | File | Lines | Purpose |
 |------|-------|---------|
 | `pbix_mcp_server.py` | 2,375 | MCP server — 51 tools for full PBIX read/write + DAX evaluation |
-| `dax_engine.py` | 3,122 | DAX expression evaluator — 153 functions with relationship propagation |
+| `dax_engine.py` | 3,200+ | DAX expression evaluator — 155 functions with relationship propagation |
 | `vertipaq_encoder.py` | 1,442 | VertiPaq column encoder — IDF, IDFMETA, dictionary, HIDX |
 | `abf_rebuild.py` | 667 | ABF archive format — read, modify, rebuild |
 | `datamodel_roundtrip.py` | 219 | XPress9 decompress/compress for DataModel |
-| `tests/test_dax_engine.py` | 358 | Test suite — 55 tests covering all DAX engine functionality |
+| `tests/test_dax_engine.py` | 358 | Core test suite — 55 tests |
+| `tests/test_dax_accuracy.py` | 498 | Accuracy tests — 50 edge case tests |
+| `tests/test_cross_report.py` | 200 | Cross-report validation — 19 tests across 4 PBIX files |
 
 ## How It Works
 
@@ -281,18 +283,37 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-**55 tests, 100% passing** — covering:
-- Aggregation functions (SUM, AVERAGE, COUNT, DISTINCTCOUNT, MIN, MAX)
-- Computed measures (DIVIDE, IF, expressions)
-- VAR/RETURN variable scoping
-- Filter propagation via relationships (year, category, region, combined)
-- Time intelligence (DATEADD, Sales LY, Sales change)
-- Iterator functions (MAXX with ALL)
-- Expression parsing (literals, operators, precedence, concatenation)
-- Logic and math functions
-- Batch evaluation
-- Edge cases (circular references, missing measures, empty tables)
-- **Real PBIX file validation** (GeoSales Dashboard — verified against Power BI Desktop)
+**124 tests, 100% passing** across **4 different PBIX files**:
+
+### Test Suites
+
+| Suite | Tests | Coverage |
+|-------|-------|----------|
+| `test_dax_engine.py` | 55 | Core functions, filter propagation, time intelligence, edge cases |
+| `test_dax_accuracy.py` | 50 | BLANK handling, nested CALCULATE, LOOKUPVALUE, iterators, text/math/info, SWITCH(TRUE()), SVG generation |
+| `test_cross_report.py` | 19 | Cross-report validation against 4 real PBIX files |
+
+### Cross-Report Validation
+
+| Dashboard | Measures | Success Rate | Crashes |
+|-----------|----------|-------------|---------|
+| GeoSales Dashboard | 43 | **86%** | 0 |
+| Agents Performance | 102 | **81%** | 0 |
+| Ecommerce Conversion | 33 | **82%** | 0 |
+| IT Support | 26 | **92%** | 0 |
+
+**Zero crashes across 204 real-world measures.** Remaining None results are disconnected parameter tables (no data) and a few unsupported patterns.
+
+### Verified Against Power BI Desktop
+
+| Measure | Power BI | DAX Engine | Match |
+|---------|----------|------------|-------|
+| Sales (Year=2015) | $470,532 | $470,533 | ✅ |
+| Profit Margin | 13.1% | 13.1% | ✅ |
+| Sales LY | $484,247 | $484,247 | ✅ |
+| Sales Change | -2.8% | -2.8% | ✅ |
+| California Sales | $88,444 | $88,444 | ✅ |
+| Technology Sales | $162,781 | $162,781 | ✅ |
 
 ## Requirements
 
