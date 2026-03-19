@@ -20,3 +20,4 @@ test_samples/*.pbix
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+test_samples/temp_dl/
