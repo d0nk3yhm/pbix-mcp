@@ -7,7 +7,7 @@ Supports 150+ DAX functions:
 - Aggregation: SUM, AVERAGE, COUNT, COUNTROWS, MIN, MAX, DISTINCTCOUNT, PRODUCT, MEDIAN
 - Iteration: SUMX, MAXX, MINX, AVERAGEX, COUNTX, COUNTAX, COUNTBLANK
 - Table: TOPN, ADDCOLUMNS, SUMMARIZE, SUMMARIZECOLUMNS, SELECTCOLUMNS, DISTINCT,
-         UNION, EXCEPT, INTERSECT, CROSSJOIN, DATATABLE, ROW, TREATAS, GENERATE, GENERATEALL
+         UNION, EXCEPT, INTERSECT, CROSSJOIN, DATATABLE, ROW, TREATAS, GENERATE, GENERATEALL, GENERATESERIES
 - Filter: CALCULATE, REMOVEFILTERS, ALL, ALLEXCEPT, ALLSELECTED, KEEPFILTERS,
           VALUES, FILTER, HASONEVALUE, HASONEFILTER, ISFILTERED, ISCROSSFILTERED,
           USERELATIONSHIP, EARLIER, EARLIEST
@@ -377,6 +377,7 @@ class DAXEngine:
             'TREATAS': self._fn_treatas,
             'GENERATE': self._fn_generate,
             'GENERATEALL': self._fn_generateall,
+            'GENERATESERIES': self._fn_generateseries,
             # --- Text ---
             'FORMAT': self._fn_format,
             'CONCATENATE': self._fn_concatenate,
@@ -1753,41 +1754,62 @@ class DAXEngine:
         return result
 
     def _fn_datatable(self, args_str: str, ctx: DAXContext) -> Any:
-        """DATATABLE(name, type, ..., data) — create inline table.
-        Simplified: returns a list of row dicts from the provided data block."""
-        # DATATABLE is complex to parse fully; provide basic support
-        args = self._split_args(args_str)
-        if len(args) < 3:
+        """DATATABLE(name, type, ..., {{val1, val2}, {val3, val4}}) — create inline table."""
+        # Split column definitions from data block
+        # Find the outermost { which starts the data rows
+        brace_pos = args_str.find('{{')
+        if brace_pos < 0:
+            brace_pos = args_str.find('{')
+
+        if brace_pos < 0:
             return []
-        # Parse column definitions: name, type pairs
+
+        col_defs_str = args_str[:brace_pos].rstrip().rstrip(',')
+        data_block = args_str[brace_pos:]
+
+        # Parse column definitions: "name", TYPE pairs
+        col_args = self._split_args(col_defs_str)
         col_names = []
+        col_types = []
         i = 0
-        while i + 1 < len(args):
-            name_val = self._eval_expr(args[i].strip(), ctx)
-            type_val = args[i + 1].strip().upper()
+        while i + 1 < len(col_args):
+            name_val = col_args[i].strip().strip('"\'')
+            type_val = col_args[i + 1].strip().upper()
             if type_val in ('INTEGER', 'STRING', 'BOOLEAN', 'DOUBLE', 'CURRENCY', 'DATETIME'):
-                col_names.append(str(name_val))
+                col_names.append(name_val)
+                col_types.append(type_val)
                 i += 2
             else:
                 break
-        # Remaining args are data values, grouped by column count
-        data_args = args[i:]
+
+        if not col_names:
+            return []
+
+        # Parse data rows from {{ ... }, { ... }} blocks
         rows = []
-        row = {}
-        col_idx = 0
-        for da in data_args:
-            val = self._eval_expr(da.strip(), ctx)
-            if col_idx < len(col_names):
-                row[col_names[col_idx]] = val
-            col_idx += 1
-            if col_idx >= len(col_names):
-                if col_names:
-                    row['__table__'] = '__datatable__'
-                    row['__column__'] = col_names[0]
-                    row['__value__'] = row.get(col_names[0])
-                rows.append(row)
+        # Extract individual row blocks {val1, val2}
+        row_pattern = re.findall(r'\{([^{}]+)\}', data_block)
+        for row_str in row_pattern:
+            values = [v.strip().strip('"\'') for v in row_str.split(',')]
+            if len(values) >= len(col_names):
                 row = {}
-                col_idx = 0
+                for j, cn in enumerate(col_names):
+                    raw = values[j]
+                    if col_types[j] == 'INTEGER':
+                        try: row[cn] = int(float(raw))
+                        except: row[cn] = 0
+                    elif col_types[j] in ('DOUBLE', 'CURRENCY'):
+                        try: row[cn] = float(raw)
+                        except: row[cn] = 0.0
+                    elif col_types[j] == 'BOOLEAN':
+                        row[cn] = raw.upper() in ('TRUE', '1')
+                    else:
+                        row[cn] = raw
+                row['__table__'] = '__datatable__'
+                row['__column__'] = col_names[0]
+                row['__value__'] = row.get(col_names[0])
+                rows.append(row)
+
         return rows
 
     def _fn_row(self, args_str: str, ctx: DAXContext) -> Any:
@@ -1883,6 +1905,42 @@ class DAXEngine:
                 # GENERATEALL keeps rows even when inner is empty
                 result.append(row_item if isinstance(row_item, dict) else {'__value__': row_item})
         return result
+
+    def _fn_generateseries(self, args_str: str, ctx: DAXContext) -> Any:
+        """GENERATESERIES(start, end, step) — generate a single-column table [Value]."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return []
+        start_val = self._eval_expr(args[0].strip(), ctx)
+        end_val = self._eval_expr(args[1].strip(), ctx)
+        step_val = self._eval_expr(args[2].strip(), ctx) if len(args) >= 3 else 1
+        try:
+            start_val = float(start_val) if start_val is not None else 0
+            end_val = float(end_val) if end_val is not None else 0
+            step_val = float(step_val) if step_val is not None else 1
+        except (TypeError, ValueError):
+            return []
+        if step_val == 0:
+            return []
+        # Use int if all values are whole numbers
+        use_int = (start_val == int(start_val) and end_val == int(end_val)
+                   and step_val == int(step_val))
+        rows = []
+        current = start_val
+        max_rows = 1000000  # safety limit
+        if step_val > 0:
+            while current <= end_val + 1e-9 and len(rows) < max_rows:
+                val = int(current) if use_int else current
+                rows.append({'Value': val, '__table__': '__generateseries__',
+                             '__column__': 'Value', '__value__': val})
+                current += step_val
+        elif step_val < 0:
+            while current >= end_val - 1e-9 and len(rows) < max_rows:
+                val = int(current) if use_int else current
+                rows.append({'Value': val, '__table__': '__generateseries__',
+                             '__column__': 'Value', '__value__': val})
+                current += step_val
+        return rows
 
     # =========================================================================
     # Filter functions

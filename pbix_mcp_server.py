@@ -24,6 +24,7 @@ import io
 import struct
 import tempfile
 import copy
+import re
 import sqlite3
 import traceback
 from pathlib import Path
@@ -2062,6 +2063,304 @@ def _get_dax_context(alias: str) -> dict:
                     }
             except Exception:
                 continue
+
+    # --- Load calculated tables from ABF metadata ---
+    try:
+        from datamodel_roundtrip import decompress_datamodel
+        from abf_rebuild import read_metadata_sqlite
+        import dax_engine
+
+        pbix_path = info["path"]
+        with zipfile.ZipFile(pbix_path, 'r') as zf:
+            dm_data = zf.read('DataModel')
+        abf_data = decompress_datamodel(dm_data)
+        db_bytes = read_metadata_sqlite(abf_data)
+
+        # Write metadata sqlite to a temp file and query it
+        tmp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        tmp_db.write(db_bytes)
+        tmp_db.close()
+        try:
+            conn = sqlite3.connect(tmp_db.name)
+            conn.row_factory = sqlite3.Row
+
+            # Find calculated tables (Partition.Type = 2)
+            calc_tables_rows = conn.execute("""
+                SELECT t.ID, t.Name, p.QueryDefinition
+                FROM [Table] t
+                JOIN [Partition] p ON p.TableID = t.ID
+                WHERE t.ModelID = 1 AND p.Type = 2 AND p.QueryDefinition IS NOT NULL
+            """).fetchall()
+
+            # Build a map of calculated table definitions for dependency resolution
+            calc_table_defs = {}
+            for row in calc_tables_rows:
+                table_id = row['ID']
+                table_name = row['Name']
+                query_def = row['QueryDefinition']
+                if table_name and query_def and table_name not in tables:
+                    calc_table_defs[table_name] = {
+                        'id': table_id,
+                        'expression': query_def.strip(),
+                    }
+
+            # Get columns for each calculated table
+            for tname, tdef in calc_table_defs.items():
+                col_rows = conn.execute("""
+                    SELECT ExplicitName, ExplicitDataType, Expression
+                    FROM [Column]
+                    WHERE TableID = ? AND ExplicitName IS NOT NULL
+                          AND ExplicitName NOT LIKE 'RowNumber%'
+                """, (tdef['id'],)).fetchall()
+                tdef['columns'] = []
+                tdef['calc_columns'] = []
+                for cr in col_rows:
+                    col_name = cr['ExplicitName']
+                    col_expr = cr['Expression']
+                    tdef['columns'].append(col_name)
+                    if col_expr:
+                        tdef['calc_columns'].append({
+                            'name': col_name,
+                            'expression': col_expr.strip(),
+                        })
+
+            conn.close()
+
+            # Topological sort: evaluate tables that reference other calc tables last
+            def _get_table_deps(expr, all_calc_names):
+                """Find which calculated table names appear in the expression."""
+                deps = set()
+                for cname in all_calc_names:
+                    # Check if expression is just a table name reference
+                    if expr.strip().strip("'\"") == cname:
+                        deps.add(cname)
+                    # Check for 'TableName' references in expression
+                    elif f"'{cname}'" in expr or f'"{cname}"' in expr:
+                        deps.add(cname)
+                return deps
+
+            all_calc_names = set(calc_table_defs.keys())
+            # Simple topological sort
+            eval_order = []
+            remaining = set(all_calc_names)
+            max_passes = len(remaining) + 1
+            for _ in range(max_passes):
+                if not remaining:
+                    break
+                progress = False
+                for tname in list(remaining):
+                    deps = _get_table_deps(calc_table_defs[tname]['expression'], remaining - {tname})
+                    if not deps:
+                        eval_order.append(tname)
+                        remaining.discard(tname)
+                        progress = True
+                if not progress:
+                    # Circular deps or unresolvable — add remaining in any order
+                    eval_order.extend(remaining)
+                    break
+
+            # Evaluate each calculated table
+            engine = dax_engine.DAXEngine()
+
+            for tname in eval_order:
+                try:
+                    tdef = calc_table_defs[tname]
+                    expr = tdef['expression']
+
+                    # Build a temporary DAX context with tables evaluated so far
+                    tmp_ctx = dax_engine.DAXContext(
+                        tables, measure_defs, None, None, None, relationships
+                    )
+
+                    # Try to evaluate the DAX expression
+                    result = None
+
+                    # Handle GENERATESERIES directly
+                    gs_match = re.match(
+                        r'^\s*GENERATESERIES\s*\(',
+                        expr, re.IGNORECASE
+                    )
+                    if gs_match:
+                        result = engine._eval_expr(expr, tmp_ctx)
+
+                    # Handle DATATABLE
+                    elif re.match(r'^\s*DATATABLE\s*\(', expr, re.IGNORECASE):
+                        result = engine._eval_expr(expr, tmp_ctx)
+
+                    # Handle CALENDAR / CALENDARAUTO
+                    elif re.match(r'^\s*CALENDAR(AUTO)?\s*\(', expr, re.IGNORECASE):
+                        result = engine._eval_expr(expr, tmp_ctx)
+
+                    # Handle table name reference (e.g., another calculated table)
+                    elif expr.strip().strip("'\"") in tables:
+                        ref_name = expr.strip().strip("'\"")
+                        ref_tbl = tables[ref_name]
+                        tables[tname] = {
+                            'columns': list(ref_tbl['columns']),
+                            'rows': [list(r) for r in ref_tbl['rows']],
+                        }
+                        continue
+
+                    # Handle calendar-generating expressions (VAR with CALENDAR inside)
+                    elif 'CALENDAR' in expr.upper() and ('VAR' in expr.upper() or 'MIN' in expr.upper()):
+                        # This is a complex calendar generator (e.g., DateAutoTemplate)
+                        # Instead of evaluating the full DAX, extract date range from fact tables
+                        try:
+                            from datetime import date, datetime, timedelta
+                            min_date = None
+                            max_date = None
+                            # Prefer fact tables (larger tables with 'fact'/'sales'/'order' in name)
+                            sorted_tables = sorted(tables.items(),
+                                key=lambda x: (0 if any(k in x[0].lower() for k in ['fact', 'sales', 'order']) else 1, -len(x[1]['rows'])))
+                            for ft_name, ft_data in sorted_tables:
+                                for ci, col in enumerate(ft_data['columns']):
+                                    if 'date' in col.lower() or 'datekey' in col.lower():
+                                        for row in ft_data['rows']:
+                                            v = row[ci]
+                                            d = None
+                                            # Handle pandas Timestamps
+                                            if hasattr(v, 'date') and callable(v.date):
+                                                try: d = v.date()
+                                                except: pass
+                                            elif isinstance(v, datetime):
+                                                d = v.date()
+                                            elif isinstance(v, date):
+                                                d = v
+                                            elif isinstance(v, str) and ('T' in v or '-' in v):
+                                                try: d = date.fromisoformat(v.split('T')[0][:10])
+                                                except: pass
+                                            elif isinstance(v, (int, float)):
+                                                try:
+                                                    ds = str(int(v))
+                                                    if len(ds) == 8:
+                                                        d = date(int(ds[:4]), int(ds[4:6]), int(ds[6:]))
+                                                except: pass
+                                            if d:
+                                                if min_date is None or d < min_date: min_date = d
+                                                if max_date is None or d > max_date: max_date = d
+                                        if min_date: break
+                                if min_date: break
+
+                            if min_date and max_date:
+                                # Extend to full years
+                                start = date(min_date.year, 1, 1)
+                                end = date(max_date.year, 12, 31)
+                                # Generate calendar rows
+                                cal_rows = []
+                                d = start
+                                while d <= end:
+                                    cal_rows.append([
+                                        d.isoformat() + 'T00:00:00',  # Date
+                                        d.year,                        # Year
+                                        d.month,                       # MonthNumber
+                                        d.strftime('%B'),              # Month
+                                        d.strftime('%b'),              # ShortMonth
+                                        d.day,                         # Day
+                                        d.strftime('%A'),              # DayOfWeek
+                                        d.isoweekday() % 7,           # DayOfWeekNumber
+                                        (d.month - 1) // 3 + 1,       # Quarter
+                                        f'Q{(d.month-1)//3+1}',       # QuarterLabel
+                                        True,                          # DateWithTransactions
+                                    ])
+                                    d += timedelta(days=1)
+
+                                # Get column names from metadata
+                                meta_cols = tdef.get('columns', [])
+                                if meta_cols:
+                                    col_names = meta_cols
+                                else:
+                                    col_names = ['Date', 'Year', 'MonthNumber', 'Month', 'ShortMonth',
+                                                 'Day', 'DayOfWeek', 'DayOfWeekNumber', 'Quarter',
+                                                 'QuarterLabel', 'DateWithTransactions']
+
+                                # Trim rows to match column count
+                                for row in cal_rows:
+                                    while len(row) < len(col_names):
+                                        row.append(None)
+                                    del row[len(col_names):]
+
+                                tables[tname] = {'columns': col_names, 'rows': cal_rows}
+                                continue
+                        except Exception as cal_err:
+                            pass  # Fall through to generic evaluation
+
+                    # Handle complex VAR/RETURN or other expressions
+                    else:
+                        result = engine._eval_expr(expr, tmp_ctx)
+
+                    # Convert result (list of dicts) into table format
+                    if isinstance(result, list) and result:
+                        # Extract column names from the first row dict
+                        sample = result[0]
+                        if isinstance(sample, dict):
+                            # Use explicitly defined columns if available, else derive from result
+                            meta_keys = {'__table__', '__column__', '__value__'}
+                            result_cols = [k for k in sample.keys() if k not in meta_keys]
+
+                            if tdef['columns']:
+                                # Map result columns to metadata column names
+                                col_names = []
+                                for mc in tdef['columns']:
+                                    col_names.append(mc)
+                                # If result has fewer cols than metadata, use result cols
+                                if not result_cols:
+                                    result_cols = col_names
+                                final_cols = result_cols if len(result_cols) >= len(col_names) else col_names
+                            else:
+                                final_cols = result_cols
+
+                            if final_cols:
+                                rows_data = []
+                                for item in result:
+                                    if isinstance(item, dict):
+                                        row_vals = [item.get(c, item.get('Value')) for c in final_cols]
+                                        rows_data.append(row_vals)
+
+                                tables[tname] = {
+                                    'columns': final_cols,
+                                    'rows': rows_data,
+                                }
+
+                                # Evaluate calculated columns for this table
+                                for calc_col in tdef.get('calc_columns', []):
+                                    cc_name = calc_col['name']
+                                    cc_expr = calc_col['expression']
+                                    if cc_name not in tables[tname]['columns']:
+                                        tables[tname]['columns'].append(cc_name)
+                                        # Evaluate expression for each row
+                                        col_idx_map = {c: i for i, c in enumerate(tables[tname]['columns'])}
+                                        for row_vals in tables[tname]['rows']:
+                                            try:
+                                                # Build row context for EARLIER-style references
+                                                row_ctx = dax_engine.DAXContext(
+                                                    tables, measure_defs, None, None,
+                                                    None, relationships
+                                                )
+                                                val = engine._eval_expr(cc_expr, row_ctx)
+                                                row_vals.append(val)
+                                            except Exception:
+                                                row_vals.append(None)
+
+                    elif isinstance(result, (int, float)):
+                        # Single scalar — wrap in single-row table
+                        col_name = tdef['columns'][0] if tdef['columns'] else 'Value'
+                        tables[tname] = {
+                            'columns': [col_name],
+                            'rows': [[result]],
+                        }
+
+                except Exception:
+                    # Skip this calculated table if evaluation fails
+                    continue
+
+        finally:
+            try:
+                os.unlink(tmp_db.name)
+            except OSError:
+                pass
+    except Exception:
+        # If ABF metadata loading fails entirely, just continue without calculated tables
+        pass
 
     # Detect date table — try multiple heuristics
     date_table = None
