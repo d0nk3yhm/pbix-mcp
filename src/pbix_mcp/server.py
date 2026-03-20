@@ -377,12 +377,17 @@ def pbix_open(file_path: str, alias: str = "") -> str:
 
 
 @mcp.tool()
-def pbix_save(alias: str, output_path: str = "") -> str:
+def pbix_save(alias: str, output_path: str = "", overwrite: bool = True, backup: bool = True) -> str:
     """Save/repack the modified PBIX/PBIT file.
+
+    Creates an automatic .bak backup before overwriting (unless backup=False).
+    Set overwrite=False to refuse overwriting an existing file.
 
     Args:
         alias: The alias of the open file
         output_path: Where to save. Empty = overwrite original.
+        overwrite: If False, refuse to overwrite an existing file (default True)
+        backup: If True (default), create a .bak backup before overwriting
     """
     try:
         info = _ensure_open(alias)
@@ -390,10 +395,14 @@ def pbix_save(alias: str, output_path: str = "") -> str:
         target = output_path or info["path"]
         target = os.path.abspath(target)
 
+        # Safety: refuse overwrite if explicitly disabled
+        if not overwrite and os.path.exists(target) and target != info["path"]:
+            return f"Error: '{target}' already exists and overwrite=False. Use overwrite=True or choose a different path."
+
         # If overwriting original, create backup
-        if target == info["path"] and os.path.exists(target):
-            backup = target + ".bak"
-            shutil.copy2(target, backup)
+        if backup and target == info["path"] and os.path.exists(target):
+            backup_path = target + ".bak"
+            shutil.copy2(target, backup_path)
 
         _repack_pbix(work_dir, target)
         info["modified"] = False
@@ -404,21 +413,28 @@ def pbix_save(alias: str, output_path: str = "") -> str:
 
 
 @mcp.tool()
-def pbix_close(alias: str) -> str:
+def pbix_close(alias: str, force: bool = False) -> str:
     """Close an open file and clean up temporary files.
+
+    Refuses to close files with unsaved changes unless force=True.
 
     Args:
         alias: The alias of the open file
+        force: If False (default), refuse to close files with unsaved changes
     """
     try:
         info = _ensure_open(alias)
         work_dir = info["work_dir"]
-        warning = ""
-        if info.get("modified"):
-            warning = f"Warning: '{alias}' had unsaved changes. "
+
+        if info.get("modified") and not force:
+            return (
+                f"Error: '{alias}' has unsaved changes. "
+                f"Use pbix_save first, or pbix_close with force=True to discard changes."
+            )
+
         shutil.rmtree(work_dir, ignore_errors=True)
         del _open_files[alias]
-        return f"{warning}Closed '{alias}'."
+        return f"Closed '{alias}'."
     except Exception as e:
         return f"Error closing: {e}"
 
