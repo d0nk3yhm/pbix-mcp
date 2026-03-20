@@ -989,7 +989,7 @@ def update_table_in_abf(
     bytes
         New ABF bytes with the table data and metadata replaced.
     """
-    from abf_rebuild import (
+    from pbix_mcp.formats.abf_rebuild import (
         list_abf_files,
         rebuild_abf_with_replacement,
     )

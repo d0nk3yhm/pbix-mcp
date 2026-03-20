@@ -3,15 +3,15 @@ Cross-report DAX engine tests — validates against multiple PBIX files.
 Tests that the engine works generically across different report structures.
 Run: python -m pytest tests/test_cross_report.py -v
 """
-import sys
 import os
 import zipfile
 import tempfile
 import shutil
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from dax_engine import DAXEngine, DAXContext, evaluate_measures_batch, evaluate_measures_smart
+from pbix_mcp.dax.engine import DAXEngine, DAXContext, evaluate_measures_batch, evaluate_measures_smart
+
+pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
 
 def _load_pbix(path):
@@ -53,7 +53,7 @@ def _load_pbix(path):
     # Load calculated tables from ABF metadata (DATATABLE, GENERATESERIES, etc.)
     # These tables aren't in VertiPaq — they exist only as DAX in metadata.
     try:
-        from calc_tables import load_calculated_tables
+        from pbix_mcp.dax.calc_tables import load_calculated_tables
         tables = load_calculated_tables(path, tables, relationships)
     except Exception:
         pass
@@ -68,7 +68,7 @@ def _load_pbix(path):
     # Extract default slicer filters from report layout
     default_filters = {}
     try:
-        from pbix_mcp_server import _get_all_default_filters
+        from pbix_mcp.server import _get_all_default_filters
         tmp = tempfile.mkdtemp()
         with zipfile.ZipFile(path, 'r') as zf:
             zf.extractall(tmp)

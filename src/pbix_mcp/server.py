@@ -1240,9 +1240,9 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
         if not columns or not rows:
             return "Error: 'columns' and 'rows' are required and must not be empty."
 
-        from datamodel_roundtrip import decompress_datamodel, compress_datamodel
-        from abf_rebuild import read_metadata_sqlite, rebuild_abf_with_replacement
-        from vertipaq_encoder import encode_table_data, update_table_in_abf
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel, compress_datamodel
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite, rebuild_abf_with_replacement
+        from pbix_mcp.formats.vertipaq_encoder import encode_table_data, update_table_in_abf
 
         dm_path = os.path.join(info["work_dir"], "DataModel")
         if not os.path.exists(dm_path):
@@ -1254,7 +1254,7 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
         abf = decompress_datamodel(dm_bytes)
 
         # Get partition number from existing ABF file listing
-        from abf_rebuild import list_abf_files
+        from pbix_mcp.formats.abf_rebuild import list_abf_files
         file_log = list_abf_files(abf)
         partition_num = None
         tbl_prefix = f"{table_name}.tbl"
@@ -1319,9 +1319,9 @@ def pbix_update_table_rows(alias: str, table_name: str, rows_json: str) -> str:
         if not rows:
             return "Error: rows must not be empty."
 
-        from datamodel_roundtrip import decompress_datamodel, compress_datamodel
-        from abf_rebuild import read_metadata_sqlite
-        from vertipaq_encoder import update_table_in_abf
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel, compress_datamodel
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.vertipaq_encoder import update_table_in_abf
         import sqlite3
 
         dm_path = os.path.join(info["work_dir"], "DataModel")
@@ -1425,8 +1425,8 @@ def _modify_metadata_sqlite(
     Returns:
         Tuple of (original_dm_bytes, new_dm_bytes, new_abf_bytes)
     """
-    from datamodel_roundtrip import decompress_datamodel, compress_datamodel
-    from abf_rebuild import (
+    from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel, compress_datamodel
+    from pbix_mcp.formats.abf_rebuild import (
         rebuild_abf_with_modified_sqlite, list_abf_files,
         read_metadata_sqlite,
     )
@@ -1470,8 +1470,8 @@ def pbix_datamodel_query_metadata(alias: str, sql_query: str) -> str:
         if not os.path.exists(dm_path):
             return "Error: No DataModel found in this file."
 
-        from datamodel_roundtrip import decompress_datamodel
-        from abf_rebuild import read_metadata_sqlite, list_abf_files
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite, list_abf_files
 
         with open(dm_path, "rb") as f:
             dm_bytes = f.read()
@@ -1790,8 +1790,8 @@ def pbix_datamodel_decompress(alias: str) -> str:
         if not os.path.exists(dm_path):
             return "Error: No DataModel found."
 
-        from datamodel_roundtrip import decompress_datamodel
-        from abf_rebuild import list_abf_files
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        from pbix_mcp.formats.abf_rebuild import list_abf_files
 
         with open(dm_path, "rb") as f:
             dm_bytes = f.read()
@@ -1835,7 +1835,7 @@ def pbix_datamodel_recompress(alias: str, abf_path: str = "") -> str:
         info = _ensure_open(alias)
         dm_path = os.path.join(info["work_dir"], "DataModel")
 
-        from datamodel_roundtrip import compress_datamodel
+        from pbix_mcp.formats.datamodel_roundtrip import compress_datamodel
 
         if not abf_path:
             abf_path = dm_path + ".abf"
@@ -1901,8 +1901,8 @@ def pbix_datamodel_replace_file(alias: str, internal_path: str, new_content_path
         if not os.path.exists(new_content_path):
             return f"Error: Replacement file not found: {new_content_path}"
 
-        from datamodel_roundtrip import decompress_datamodel, compress_datamodel
-        from abf_rebuild import (
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel, compress_datamodel
+        from pbix_mcp.formats.abf_rebuild import (
             rebuild_abf_with_replacement, list_abf_files, find_abf_file,
         )
 
@@ -1952,8 +1952,8 @@ def pbix_datamodel_extract_file(alias: str, internal_path: str, output_path: str
         if not os.path.exists(dm_path):
             return "Error: No DataModel found."
 
-        from datamodel_roundtrip import decompress_datamodel
-        from abf_rebuild import list_abf_files, find_abf_file, read_abf_file
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        from pbix_mcp.formats.abf_rebuild import list_abf_files, find_abf_file, read_abf_file
 
         with open(dm_path, "rb") as f:
             dm_bytes = f.read()
@@ -1995,8 +1995,8 @@ def pbix_datamodel_list_abf_files(alias: str) -> str:
         if not os.path.exists(dm_path):
             return "Error: No DataModel found."
 
-        from datamodel_roundtrip import decompress_datamodel
-        from abf_rebuild import ABFArchive, list_abf_files
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        from pbix_mcp.formats.abf_rebuild import ABFArchive, list_abf_files
 
         with open(dm_path, "rb") as f:
             dm_bytes = f.read()
@@ -2069,7 +2069,7 @@ def _get_dax_context(alias: str) -> dict:
     # DATATABLE, GENERATESERIES, CALENDAR, and other calculated table expressions
     # that PBIXRay can't read (they exist only as DAX in metadata, not in VertiPaq).
     try:
-        from calc_tables import load_calculated_tables
+        from pbix_mcp.dax.calc_tables import load_calculated_tables
         tables = load_calculated_tables(info["path"], tables, relationships)
     except Exception:
         pass  # If calculated table loading fails, continue without them
@@ -2149,7 +2149,7 @@ def pbix_evaluate_dax(
         filter_context: Optional JSON filter context, e.g. '{"dim-Date.Year": [2015]}'
     """
     try:
-        import dax_engine
+        from pbix_mcp.dax import engine as dax_engine
 
         ctx = _get_dax_context(alias)
         measure_names = [m.strip() for m in measures.split(',') if m.strip()]
@@ -2208,7 +2208,7 @@ def pbix_evaluate_dax_per_dimension(
         max_values: Maximum dimension values to evaluate (default 20)
     """
     try:
-        import dax_engine
+        from pbix_mcp.dax import engine as dax_engine
 
         ctx = _get_dax_context(alias)
         measure_names = [m.strip() for m in measures.split(',') if m.strip()]

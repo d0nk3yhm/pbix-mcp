@@ -1,0 +1,14 @@
+[run]
+source = src/pbix_mcp
+branch = true
+omit =
+    tests/*
+    */__pycache__/*
+
+[report]
+show_missing = true
+fail_under = 70
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.
+    pass

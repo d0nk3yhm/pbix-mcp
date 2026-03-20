@@ -3,13 +3,12 @@ DAX Engine Accuracy Tests — Tests targeting known weak spots.
 These test the edge cases that break on real-world reports.
 Run: python -m pytest tests/test_dax_accuracy.py -v
 """
-import sys
-import os
 import math
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from dax_engine import DAXEngine, DAXContext
+from pbix_mcp.dax.engine import DAXEngine, DAXContext
+
+pytestmark = pytest.mark.unit
 
 
 @pytest.fixture

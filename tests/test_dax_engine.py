@@ -2,13 +2,12 @@
 Tests for the DAX evaluation engine.
 Run: python -m pytest tests/ -v
 """
-import sys
 import os
 import pytest
 
-# Add parent dir to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from dax_engine import DAXEngine, DAXContext, evaluate_measures_batch
+from pbix_mcp.dax.engine import DAXEngine, DAXContext, evaluate_measures_batch
+
+pytestmark = pytest.mark.unit
 
 
 # ---------------------------------------------------------------------------

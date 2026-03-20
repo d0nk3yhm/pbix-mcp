@@ -1,5 +1,7 @@
 # Power BI PBIX MCP Server
 
+[![CI](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml)
+
 A Model Context Protocol (MCP) server that gives AI assistants (Claude, Codex, etc.) **full read/write access to every layer** of Power BI `.pbix` and `.pbit` files — including a **built-in DAX evaluation engine**.
 
 ## What It Does
@@ -35,13 +37,15 @@ This MCP server treats PBIX files as structured containers and exposes **51 tool
 
 ## Quick Start
 
-### Prerequisites
+### Install
 
 ```bash
-pip install mcp pbixray xpress9 pandas kaitaistruct apsw
+pip install -e .
 ```
 
-### Install for Claude Desktop
+This installs the `pbix-mcp` package and all dependencies. The `pbix-mcp-server` command becomes available globally.
+
+### Claude Desktop
 
 Add to your Claude Desktop config (`claude_desktop_config.json`):
 
@@ -49,14 +53,13 @@ Add to your Claude Desktop config (`claude_desktop_config.json`):
 {
   "mcpServers": {
     "powerbi": {
-      "command": "python",
-      "args": ["F:/PowerBI_MCP_editor/pbix_mcp_server.py"]
+      "command": "pbix-mcp-server"
     }
   }
 }
 ```
 
-### Install for Claude Code
+### Claude Code
 
 Add to your project's `.claude/settings.json`:
 
@@ -64,20 +67,16 @@ Add to your project's `.claude/settings.json`:
 {
   "mcpServers": {
     "powerbi": {
-      "command": "python",
-      "args": ["pbix_mcp_server.py"],
-      "cwd": "/path/to/PowerBI_MCP_editor"
+      "command": "pbix-mcp-server"
     }
   }
 }
 ```
 
-### Install for Codex / Other MCP Clients
-
-Run the server directly:
+### Generic MCP (stdio)
 
 ```bash
-python pbix_mcp_server.py
+pbix-mcp-server
 ```
 
 The server communicates via stdio using the MCP JSON-RPC protocol.
@@ -256,14 +255,14 @@ PBIX file (ZIP)
 
 ### Modules
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `pbix_mcp_server.py` | 2,100+ | MCP server — 51 tools for full PBIX read/write + DAX evaluation |
-| `dax_engine.py` | 3,370+ | DAX expression evaluator — 154 functions with relationship propagation |
-| `calc_tables.py` | 500+ | Calculated table evaluator — DATATABLE, GENERATESERIES, CALENDAR, field parameters from ABF metadata |
-| `vertipaq_encoder.py` | 1,442 | VertiPaq column encoder — IDF, IDFMETA, dictionary, HIDX |
-| `abf_rebuild.py` | 667 | ABF archive format — read, modify, rebuild |
-| `datamodel_roundtrip.py` | 219 | XPress9 decompress/compress for DataModel |
+| Module | Lines | Purpose |
+|--------|-------|---------|
+| `src/pbix_mcp/server.py` | 2,500+ | MCP server — 51 tools for full PBIX read/write + DAX evaluation |
+| `src/pbix_mcp/dax/engine.py` | 3,500+ | DAX expression evaluator — 154 functions with relationship propagation |
+| `src/pbix_mcp/dax/calc_tables.py` | 500+ | Calculated table evaluator — DATATABLE, GENERATESERIES, CALENDAR, field parameters |
+| `src/pbix_mcp/formats/vertipaq_encoder.py` | 1,442 | VertiPaq column encoder — IDF, IDFMETA, dictionary, HIDX |
+| `src/pbix_mcp/formats/abf_rebuild.py` | 667 | ABF archive format — read, modify, rebuild |
+| `src/pbix_mcp/formats/datamodel_roundtrip.py` | 219 | XPress9 decompress/compress for DataModel |
 | `tests/test_dax_engine.py` | 358 | Core test suite — 55 tests |
 | `tests/test_dax_accuracy.py` | 498 | Accuracy tests — 50 edge case tests |
 | `tests/test_cross_report.py` | 200 | Cross-report validation — 19 tests across 4 PBIX files |
@@ -339,12 +338,16 @@ Combined, these features take the engine from ~82% (PBIXRay-only) to **99%** —
 ## Requirements
 
 - Python 3.10+
-- `mcp` >= 1.0.0 (Model Context Protocol SDK)
-- `pbixray` >= 0.5.0 (PBIX decompression and reading)
-- `xpress9` (XPress9 compression/decompression)
-- `pandas` (data handling)
-- `kaitaistruct` (binary format parsing)
-- `apsw` (SQLite for pbixray)
+- Dependencies are managed via `pyproject.toml` and installed automatically with `pip install -e .`
+
+## Development
+
+```bash
+git clone https://github.com/d0nk3yhm/pbix-mcp.git
+cd pbix-mcp
+pip install -e ".[dev]"
+pytest -m "not slow"
+```
 
 ## License
 

@@ -37,8 +37,8 @@ def load_calculated_tables(
     tables = dict(existing_tables)  # Don't modify the original
 
     try:
-        from datamodel_roundtrip import decompress_datamodel
-        from abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
 
         with zipfile.ZipFile(pbix_path, 'r') as zf:
             dm_data = zf.read('DataModel')
@@ -179,7 +179,7 @@ def _evaluate_table_expression(
 
     # 5. Try DAX engine evaluation
     try:
-        import dax_engine
+        from pbix_mcp.dax import engine as dax_engine
         engine = dax_engine.DAXEngine()
         ctx = dax_engine.DAXContext(tables, {}, None, None, None, relationships or [])
         result = engine._eval_expr(clean, ctx)
