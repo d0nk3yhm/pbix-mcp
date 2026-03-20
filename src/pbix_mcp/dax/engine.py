@@ -288,6 +288,7 @@ class DAXEngine:
 
     def __init__(self):
         self._current_var_scope = None  # Active variable scope during VAR/RETURN eval
+        self.unsupported_functions: set[str] = set()  # Track unsupported DAX functions hit
         self._func_map = {
             # --- Aggregation ---
             'SUM': self._fn_sum,
@@ -632,7 +633,12 @@ class DAXEngine:
                 fn = self._func_map.get(func_name)
                 if fn:
                     return fn(args_text, ctx)
-                # Unknown function — try to evaluate args
+                # Unknown/unsupported function — track and log
+                self.unsupported_functions.add(func_name)
+                import logging
+                logging.getLogger("pbix_mcp.dax").debug(
+                    "Unsupported DAX function: %s", func_name
+                )
                 return None
 
         # Binary operations: +, -, *, /

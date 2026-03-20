@@ -2177,6 +2177,9 @@ def pbix_evaluate_dax(
             # so SELECTEDVALUE-based measures return actual values
             fc = ctx.get('default_filters') or None
 
+        # Reset unsupported tracker before evaluation
+        dax_engine._engine.unsupported_functions.clear()
+
         results = dax_engine.evaluate_measures_smart(
             measure_names, ctx['tables'], ctx['measure_defs'],
             fc, ctx['date_table'], ctx['date_column'],
@@ -2195,9 +2198,15 @@ def pbix_evaluate_dax(
             elif isinstance(val, int):
                 lines.append(f"  {name}: {val:,}")
             elif val is None:
-                lines.append(f"  {name}: (null)")
+                lines.append(f"  {name}: (blank)")
             else:
                 lines.append(f"  {name}: {val}")
+
+        # Report unsupported functions as warnings
+        unsupported = dax_engine._engine.unsupported_functions
+        if unsupported:
+            lines.append(f"\nWarning: {len(unsupported)} unsupported DAX function(s) encountered: {', '.join(sorted(unsupported))}")
+
         return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}\n{traceback.format_exc()}"
