@@ -2784,6 +2784,94 @@ def pbix_clear_dax_cache(alias: str = "") -> str:
 # ---- Section 10: Diagnostics ----
 
 @mcp.tool()
+def pbix_get_password(alias: str) -> str:
+    """Extract embedded passwords from a PBIX file.
+
+    Scans the data model for password-like tables (tables with 'password'
+    in the name) and DAX measures that reference them (ISFILTERED, SELECTEDVALUE).
+    Extracts the expected password value from the DAX expression.
+
+    This is useful for dashboards that use a password-slicer gate pattern
+    where the report is locked until the correct password is entered.
+
+    Args:
+        alias: The alias of the open file
+    """
+    try:
+        info = _ensure_open(alias)
+        from pbixray import PBIXRay
+        model = PBIXRay(info["path"])
+
+        results = []
+
+        # Strategy 1: Find tables with 'password' in the name and read their data
+        schema = model.schema
+        if schema is not None and not schema.empty:
+            for tname in schema["TableName"].unique():
+                if "password" in tname.lower():
+                    try:
+                        df = model.get_table(tname)
+                        if df is not None and not df.empty:
+                            # Get unique values
+                            for col in df.columns:
+                                vals = df[col].dropna().unique().tolist()
+                                if vals:
+                                    results.append(f"Table '{tname}', column '{col}': {len(vals)} values")
+                                    # Show first few
+                                    for v in vals[:10]:
+                                        results.append(f"  {v}")
+                                    if len(vals) > 10:
+                                        results.append(f"  ... and {len(vals) - 10} more")
+                    except Exception:
+                        pass
+
+        # Strategy 2: Find DAX measures that check passwords
+        measures_df = model.dax_measures
+        if measures_df is not None and not measures_df.empty:
+            import re as _re
+            for _, row in measures_df.iterrows():
+                expr = row.get("Expression", "")
+                name = row.get("Name", "")
+                if not expr:
+                    continue
+                # Look for SELECTEDVALUE(...[...]) = "value" patterns near password context
+                for m in _re.finditer(
+                    r"""SELECTEDVALUE\s*\(\s*'?([^')]+)'?\s*\[([^\]]+)\]\s*\)\s*=\s*["']([^"']+)["']""",
+                    expr, _re.IGNORECASE
+                ):
+                    table = m.group(1).strip()
+                    column = m.group(2).strip()
+                    password = m.group(3)
+                    if "password" in table.lower() or "password" in column.lower() or "password" in name.lower():
+                        results.append(f"  >>> PASSWORD: \"{password}\"  (from SELECTEDVALUE('{table}'[{column}]) in measure '{name}')")
+
+                # Also look for hardcoded password strings near password context
+                skip_words = {"correct", "wrong", "true", "false", "password",
+                              "enjoy", "dashboard", "filter", "warning", "error",
+                              "selected", "value", "blank"}
+                for m in _re.finditer(r'''["']([^"'\n]{3,30})["']''', expr):
+                    candidate = m.group(1).strip()
+                    if candidate.lower() in skip_words:
+                        continue
+                    # Only flag if near a password-related context
+                    context_start = max(0, m.start() - 200)
+                    context = expr[context_start:m.end()].lower()
+                    if "password" in context:
+                        # Skip obvious UI text
+                        if any(w in candidate.lower() for w in ["correct", "wrong", "enjoy", "⚠", "✔"]):
+                            continue
+                        results.append(f"  Candidate in measure '{name}': \"{candidate}\"")
+
+        if not results:
+            return "No password tables or password-checking measures found in this file."
+
+        return "Password analysis:\n" + "\n".join(results)
+
+    except Exception as e:
+        return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
+
+
+@mcp.tool()
 def pbix_doctor(alias: str) -> str:
     """Run diagnostic checks on an open PBIX/PBIT file.
 

@@ -3484,8 +3484,30 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
         # Value is BLANK — check if measure uses SELECTEDVALUE on a parameter table
         expr = measures.get(name, '')
 
-        # Skip smart retry for expensive measures (RANKX, nested CALCULATE with FILTER+ALL)
-        # Check both the measure itself and any referenced measures
+        targets = _find_selectedvalue_targets(expr)
+
+        # Also check for ISFILTERED('Table'[Column]) patterns
+        isfiltered_targets = set()
+        for m in re.finditer(r"ISFILTERED\s*\(\s*'?([^'(\[]+)'?\s*\[([^\]]+)\]", expr, re.IGNORECASE):
+            tgt = (m.group(1).strip(), m.group(2).strip())
+            isfiltered_targets.add(tgt)
+            if tgt not in targets:
+                targets.append(tgt)
+
+        # Also check for implicit column references like 'Table'[Column] in scalar context
+        for m in re.finditer(r"'([^']+)'\s*\[([^\]]+)\]", expr):
+            tbl_name, col_name = m.group(1), m.group(2)
+            if (tbl_name, col_name) not in targets:
+                tbl = tables.get(tbl_name)
+                if tbl and len(tbl['rows']) < 50:
+                    targets.append((tbl_name, col_name))
+
+        if not targets:
+            results[name] = val
+            continue
+
+        # Check if measure is expensive (RANKX chain) — if so, only try
+        # small parameter tables (< 10 unique values) to keep retries fast
         def _is_expensive(measure_name, visited=None):
             if visited is None:
                 visited = set()
@@ -3495,40 +3517,15 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
             mexp = measures.get(measure_name, '').upper()
             if 'RANKX' in mexp:
                 return True
-            # Check referenced measures: [MeasureName]
             for ref_match in re.finditer(r'\[([^\]]+)\]', mexp):
                 ref_name = ref_match.group(1)
                 if ref_name in measures and _is_expensive(ref_name, visited):
                     return True
             return False
 
-        if _is_expensive(name):
-            results[name] = val
-            continue
+        expensive = _is_expensive(name)
 
-        targets = _find_selectedvalue_targets(expr)
-
-        # Also check for ISFILTERED('Table'[Column]) patterns
-        for m in re.finditer(r"ISFILTERED\s*\(\s*'?([^'(\[]+)'?\s*\[([^\]]+)\]", expr, re.IGNORECASE):
-            tgt = (m.group(1).strip(), m.group(2).strip())
-            if tgt not in targets:
-                targets.append(tgt)
-
-        # Also check for implicit column references like 'Table'[Column] in scalar context
-        for m in re.finditer(r"'([^']+)'\s*\[([^\]]+)\]", expr):
-            tbl_name, col_name = m.group(1), m.group(2)
-            # Skip if it's part of SELECTEDVALUE/ISFILTERED (already captured)
-            if (tbl_name, col_name) not in targets:
-                # Only consider small parameter tables (< 50 rows)
-                tbl = tables.get(tbl_name)
-                if tbl and len(tbl['rows']) < 50:
-                    targets.append((tbl_name, col_name))
-
-        if not targets:
-            results[name] = val
-            continue
-
-        # Try evaluating with each possible value of the first SELECTEDVALUE target
+        # Try evaluating with each possible value from the target tables
         resolved = False
         for tbl_name, col_name in targets:
             tbl = tables.get(tbl_name)
@@ -3539,10 +3536,15 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
                 continue
 
             unique_vals = list(set(row[col_idx] for row in tbl['rows'] if row[col_idx] is not None))
-            if not unique_vals or len(unique_vals) > 50:
+            if not unique_vals:
                 continue
 
-            # Try the first value
+            # For expensive measures, only try tiny tables (< 10 values)
+            if expensive and len(unique_vals) > 10:
+                continue
+
+            # For ISFILTERED targets, any single value works (just need the filter active)
+            # For SELECTEDVALUE targets, try the first value
             for try_val in unique_vals[:1]:
                 extra_fc = dict(filter_context or {})
                 extra_fc[f"{tbl_name}.{col_name}"] = [try_val]
