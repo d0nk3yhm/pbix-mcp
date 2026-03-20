@@ -283,8 +283,17 @@ class PBIXBuilder:
                 "[Content_Types].xml",
                 '<?xml version="1.0" encoding="UTF-8"?>'
                 '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Override PartName="/DataModel" ContentType=""/>'
+                '<Override PartName="/Report/Layout" ContentType="application/json"/>'
+                '<Override PartName="/Settings" ContentType="application/json"/>'
+                '<Override PartName="/Metadata" ContentType="application/json"/>'
                 "</Types>",
             )
+
+            # Add minimal DataMashup (empty M code container)
+            # Power BI Desktop regenerates this on first open, but having
+            # it present prevents some tooling from complaining
+            zf.writestr("DataMashup", b"")
 
         return buf.getvalue()
 

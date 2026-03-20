@@ -40,19 +40,20 @@ pip install -e .
 
 ```bash
 pbix-mcp-server
+# With debug logging:
+pbix-mcp-server --log-level debug
 ```
 
 ## Stability
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| PBIX creation from scratch | **Stable** | Full DataModel + layout + VertiPaq row data, no Power BI Desktop needed |
+| PBIX creation from scratch | **Stable** | Full DataModel + layout + VertiPaq row data |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
 | Visual add/remove | **Stable** | Cards, charts, shapes/buttons, images, textboxes, slicers |
 | Visual property editing | **Stable** | Dot-path and full JSON |
 | DAX measure CRUD | **Stable** | Add, modify, remove via metadata SQL |
-| DAX evaluation (154 functions) | **Stable** | 99.5% non-BLANK across 204 measures from 4 dashboards |
-| Password extraction | **Stable** | Extracts embedded passwords from password-gated dashboards |
+| DAX evaluation (156 functions) | **Stable** | Best-effort evaluator; see accuracy notes below |
 | Metadata SQL read/write | **Stable** | Full SQLite access to tables, columns, relationships |
 | Default slicer filter extraction | **Stable** | Legacy Layout JSON and PBIR format |
 | Table data read (PBIXRay) | **Stable** | All materialized VertiPaq tables |
@@ -62,20 +63,23 @@ pbix-mcp-server
 | VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal column types |
 | DataMashup (M code) editing | **Stable** | Read/write Power Query expressions |
 | File save/repack | **Stable** | Auto-backup on overwrite, SecurityBindings auto-removed |
-| Calculated column evaluation | **Stable** | Per-row DAX expression evaluation |
-| Row-Level Security (RLS) | **Stable** | Read/write roles, evaluate filter expressions |
-| Diagnostic tool (`pbix_doctor`) | **Stable** | 8-point health check |
+| Calculated column evaluation | **Beta** | Per-row DAX expression evaluation; tested with synthetic data |
+| Password extraction | **Beta** | Regex scan of DAX measures for embedded passwords |
+| Row-Level Security (RLS) | **Beta** | Read/write roles, evaluate filter expressions against data |
+| Diagnostic tool (`pbix_doctor`) | **Beta** | 8-point health check |
 
 ## Known Limitations
 
+- **DAX engine is best-effort, not a strict runtime** — it returns `None` for unsupported functions, uses heuristics for date-table detection, and returns 0 for circular references. It is designed for practical evaluation, not semantic parity with the Analysis Services engine.
 - **PBIR format** is read-only for filter extraction; layout write requires legacy format
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **VertiPaq write** encodes String, Int64, Double, DateTime, Decimal; Boolean type not yet supported
 - **Created PBIX files** contain valid VertiPaq data but Power BI Desktop may need a refresh to fully index the data
 - **Performance** degrades on large tables (millions of rows) — the DAX engine operates on in-memory Python data
 - **Import mode only** — DirectQuery, composite models, and live connections are not supported
+- **Builder `[Content_Types].xml`** is minimal; Power BI Desktop regenerates it on first open
 
-## Tools (59)
+## Tools (60)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
@@ -127,36 +131,36 @@ Then add visuals:
 
 Supported visual types: `card`, `table`, `matrix`, `slicer`, `clusteredBarChart`, `clusteredColumnChart`, `lineChart`, `areaChart`, `pieChart`, `donutChart`, `treemap`, `map`, `filledMap`, `shape` (buttons), `image`, `textbox`, `kpi`, `gauge`, `waterfallChart`, `funnel`, `scatterChart`, and any custom visual type.
 
-For images, use `pbix_add_visual` with `visual_type="image"` and set the image URL via `config_json`:
-
-```
-> pbix_add_visual("sales", 0, "image", x=20, y=20, width=200, height=100,
-    config_json='{"singleVisual": {"objects": {"general": [{"properties": {"imageUrl": {"expr": {"Literal": {"Value": "https://example.com/logo.png"}}}}}]}}}')
-```
-
-For buttons/shapes with text, use `visual_type="shape"`:
-
-```
-> pbix_add_visual("sales", 0, "shape", x=20, y=500, width=200, height=50,
-    config_json='{"singleVisual": {"objects": {"text": [{"properties": {"text": {"expr": {"Literal": {"Value": "Click Me"}}}}}]}}}')
-```
-
 ## DAX Engine
 
-154 functions across 10 categories. Tested against 4 real-world dashboards (204 measures total, 99.5% non-BLANK, 0 crashes).
+156 functions across 10 categories. This is a **best-effort evaluator** — it produces correct results for common patterns but does not aim for semantic parity with Analysis Services.
 
 | Category | Functions |
 |----------|-----------|
 | Aggregation | `SUM`, `AVERAGE`, `COUNT`, `COUNTROWS`, `MIN`, `MAX`, `DISTINCTCOUNT`, `PRODUCT`, `MEDIAN`, `COUNTBLANK` |
 | Iterators | `SUMX`, `MAXX`, `MINX`, `AVERAGEX`, `COUNTX`, `COUNTAX`, `CONCATENATEX`, `RANKX`, `FILTER`, `GENERATE`, `GENERATEALL` |
 | Table | `TOPN`, `ADDCOLUMNS`, `SUMMARIZE`, `SUMMARIZECOLUMNS`, `SELECTCOLUMNS`, `DISTINCT`, `UNION`, `EXCEPT`, `INTERSECT`, `CROSSJOIN`, `DATATABLE`, `ROW`, `TREATAS` |
-| Time Intelligence | `CALCULATE`, `DATEADD`, `SAMEPERIODLASTYEAR`, `TOTALYTD/MTD/QTD`, `PREVIOUSMONTH/QUARTER/YEAR`, `NEXTMONTH/QUARTER/YEAR`, `PARALLELPERIOD`, `DATESYTD/MTD/QTD`, `STARTOF/ENDOF`, `FIRSTDATE/LASTDATE`, `DATESBETWEEN`, `DATESINPERIOD`, `CALENDAR`, `CALENDARAUTO`, `OPENING/CLOSINGBALANCE` |
+| Time Intelligence | `CALCULATE`, `DATEADD`, `SAMEPERIODLASTYEAR`, `TOTALYTD`, `TOTALMTD`, `TOTALQTD`, `PREVIOUSMONTH`, `PREVIOUSQUARTER`, `PREVIOUSYEAR`, `NEXTMONTH`, `NEXTQUARTER`, `NEXTYEAR`, `PARALLELPERIOD`, `DATESYTD`, `DATESMTD`, `DATESQTD`, `STARTOFMONTH`, `STARTOFQUARTER`, `STARTOFYEAR`, `ENDOFMONTH`, `ENDOFQUARTER`, `ENDOFYEAR`, `FIRSTDATE`, `LASTDATE`, `DATESBETWEEN`, `DATESINPERIOD`, `CALENDAR`, `CALENDARAUTO`, `OPENINGBALANCEMONTH`, `OPENINGBALANCEQUARTER`, `OPENINGBALANCEYEAR`, `CLOSINGBALANCEMONTH`, `CLOSINGBALANCEQUARTER`, `CLOSINGBALANCEYEAR` |
 | Filter | `REMOVEFILTERS`, `ALL`, `ALLEXCEPT`, `ALLSELECTED`, `KEEPFILTERS`, `VALUES`, `SELECTEDVALUE`, `HASONEVALUE`, `HASONEFILTER`, `ISFILTERED`, `ISCROSSFILTERED` |
 | Logic | `IF`, `SWITCH`, `AND`, `OR`, `NOT`, `ISBLANK`, `IFERROR`, `COALESCE`, `CONTAINS`, `TRUE`, `FALSE` |
-| Math | `DIVIDE`, `ABS`, `ROUND`, `INT`, `CEILING`, `FLOOR`, `MOD`, `POWER`, `SQRT`, `LOG`, `LOG10`, `LN`, `EXP`, `SIGN`, `TRUNC`, `EVEN`, `ODD`, `FACT`, `GCD`, `LCM`, `PI`, `RAND`, `RANDBETWEEN` |
-| Text | `CONCATENATE`, `FORMAT`, `LEFT`, `RIGHT`, `MID`, `LEN`, `UPPER`, `LOWER`, `PROPER`, `TRIM`, `SUBSTITUTE`, `REPLACE`, `REPT`, `SEARCH`, `FIND`, `CONTAINSSTRING`, `EXACT`, `UNICHAR`, `UNICODE`, `VALUE`, `COMBINEVALUES` |
-| Relationship | `RELATED`, `RELATEDTABLE`, `USERELATIONSHIP`, `CROSSFILTER`, `EARLIER`, `EARLIEST` |
-| Information | `LOOKUPVALUE`, `ISNUMBER`, `ISTEXT`, `ISNONTEXT`, `ISLOGICAL`, `ISERROR`, `USERNAME`, `USERPRINCIPALNAME` |
+| Math | `DIVIDE`, `ABS`, `ROUND`, `INT`, `CEILING`, `FLOOR`, `MOD`, `POWER`, `SQRT`, `LOG`, `LOG10`, `LN`, `EXP`, `SIGN`, `TRUNC`, `EVEN`, `ODD`, `FACT`, `GCD`, `LCM`, `PI`, `RAND`, `RANDBETWEEN`, `CURRENCY`, `FIXED` |
+| Text | `CONCATENATE`, `FORMAT`, `LEFT`, `RIGHT`, `MID`, `LEN`, `UPPER`, `LOWER`, `PROPER`, `TRIM`, `SUBSTITUTE`, `REPLACE`, `REPT`, `SEARCH`, `FIND`, `CONTAINSSTRING`, `CONTAINSSTRINGEXACT`, `EXACT`, `UNICHAR`, `UNICODE`, `VALUE`, `COMBINEVALUES` |
+| Relationship | `RELATED`, `RELATEDTABLE`, `USERELATIONSHIP`, `CROSSFILTER`, `EARLIER`, `EARLIEST`, `PATHITEM`, `PATHLENGTH`, `PATHCONTAINS` |
+| Information | `LOOKUPVALUE`, `ISNUMBER`, `ISTEXT`, `ISNONTEXT`, `ISLOGICAL`, `ISERROR`, `USERNAME`, `USERPRINCIPALNAME`, `BLANK`, `GENERATESERIES` |
+
+### Accuracy
+
+Tested against 4 real-world Power BI dashboards (204 measures total). **These dashboards are not included in the repo** — they are private test files. The numbers below are from internal testing; they cannot be reproduced from a fresh clone.
+
+| Dashboard | Measures | Non-BLANK | Accuracy |
+|-----------|----------|-----------|----------|
+| GeoSales | 71 | 70 | 98.6% |
+| Agents Performance | 42 | 42 | 100% |
+| Ecommerce Conversion | 70 | 70 | 100% |
+| IT Support | 21 | 21 | 100% |
+| **Total** | **204** | **203** | **99.5%** |
+
+The 1 BLANK measure requires per-employee RANKX visual row context that doesn't exist at report level.
 
 ### Verified Against Power BI Desktop
 
@@ -188,13 +192,14 @@ pytest -v
 
 | Suite | Tests | Marker | Needs PBIX? |
 |-------|-------|--------|-------------|
-| `test_dax_engine.py` | 55 | `unit` | No |
+| `test_dax_engine.py` | 55 | `unit` | 6 skip without private files |
 | `test_dax_accuracy.py` | 50 | `unit` | No |
-| `test_golden.py` | 15 | `golden` | Partial (2 skip gracefully) |
+| `test_golden.py` | 15 | `golden` | 2 skip without private files |
 | `test_fixtures.py` | 18 | `unit` | No (ships with repo) |
+| `test_beta_features.py` | 10 | `unit` | No |
 | `test_cross_report.py` | 19 | `slow`, `integration` | Yes (4 private PBIX files) |
 
-**138 tests pass from a fresh clone.** 19 integration tests require private PBIX files and skip gracefully.
+**From a fresh clone: ~140 tests pass, ~8 skip gracefully, 19 integration tests skip.** The skipped tests require private PBIX files not included in the repo. Set `PBIX_TEST_SAMPLES` env var to point to your PBIX test corpus.
 
 ## Architecture
 
@@ -220,12 +225,12 @@ PBIX file (ZIP)
 ```
 src/pbix_mcp/
   server.py              # MCP server (60 tools)
-  cli.py                 # Entry point (pbix-mcp-server)
+  cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX file builder (create from scratch)
   errors.py              # Typed exceptions with stable error codes
   logging_config.py      # Diagnostic logging (normal/debug/trace)
   dax/
-    engine.py            # DAX evaluator (154 functions)
+    engine.py            # DAX evaluator (156 functions, best-effort)
     calc_tables.py       # Calculated table support
   formats/
     abf_rebuild.py       # ABF archive format
@@ -244,6 +249,7 @@ cd pbix-mcp
 pip install -e ".[dev]"
 pytest -m "not slow"
 ruff check src/ tests/
+mypy src/pbix_mcp/
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for project conventions and [SUPPORT.md](SUPPORT.md) for what counts as a bug vs unsupported behavior.

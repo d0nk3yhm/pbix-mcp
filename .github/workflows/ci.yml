@@ -27,8 +27,12 @@ jobs:
       - name: Lint with ruff
         run: ruff check src/ tests/
 
-      - name: Run unit tests
-        run: pytest -m "not slow and not integration" -v --tb=short
+      - name: Type check with mypy
+        run: mypy src/pbix_mcp/ --ignore-missing-imports --no-error-summary || true
+        # mypy runs but does not block CI yet — errors are tracked for gradual cleanup
+
+      - name: Run unit tests with coverage
+        run: pytest -m "not slow and not integration" -v --tb=short --cov=src/pbix_mcp --cov-report=term-missing --cov-fail-under=40
 
       - name: Build package
         run: python -m build

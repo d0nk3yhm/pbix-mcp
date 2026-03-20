@@ -124,15 +124,14 @@ class TestXPress9RoundTrip:
     @pytest.fixture
     def sample_pbix(self):
         """Find a test PBIX file."""
-        candidates = [
-            os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                         "test_samples", "..", "..", "OpenBI", "test_samples",
-                         "GeoSales_Dashboard.pbix"),
-        ]
-        for p in candidates:
-            if os.path.exists(p):
-                return p
-        pytest.skip("No test PBIX file available")
+        samples_dir = os.environ.get(
+            "PBIX_TEST_SAMPLES",
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "OpenBI", "test_samples"),
+        )
+        p = os.path.join(samples_dir, "GeoSales_Dashboard.pbix")
+        if os.path.exists(p):
+            return p
+        pytest.skip("No test PBIX file available (set PBIX_TEST_SAMPLES env var)")
 
     def test_decompress_recompress(self, sample_pbix):
         """Decompress DataModel then recompress — result must decompress again."""
@@ -165,15 +164,14 @@ class TestABFMetadata:
 
     @pytest.fixture
     def sample_pbix(self):
-        candidates = [
-            os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                         "test_samples", "..", "..", "OpenBI", "test_samples",
-                         "GeoSales_Dashboard.pbix"),
-        ]
-        for p in candidates:
-            if os.path.exists(p):
-                return p
-        pytest.skip("No test PBIX file available")
+        samples_dir = os.environ.get(
+            "PBIX_TEST_SAMPLES",
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "OpenBI", "test_samples"),
+        )
+        p = os.path.join(samples_dir, "GeoSales_Dashboard.pbix")
+        if os.path.exists(p):
+            return p
+        pytest.skip("No test PBIX file available (set PBIX_TEST_SAMPLES env var)")
 
     def test_metadata_has_tables_and_measures(self, sample_pbix):
         """Extracted metadata must contain Table and Measure entries."""

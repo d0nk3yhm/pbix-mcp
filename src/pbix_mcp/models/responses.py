@@ -1,8 +1,8 @@
 """
 Structured response models for MCP tool boundaries.
 
-Every MCP tool should return a ToolResponse (serialized to JSON string)
-so clients can inspect success/failure without string parsing.
+Every MCP tool returns a ToolResponse serialized as JSON so clients can
+inspect success/failure programmatically without string parsing.
 """
 
 from __future__ import annotations
@@ -22,7 +22,15 @@ class ToolResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
     def to_text(self) -> str:
-        """Render as human-readable text for MCP tool return value."""
+        """Serialize as JSON string for MCP tool return value.
+
+        This is the primary serialization method. All MCP tools return
+        JSON so clients can parse success/failure programmatically.
+        """
+        return self.model_dump_json(exclude_none=True)
+
+    def to_human(self) -> str:
+        """Render as human-readable text (for logging/debugging)."""
         if not self.success:
             parts = [f"Error [{self.error_code}]: {self.message}"]
             if self.warnings:
@@ -75,15 +83,20 @@ class DAXEvalResponse(ToolResponse):
     results: list[DAXResult] = Field(default_factory=list)
 
     def to_text(self) -> str:
+        """Serialize as JSON string including results."""
+        return self.model_dump_json(exclude_none=True)
+
+    def to_human(self) -> str:
+        """Human-readable format for debugging."""
         if not self.success:
-            return super().to_text()
+            return f"Error [{self.error_code}]: {self.message}"
 
         lines = [f"DAX Evaluation Results ({len(self.results)} measures):\n"]
         for r in self.results:
             if r.status == "error":
-                lines.append(f"  {r.name}: ERROR — {r.error_message}")
+                lines.append(f"  {r.name}: ERROR -- {r.error_message}")
             elif r.status == "unsupported":
-                lines.append(f"  {r.name}: UNSUPPORTED — {r.error_message}")
+                lines.append(f"  {r.name}: UNSUPPORTED -- {r.error_message}")
             elif r.value is None:
                 lines.append(f"  {r.name}: (blank)")
             elif isinstance(r.value, float):
@@ -101,5 +114,3 @@ class DAXEvalResponse(ToolResponse):
         if self.warnings:
             lines.append(f"\nWarnings: {'; '.join(self.warnings)}")
         return "\n".join(lines)
-
-

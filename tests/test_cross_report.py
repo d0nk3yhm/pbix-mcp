@@ -84,14 +84,21 @@ def _load_pbix(path):
 # ---------------------------------------------------------------------------
 # Paths to test PBIX files
 # ---------------------------------------------------------------------------
-SAMPLES = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'test_samples')
-GEOSALES = os.path.join(SAMPLES, '..', '..', 'OpenBI', 'test_samples', 'GeoSales_Dashboard.pbix')
-AGENTS = os.path.join(SAMPLES, 'temp_dl', 'Full Dashboards',
-                       'Agents Performance - Dashboard', 'Agents Performance - Dashboard.pbix')
-ECOMMERCE = os.path.join(SAMPLES, 'temp_dl', 'Full Dashboards',
-                          'Ecommerce Conversion Dashboard', 'Ecommerce Conversion Dashboard.pbix')
-IT_SUPPORT = os.path.join(SAMPLES, 'temp_dl', 'Full Dashboards',
-                           'IT Support Performance Dashboard', 'IT_Support_Ticket_Desk.pbix')
+SAMPLES = os.environ.get(
+    "PBIX_TEST_SAMPLES",
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "test_samples"),
+)
+_OPENBI = os.environ.get(
+    "PBIX_TEST_OPENBI",
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "OpenBI", "test_samples"),
+)
+GEOSALES = os.path.join(_OPENBI, "GeoSales_Dashboard.pbix")
+AGENTS = os.path.join(SAMPLES, "temp_dl", "Full Dashboards",
+                       "Agents Performance - Dashboard", "Agents Performance - Dashboard.pbix")
+ECOMMERCE = os.path.join(SAMPLES, "temp_dl", "Full Dashboards",
+                          "Ecommerce Conversion Dashboard", "Ecommerce Conversion Dashboard.pbix")
+IT_SUPPORT = os.path.join(SAMPLES, "temp_dl", "Full Dashboards",
+                           "IT Support Performance Dashboard", "IT_Support_Ticket_Desk.pbix")
 
 
 # ---------------------------------------------------------------------------

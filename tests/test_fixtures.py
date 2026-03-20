@@ -160,9 +160,16 @@ class TestPackageImports:
         assert issubclass(InvalidPBIXError, PBIXMCPError)
 
     def test_import_models(self):
+        import json
+
         from pbix_mcp.models.responses import ToolResponse
         r = ToolResponse.ok("test")
         assert r.success is True
+        # Verify to_text() returns valid JSON
+        output = r.to_text()
+        parsed = json.loads(output)
+        assert parsed["success"] is True
+        assert parsed["message"] == "test"
 
     def test_import_logging(self):
         from pbix_mcp.logging_config import logger, set_level

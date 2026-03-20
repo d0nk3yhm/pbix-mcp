@@ -17,25 +17,29 @@
 - File open/close/save/repack (auto-backup, force flags)
 - Report layout read/write (pages, visuals, filters, positions)
 - Visual add/remove (cards, charts, shapes, images, textboxes, slicers)
-- DAX measure read/write/evaluate (154 functions, 99.5% non-BLANK)
+- DAX measure read/write/evaluate (156 functions, best-effort)
 - Calculated table evaluation (DATATABLE, GENERATESERIES, CALENDAR, field parameters)
-- Calculated column evaluation (per-row DAX expressions)
-- Row-Level Security read/write/evaluate
 - Metadata SQL read/write
 - Table data read (via PBIXRay)
 - VertiPaq table data write (String, Int64, Double, DateTime, Decimal)
 - ABF archive manipulation (list, extract, replace, build from scratch)
 - DataMashup (M code) read/write
 - XPress9 DataModel decompress/recompress (byte-exact round-trip)
-- Password extraction from protected dashboards
-- Diagnostic health check (pbix_doctor)
+
+### Beta
+- Calculated column evaluation (per-row DAX; tested with synthetic data only)
+- Row-Level Security read/write/evaluate (implemented, limited test coverage)
+- Password extraction from protected dashboards (regex-based, limited test coverage)
+- Diagnostic health check (`pbix_doctor`) (implemented, limited test coverage)
 
 ### Known Limitations
+- DAX engine is best-effort, not a strict runtime (returns None for unsupported functions, 0 for circular refs)
 - PBIR format is read-only for filter extraction (no layout write)
 - VertiPaq Boolean column type not yet supported
 - Performance degrades on large tables (millions of rows) — in-memory Python
 - Import mode only — DirectQuery, composite models, live connections not supported
 - Created PBIX files may need a refresh in Power BI Desktop to fully index data
+- Builder `[Content_Types].xml` is minimal; Power BI Desktop regenerates on open
 - 1 out of 204 tested measures returns BLANK (requires per-employee RANKX visual row context)
 
 ## Bug Reports

@@ -195,10 +195,11 @@ def build_basic_measures_pbix(base_pbix_path, output_path):
 
 
 if __name__ == "__main__":
-    base = os.path.join(
-        os.path.dirname(__file__), "..", "..", "OpenBI", "test_samples",
-        "GeoSales_Dashboard.pbix",
+    samples_dir = os.environ.get(
+        "PBIX_TEST_SAMPLES",
+        os.path.join(os.path.dirname(__file__), "..", "..", "OpenBI", "test_samples"),
     )
+    base = os.path.join(samples_dir, "GeoSales_Dashboard.pbix")
     if not os.path.exists(base):
         print(f"ERROR: Base PBIX not found at {base}")
         sys.exit(1)

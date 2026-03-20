@@ -27,7 +27,7 @@ import traceback
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from mcp.server.fastmcp import FastMCP
 
@@ -143,7 +143,7 @@ def _write_json_component(work_dir: str, rel_path: str, data: Any) -> None:
         f.write(text.encode(enc))
 
 
-def _read_datamashup_m_code(work_dir: str) -> Optional[str]:
+def _read_datamashup_m_code(work_dir: str) -> str | None:
     """Extract M code from the DataMashup binary.
 
     The DataMashup is a binary stream that embeds a ZIP archive.
@@ -265,7 +265,7 @@ def _detect_encoding(file_path: str) -> str:
     return "utf-8"
 
 
-def _get_layout(work_dir: str) -> Optional[dict]:
+def _get_layout(work_dir: str) -> dict | None:
     """Read the Report/Layout JSON."""
     layout_path = os.path.join(work_dir, "Report", "Layout")
     if not os.path.exists(layout_path):
@@ -2498,7 +2498,7 @@ def pbix_evaluate_dax_per_dimension(
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "DAX_EVAL_FAILED").to_text()
 
 
-def _get_layout_pbir(work_dir: str) -> Optional[dict]:
+def _get_layout_pbir(work_dir: str) -> dict | None:
     """Read PBIR-format layout as a legacy-compatible structure.
 
     PBIR stores each visual as a separate JSON file under
