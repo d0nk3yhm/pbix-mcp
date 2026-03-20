@@ -5,10 +5,13 @@ Run: python -m pytest tests/test_cross_report.py -v
 """
 import sys
 import os
+import zipfile
+import tempfile
+import shutil
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from dax_engine import DAXEngine, DAXContext, evaluate_measures_batch
+from dax_engine import DAXEngine, DAXContext, evaluate_measures_batch, evaluate_measures_smart
 
 
 def _load_pbix(path):
@@ -62,7 +65,19 @@ def _load_pbix(path):
                 date_table, date_column = t, 'Date'
                 break
 
-    return tables, measure_defs, relationships, date_table, date_column
+    # Extract default slicer filters from report layout
+    default_filters = {}
+    try:
+        from pbix_mcp_server import _get_all_default_filters
+        tmp = tempfile.mkdtemp()
+        with zipfile.ZipFile(path, 'r') as zf:
+            zf.extractall(tmp)
+        default_filters = _get_all_default_filters(tmp)
+        shutil.rmtree(tmp, ignore_errors=True)
+    except Exception:
+        pass
+
+    return tables, measure_defs, relationships, date_table, date_column, default_filters
 
 
 # ---------------------------------------------------------------------------
@@ -90,49 +105,49 @@ class TestGeoSalesDashboard:
         return _load_pbix(GEOSALES)
 
     def test_loads(self, data):
-        tables, measures, rels, dt, dc = data
+        tables, measures, rels, dt, dc, df = data
         assert len(tables) >= 5
         assert len(measures) >= 20
         assert len(rels) >= 5
 
     def test_sales_unfiltered(self, data):
-        tables, measures, rels, dt, dc = data
+        tables, measures, rels, dt, dc, df = data
         r = evaluate_measures_batch(['Sales'], tables, measures, None, dt, dc, rels)
         assert r['Sales'] == pytest.approx(2297201, rel=0.01)
 
     def test_sales_2015(self, data):
-        tables, measures, rels, dt, dc = data
+        tables, measures, rels, dt, dc, df = data
         r = evaluate_measures_batch(['Sales'], tables, measures,
                                      {'dim-Date.Year': [2015]}, dt, dc, rels)
         assert r['Sales'] == pytest.approx(470533, rel=0.01)
 
     def test_profit_margin_2015(self, data):
-        tables, measures, rels, dt, dc = data
+        tables, measures, rels, dt, dc, df = data
         r = evaluate_measures_batch(['Profit Margin'], tables, measures,
                                      {'dim-Date.Year': [2015]}, dt, dc, rels)
         assert r['Profit Margin'] == pytest.approx(0.131, rel=0.05)
 
     def test_sales_ly(self, data):
-        tables, measures, rels, dt, dc = data
+        tables, measures, rels, dt, dc, df = data
         r = evaluate_measures_batch(['Sales LY'], tables, measures,
                                      {'dim-Date.Year': [2015]}, dt, dc, rels)
         assert r['Sales LY'] == pytest.approx(484247, rel=0.01)
 
     def test_sales_change(self, data):
-        tables, measures, rels, dt, dc = data
+        tables, measures, rels, dt, dc, df = data
         r = evaluate_measures_batch(['Sales change'], tables, measures,
                                      {'dim-Date.Year': [2015]}, dt, dc, rels)
         assert r['Sales change'] == pytest.approx(-0.028, abs=0.005)
 
     def test_california_2015(self, data):
-        tables, measures, rels, dt, dc = data
+        tables, measures, rels, dt, dc, df = data
         r = evaluate_measures_batch(['Sales'], tables, measures,
                                      {'dim-Date.Year': [2015], 'dim-Geo.State': ['California']},
                                      dt, dc, rels)
         assert r['Sales'] == pytest.approx(88444, rel=0.01)
 
     def test_category_filter(self, data):
-        tables, measures, rels, dt, dc = data
+        tables, measures, rels, dt, dc, df = data
         for cat, expected in [('Technology', 162781), ('Office Supplies', 137233), ('Furniture', 170518)]:
             r = evaluate_measures_batch(['Sales'], tables, measures,
                                          {'dim-Date.Year': [2015], 'dim-Product.Category': [cat]},
@@ -141,23 +156,23 @@ class TestGeoSalesDashboard:
 
     def test_all_measures_no_crash(self, data):
         """Every measure should evaluate without crashing."""
-        tables, measures, rels, dt, dc = data
+        tables, measures, rels, dt, dc, df = data
         for name in measures:
             try:
                 r = evaluate_measures_batch([name], tables, measures, None, dt, dc, rels)
             except Exception as e:
                 pytest.fail(f'Measure "{name}" crashed: {e}')
 
-    def test_success_rate_above_90(self, data):
-        """At least 90% of measures should return non-None values."""
-        tables, measures, rels, dt, dc = data
+    def test_success_rate_with_defaults(self, data):
+        """At least 95% of measures should return non-None with default filters + smart eval."""
+        tables, measures, rels, dt, dc, df = data
         success = 0
         for name in measures:
-            r = evaluate_measures_batch([name], tables, measures, None, dt, dc, rels)
+            r = evaluate_measures_smart([name], tables, measures, df or None, dt, dc, rels)
             if r.get(name) is not None:
                 success += 1
         rate = success / len(measures)
-        assert rate >= 0.90, f'Success rate {rate:.0%} < 90%'
+        assert rate >= 0.95, f'Success rate {rate:.0%} < 95%'
 
 
 # ---------------------------------------------------------------------------
@@ -172,24 +187,25 @@ class TestAgentsPerformance:
         return _load_pbix(AGENTS)
 
     def test_loads(self, data):
-        tables, measures, rels, dt, dc = data
+        tables, measures, rels, dt, dc, df = data
         assert len(tables) >= 2
         assert len(measures) >= 50
 
     def test_all_measures_no_crash(self, data):
-        tables, measures, rels, dt, dc = data
+        tables, measures, rels, dt, dc, df = data
         for name in measures:
             try:
-                evaluate_measures_batch([name], tables, measures, None, dt, dc, rels)
+                evaluate_measures_batch([name], tables, measures, df or None, dt, dc, rels)
             except Exception as e:
                 pytest.fail(f'Measure "{name}" crashed: {e}')
 
-    def test_success_rate_above_90(self, data):
-        tables, measures, rels, dt, dc = data
+    def test_success_rate_with_defaults(self, data):
+        """At least 93% with default filters (RANKX measures need row context)."""
+        tables, measures, rels, dt, dc, df = data
         success = sum(1 for name in measures
-                      if evaluate_measures_batch([name], tables, measures, None, dt, dc, rels).get(name) is not None)
+                      if evaluate_measures_batch([name], tables, measures, df or None, dt, dc, rels).get(name) is not None)
         rate = success / len(measures)
-        assert rate >= 0.90, f'Success rate {rate:.0%} < 90%'
+        assert rate >= 0.93, f'Success rate {rate:.0%} < 93%'
 
 
 # ---------------------------------------------------------------------------
@@ -204,24 +220,25 @@ class TestEcommerce:
         return _load_pbix(ECOMMERCE)
 
     def test_loads(self, data):
-        tables, measures, rels, dt, dc = data
+        tables, measures, rels, dt, dc, df = data
         assert len(tables) >= 1
         assert len(measures) >= 20
 
     def test_all_measures_no_crash(self, data):
-        tables, measures, rels, dt, dc = data
+        tables, measures, rels, dt, dc, df = data
         for name in measures:
             try:
-                evaluate_measures_batch([name], tables, measures, None, dt, dc, rels)
+                evaluate_measures_batch([name], tables, measures, df or None, dt, dc, rels)
             except Exception as e:
                 pytest.fail(f'Measure "{name}" crashed: {e}')
 
-    def test_success_rate_above_80(self, data):
-        tables, measures, rels, dt, dc = data
+    def test_success_rate_100_with_defaults(self, data):
+        """Ecommerce should hit 100% with default filters."""
+        tables, measures, rels, dt, dc, df = data
         success = sum(1 for name in measures
-                      if evaluate_measures_batch([name], tables, measures, None, dt, dc, rels).get(name) is not None)
+                      if evaluate_measures_batch([name], tables, measures, df or None, dt, dc, rels).get(name) is not None)
         rate = success / len(measures)
-        assert rate >= 0.80, f'Success rate {rate:.0%} < 80%'
+        assert rate >= 1.0, f'Success rate {rate:.0%} < 100%'
 
 
 # ---------------------------------------------------------------------------
@@ -236,24 +253,25 @@ class TestITSupport:
         return _load_pbix(IT_SUPPORT)
 
     def test_loads(self, data):
-        tables, measures, rels, dt, dc = data
+        tables, measures, rels, dt, dc, df = data
         assert len(tables) >= 2
         assert len(measures) >= 15
 
     def test_all_measures_no_crash(self, data):
-        tables, measures, rels, dt, dc = data
+        tables, measures, rels, dt, dc, df = data
         for name in measures:
             try:
-                evaluate_measures_batch([name], tables, measures, None, dt, dc, rels)
+                evaluate_measures_batch([name], tables, measures, df or None, dt, dc, rels)
             except Exception as e:
                 pytest.fail(f'Measure "{name}" crashed: {e}')
 
-    def test_success_rate_above_90(self, data):
-        tables, measures, rels, dt, dc = data
+    def test_success_rate_100_with_defaults(self, data):
+        """IT Support should hit 100% with default filters."""
+        tables, measures, rels, dt, dc, df = data
         success = sum(1 for name in measures
-                      if evaluate_measures_batch([name], tables, measures, None, dt, dc, rels).get(name) is not None)
+                      if evaluate_measures_smart([name], tables, measures, df or None, dt, dc, rels).get(name) is not None)
         rate = success / len(measures)
-        assert rate >= 0.90, f'Success rate {rate:.0%} < 90%'
+        assert rate >= 1.0, f'Success rate {rate:.0%} < 100%'
 
 
 if __name__ == '__main__':

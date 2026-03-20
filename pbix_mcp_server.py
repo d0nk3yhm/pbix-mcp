@@ -2106,12 +2106,24 @@ def _get_dax_context(alias: str) -> dict:
                 date_column = tdata['columns'][date_col_idx]
                 break
 
+    # --- Load default slicer filters from report layout ---
+    # These are the slicer values that Power BI applies when you first open
+    # the report (before any user interaction). Without them, measures using
+    # SELECTEDVALUE on parameter tables return BLANK.
+    default_filters = {}
+    try:
+        default_filters = _get_all_default_filters(info["work_dir"])
+    except Exception:
+        pass
+
     ctx = {
         'tables': tables,
         'measure_defs': measure_defs,
         'date_table': date_table,
         'date_column': date_column,
         'relationships': relationships,
+        'default_filters': default_filters,
+        'work_dir': info["work_dir"],
     }
     _dax_cache[alias] = ctx
     return ctx
@@ -2142,9 +2154,14 @@ def pbix_evaluate_dax(
         ctx = _get_dax_context(alias)
         measure_names = [m.strip() for m in measures.split(',') if m.strip()]
 
-        fc = json.loads(filter_context) if filter_context else None
+        if filter_context:
+            fc = json.loads(filter_context)
+        else:
+            # Auto-apply default slicer filters from the report layout
+            # so SELECTEDVALUE-based measures return actual values
+            fc = ctx.get('default_filters') or None
 
-        results = dax_engine.evaluate_measures_batch(
+        results = dax_engine.evaluate_measures_smart(
             measure_names, ctx['tables'], ctx['measure_defs'],
             fc, ctx['date_table'], ctx['date_column'],
             ctx.get('relationships')
@@ -2253,11 +2270,213 @@ def pbix_evaluate_dax_per_dimension(
 
 
 @mcp.tool()
+def _get_layout_pbir(work_dir: str) -> Optional[dict]:
+    """Read PBIR-format layout as a legacy-compatible structure.
+
+    PBIR stores each visual as a separate JSON file under
+    Report/definition/pages/<pageId>/visuals/<visualId>/visual.json.
+    We convert these into the legacy { sections: [ { visualContainers: [...] } ] } format.
+    """
+    pages_json = os.path.join(work_dir, "Report", "definition", "pages", "pages.json")
+    if not os.path.exists(pages_json):
+        return None
+
+    try:
+        with open(pages_json, "r", encoding="utf-8") as f:
+            pages_meta = json.load(f)
+    except Exception:
+        return None
+
+    pages_dir = os.path.dirname(pages_json)
+    sections = []
+
+    # pages_meta is typically a list of page objects with 'id' or a directory listing
+    page_dirs = []
+    if isinstance(pages_meta, list):
+        for pm in pages_meta:
+            pid = pm.get("id") or pm.get("name", "")
+            if pid:
+                page_dirs.append(pid)
+    elif isinstance(pages_meta, dict):
+        # Single page or some other structure
+        for pid in os.listdir(pages_dir):
+            pdir = os.path.join(pages_dir, pid)
+            if os.path.isdir(pdir) and os.path.exists(os.path.join(pdir, "visuals")):
+                page_dirs.append(pid)
+
+    for pid in page_dirs:
+        visuals_dir = os.path.join(pages_dir, pid, "visuals")
+        if not os.path.isdir(visuals_dir):
+            continue
+
+        containers = []
+        for vid in os.listdir(visuals_dir):
+            visual_json = os.path.join(visuals_dir, vid, "visual.json")
+            if not os.path.exists(visual_json):
+                continue
+            try:
+                with open(visual_json, "r", encoding="utf-8") as f:
+                    vdata = json.load(f)
+                # PBIR visual.json has { visual: { visualType, objects, ... } }
+                # Convert to legacy format: config = { singleVisual: { ... } }
+                visual_obj = vdata.get("visual", vdata)
+                container = {
+                    "config": json.dumps({"singleVisual": visual_obj}),
+                    "x": vdata.get("position", {}).get("x", 0),
+                    "y": vdata.get("position", {}).get("y", 0),
+                    "width": vdata.get("position", {}).get("width", 0),
+                    "height": vdata.get("position", {}).get("height", 0),
+                }
+                containers.append(container)
+            except Exception:
+                continue
+
+        sections.append({
+            "displayName": pid,
+            "visualContainers": containers,
+        })
+
+    return {"sections": sections} if sections else None
+
+
+def _extract_default_filters_dict(work_dir: str, page_index: int = 0) -> dict:
+    """Internal: extract default slicer filters as a dict for programmatic use.
+
+    Handles both In-type (value list) and Comparison-type (equality/range) filters.
+    Returns { 'Entity.Property': [values] } suitable for use as filter_context.
+    """
+    layout = _get_layout(work_dir)
+    if not layout:
+        # Try PBIR format
+        layout = _get_layout_pbir(work_dir)
+    if not layout:
+        return {}
+
+    sections = layout.get("sections", [])
+    if page_index < 0 or page_index >= len(sections):
+        return {}
+
+    page = sections[page_index]
+    containers = page.get("visualContainers", [])
+    filters = {}
+
+    import re as _re
+
+    def _parse_literal(lit):
+        """Parse a literal value from filter JSON."""
+        if lit is None:
+            return None
+        s = str(lit)
+        # Numeric literals (possibly suffixed with D/L for double/long)
+        num_match = _re.match(r'^(-?\d+(?:\.\d+)?)[DL]?$', s, _re.IGNORECASE)
+        if num_match:
+            return float(num_match.group(1)) if '.' in num_match.group(1) else int(num_match.group(1))
+        # Datetime literals: datetime'2024-01-01T00:00:00'
+        dt_match = _re.match(r"^datetime'([^']+)'$", s, _re.IGNORECASE)
+        if dt_match:
+            return dt_match.group(1)  # Return the ISO datetime string
+        # Power BI escapes single quotes as '' in filter JSON —
+        # normalize to single quotes to match actual data values
+        s = s.replace("''", "'")
+        if s.startswith("'") and s.endswith("'"):
+            s = s[1:-1]
+        return s
+
+    def _resolve_column(col_expr, from_entries):
+        """Resolve Entity.Property from a column expression and From entries."""
+        source = col_expr.get("Expression", {}).get("SourceRef", {}).get("Source")
+        prop = col_expr.get("Property")
+        from_entry = next((f for f in from_entries if f.get("Name") == source), {})
+        entity = from_entry.get("Entity")
+        if entity and prop:
+            return f"{entity}.{prop}"
+        return None
+
+    for vc in containers:
+        config = _parse_visual_config(vc)
+        sv = config.get("singleVisual", {})
+
+        # Check for filter in objects.general
+        general_arr = sv.get("objects", {}).get("general", [])
+        for gen in general_arr:
+            filter_obj = gen.get("properties", {}).get("filter", {}).get("filter", {})
+            if not filter_obj or not filter_obj.get("Where"):
+                continue
+
+            from_entries = filter_obj.get("From", [])
+
+            for where in filter_obj["Where"]:
+                cond = where.get("Condition", {})
+
+                # --- In-type: value list filters ---
+                if "In" in cond:
+                    expr = cond["In"].get("Expressions", [{}])[0]
+                    values = cond["In"].get("Values", [])
+                    col_expr = expr.get("Column", {})
+                    key = _resolve_column(col_expr, from_entries)
+
+                    if key and values:
+                        vals = []
+                        for v in values:
+                            lit = v[0].get("Literal", {}).get("Value") if v else None
+                            parsed = _parse_literal(lit)
+                            if parsed is not None:
+                                vals.append(parsed)
+                        if vals:
+                            filters[key] = vals
+
+                # --- Comparison-type: equality / range filters ---
+                if "Comparison" in cond:
+                    comp = cond["Comparison"]
+                    kind = comp.get("ComparisonKind", 0)  # 0=Equal, 1=GT, 2=GTE, 3=LT, 4=LTE
+                    left = comp.get("Left", {})
+                    right = comp.get("Right", {})
+
+                    # Left side should be a column reference
+                    col_expr = left.get("Column", {})
+                    key = _resolve_column(col_expr, from_entries)
+
+                    # Right side should be a literal value
+                    lit = right.get("Literal", {}).get("Value")
+                    parsed = _parse_literal(lit)
+
+                    if key and parsed is not None:
+                        if kind == 0:
+                            # Equality: single value filter
+                            filters[key] = [parsed]
+                        else:
+                            # Range filter (GT/GTE/LT/LTE) — store as single value
+                            # for SELECTEDVALUE to work on numeric slicers
+                            filters[key] = [parsed]
+
+    return filters
+
+
+def _get_all_default_filters(work_dir: str) -> dict:
+    """Get default filters merged across all pages."""
+    layout = _get_layout(work_dir)
+    if not layout:
+        layout = _get_layout_pbir(work_dir)
+    if not layout:
+        return {}
+
+    all_filters = {}
+    sections = layout.get("sections", [])
+    for i in range(len(sections)):
+        page_filters = _extract_default_filters_dict(work_dir, i)
+        # Merge — later pages don't overwrite earlier ones
+        for k, v in page_filters.items():
+            if k not in all_filters:
+                all_filters[k] = v
+    return all_filters
+
+
 def pbix_get_default_filters(alias: str, page_index: int = 0) -> str:
     """Extract default slicer filter selections from a report page.
 
     Reads the filter config from slicer visuals (advancedSlicerVisual, slicer)
     to determine what the dashboard's default filtered state is.
+    Supports both In-type (value list) and Comparison-type (equality/range) filters.
 
     Args:
         alias: The alias of the open file
@@ -2265,56 +2484,7 @@ def pbix_get_default_filters(alias: str, page_index: int = 0) -> str:
     """
     try:
         info = _ensure_open(alias)
-        layout = _get_layout(info["work_dir"])
-        if not layout:
-            return "No layout found."
-
-        sections = layout.get("sections", [])
-        if page_index < 0 or page_index >= len(sections):
-            return f"Error: Page index {page_index} out of range"
-
-        page = sections[page_index]
-        containers = page.get("visualContainers", [])
-
-        filters = {}
-        for vc in containers:
-            config = _parse_visual_config(vc)
-            sv = config.get("singleVisual", {})
-
-            # Check for filter in objects.general
-            general_arr = sv.get("objects", {}).get("general", [])
-            for gen in general_arr:
-                filter_obj = gen.get("properties", {}).get("filter", {}).get("filter", {})
-                if not filter_obj or not filter_obj.get("Where"):
-                    continue
-
-                for where in filter_obj["Where"]:
-                    cond = where.get("Condition", {})
-                    if "In" in cond:
-                        expr = cond["In"].get("Expressions", [{}])[0]
-                        values = cond["In"].get("Values", [])
-                        source = expr.get("Column", {}).get("Expression", {}).get("SourceRef", {}).get("Source")
-                        prop = expr.get("Column", {}).get("Property")
-                        from_entry = next((f for f in filter_obj.get("From", []) if f.get("Name") == source), {})
-                        entity = from_entry.get("Entity")
-
-                        if entity and prop and values:
-                            key = f"{entity}.{prop}"
-                            vals = []
-                            for v in values:
-                                lit = v[0].get("Literal", {}).get("Value") if v else None
-                                if lit is not None:
-                                    s = str(lit)
-                                    import re as _re
-                                    num_match = _re.match(r'^(-?\d+(?:\.\d+)?)[DL]?$', s, _re.IGNORECASE)
-                                    if num_match:
-                                        vals.append(float(num_match.group(1)) if '.' in num_match.group(1) else int(num_match.group(1)))
-                                    else:
-                                        if s.startswith("'") and s.endswith("'"):
-                                            s = s[1:-1]
-                                        vals.append(s)
-                            if vals:
-                                filters[key] = vals
+        filters = _extract_default_filters_dict(info["work_dir"], page_index)
 
         if not filters:
             return "No default slicer filters found on this page."

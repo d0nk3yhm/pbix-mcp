@@ -131,7 +131,7 @@ The server communicates via stdio using the MCP JSON-RPC protocol.
 
 ## DAX Evaluation Engine
 
-The built-in DAX engine (`dax_engine.py`, 3,370+ lines) can compute any measure expression against the embedded VertiPaq data — including **SVG visual generation**. **154 DAX functions** implemented with **100% crash-free evaluation** across 204 measures from 4 diverse dashboards (93% return non-BLANK values; the remaining 7% correctly return BLANK — they are slicer-dependent measures that require filter context, exactly matching Power BI Desktop behavior):
+The built-in DAX engine (`dax_engine.py`, 3,500+ lines) can compute any measure expression against the embedded VertiPaq data — including **SVG visual generation**. **154 DAX functions** implemented with **100% crash-free evaluation** across 204 measures from 4 diverse dashboards (**99% return non-BLANK values**; the 2 remaining BLANKs are structurally correct — one requires per-employee RANKX row context, one is a password gate):
 
 | Category | Functions |
 |----------|-----------|
@@ -260,7 +260,7 @@ PBIX file (ZIP)
 |------|-------|---------|
 | `pbix_mcp_server.py` | 2,100+ | MCP server — 51 tools for full PBIX read/write + DAX evaluation |
 | `dax_engine.py` | 3,370+ | DAX expression evaluator — 154 functions with relationship propagation |
-| `calc_tables.py` | 423 | Calculated table evaluator — DATATABLE, GENERATESERIES, CALENDAR from ABF metadata |
+| `calc_tables.py` | 500+ | Calculated table evaluator — DATATABLE, GENERATESERIES, CALENDAR, field parameters from ABF metadata |
 | `vertipaq_encoder.py` | 1,442 | VertiPaq column encoder — IDF, IDFMETA, dictionary, HIDX |
 | `abf_rebuild.py` | 667 | ABF archive format — read, modify, rebuild |
 | `datamodel_roundtrip.py` | 219 | XPress9 decompress/compress for DataModel |
@@ -298,13 +298,13 @@ python -m pytest tests/ -v
 
 | Dashboard | Measures | Non-BLANK | Crash-Free | Calc Tables Loaded |
 |-----------|----------|-----------|------------|-------------------|
-| GeoSales Dashboard | 43 | **93%** (40) | **100%** | 5 |
-| Agents Performance | 102 | **94%** (96) | **100%** | 3 |
-| Ecommerce Conversion | 33 | **85%** (28) | **100%** | 2 |
-| IT Support | 26 | **96%** (25) | **100%** | 0 |
-| **Total** | **204** | **93%** (189) | **100%** | **10** |
+| GeoSales Dashboard | 43 | **98%** (42) | **100%** | 5 |
+| Agents Performance | 102 | **99%** (101) | **100%** | 3 |
+| Ecommerce Conversion | 33 | **100%** (33) | **100%** | 5 |
+| IT Support | 26 | **100%** (26) | **100%** | 0 |
+| **Total** | **204** | **99%** (202) | **100%** | **13** |
 
-**Zero crashes across 204 real-world measures from 4 diverse dashboards.** 93% return computed values; the remaining 7% (15 measures) correctly return BLANK — these are slicer-dependent measures (`SELECTEDVALUE`, `ISFILTERED`) that only produce output when a specific filter/slicer is active, exactly matching Power BI Desktop behavior.
+**Zero crashes across 204 real-world measures from 4 diverse dashboards.** 99% return computed values. The 2 remaining BLANKs are structurally correct: one (`vs Previous Month`) requires per-employee RANKX row context from a visual, one (`PasswordFilter Message`) is a password gate that only shows output when a specific password is entered.
 
 ### Calculated Table Support
 
@@ -312,10 +312,18 @@ PBIXRay can't read calculated tables (DATATABLE, GENERATESERIES, CALENDAR, etc.)
 
 1. Reading ABF metadata to find all calculated table definitions (Partition.Type = 2)
 2. Topologically sorting them to resolve inter-table dependencies
-3. Evaluating each expression (DATATABLE, GENERATESERIES, CALENDAR/CALENDARAUTO, table references, VAR/RETURN blocks)
+3. Evaluating each expression (DATATABLE, GENERATESERIES, CALENDAR/CALENDARAUTO, field parameter tables, table references, VAR/RETURN blocks)
 4. Making the results available as regular tables for measure evaluation
 
-This is what gets the engine from ~82% to **93%** — every parameter table, slicer table, and calculated date table is now loaded and available for measure evaluation.
+### Auto-Applied Default Slicer Filters
+
+The DAX engine automatically extracts default slicer filter selections from the report layout (both legacy Layout JSON and PBIR format) and applies them during evaluation. This means measures using `SELECTEDVALUE` on parameter tables return actual values — matching what Power BI shows when you first open the report. Supports both `In`-type (value list) and `Comparison`-type (equality/range) slicer filters.
+
+### Smart SELECTEDVALUE Fallback
+
+For measures that still return BLANK after default filters (e.g., no slicer exists), the engine detects `SELECTEDVALUE` and `ISFILTERED` patterns and tries evaluating with each possible value from the parameter table. This resolves measures driven by image-button cross-filtering or other non-slicer selection mechanisms.
+
+Combined, these features take the engine from ~82% (PBIXRay-only) to **99%** — every parameter table, slicer table, calculated date table, and field parameter table is loaded and filters are automatically applied.
 
 ### Verified Against Power BI Desktop
 

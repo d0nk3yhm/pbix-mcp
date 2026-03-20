@@ -162,6 +162,11 @@ def _evaluate_table_expression(
     if re.match(r'DATATABLE\s*\(', clean, re.IGNORECASE):
         return _parse_datatable(clean, tdef)
 
+    # 2b. Field parameter tables: { ("Display", NAMEOF('Table'[Col]), 0), ... }
+    fp_result = _parse_field_parameter(clean, tdef)
+    if fp_result:
+        return fp_result
+
     # 3. Table name reference (another calculated table)
     ref_name = clean.strip("'\"")
     if ref_name in tables:
@@ -183,6 +188,108 @@ def _evaluate_table_expression(
     except Exception:
         pass
 
+    return None
+
+
+def _extract_balanced_tuples(text: str) -> list:
+    """Extract balanced parenthesized groups from text, handling nested parens."""
+    results = []
+    i = 0
+    while i < len(text):
+        if text[i] == '(':
+            depth = 1
+            start = i + 1
+            i += 1
+            while i < len(text) and depth > 0:
+                if text[i] == '(':
+                    depth += 1
+                elif text[i] == ')':
+                    depth -= 1
+                i += 1
+            if depth == 0:
+                results.append(text[start:i - 1])
+        else:
+            i += 1
+    return results
+
+
+def _parse_field_parameter(expr: str, tdef: dict) -> Optional[dict]:
+    """Parse Power BI field parameter tables.
+
+    Format: { ("Display", NAMEOF('Table'[Column]), OrderNum), ... }
+    or:     { ("Display", NAMEOF('Table'[Column]), OrderNum, NAMEOF(...)), ... }
+
+    These create tables with 3+ columns:
+      - Parameter (display name)
+      - Parameter Fields (NAMEOF result as string, e.g. "'Table'[Column]")
+      - Parameter Order (integer)
+    """
+    # Match pattern: starts with { and contains NAMEOF
+    if not (expr.strip().startswith('{') and 'NAMEOF' in expr.upper()):
+        return None
+
+    # Get column names from metadata
+    col_names = tdef.get('columns', [])
+    if not col_names:
+        col_names = ['Parameter', 'Parameter Fields', 'Parameter Order']
+
+    # Extract row tuples: ("display", NAMEOF('Table'[Col]), 0)
+    rows = []
+    # Find all balanced (...) groups inside the outer {}
+    inner = expr.strip().strip('{}').strip()
+    # Use balanced-parenthesis extraction since NAMEOF(...) nests parens
+    tuple_pattern = _extract_balanced_tuples(inner)
+
+    for t in tuple_pattern:
+        # Parse the tuple: "Display Name", NAMEOF('Table'[Col]), 0
+        parts = []
+        remaining = t.strip()
+
+        while remaining:
+            remaining = remaining.strip().lstrip(',').strip()
+            if not remaining:
+                break
+
+            # Quoted string
+            if remaining.startswith('"'):
+                end = remaining.index('"', 1)
+                parts.append(remaining[1:end])
+                remaining = remaining[end + 1:]
+            # NAMEOF('Table'[Column])
+            elif remaining.upper().startswith('NAMEOF'):
+                m = re.match(r"NAMEOF\s*\(\s*'([^']+)'\s*\[([^\]]+)\]\s*\)", remaining, re.IGNORECASE)
+                if m:
+                    # Store as "'Table'[Column]" format
+                    parts.append(f"'{m.group(1)}'[{m.group(2)}]")
+                    remaining = remaining[m.end():]
+                else:
+                    break
+            # Number
+            elif re.match(r'^-?\d', remaining):
+                m = re.match(r'(-?\d+(?:\.\d+)?)', remaining)
+                if m:
+                    val = float(m.group(1)) if '.' in m.group(1) else int(m.group(1))
+                    parts.append(val)
+                    remaining = remaining[m.end():]
+                else:
+                    break
+            else:
+                # Skip unknown tokens
+                m = re.match(r'[^,)]+', remaining)
+                if m:
+                    parts.append(m.group(0).strip())
+                    remaining = remaining[m.end():]
+                else:
+                    break
+
+        if parts:
+            # Pad or trim to match column count
+            while len(parts) < len(col_names):
+                parts.append(None)
+            rows.append(parts[:len(col_names)])
+
+    if rows:
+        return {'columns': col_names, 'rows': rows}
     return None
 
 

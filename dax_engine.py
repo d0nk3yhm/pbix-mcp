@@ -227,11 +227,15 @@ class DAXContext:
 
         rows = tbl['rows']
 
-        # Apply direct filter context for this column
-        filter_key = f"{table_name}.{column_name}"
-        if filter_key in self.filter_context:
-            allowed = set(str(v) for v in self.filter_context[filter_key])
-            rows = [row for row in rows if str(row[col_idx]) in allowed]
+        # Apply ALL direct filters for this table (not just the target column)
+        for fk, allowed_values in self.filter_context.items():
+            parts = fk.split('.', 1)
+            if parts[0] == table_name and len(parts) == 2:
+                filt_col = parts[1]
+                filt_idx = self._find_col_idx(cols, filt_col)
+                if filt_idx >= 0:
+                    allowed = set(str(v) for v in allowed_values)
+                    rows = [row for row in rows if str(row[filt_idx]) in allowed]
 
         # Apply ALL cross-table filters (star-schema propagation via relationships)
         for allowed_vals, join_idx in self._get_cross_table_filters(table_name):
@@ -3438,4 +3442,116 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
     results = {}
     for name in measure_names:
         results[name] = _engine.evaluate_measure(name, ctx)
+    return results
+
+
+def _find_selectedvalue_targets(expr: str) -> list:
+    """Find all SELECTEDVALUE('Table'[Column]) references in a DAX expression.
+
+    Returns list of (table_name, column_name) tuples.
+    """
+    targets = []
+    # SELECTEDVALUE('Table'[Column], ...) or SELECTEDVALUE(Table[Column], ...)
+    for m in re.finditer(r"SELECTEDVALUE\s*\(\s*'?([^'(\[]+)'?\s*\[([^\]]+)\]", expr, re.IGNORECASE):
+        targets.append((m.group(1).strip(), m.group(2).strip()))
+    return targets
+
+
+def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
+                            filter_context: dict = None,
+                            date_table: str = None, date_column: str = None,
+                            relationships: list = None) -> dict:
+    """Evaluate measures with smart fallback for SELECTEDVALUE-dependent measures.
+
+    When a measure returns BLANK and its expression uses SELECTEDVALUE on a
+    parameter table, this tries evaluating with each possible value to find
+    a non-BLANK result. This simulates what Power BI does when a visual
+    provides row context for a parameter table.
+    """
+    ctx = DAXContext(tables, measures, date_table, date_column, filter_context, relationships)
+    results = {}
+
+    for name in measure_names:
+        val = _engine.evaluate_measure(name, ctx)
+        if val is not None:
+            results[name] = val
+            continue
+
+        # Value is BLANK — check if measure uses SELECTEDVALUE on a parameter table
+        expr = measures.get(name, '')
+
+        # Skip smart retry for expensive measures (RANKX, nested CALCULATE with FILTER+ALL)
+        # Check both the measure itself and any referenced measures
+        def _is_expensive(measure_name, visited=None):
+            if visited is None:
+                visited = set()
+            if measure_name in visited:
+                return False
+            visited.add(measure_name)
+            mexp = measures.get(measure_name, '').upper()
+            if 'RANKX' in mexp:
+                return True
+            # Check referenced measures: [MeasureName]
+            for ref_match in re.finditer(r'\[([^\]]+)\]', mexp):
+                ref_name = ref_match.group(1)
+                if ref_name in measures and _is_expensive(ref_name, visited):
+                    return True
+            return False
+
+        if _is_expensive(name):
+            results[name] = val
+            continue
+
+        targets = _find_selectedvalue_targets(expr)
+
+        # Also check for ISFILTERED('Table'[Column]) patterns
+        for m in re.finditer(r"ISFILTERED\s*\(\s*'?([^'(\[]+)'?\s*\[([^\]]+)\]", expr, re.IGNORECASE):
+            tgt = (m.group(1).strip(), m.group(2).strip())
+            if tgt not in targets:
+                targets.append(tgt)
+
+        # Also check for implicit column references like 'Table'[Column] in scalar context
+        for m in re.finditer(r"'([^']+)'\s*\[([^\]]+)\]", expr):
+            tbl_name, col_name = m.group(1), m.group(2)
+            # Skip if it's part of SELECTEDVALUE/ISFILTERED (already captured)
+            if (tbl_name, col_name) not in targets:
+                # Only consider small parameter tables (< 50 rows)
+                tbl = tables.get(tbl_name)
+                if tbl and len(tbl['rows']) < 50:
+                    targets.append((tbl_name, col_name))
+
+        if not targets:
+            results[name] = val
+            continue
+
+        # Try evaluating with each possible value of the first SELECTEDVALUE target
+        resolved = False
+        for tbl_name, col_name in targets:
+            tbl = tables.get(tbl_name)
+            if not tbl:
+                continue
+            col_idx = next((i for i, c in enumerate(tbl['columns']) if c == col_name), -1)
+            if col_idx < 0:
+                continue
+
+            unique_vals = list(set(row[col_idx] for row in tbl['rows'] if row[col_idx] is not None))
+            if not unique_vals or len(unique_vals) > 50:
+                continue
+
+            # Try the first value
+            for try_val in unique_vals[:1]:
+                extra_fc = dict(filter_context or {})
+                extra_fc[f"{tbl_name}.{col_name}"] = [try_val]
+                try_ctx = DAXContext(tables, measures, date_table, date_column, extra_fc, relationships)
+                try_val_result = _engine.evaluate_measure(name, try_ctx)
+                if try_val_result is not None:
+                    results[name] = try_val_result
+                    resolved = True
+                    break
+            if resolved:
+                break
+
+        if not resolved:
+            results[name] = val
+
     return results
