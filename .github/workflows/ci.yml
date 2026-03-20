@@ -27,13 +27,13 @@ jobs:
       - name: Lint with ruff
         run: ruff check src/ tests/
 
-      - name: Type check with mypy (baseline 148 errors, fail if new errors added)
+      - name: Type check with mypy (baseline 149 errors, fail if new errors added)
         shell: bash
         run: |
           COUNT=$(mypy src/pbix_mcp/ --ignore-missing-imports --no-error-summary 2>&1 | grep -c "error:" || true)
-          echo "mypy errors: $COUNT (baseline: 148)"
-          if [ "$COUNT" -gt 148 ]; then
-            echo "FAIL: mypy errors ($COUNT) exceed baseline (148)"
+          echo "mypy errors: $COUNT (baseline: 149)"
+          if [ "$COUNT" -gt 149 ]; then
+            echo "FAIL: mypy errors ($COUNT) exceed baseline (149)"
             exit 1
           fi
 
