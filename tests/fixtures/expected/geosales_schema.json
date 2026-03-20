@@ -1,0 +1,15 @@
+{
+  "min_tables": 5,
+  "min_measures": 20,
+  "min_relationships": 5,
+  "known_measures": {
+    "Sales": {
+      "unfiltered": 2297201,
+      "tolerance": 0.01
+    },
+    "Profit Margin": {
+      "filtered_2015": 0.131,
+      "tolerance": 0.05
+    }
+  }
+}

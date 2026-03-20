@@ -1,0 +1,12 @@
+{
+  "pages": [
+    {
+      "name": "Page 1",
+      "visual_count": 2
+    }
+  ],
+  "visual_types": [
+    "card",
+    "columnChart"
+  ]
+}

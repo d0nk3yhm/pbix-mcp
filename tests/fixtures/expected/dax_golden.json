@@ -1,0 +1,49 @@
+{
+  "sales_fixture": {
+    "tables": {
+      "Sales": {
+        "columns": [
+          "Product",
+          "Amount",
+          "Qty",
+          "Date"
+        ],
+        "row_count": 5
+      },
+      "Products": {
+        "columns": [
+          "Product",
+          "Category"
+        ],
+        "row_count": 3
+      }
+    },
+    "measures": {
+      "Total Sales": {
+        "expected": 800.0,
+        "type": "float"
+      },
+      "Avg Price": {
+        "expected": 160.0,
+        "type": "float"
+      },
+      "Item Count": {
+        "expected": 5,
+        "type": "int"
+      },
+      "Unique Products": {
+        "expected": 3,
+        "type": "int"
+      },
+      "Revenue Per Unit": {
+        "expected": 38.095,
+        "type": "float",
+        "tolerance": 0.001
+      },
+      "Hardware Sales": {
+        "expected": 300.0,
+        "type": "float"
+      }
+    }
+  }
+}
