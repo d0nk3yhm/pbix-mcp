@@ -317,5 +317,145 @@ class TestPBIXFromScratch:
         assert abf1 == abf2
 
 
+class TestFullReportFromScratch:
+    """Build a complete dashboard with sample data, visuals, and measures.
+    This is the end-to-end proof that pbix-mcp can create real reports."""
+
+    def test_complete_dashboard(self):
+        """Build a sales dashboard from scratch and verify every component."""
+        import io
+        import json
+        import sqlite3
+        import tempfile
+        import zipfile
+
+        from pbix_mcp.builder import PBIXBuilder
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        # Build a realistic dashboard
+        builder = PBIXBuilder()
+
+        # Tables with proper types
+        builder.add_table("Sales", [
+            {"name": "OrderID", "data_type": "Int64"},
+            {"name": "Product", "data_type": "String"},
+            {"name": "Amount", "data_type": "Double"},
+            {"name": "Quantity", "data_type": "Int64"},
+            {"name": "Date", "data_type": "DateTime"},
+            {"name": "CustomerID", "data_type": "Int64"},
+        ])
+        builder.add_table("Products", [
+            {"name": "Product", "data_type": "String"},
+            {"name": "Category", "data_type": "String"},
+            {"name": "UnitPrice", "data_type": "Double"},
+        ])
+        builder.add_table("Customers", [
+            {"name": "CustomerID", "data_type": "Int64"},
+            {"name": "Name", "data_type": "String"},
+            {"name": "Country", "data_type": "String"},
+        ])
+
+        # Measures
+        builder.add_measure("Sales", "Total Revenue", "SUM(Sales[Amount])")
+        builder.add_measure("Sales", "Total Qty", "SUM(Sales[Quantity])")
+        builder.add_measure("Sales", "Avg Order Value", "DIVIDE([Total Revenue], COUNTROWS(Sales))")
+        builder.add_measure("Sales", "Unique Customers", "DISTINCTCOUNT(Sales[CustomerID])")
+        builder.add_measure("Sales", "Revenue per Customer", "DIVIDE([Total Revenue], [Unique Customers])")
+
+        # Relationships
+        builder.add_relationship("Sales", "Product", "Products", "Product")
+        builder.add_relationship("Sales", "CustomerID", "Customers", "CustomerID")
+
+        # Dashboard page with multiple visual types
+        builder.add_page("Sales Overview", [
+            {"name": "revenue_card", "type": "card", "x": 20, "y": 20, "width": 200, "height": 120},
+            {"name": "qty_card", "type": "card", "x": 240, "y": 20, "width": 200, "height": 120},
+            {"name": "aov_card", "type": "card", "x": 460, "y": 20, "width": 200, "height": 120},
+            {"name": "bar_by_product", "type": "clusteredBarChart", "x": 20, "y": 160, "width": 400, "height": 300},
+            {"name": "line_trend", "type": "lineChart", "x": 440, "y": 160, "width": 400, "height": 300},
+            {"name": "pie_category", "type": "pieChart", "x": 20, "y": 480, "width": 300, "height": 250},
+            {"name": "data_table", "type": "table", "x": 340, "y": 480, "width": 500, "height": 250},
+            {"name": "product_slicer", "type": "slicer", "x": 860, "y": 20, "width": 200, "height": 300},
+            {"name": "title_text", "type": "textbox", "x": 680, "y": 20, "width": 160, "height": 40},
+            {"name": "action_button", "type": "shape", "x": 860, "y": 340, "width": 200, "height": 50},
+        ])
+
+        # Build it
+        pbix_bytes = builder.build()
+        assert len(pbix_bytes) > 0
+
+        # VERIFY: Valid ZIP with all entries
+        zf = zipfile.ZipFile(io.BytesIO(pbix_bytes))
+        names = zf.namelist()
+        assert "Report/Layout" in names
+        assert "DataModel" in names
+        assert "Settings" in names
+
+        # VERIFY: Layout has correct page and visuals
+        layout = json.loads(zf.read("Report/Layout").decode("utf-16-le"))
+        assert len(layout["sections"]) == 1
+        page = layout["sections"][0]
+        assert page["displayName"] == "Sales Overview"
+        assert len(page["visualContainers"]) == 10
+
+        # Verify visual types
+        vtypes = []
+        for vc in page["visualContainers"]:
+            config = json.loads(vc["config"])
+            vtypes.append(config["singleVisual"]["visualType"])
+        assert "card" in vtypes
+        assert "clusteredBarChart" in vtypes
+        assert "lineChart" in vtypes
+        assert "pieChart" in vtypes
+        assert "table" in vtypes
+        assert "slicer" in vtypes
+        assert "textbox" in vtypes
+        assert "shape" in vtypes  # button
+
+        # VERIFY: DataModel has correct metadata
+        dm = zf.read("DataModel")
+        abf = decompress_datamodel(dm)
+        meta = read_metadata_sqlite(abf)
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(meta)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            tables = [r[0] for r in conn.execute(
+                "SELECT Name FROM [Table] WHERE ModelID=1"
+            ).fetchall()]
+            measures = [r[0] for r in conn.execute(
+                "SELECT Name FROM [Measure]"
+            ).fetchall()]
+            rels = conn.execute("SELECT COUNT(*) FROM [Relationship]").fetchone()[0]
+            cols = conn.execute("SELECT COUNT(*) FROM [Column]").fetchone()[0]
+            conn.close()
+
+            # 3 data tables
+            assert "Sales" in tables
+            assert "Products" in tables
+            assert "Customers" in tables
+
+            # 5 measures
+            assert "Total Revenue" in measures
+            assert "Total Qty" in measures
+            assert "Avg Order Value" in measures
+            assert "Unique Customers" in measures
+            assert "Revenue per Customer" in measures
+            assert len(measures) == 5
+
+            # 2 relationships
+            assert rels == 2
+
+            # 6 + 3 + 3 = 12 columns across 3 tables
+            assert cols >= 12
+        finally:
+            os.unlink(tmp.name)
+
+        zf.close()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
