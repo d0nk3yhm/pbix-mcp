@@ -203,5 +203,119 @@ class TestABFMetadata:
             os.unlink(tmp.name)
 
 
+class TestPBIXFromScratch:
+    """Build a complete PBIX from scratch and verify every layer."""
+
+    def test_build_and_verify_all_layers(self):
+        """PBIXBuilder must produce a valid PBIX with all layers intact."""
+        import json
+        import sqlite3
+        import tempfile
+        import zipfile
+
+        from pbix_mcp.builder import PBIXBuilder
+        from pbix_mcp.formats.abf_rebuild import list_abf_files, read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        builder = PBIXBuilder()
+        builder.add_table("Sales", [
+            {"name": "Product", "data_type": "String"},
+            {"name": "Amount", "data_type": "Double"},
+        ])
+        builder.add_table("Products", [
+            {"name": "Product", "data_type": "String"},
+            {"name": "Category", "data_type": "String"},
+        ])
+        builder.add_measure("Sales", "Total Sales", "SUM(Sales[Amount])")
+        builder.add_measure("Sales", "Item Count", "COUNTROWS(Sales)")
+        builder.add_relationship("Sales", "Product", "Products", "Product")
+        builder.add_page("Dashboard", [
+            {"name": "card1", "type": "card"},
+        ])
+
+        pbix_bytes = builder.build()
+        assert len(pbix_bytes) > 0
+
+        # Layer 1: Valid ZIP
+        import io
+        zf = zipfile.ZipFile(io.BytesIO(pbix_bytes))
+        names = zf.namelist()
+        assert "Report/Layout" in names
+        assert "DataModel" in names
+        assert "Settings" in names
+        assert "[Content_Types].xml" in names
+
+        # Layer 2: Layout is valid JSON
+        layout_raw = zf.read("Report/Layout")
+        layout = json.loads(layout_raw.decode("utf-16-le"))
+        assert len(layout["sections"]) == 1
+        assert layout["sections"][0]["displayName"] == "Dashboard"
+        assert len(layout["sections"][0]["visualContainers"]) == 1
+
+        # Layer 3: DataModel decompresses
+        dm = zf.read("DataModel")
+        abf = decompress_datamodel(dm)
+        assert len(abf) > len(dm)
+
+        # Layer 4: ABF has metadata
+        files = list_abf_files(abf)
+        assert len(files) >= 1
+        meta_names = [f["Path"] for f in files]
+        assert any("metadata" in n.lower() for n in meta_names)
+
+        # Layer 5: Metadata has expected tables and measures
+        meta = read_metadata_sqlite(abf)
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(meta)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            tables = [r[0] for r in conn.execute(
+                "SELECT Name FROM [Table] WHERE ModelID=1"
+            ).fetchall()]
+            measures = [r[0] for r in conn.execute(
+                "SELECT Name FROM [Measure]"
+            ).fetchall()]
+            rels = conn.execute("SELECT COUNT(*) FROM [Relationship]").fetchone()[0]
+            conn.close()
+
+            assert "Sales" in tables
+            assert "Products" in tables
+            assert "Total Sales" in measures
+            assert "Item Count" in measures
+            assert len(measures) == 2
+            assert rels == 1
+        finally:
+            os.unlink(tmp.name)
+
+        zf.close()
+
+    def test_xpress9_roundtrip_from_scratch(self):
+        """PBIX built from scratch must survive XPress9 round-trip."""
+        import io
+        import zipfile
+
+        from pbix_mcp.builder import PBIXBuilder
+        from pbix_mcp.formats.datamodel_roundtrip import (
+            compress_datamodel,
+            decompress_datamodel,
+        )
+
+        builder = PBIXBuilder()
+        builder.add_table("T", [{"name": "X", "data_type": "Int64"}])
+        builder.add_measure("T", "S", "SUM(T[X])")
+        pbix_bytes = builder.build()
+
+        zf = zipfile.ZipFile(io.BytesIO(pbix_bytes))
+        dm = zf.read("DataModel")
+        zf.close()
+
+        # Decompress -> recompress -> decompress
+        abf1 = decompress_datamodel(dm)
+        dm2 = compress_datamodel(abf1)
+        abf2 = decompress_datamodel(dm2)
+        assert abf1 == abf2
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

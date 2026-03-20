@@ -663,3 +663,134 @@ class ABFArchive:
         """
         new_abf = rebuild_abf_with_modified_sqlite(self._abf, modifier_fn)
         return ABFArchive(new_abf)
+
+
+# ---------------------------------------------------------------------------
+# Build ABF from scratch (no existing ABF required)
+# ---------------------------------------------------------------------------
+
+def build_abf_from_scratch(
+    files: dict[str, bytes],
+    database_id: str = "00000000-0000-0000-0000-000000000001",
+) -> bytes:
+    """
+    Build a complete ABF archive from scratch — no existing ABF needed.
+
+    Parameters
+    ----------
+    files : dict[str, bytes]
+        Internal file paths mapped to their content.
+        Must include at least ``metadata.sqlitedb``.
+        Example: ``{"metadata.sqlitedb": sqlite_bytes}``
+    database_id : str
+        A GUID for the database (used in the BackupLog).
+
+    Returns
+    -------
+    bytes
+        A valid ABF blob that can be XPress9-compressed into a DataModel.
+    """
+    if "metadata.sqlitedb" not in files:
+        raise ValueError("files must include 'metadata.sqlitedb'")
+
+    buf = bytearray()
+
+    # ---- 1. Signature + Header placeholder ----
+    buf.extend(STREAM_STORAGE_SIGNATURE)
+    header_page_start = len(buf)
+    # Reserve the header page (will be patched later)
+    buf.extend(b"\x00" * (_HEADER_PAGE_SIZE - _SIGNATURE_LEN))
+
+    # ---- 2. Data files ----
+    # Assign storage paths and write file data
+    persist_root = f"Sandboxes\\{database_id}\\"
+    storage_paths = {}  # filename -> storage_path
+    data_offsets = {}   # storage_path -> offset
+    data_sizes = {}     # storage_path -> size
+
+    for i, (filename, content) in enumerate(files.items()):
+        sp = f"StoragePath_{i}"
+        storage_paths[filename] = sp
+        data_offsets[sp] = len(buf)
+        data_sizes[sp] = len(content)
+        buf.extend(content)
+
+    # ---- 3. BackupLog ----
+    blog_root = ET.Element("BackupLog")
+    ET.SubElement(blog_root, "Log")
+    file_groups = ET.SubElement(blog_root, "FileGroups")
+
+    # FileGroup 0: BackupLog itself (system)
+    fg0 = ET.SubElement(file_groups, "FileGroup")
+    ET.SubElement(fg0, "Index").text = "0"
+    ET.SubElement(fg0, "PersistLocationPath")
+
+    # FileGroup 1: Database files
+    fg1 = ET.SubElement(file_groups, "FileGroup")
+    ET.SubElement(fg1, "Index").text = "1"
+    ET.SubElement(fg1, "PersistLocationPath").text = f"Sandboxes\\{database_id}"
+    file_list = ET.SubElement(fg1, "FileList")
+
+    for filename, sp in storage_paths.items():
+        bf = ET.SubElement(file_list, "BackupFile")
+        ET.SubElement(bf, "Path").text = persist_root + filename
+        ET.SubElement(bf, "StoragePath").text = sp
+        ET.SubElement(bf, "Size").text = str(data_sizes[sp])
+
+    blog_bytes = _xml_to_utf16_bytes(blog_root)
+    blog_sp = "StoragePath_BackupLog"
+    blog_offset = len(buf)
+    blog_size = len(blog_bytes)
+    buf.extend(blog_bytes)
+
+    # ---- 4. VirtualDirectory ----
+    vdir_root = ET.Element("VirtualDirectory")
+
+    timestamp = 132000000000000000  # Fixed timestamp
+
+    for filename, sp in storage_paths.items():
+        bf_elem = ET.SubElement(vdir_root, "BackupFile")
+        ET.SubElement(bf_elem, "Path").text = sp
+        ET.SubElement(bf_elem, "Size").text = str(data_sizes[sp])
+        ET.SubElement(bf_elem, "m_cbOffsetHeader").text = str(data_offsets[sp])
+        ET.SubElement(bf_elem, "Delete").text = "false"
+        ET.SubElement(bf_elem, "CreatedTimestamp").text = str(timestamp)
+        ET.SubElement(bf_elem, "Access").text = "0"
+        ET.SubElement(bf_elem, "LastWriteTime").text = str(timestamp)
+
+    # BackupLog as last VDir entry
+    bf_elem = ET.SubElement(vdir_root, "BackupFile")
+    ET.SubElement(bf_elem, "Path").text = blog_sp
+    ET.SubElement(bf_elem, "Size").text = str(blog_size)
+    ET.SubElement(bf_elem, "m_cbOffsetHeader").text = str(blog_offset)
+    ET.SubElement(bf_elem, "Delete").text = "false"
+    ET.SubElement(bf_elem, "CreatedTimestamp").text = str(timestamp)
+    ET.SubElement(bf_elem, "Access").text = "0"
+    ET.SubElement(bf_elem, "LastWriteTime").text = str(timestamp)
+
+    vdir_bytes = _xml_to_utf16_bytes(vdir_root)
+    vdir_offset = len(buf)
+    vdir_size = len(vdir_bytes)
+    buf.extend(vdir_bytes)
+
+    # ---- 5. Patch the BackupLogHeader ----
+    total_files = len(files) + 1  # data files + backup log
+
+    hdr_root = ET.Element("BackupLogHeader")
+    ET.SubElement(hdr_root, "Version").text = "1"
+    ET.SubElement(hdr_root, "m_cbOffsetHeader").text = str(vdir_offset)
+    ET.SubElement(hdr_root, "DataSize").text = str(vdir_size)
+    ET.SubElement(hdr_root, "m_cbOffsetData").text = str(_HEADER_PAGE_SIZE)
+    ET.SubElement(hdr_root, "Files").text = str(total_files)
+    ET.SubElement(hdr_root, "DatabaseName").text = "Model"
+    ET.SubElement(hdr_root, "ErrorCode").text = "false"
+
+    hdr_bytes = _xml_to_utf16_bytes(hdr_root)
+    available = _HEADER_PAGE_SIZE - _SIGNATURE_LEN
+    if len(hdr_bytes) > available:
+        raise ValueError(f"Header XML too large: {len(hdr_bytes)} > {available}")
+
+    hdr_padded = hdr_bytes + b"\x00" * (available - len(hdr_bytes))
+    buf[header_page_start: header_page_start + available] = hdr_padded
+
+    return bytes(buf)
