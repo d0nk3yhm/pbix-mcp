@@ -32,7 +32,10 @@ from typing import Any, Callable, Optional
 from mcp.server.fastmcp import FastMCP
 
 from pbix_mcp.errors import (
+    FileAlreadyOpenError,
     FileNotOpenError,
+    InvalidPBIXError,
+    LayoutParseError,
 )
 from pbix_mcp.logging_config import logger
 from pbix_mcp.models.requests import DimensionRef, FilterContext
@@ -339,14 +342,20 @@ def pbix_open(file_path: str, alias: str = "") -> str:
     """
     file_path = os.path.abspath(file_path)
     if not os.path.exists(file_path):
-        return ToolResponse.error(f"File not found: {file_path}", "SESSION_ERROR").to_text()
+        return ToolResponse.error(f"File not found: {file_path}", InvalidPBIXError.code).to_text()
 
     ext = os.path.splitext(file_path)[1].lower()
     if ext not in (".pbix", ".pbit"):
-        return ToolResponse.error(f"Expected .pbix or .pbit file, got '{ext}'", "SESSION_ERROR").to_text()
+        return ToolResponse.error(f"Expected .pbix or .pbit file, got '{ext}'", InvalidPBIXError.code).to_text()
 
     if not alias:
         alias = Path(file_path).stem
+
+    if alias in _open_files:
+        return ToolResponse.error(
+            f"Alias '{alias}' is already in use. Close it first or choose a different alias.",
+            FileAlreadyOpenError.code,
+        ).to_text()
 
     # Create work directory
     work_dir = os.path.join(
@@ -475,7 +484,7 @@ def pbix_get_pages(alias: str) -> str:
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return ToolResponse.ok("No layout found in this file.").to_text()
+            return ToolResponse.error("No layout found in this file", LayoutParseError.code).to_text()
 
         sections = layout.get("sections", [])
         lines = [f"Report has {len(sections)} page(s):\n"]
@@ -488,7 +497,7 @@ def pbix_get_pages(alias: str) -> str:
             lines.append(f"  [{i}] {name} — {vis_count} visuals, {width}x{height}{hidden}")
         return ToolResponse.ok("\n".join(lines)).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -503,11 +512,11 @@ def pbix_get_page_visuals(alias: str, page_index: int = 0) -> str:
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return ToolResponse.ok("No layout found.").to_text()
+            return ToolResponse.error("No layout found", LayoutParseError.code).to_text()
 
         sections = layout.get("sections", [])
         if page_index < 0 or page_index >= len(sections):
-            return ToolResponse.error(f"Page index {page_index} out of range (0-{len(sections)-1})", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Page index {page_index} out of range (0-{len(sections)-1})", LayoutParseError.code).to_text()
 
         page = sections[page_index]
         page_name = page.get("displayName", f"Page {page_index}")
@@ -525,7 +534,7 @@ def pbix_get_page_visuals(alias: str, page_index: int = 0) -> str:
             lines.append(f"  [{i}] {vtype} (name={vname}) at ({x},{y}) size {w}x{h}")
         return ToolResponse.ok("\n".join(lines)).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -541,15 +550,15 @@ def pbix_get_visual_detail(alias: str, page_index: int, visual_index: int) -> st
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return ToolResponse.ok("No layout found.").to_text()
+            return ToolResponse.error("No layout found", LayoutParseError.code).to_text()
 
         sections = layout.get("sections", [])
         if page_index < 0 or page_index >= len(sections):
-            return ToolResponse.error(f"Page index {page_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Page index {page_index} out of range", LayoutParseError.code).to_text()
 
         containers = sections[page_index].get("visualContainers", [])
         if visual_index < 0 or visual_index >= len(containers):
-            return ToolResponse.error(f"Visual index {visual_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Visual index {visual_index} out of range", LayoutParseError.code).to_text()
 
         vc = containers[visual_index]
         config = _parse_visual_config(vc)
@@ -575,7 +584,7 @@ def pbix_get_visual_detail(alias: str, page_index: int, visual_index: int) -> st
 
         return ToolResponse.ok(json.dumps(result, indent=2, ensure_ascii=False)).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -596,15 +605,15 @@ def pbix_set_visual_property(
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return ToolResponse.ok("No layout found.").to_text()
+            return ToolResponse.error("No layout found", LayoutParseError.code).to_text()
 
         sections = layout.get("sections", [])
         if page_index < 0 or page_index >= len(sections):
-            return ToolResponse.error(f"Page index {page_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Page index {page_index} out of range", LayoutParseError.code).to_text()
 
         containers = sections[page_index].get("visualContainers", [])
         if visual_index < 0 or visual_index >= len(containers):
-            return ToolResponse.error(f"Visual index {visual_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Visual index {visual_index} out of range", LayoutParseError.code).to_text()
 
         vc = containers[visual_index]
         config = _parse_visual_config(vc)
@@ -623,7 +632,7 @@ def pbix_set_visual_property(
         info["modified"] = True
         return ToolResponse.ok(f"Set {property_path} = {value} on page {page_index}, visual {visual_index}").to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -642,28 +651,28 @@ def pbix_update_visual_json(
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return ToolResponse.ok("No layout found.").to_text()
+            return ToolResponse.error("No layout found", LayoutParseError.code).to_text()
 
         sections = layout.get("sections", [])
         if page_index < 0 or page_index >= len(sections):
-            return ToolResponse.error(f"Page index {page_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Page index {page_index} out of range", LayoutParseError.code).to_text()
 
         containers = sections[page_index].get("visualContainers", [])
         if visual_index < 0 or visual_index >= len(containers):
-            return ToolResponse.error(f"Visual index {visual_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Visual index {visual_index} out of range", LayoutParseError.code).to_text()
 
         # Validate JSON
         try:
             new_config = json.loads(config_json)
         except json.JSONDecodeError as e:
-            return ToolResponse.error(f"Invalid JSON: {e}", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Invalid JSON: {e}", LayoutParseError.code).to_text()
 
         containers[visual_index]["config"] = json.dumps(new_config, ensure_ascii=False)
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
         return ToolResponse.ok(f"Updated visual config on page {page_index}, visual {visual_index}").to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -680,7 +689,7 @@ def pbix_add_page(alias: str, display_name: str, width: int = 1280, height: int 
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return ToolResponse.ok("No layout found.").to_text()
+            return ToolResponse.error("No layout found", LayoutParseError.code).to_text()
 
         import uuid
         new_section = {
@@ -701,7 +710,7 @@ def pbix_add_page(alias: str, display_name: str, width: int = 1280, height: int 
         idx = len(layout["sections"]) - 1
         return ToolResponse.ok(f"Added page '{display_name}' at index {idx} ({width}x{height})").to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -716,11 +725,11 @@ def pbix_remove_page(alias: str, page_index: int) -> str:
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return ToolResponse.ok("No layout found.").to_text()
+            return ToolResponse.error("No layout found", LayoutParseError.code).to_text()
 
         sections = layout.get("sections", [])
         if page_index < 0 or page_index >= len(sections):
-            return ToolResponse.error(f"Page index {page_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Page index {page_index} out of range", LayoutParseError.code).to_text()
 
         removed = sections.pop(page_index)
         name = removed.get("displayName", f"Page {page_index}")
@@ -728,7 +737,7 @@ def pbix_remove_page(alias: str, page_index: int) -> str:
         info["modified"] = True
         return ToolResponse.ok(f"Removed page '{name}' (was index {page_index}). {len(sections)} pages remain.").to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -830,11 +839,11 @@ def pbix_add_visual(
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return ToolResponse.error("No layout found", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error("No layout found", LayoutParseError.code).to_text()
 
         sections = layout.get("sections", [])
         if page_index < 0 or page_index >= len(sections):
-            return ToolResponse.error(f"Page index {page_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Page index {page_index} out of range", LayoutParseError.code).to_text()
 
         import uuid
         visual_name = str(uuid.uuid4()).replace("-", "")[:16]
@@ -857,7 +866,7 @@ def pbix_add_visual(
                         else:
                             config[key] = val
             except json.JSONDecodeError:
-                return ToolResponse.error("Invalid config_json", "LAYOUT_JSON_INVALID").to_text()
+                return ToolResponse.error("Invalid config_json", LayoutParseError.code).to_text()
 
         container = {
             "x": x,
@@ -877,7 +886,7 @@ def pbix_add_visual(
         return ToolResponse.ok(f"Added {visual_type} visual at ({x},{y}) {width}x{height} on '{page_name}' (index {idx})").to_text()
 
     except Exception as e:
-        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -893,15 +902,15 @@ def pbix_remove_visual(alias: str, page_index: int, visual_index: int) -> str:
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return ToolResponse.error("No layout found", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error("No layout found", LayoutParseError.code).to_text()
 
         sections = layout.get("sections", [])
         if page_index < 0 or page_index >= len(sections):
-            return ToolResponse.error(f"Page index {page_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Page index {page_index} out of range", LayoutParseError.code).to_text()
 
         containers = sections[page_index].get("visualContainers", [])
         if visual_index < 0 or visual_index >= len(containers):
-            return ToolResponse.error(f"Visual index {visual_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Visual index {visual_index} out of range", LayoutParseError.code).to_text()
 
         removed = containers.pop(visual_index)
         config = _parse_visual_config(removed)
@@ -912,7 +921,7 @@ def pbix_remove_visual(alias: str, page_index: int, visual_index: int) -> str:
         return ToolResponse.ok(f"Removed {vtype} visual (was index {visual_index}). {len(containers)} visuals remain.").to_text()
 
     except Exception as e:
-        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -926,10 +935,10 @@ def pbix_get_layout_raw(alias: str) -> str:
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return ToolResponse.ok("No layout found.").to_text()
+            return ToolResponse.error("No layout found", LayoutParseError.code).to_text()
         return ToolResponse.ok(json.dumps(layout, indent=2, ensure_ascii=False)).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -945,12 +954,12 @@ def pbix_set_layout_raw(alias: str, layout_json: str) -> str:
         try:
             layout = json.loads(layout_json)
         except json.JSONDecodeError as e:
-            return ToolResponse.error(f"Invalid JSON: {e}", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Invalid JSON: {e}", LayoutParseError.code).to_text()
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
         return ToolResponse.ok("Layout updated.").to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -965,7 +974,7 @@ def pbix_get_filters(alias: str, page_index: int = -1) -> str:
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return ToolResponse.ok("No layout found.").to_text()
+            return ToolResponse.error("No layout found", LayoutParseError.code).to_text()
 
         if page_index == -1:
             # Report-level filters
@@ -973,7 +982,7 @@ def pbix_get_filters(alias: str, page_index: int = -1) -> str:
         else:
             sections = layout.get("sections", [])
             if page_index < 0 or page_index >= len(sections):
-                return ToolResponse.error(f"Page index {page_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+                return ToolResponse.error(f"Page index {page_index} out of range", LayoutParseError.code).to_text()
             filters_raw = sections[page_index].get("filters", "[]")
 
         if isinstance(filters_raw, str):
@@ -987,7 +996,7 @@ def pbix_get_filters(alias: str, page_index: int = -1) -> str:
         level = f"page {page_index}" if page_index >= 0 else "report"
         return ToolResponse.ok(f"Filters ({level}):\n{json.dumps(filters, indent=2, ensure_ascii=False)}").to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -1003,20 +1012,20 @@ def pbix_set_filters(alias: str, filters_json: str, page_index: int = -1) -> str
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return ToolResponse.ok("No layout found.").to_text()
+            return ToolResponse.error("No layout found", LayoutParseError.code).to_text()
 
         # Validate JSON
         try:
             json.loads(filters_json)
         except json.JSONDecodeError as e:
-            return ToolResponse.error(f"Invalid JSON: {e}", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Invalid JSON: {e}", LayoutParseError.code).to_text()
 
         if page_index == -1:
             layout["filters"] = filters_json
         else:
             sections = layout.get("sections", [])
             if page_index < 0 or page_index >= len(sections):
-                return ToolResponse.error(f"Page index {page_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+                return ToolResponse.error(f"Page index {page_index} out of range", LayoutParseError.code).to_text()
             sections[page_index]["filters"] = filters_json
 
         _set_layout(info["work_dir"], layout)
@@ -1024,7 +1033,7 @@ def pbix_set_filters(alias: str, filters_json: str, page_index: int = -1) -> str
         level = f"page {page_index}" if page_index >= 0 else "report"
         return ToolResponse.ok(f"Filters updated ({level}).").to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -1057,7 +1066,7 @@ def pbix_set_settings(alias: str, settings_json: str) -> str:
         try:
             settings = json.loads(settings_json)
         except json.JSONDecodeError as e:
-            return ToolResponse.error(f"Invalid JSON: {e}", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Invalid JSON: {e}", LayoutParseError.code).to_text()
         _write_json_component(info["work_dir"], os.path.join("Report", "Settings"), settings)
         info["modified"] = True
         return ToolResponse.ok("Settings updated.").to_text()
@@ -1076,7 +1085,7 @@ def pbix_get_bookmarks(alias: str) -> str:
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return ToolResponse.ok("No layout found.").to_text()
+            return ToolResponse.error("No layout found", LayoutParseError.code).to_text()
 
         config_str = layout.get("config", "{}")
         if isinstance(config_str, str):
@@ -1097,7 +1106,7 @@ def pbix_get_bookmarks(alias: str) -> str:
             lines.append(f"  [{i}] {name}")
         return ToolResponse.ok("\n".join(lines)).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -1206,7 +1215,7 @@ def pbix_set_theme(alias: str, theme_json: str, filename: str = "CY24SU11.json")
         try:
             theme = json.loads(theme_json)
         except json.JSONDecodeError as e:
-            return ToolResponse.error(f"Invalid JSON: {e}", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Invalid JSON: {e}", LayoutParseError.code).to_text()
 
         fp = os.path.join(theme_dir, filename)
         with open(fp, "w", encoding="utf-8") as fh:
@@ -2489,7 +2498,6 @@ def pbix_evaluate_dax_per_dimension(
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "DAX_EVAL_FAILED").to_text()
 
 
-@mcp.tool()
 def _get_layout_pbir(work_dir: str) -> Optional[dict]:
     """Read PBIR-format layout as a legacy-compatible structure.
 
@@ -2691,6 +2699,7 @@ def _get_all_default_filters(work_dir: str) -> dict:
     return all_filters
 
 
+@mcp.tool()
 def pbix_get_default_filters(alias: str, page_index: int = 0) -> str:
     """Extract default slicer filter selections from a report page.
 
@@ -2716,7 +2725,7 @@ def pbix_get_default_filters(alias: str, page_index: int = 0) -> str:
         lines.append(f"  {json.dumps(filters)}")
         return "\n".join(lines)
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -2734,11 +2743,11 @@ def pbix_get_visual_positions(alias: str, page_index: int = 0) -> str:
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return ToolResponse.ok("No layout found.").to_text()
+            return ToolResponse.error("No layout found", LayoutParseError.code).to_text()
 
         sections = layout.get("sections", [])
         if page_index < 0 or page_index >= len(sections):
-            return ToolResponse.error(f"Page index {page_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+            return ToolResponse.error(f"Page index {page_index} out of range", LayoutParseError.code).to_text()
 
         page = sections[page_index]
         containers = page.get("visualContainers", [])
@@ -2771,7 +2780,7 @@ def pbix_get_visual_positions(alias: str, page_index: int = 0) -> str:
 
         return ToolResponse.ok("\n".join(lines)).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "LAYOUT_JSON_INVALID").to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", LayoutParseError.code).to_text()
 
 
 @mcp.tool()
@@ -2792,7 +2801,79 @@ def pbix_clear_dax_cache(alias: str = "") -> str:
         return ToolResponse.ok("DAX cache cleared for all files").to_text()
 
 
-# ---- Section 10: RLS (Row-Level Security) ----
+# ---- Section 10: Calculated Columns ----
+
+@mcp.tool()
+def pbix_evaluate_calculated_columns(alias: str) -> str:
+    """Evaluate all calculated columns in the data model.
+
+    Finds columns with DAX expressions in the metadata, evaluates them
+    per-row against actual table data, and adds the results to the
+    cached data context. This is useful when calculated columns were
+    defined but their values aren't materialized in VertiPaq.
+
+    Args:
+        alias: The alias of the open file
+    """
+    try:
+        info = _ensure_open(alias)
+
+        # Force re-build of DAX context with calculated columns
+        global _dax_cache
+        _dax_cache.pop(alias, None)
+        ctx = _get_dax_context(alias)
+
+        # Check if any calculated columns were evaluated
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found", "DATAMODEL_DECOMPRESS_FAILED").to_text()
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        with open(dm_path, "rb") as f:
+            dm = f.read()
+        abf = decompress_datamodel(dm)
+        db_bytes = read_metadata_sqlite(abf)
+
+        import sqlite3
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(db_bytes)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            calc_cols = conn.execute("""
+                SELECT c.ExplicitName, c.Expression, t.Name
+                FROM [Column] c JOIN [Table] t ON c.TableID = t.ID
+                WHERE c.Expression IS NOT NULL AND c.Expression != ''
+                  AND c.ExplicitName IS NOT NULL
+                  AND c.ExplicitName NOT LIKE 'RowNumber%'
+                  AND t.ModelID = 1
+            """).fetchall()
+            conn.close()
+        finally:
+            os.unlink(tmp.name)
+
+        if not calc_cols:
+            return ToolResponse.ok("No calculated columns found in the data model.").to_text()
+
+        lines = [f"Calculated columns ({len(calc_cols)}):\n"]
+        for cc in calc_cols:
+            tname = cc[2]
+            cname = cc[0]
+            expr = cc[1][:60].strip().replace('\n', ' ')
+            tbl = ctx['tables'].get(tname)
+            if tbl and cname in tbl['columns']:
+                lines.append(f"  ✅ {tname}[{cname}] = {expr}...")
+            else:
+                lines.append(f"  ⚠ {tname}[{cname}] = {expr}... (not evaluated)")
+
+        return ToolResponse.ok("\n".join(lines)).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "DAX_EVAL_FAILED").to_text()
+
+
+# ---- Section 11: RLS (Row-Level Security) ----
 
 @mcp.tool()
 def pbix_get_rls_roles(alias: str) -> str:

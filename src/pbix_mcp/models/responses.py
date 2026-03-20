@@ -103,20 +103,3 @@ class DAXEvalResponse(ToolResponse):
         return "\n".join(lines)
 
 
-class SchemaInfo(BaseModel):
-    """Table schema information."""
-
-    table_name: str
-    columns: list[str]
-    row_count: int
-
-
-class FileInfo(BaseModel):
-    """Open file session info."""
-
-    alias: str
-    path: str
-    pages: int = 0
-    tables: int = 0
-    measures: int = 0
-    relationships: int = 0

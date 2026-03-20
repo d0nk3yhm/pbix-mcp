@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml)
 
-An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files. Exposes 59 tools covering report creation from scratch (with actual row data), layout editing, visual management, DAX evaluation, RLS security, password extraction, VertiPaq data, and binary format internals.
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files. Exposes 60 tools covering report creation from scratch (with actual row data), layout editing, visual management, DAX evaluation, RLS security, password extraction, VertiPaq data, and binary format internals.
 
 ## Quick Start
 
@@ -72,23 +72,22 @@ pbix-mcp-server
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **VertiPaq write** encodes String, Int64, Double, DateTime, Decimal; Boolean type not yet supported
 - **Created PBIX files** contain valid VertiPaq data but Power BI Desktop may need a refresh to fully index the data
+- **Performance** degrades on large tables (millions of rows) — the DAX engine operates on in-memory Python data
+- **Import mode only** — DirectQuery, composite models, and live connections are not supported
 
 ## Tools (59)
 
 ### Create & File Management (5)
-`pbix_create` — **Create a new PBIX from scratch** (tables, measures, relationships → valid DataModel)
-`pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
+`pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
 
-### Report Layout & Visuals (19)
-`pbix_add_visual` — **Add any visual type** (card, chart, table, shape/button, image, textbox, slicer)
-`pbix_remove_visual` — Remove a visual from a page
-`pbix_get_pages` · `pbix_add_page` · `pbix_remove_page` · `pbix_get_page_visuals` · `pbix_get_visual_detail` · `pbix_get_visual_positions` · `pbix_set_visual_property` · `pbix_update_visual_json` · `pbix_get_layout_raw` · `pbix_set_layout_raw` · `pbix_get_filters` · `pbix_set_filters` · `pbix_get_default_filters` · `pbix_get_settings` · `pbix_set_settings` · `pbix_get_bookmarks`
+### Report Layout & Visuals (18)
+`pbix_add_visual` · `pbix_remove_visual` · `pbix_get_pages` · `pbix_add_page` · `pbix_remove_page` · `pbix_get_page_visuals` · `pbix_get_visual_detail` · `pbix_get_visual_positions` · `pbix_set_visual_property` · `pbix_update_visual_json` · `pbix_get_layout_raw` · `pbix_set_layout_raw` · `pbix_get_filters` · `pbix_set_filters` · `pbix_get_default_filters` · `pbix_get_settings` · `pbix_set_settings` · `pbix_get_bookmarks`
 
-### DAX Engine (3)
-`pbix_evaluate_dax` · `pbix_evaluate_dax_per_dimension` · `pbix_clear_dax_cache`
+### DAX Engine (4)
+`pbix_evaluate_dax` · `pbix_evaluate_dax_per_dimension` · `pbix_evaluate_calculated_columns` · `pbix_clear_dax_cache`
 
-### DataModel Read (7)
-`pbix_get_model_schema` · `pbix_get_model_measures` · `pbix_get_model_relationships` · `pbix_get_model_power_query` · `pbix_get_model_columns` · `pbix_get_table_data` · `pbix_list_tables`
+### DataModel Read (8)
+`pbix_get_model_schema` · `pbix_get_model_measures` · `pbix_get_model_relationships` · `pbix_get_model_power_query` · `pbix_get_model_columns` · `pbix_get_table_data` · `pbix_list_tables` · `pbix_get_metadata`
 
 ### DataModel Write (13)
 `pbix_datamodel_query_metadata` · `pbix_datamodel_modify_metadata` · `pbix_datamodel_add_measure` · `pbix_datamodel_modify_measure` · `pbix_datamodel_remove_measure` · `pbix_datamodel_modify_column` · `pbix_datamodel_decompress` · `pbix_datamodel_recompress` · `pbix_datamodel_replace_file` · `pbix_datamodel_extract_file` · `pbix_datamodel_list_abf_files` · `pbix_set_table_data` · `pbix_update_table_rows`
@@ -100,12 +99,10 @@ pbix-mcp-server
 `pbix_get_m_code` · `pbix_set_m_code`
 
 ### Row-Level Security (3)
-`pbix_get_rls_roles` — **Read all RLS roles and filter expressions**
-`pbix_set_rls_role` — **Create/update RLS roles with DAX filters**
-`pbix_evaluate_rls` — **Evaluate RLS filter against actual data to see which rows are visible**
+`pbix_get_rls_roles` · `pbix_set_rls_role` · `pbix_evaluate_rls`
 
-### Diagnostics & Security (3)
-`pbix_doctor` · `pbix_get_metadata` · `pbix_get_password` — **Extract embedded passwords from protected dashboards**
+### Diagnostics & Security (2)
+`pbix_doctor` · `pbix_get_password`
 
 ## Creating Reports from Scratch
 
@@ -146,7 +143,7 @@ For buttons/shapes with text, use `visual_type="shape"`:
 
 ## DAX Engine
 
-154 functions across 10 categories. Tested against 4 real-world dashboards (204 measures total, 99% non-BLANK, 0 crashes).
+154 functions across 10 categories. Tested against 4 real-world dashboards (204 measures total, 99.5% non-BLANK, 0 crashes).
 
 | Category | Functions |
 |----------|-----------|
@@ -193,7 +190,7 @@ pytest -v
 |-------|-------|--------|-------------|
 | `test_dax_engine.py` | 55 | `unit` | No |
 | `test_dax_accuracy.py` | 50 | `unit` | No |
-| `test_golden.py` | 9 | `golden` | Partial (2 skip gracefully) |
+| `test_golden.py` | 15 | `golden` | Partial (2 skip gracefully) |
 | `test_fixtures.py` | 18 | `unit` | No (ships with repo) |
 | `test_cross_report.py` | 19 | `slow`, `integration` | Yes (4 private PBIX files) |
 
@@ -222,7 +219,7 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (59 tools)
+  server.py              # MCP server (60 tools)
   cli.py                 # Entry point (pbix-mcp-server)
   builder.py             # PBIX file builder (create from scratch)
   errors.py              # Typed exceptions with stable error codes

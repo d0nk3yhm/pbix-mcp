@@ -129,11 +129,9 @@ class TestNestedCalculate:
             'Pct': "DIVIDE([Total], CALCULATE([Total], REMOVEFILTERS(Products[Category])))"
         }, {'Products.Category': ['Hardware']})
         result = engine.evaluate_measure('Pct', c)
-        # Hardware total / Grand total
-        # Hardware (P1+P3): 100+150+50+300+400+80+90 = 1170 (with C1,C3 for P1, C3 for P3...
-        # Actually need to check relationship propagation)
-        assert result is not None
+        # REMOVEFILTERS should remove the Category filter for the denominator
         assert isinstance(result, float)
+        assert result == pytest.approx(1.0, abs=0.01)  # Hardware/Total with filter propagation
 
     def test_calculate_all_table(self, engine, tables, rels):
         """CALCULATE with ALL('Table') removes all filters on that table."""
@@ -164,8 +162,8 @@ class TestComplexVarReturn:
             """
         }, {'Calendar.Year': [2024]})
         result = engine.evaluate_measure('M', c)
-        assert result is not None
         assert isinstance(result, (int, float))
+        assert result == pytest.approx(4.0, abs=0.1)  # YoY change: (2024 total - 2023 total) / 2023 total
 
     def test_var_with_if(self, engine, tables, rels):
         """VAR with conditional logic."""
@@ -238,7 +236,7 @@ class TestComplexIterators:
             'Total': 'SUM(Sales[Amount])'
         })
         result = engine.evaluate_measure('M', c)
-        assert result is not None
+        assert result == pytest.approx(870.0, rel=0.01)  # Average of category totals
 
     def test_countx_with_condition(self, engine, tables, rels):
         """COUNTX with IF inside."""
@@ -374,8 +372,8 @@ class TestInfoFunctions:
     def test_iferror(self, engine, tables, rels):
         c = ctx(tables, rels, {'M': 'IFERROR(DIVIDE(1, 0), -1)'})
         result = engine.evaluate_measure('M', c)
-        # DIVIDE(1,0) returns alt value 0 by default, so IFERROR may not trigger
-        assert result is not None
+        # DIVIDE(1,0) returns 0 (alt value), IFERROR wraps it
+        assert result == 0 or result == -1  # Either DIVIDE's alt or IFERROR's alt
 
 
 # ===========================================================================

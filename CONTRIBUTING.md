@@ -30,24 +30,27 @@ pytest --cov=src/pbix_mcp --cov-report=term-missing -m "not slow"
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (51 tools)
-  cli.py                 # Entry point
-  errors.py              # Typed exceptions
-  logging_config.py      # Diagnostic logging
+  server.py              # MCP server (60 tools)
+  cli.py                 # Entry point (pbix-mcp-server)
+  builder.py             # PBIX file builder (create from scratch with row data)
+  errors.py              # Typed exceptions with stable error codes
+  logging_config.py      # Diagnostic logging (normal/debug/trace)
   dax/
     engine.py            # DAX evaluator (154 functions)
-    calc_tables.py       # Calculated table support
+    calc_tables.py       # Calculated table + column support
   formats/
-    abf_rebuild.py       # ABF archive format
+    abf_rebuild.py       # ABF archive format (read, modify, build from scratch)
     datamodel_roundtrip.py  # XPress9 compress/decompress
-    vertipaq_encoder.py  # VertiPaq column encoding
+    vertipaq_encoder.py  # VertiPaq column encoding (5 data types)
   models/
-    requests.py          # Tool input models
-    responses.py         # Tool output models
+    requests.py          # Tool input models (FilterContext, DimensionRef)
+    responses.py         # Tool output models (ToolResponse, DAXEvalResponse)
 tests/
   test_dax_engine.py     # Unit tests (55)
   test_dax_accuracy.py   # Accuracy tests (50)
-  test_cross_report.py   # Integration tests (19)
+  test_golden.py         # Golden tests (15) — round-trips, exact values, PBIX from scratch
+  test_fixtures.py       # Fixture tests (18) — public PBIX verification, package imports
+  test_cross_report.py   # Integration tests (19) — 4 real PBIX files
 ```
 
 ## Commit Messages
