@@ -674,7 +674,18 @@ def build_abf_from_scratch(
     database_id: str = "00000000-0000-0000-0000-000000000001",
 ) -> bytes:
     """
-    Build a complete ABF archive from scratch — no existing ABF needed.
+    Build a complete ABF archive from scratch -- no existing ABF needed.
+
+    Produces the flat ABF layout that Analysis Services / Power BI Desktop
+    expects::
+
+      Page 0 (0..4095):  STREAM_STORAGE_SIGNATURE + BackupLogHeader XML
+      Data   (4096..):   Files laid out sequentially
+      VirtualDirectory:  File index with flat paths and direct byte offsets
+
+    VirtualDirectory paths are flat names (``ADDITIONAL_LOG``,
+    ``PARTITIONS``, ``metadata.sqlitedb``, ``LOG``, ...) -- no
+    ``Sandboxes\\`` prefix or ``StoragePath_X`` indirection.
 
     Parameters
     ----------
@@ -693,88 +704,108 @@ def build_abf_from_scratch(
     if "metadata.sqlitedb" not in files:
         raise ValueError("files must include 'metadata.sqlitedb'")
 
+    timestamp = 134002835794032078  # Windows FILETIME timestamp
+
     buf = bytearray()
 
-    # ---- 1. Signature + Header placeholder ----
+    # ---- 1. Signature + Header placeholder (first 4096 bytes) ----
     buf.extend(STREAM_STORAGE_SIGNATURE)
     header_page_start = len(buf)
-    # Reserve the header page (will be patched later)
+    # Reserve the rest of the header page (will be patched at the end)
     buf.extend(b"\x00" * (_HEADER_PAGE_SIZE - _SIGNATURE_LEN))
+    assert len(buf) == _HEADER_PAGE_SIZE
 
-    # ---- 2. Data files ----
-    # Assign storage paths and write file data
-    persist_root = f"Sandboxes\\{database_id}\\"
-    storage_paths = {}  # filename -> storage_path
-    data_offsets = {}   # storage_path -> offset
-    data_sizes = {}     # storage_path -> size
+    # ---- 2. Data files sequentially starting at offset 4096 ----
+    # Build the ordered list of (flat_name, content) entries.
+    # Required system files come first, then user-supplied extras,
+    # then the LOG entry is always written last.
 
-    for i, (filename, content) in enumerate(files.items()):
-        sp = f"StoragePath_{i}"
-        storage_paths[filename] = sp
-        data_offsets[sp] = len(buf)
-        data_sizes[sp] = len(content)
+    _ADDITIONAL_LOG_CONTENT = (
+        b'<Property><ProductName>Default</ProductName></Property>'
+    )
+    _PARTITIONS_CONTENT = b'<Partitions />'
+
+    # Collect flat-name -> content, preserving required ordering.
+    ordered_files: list[tuple[str, bytes]] = []
+
+    # (a) ADDITIONAL_LOG -- always first
+    ordered_files.append(("ADDITIONAL_LOG", _ADDITIONAL_LOG_CONTENT))
+
+    # (b) PARTITIONS -- always second
+    ordered_files.append(("PARTITIONS", _PARTITIONS_CONTENT))
+
+    # (c) metadata.sqlitedb
+    ordered_files.append(("metadata.sqlitedb", files["metadata.sqlitedb"]))
+
+    # (d) Any remaining user-supplied files (VertiPaq data, etc.)
+    _SKIP = {"metadata.sqlitedb", "ADDITIONAL_LOG", "PARTITIONS", "LOG"}
+    for fname, content in files.items():
+        if fname not in _SKIP:
+            ordered_files.append((fname, content))
+
+    # Write each file and record offset/size for the VirtualDirectory.
+    file_records: list[tuple[str, int, int]] = []  # (flat_name, offset, size)
+    for flat_name, content in ordered_files:
+        file_records.append((flat_name, len(buf), len(content)))
         buf.extend(content)
 
-    # ---- 3. BackupLog ----
+    # ---- 3. LOG (BackupLog data) -- always last data entry ----
     blog_root = ET.Element("BackupLog")
+    ET.SubElement(blog_root, "BackupRestoreSyncVersion").text = "11.53"
+    ET.SubElement(blog_root, "ServerRoot").text = (
+        f"Sandboxes\\{database_id}"
+    )
     ET.SubElement(blog_root, "Log")
     file_groups = ET.SubElement(blog_root, "FileGroups")
 
-    # FileGroup 0: BackupLog itself (system)
+    # FileGroup 0: system (BackupLog itself)
     fg0 = ET.SubElement(file_groups, "FileGroup")
     ET.SubElement(fg0, "Index").text = "0"
     ET.SubElement(fg0, "PersistLocationPath")
 
-    # FileGroup 1: Database files
+    # FileGroup 1: database files
     fg1 = ET.SubElement(file_groups, "FileGroup")
     ET.SubElement(fg1, "Index").text = "1"
-    ET.SubElement(fg1, "PersistLocationPath").text = f"Sandboxes\\{database_id}"
+    ET.SubElement(fg1, "PersistLocationPath").text = (
+        f"Sandboxes\\{database_id}"
+    )
     file_list = ET.SubElement(fg1, "FileList")
-
-    for filename, sp in storage_paths.items():
+    for flat_name, _offset, size in file_records:
         bf = ET.SubElement(file_list, "BackupFile")
-        ET.SubElement(bf, "Path").text = persist_root + filename
-        ET.SubElement(bf, "StoragePath").text = sp
-        ET.SubElement(bf, "Size").text = str(data_sizes[sp])
+        ET.SubElement(bf, "Path").text = (
+            f"Sandboxes\\{database_id}\\{flat_name}"
+        )
+        ET.SubElement(bf, "StoragePath").text = flat_name
+        ET.SubElement(bf, "Size").text = str(size)
 
     blog_bytes = _xml_to_utf16_bytes(blog_root)
-    blog_sp = "StoragePath_BackupLog"
-    blog_offset = len(buf)
-    blog_size = len(blog_bytes)
+    log_offset = len(buf)
+    log_size = len(blog_bytes)
     buf.extend(blog_bytes)
 
-    # ---- 4. VirtualDirectory ----
+    # Add LOG to file_records so VirtualDirectory includes it as last entry
+    file_records.append(("LOG", log_offset, log_size))
+
+    # ---- 4. VirtualDirectory (file index, written after all data) ----
     vdir_root = ET.Element("VirtualDirectory")
 
-    timestamp = 132000000000000000  # Fixed timestamp
-
-    for filename, sp in storage_paths.items():
+    for flat_name, offset, size in file_records:
         bf_elem = ET.SubElement(vdir_root, "BackupFile")
-        ET.SubElement(bf_elem, "Path").text = sp
-        ET.SubElement(bf_elem, "Size").text = str(data_sizes[sp])
-        ET.SubElement(bf_elem, "m_cbOffsetHeader").text = str(data_offsets[sp])
+        ET.SubElement(bf_elem, "Path").text = flat_name
+        ET.SubElement(bf_elem, "Size").text = str(size)
+        ET.SubElement(bf_elem, "m_cbOffsetHeader").text = str(offset)
         ET.SubElement(bf_elem, "Delete").text = "false"
         ET.SubElement(bf_elem, "CreatedTimestamp").text = str(timestamp)
-        ET.SubElement(bf_elem, "Access").text = "0"
+        ET.SubElement(bf_elem, "Access").text = str(timestamp)
         ET.SubElement(bf_elem, "LastWriteTime").text = str(timestamp)
-
-    # BackupLog as last VDir entry
-    bf_elem = ET.SubElement(vdir_root, "BackupFile")
-    ET.SubElement(bf_elem, "Path").text = blog_sp
-    ET.SubElement(bf_elem, "Size").text = str(blog_size)
-    ET.SubElement(bf_elem, "m_cbOffsetHeader").text = str(blog_offset)
-    ET.SubElement(bf_elem, "Delete").text = "false"
-    ET.SubElement(bf_elem, "CreatedTimestamp").text = str(timestamp)
-    ET.SubElement(bf_elem, "Access").text = "0"
-    ET.SubElement(bf_elem, "LastWriteTime").text = str(timestamp)
 
     vdir_bytes = _xml_to_utf16_bytes(vdir_root)
     vdir_offset = len(buf)
     vdir_size = len(vdir_bytes)
     buf.extend(vdir_bytes)
 
-    # ---- 5. Patch the BackupLogHeader ----
-    total_files = len(files) + 1  # data files + backup log
+    # ---- 5. Patch the header page with correct offsets ----
+    total_files = len(file_records)  # all data files + LOG
 
     hdr_root = ET.Element("BackupLog")
     ET.SubElement(hdr_root, "BackupRestoreSyncVersion").text = "140"
