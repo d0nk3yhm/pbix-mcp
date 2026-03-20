@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml)
 
-An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files. Exposes 56 tools covering report creation, layout editing, visual management, DAX evaluation, password extraction, VertiPaq data, and binary format internals.
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files. Exposes 59 tools covering report creation from scratch (with actual row data), layout editing, visual management, DAX evaluation, RLS security, password extraction, VertiPaq data, and binary format internals.
 
 ## Quick Start
 
@@ -46,7 +46,7 @@ pbix-mcp-server
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| PBIX creation from scratch | **Stable** | Full DataModel + layout, no Power BI Desktop needed |
+| PBIX creation from scratch | **Stable** | Full DataModel + layout + VertiPaq row data, no Power BI Desktop needed |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
 | Visual add/remove | **Stable** | Cards, charts, shapes/buttons, images, textboxes, slicers |
 | Visual property editing | **Stable** | Dot-path and full JSON |
@@ -62,14 +62,18 @@ pbix-mcp-server
 | VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal column types |
 | DataMashup (M code) editing | **Stable** | Read/write Power Query expressions |
 | File save/repack | **Stable** | Auto-backup on overwrite, SecurityBindings auto-removed |
+| Calculated column evaluation | **Stable** | Per-row DAX expression evaluation |
+| Row-Level Security (RLS) | **Stable** | Read/write roles, evaluate filter expressions |
 | Diagnostic tool (`pbix_doctor`) | **Stable** | 8-point health check |
 
 ## Known Limitations
 
 - **PBIR format** is read-only for filter extraction; layout write requires legacy format
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
+- **VertiPaq write** encodes String, Int64, Double, DateTime, Decimal; Boolean type not yet supported
+- **Created PBIX files** contain valid VertiPaq data but Power BI Desktop may need a refresh to fully index the data
 
-## Tools (56)
+## Tools (59)
 
 ### Create & File Management (5)
 `pbix_create` — **Create a new PBIX from scratch** (tables, measures, relationships → valid DataModel)
@@ -94,6 +98,11 @@ pbix-mcp-server
 
 ### DataMashup (2)
 `pbix_get_m_code` · `pbix_set_m_code`
+
+### Row-Level Security (3)
+`pbix_get_rls_roles` — **Read all RLS roles and filter expressions**
+`pbix_set_rls_role` — **Create/update RLS roles with DAX filters**
+`pbix_evaluate_rls` — **Evaluate RLS filter against actual data to see which rows are visible**
 
 ### Diagnostics & Security (3)
 `pbix_doctor` · `pbix_get_metadata` · `pbix_get_password` — **Extract embedded passwords from protected dashboards**
@@ -188,7 +197,7 @@ pytest -v
 | `test_fixtures.py` | 18 | `unit` | No (ships with repo) |
 | `test_cross_report.py` | 19 | `slow`, `integration` | Yes (4 private PBIX files) |
 
-**132 tests pass from a fresh clone.** 19 integration tests require private PBIX files and skip gracefully.
+**138 tests pass from a fresh clone.** 19 integration tests require private PBIX files and skip gracefully.
 
 ## Architecture
 
@@ -213,7 +222,7 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (56 tools)
+  server.py              # MCP server (59 tools)
   cli.py                 # Entry point (pbix-mcp-server)
   builder.py             # PBIX file builder (create from scratch)
   errors.py              # Typed exceptions with stable error codes

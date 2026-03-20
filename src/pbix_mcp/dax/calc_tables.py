@@ -35,6 +35,7 @@ def load_calculated_tables(
         Updated tables dict with calculated tables added
     """
     tables = dict(existing_tables)  # Don't modify the original
+    db_bytes = None  # Will be set if metadata extraction succeeds
 
     try:
         from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
@@ -89,26 +90,134 @@ def load_calculated_tables(
         finally:
             os.unlink(tmp_db.name)
 
-        if not calc_defs:
-            return tables
+        if calc_defs:
+            # Topological sort: evaluate tables that others depend on first
+            eval_order = _topo_sort(calc_defs, tables)
 
-        # Topological sort: evaluate tables that others depend on first
-        eval_order = _topo_sort(calc_defs, tables)
+            # Evaluate each calculated table
+            for tname in eval_order:
+                try:
+                    tdef = calc_defs[tname]
+                    expr = tdef['expression']
+                    result = _evaluate_table_expression(expr, tname, tdef, tables, relationships)
 
-        # Evaluate each calculated table
-        for tname in eval_order:
-            try:
-                tdef = calc_defs[tname]
-                expr = tdef['expression']
-                result = _evaluate_table_expression(expr, tname, tdef, tables, relationships)
-
-                if result:
-                    tables[tname] = result
-            except Exception:
-                pass  # Skip silently
+                    if result:
+                        tables[tname] = result
+                except Exception:
+                    pass  # Skip silently
 
     except Exception:
         pass  # If ABF reading fails entirely, just return existing tables
+
+    # --- Evaluate calculated columns ---
+    # Calculated columns have DAX expressions that are evaluated per-row
+    # and added as new columns to existing tables.
+    try:
+        tables = _evaluate_calculated_columns(tables, db_bytes, relationships)
+    except Exception:
+        pass
+
+    return tables
+
+
+def _evaluate_calculated_columns(
+    tables: Dict[str, dict],
+    db_bytes: bytes,
+    relationships: List[dict],
+) -> Dict[str, dict]:
+    """Evaluate calculated columns and add them to their parent tables.
+
+    Calculated columns have a DAX expression in the Column.Expression field.
+    They are evaluated per-row, with each row's values available as column references.
+    """
+    if not db_bytes:
+        return tables
+
+    tmp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    tmp_db.write(db_bytes)
+    tmp_db.close()
+
+    try:
+        conn = sqlite3.connect(tmp_db.name)
+        conn.row_factory = sqlite3.Row
+
+        # Find all calculated columns
+        calc_cols = conn.execute("""
+            SELECT c.ExplicitName, c.Expression, t.Name as TableName
+            FROM [Column] c
+            JOIN [Table] t ON c.TableID = t.ID
+            WHERE c.Expression IS NOT NULL AND c.Expression != ''
+              AND c.ExplicitName IS NOT NULL
+              AND c.ExplicitName NOT LIKE 'RowNumber%'
+              AND t.ModelID = 1
+        """).fetchall()
+
+        conn.close()
+    finally:
+        os.unlink(tmp_db.name)
+
+    if not calc_cols:
+        return tables
+
+    from pbix_mcp.dax import engine as dax_engine
+
+    for cc in calc_cols:
+        col_name = cc['ExplicitName']
+        expr = cc['Expression'].strip()
+        table_name = cc['TableName']
+
+        tbl = tables.get(table_name)
+        if not tbl:
+            continue
+
+        # Skip if column already exists
+        if col_name in tbl['columns']:
+            continue
+
+        # Strip comments from expression
+        clean_expr = re.sub(r'--[^\n]*', '', expr)
+        clean_expr = re.sub(r'//[^\n]*', '', clean_expr)
+        clean_expr = clean_expr.strip()
+
+        # Evaluate per-row: for each row, set up a row context and evaluate
+        engine = dax_engine.DAXEngine()
+        new_values = []
+
+        for row in tbl['rows']:
+            # Create a row context: table[column] references resolve to this row's values
+            row_data = {}
+            for ci, cn in enumerate(tbl['columns']):
+                row_data[cn] = row[ci]
+
+            # Evaluate expression with row context
+            try:
+                # Replace table[column] references with the row's actual values
+                row_expr = clean_expr
+                for cn, val in row_data.items():
+                    # Replace 'TableName'[ColumnName] and TableName[ColumnName]
+                    patterns = [
+                        f"'{table_name}'[{cn}]",
+                        f"{table_name}[{cn}]",
+                    ]
+                    for pat in patterns:
+                        if pat in row_expr:
+                            if isinstance(val, str):
+                                row_expr = row_expr.replace(pat, f'"{val}"')
+                            elif val is None:
+                                row_expr = row_expr.replace(pat, 'BLANK()')
+                            else:
+                                row_expr = row_expr.replace(pat, str(val))
+
+                ctx = dax_engine.DAXContext(tables, {}, None, None, None, relationships or [])
+                result = engine._eval_expr(row_expr, ctx)
+                new_values.append(result)
+            except Exception:
+                new_values.append(None)
+
+        # Add the calculated column to the table
+        tbl['columns'].append(col_name)
+        for i, row in enumerate(tbl['rows']):
+            row.append(new_values[i] if i < len(new_values) else None)
 
     return tables
 

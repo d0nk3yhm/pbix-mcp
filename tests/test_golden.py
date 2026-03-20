@@ -317,6 +317,91 @@ class TestPBIXFromScratch:
         assert abf1 == abf2
 
 
+class TestVertiPaqAllTypes:
+    """Verify VertiPaq encoding works for ALL data types including DateTime/Decimal."""
+
+    def test_encode_all_five_types(self):
+        """String, Int64, Double, DateTime, Decimal must all encode successfully."""
+        from pbix_mcp.formats.vertipaq_encoder import encode_table_data
+
+        columns = [
+            {"name": "Name", "data_type": "String", "nullable": False},
+            {"name": "Count", "data_type": "Int64", "nullable": False},
+            {"name": "Price", "data_type": "Double", "nullable": False},
+            {"name": "Date", "data_type": "DateTime", "nullable": False},
+            {"name": "Total", "data_type": "Decimal", "nullable": False},
+        ]
+        rows = [
+            {"Name": "Widget", "Count": 5, "Price": 19.99, "Date": "2024-01-15", "Total": 99.95},
+            {"Name": "Gadget", "Count": 3, "Price": 66.83, "Date": "2024-02-20", "Total": 200.50},
+            {"Name": "Doohickey", "Count": 10, "Price": 5.0, "Date": "2024-03-10", "Total": 50.00},
+        ]
+
+        result = encode_table_data("Test", 0, columns, rows)
+
+        # Every column should produce 4 files: IDF, meta, dict, hidx
+        for col in columns:
+            cn = col["name"]
+            assert f"Test.tbl\\0.prt\\column.{cn}" in result, f"Missing IDF for {cn}"
+            assert f"Test.tbl\\0.prt\\column.{cn}meta" in result, f"Missing meta for {cn}"
+            assert f"Test.tbl\\0.prt\\column.{cn}.dict" in result, f"Missing dict for {cn}"
+            assert f"Test.tbl\\0.prt\\column.{cn}.hidx" in result, f"Missing hidx for {cn}"
+
+        # Total files: 5 columns * 4 files = 20
+        assert len(result) == 20
+
+
+class TestCalculatedColumns:
+    """Test that calculated columns are evaluated per-row."""
+
+    def test_calculated_column_evaluation(self):
+        """Evaluate a calculated column expression per-row."""
+        import sqlite3
+        import tempfile
+
+        from pbix_mcp.dax.calc_tables import _evaluate_calculated_columns
+
+        # Create metadata with a calculated column
+        db_path = tempfile.mktemp(suffix=".db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE [Model] (ID INTEGER PRIMARY KEY, Name TEXT)")
+        conn.execute("INSERT INTO [Model] VALUES (1, 'Model')")
+        conn.execute("""CREATE TABLE [Table] (
+            ID INTEGER PRIMARY KEY, ModelID INTEGER, Name TEXT,
+            IsHidden INTEGER DEFAULT 0, Description TEXT DEFAULT '')""")
+        conn.execute("INSERT INTO [Table] VALUES (1, 1, 'Sales', 0, '')")
+        conn.execute("""CREATE TABLE [Column] (
+            ID INTEGER PRIMARY KEY, TableID INTEGER,
+            ExplicitName TEXT, InferredName TEXT,
+            Expression TEXT, Type INTEGER DEFAULT 1,
+            IsHidden INTEGER DEFAULT 0, IsKey INTEGER DEFAULT 0)""")
+        # Regular column (no expression)
+        conn.execute("INSERT INTO [Column] VALUES (1, 1, 'Amount', NULL, NULL, 1, 0, 0)")
+        # Calculated column with expression
+        conn.execute("""INSERT INTO [Column] VALUES (2, 1, 'PriceGroup', NULL,
+            'IF(Sales[Amount] > 200, "High", "Low")', 1, 0, 0)""")
+        conn.commit()
+        conn.close()
+
+        with open(db_path, "rb") as f:
+            db_bytes = f.read()
+        os.unlink(db_path)
+
+        tables = {
+            "Sales": {
+                "columns": ["Amount"],
+                "rows": [[100.0], [300.0], [50.0], [250.0]],
+            }
+        }
+
+        result = _evaluate_calculated_columns(tables, db_bytes, [])
+
+        assert "PriceGroup" in result["Sales"]["columns"]
+        pg_idx = result["Sales"]["columns"].index("PriceGroup")
+        values = [r[pg_idx] for r in result["Sales"]["rows"]]
+        assert values == ["Low", "High", "Low", "High"]
+
+
 class TestFullReportFromScratch:
     """Build a complete dashboard with sample data, visuals, and measures.
     This is the end-to-end proof that pbix-mcp can create real reports."""
@@ -455,6 +540,47 @@ class TestFullReportFromScratch:
             os.unlink(tmp.name)
 
         zf.close()
+
+
+class TestPBIXWithData:
+    """Build PBIX with actual row data and verify VertiPaq encoding."""
+
+    def test_build_with_data_and_verify(self):
+        """Build PBIX with rows, verify ABF contains VertiPaq column files."""
+        import io
+        import zipfile
+
+        from pbix_mcp.builder import PBIXBuilder
+        from pbix_mcp.formats.abf_rebuild import list_abf_files
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        builder = PBIXBuilder()
+        builder.add_table("Sales", [
+            {"name": "Product", "data_type": "String"},
+            {"name": "Amount", "data_type": "Double"},
+            {"name": "Qty", "data_type": "Int64"},
+        ], rows=[
+            {"Product": "Widget", "Amount": 100.0, "Qty": 2},
+            {"Product": "Gadget", "Amount": 200.0, "Qty": 3},
+            {"Product": "Widget", "Amount": 150.0, "Qty": 1},
+        ])
+        builder.add_measure("Sales", "Total", "SUM(Sales[Amount])")
+
+        pbix_bytes = builder.build()
+        zf = zipfile.ZipFile(io.BytesIO(pbix_bytes))
+        dm = zf.read("DataModel")
+        zf.close()
+
+        abf = decompress_datamodel(dm)
+        files = list_abf_files(abf)
+        file_paths = [f["Path"] for f in files]
+
+        # Must have VertiPaq files for each column
+        assert any("column.Product" in p and p.endswith("meta") for p in file_paths)
+        assert any("column.Amount" in p and p.endswith("meta") for p in file_paths)
+        assert any("column.Qty" in p and p.endswith("meta") for p in file_paths)
+        # Plus IDF, dict, hidx for each
+        assert len(files) >= 13  # 1 metadata + 3 columns * 4 files each
 
 
 if __name__ == "__main__":

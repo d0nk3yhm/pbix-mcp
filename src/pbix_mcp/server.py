@@ -35,6 +35,7 @@ from pbix_mcp.errors import (
     FileNotOpenError,
 )
 from pbix_mcp.logging_config import logger
+from pbix_mcp.models.requests import DimensionRef, FilterContext
 from pbix_mcp.models.responses import DAXEvalResponse, DAXResult, ToolResponse
 
 # ---------------------------------------------------------------------------
@@ -378,11 +379,11 @@ def pbix_open(file_path: str, alias: str = "") -> str:
             size = os.path.getsize(os.path.join(root, f))
             components.append(f"  {rel} ({size:,} bytes)")
 
-    return (
+    return ToolResponse.ok(
         f"Opened '{file_path}' as '{alias}'\n"
         f"Type: {'PBIT template' if ext == '.pbit' else 'PBIX report'}\n"
         f"Components:\n" + "\n".join(sorted(components))
-    )
+    ).to_text()
 
 
 @mcp.tool()
@@ -416,7 +417,7 @@ def pbix_save(alias: str, output_path: str = "", overwrite: bool = True, backup:
         _repack_pbix(work_dir, target)
         info["modified"] = False
         size = os.path.getsize(target)
-        return f"Saved '{alias}' to {target} ({size:,} bytes)"
+        return ToolResponse.ok(f"Saved '{alias}' to {target} ({size:,} bytes)").to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "SESSION_ERROR").to_text()
 
@@ -443,7 +444,7 @@ def pbix_close(alias: str, force: bool = False) -> str:
 
         shutil.rmtree(work_dir, ignore_errors=True)
         del _open_files[alias]
-        return f"Closed '{alias}'."
+        return ToolResponse.ok(f"Closed '{alias}'.").to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "SESSION_ERROR").to_text()
 
@@ -452,13 +453,13 @@ def pbix_close(alias: str, force: bool = False) -> str:
 def pbix_list_open() -> str:
     """List all currently open PBIX/PBIT files."""
     if not _open_files:
-        return "No files currently open."
+        return ToolResponse.ok("No files currently open.").to_text()
     lines = []
     for alias, info in _open_files.items():
         status = "modified" if info.get("modified") else "clean"
         ftype = "PBIT" if info.get("is_pbit") else "PBIX"
         lines.append(f"  {alias}: {info['path']} [{ftype}, {status}]")
-    return "Open files:\n" + "\n".join(lines)
+    return ToolResponse.ok("Open files:\n" + "\n".join(lines)).to_text()
 
 
 # ---- Section 4: Report Layout tools ----
@@ -474,7 +475,7 @@ def pbix_get_pages(alias: str) -> str:
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return "No layout found in this file."
+            return ToolResponse.ok("No layout found in this file.").to_text()
 
         sections = layout.get("sections", [])
         lines = [f"Report has {len(sections)} page(s):\n"]
@@ -485,7 +486,7 @@ def pbix_get_pages(alias: str) -> str:
             height = sec.get("height", "?")
             hidden = " [HIDDEN]" if sec.get("config", "").find('"visibility":1') >= 0 else ""
             lines.append(f"  [{i}] {name} — {vis_count} visuals, {width}x{height}{hidden}")
-        return "\n".join(lines)
+        return ToolResponse.ok("\n".join(lines)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
 
@@ -502,7 +503,7 @@ def pbix_get_page_visuals(alias: str, page_index: int = 0) -> str:
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return "No layout found."
+            return ToolResponse.ok("No layout found.").to_text()
 
         sections = layout.get("sections", [])
         if page_index < 0 or page_index >= len(sections):
@@ -522,7 +523,7 @@ def pbix_get_page_visuals(alias: str, page_index: int = 0) -> str:
             w = vc.get("width", 0)
             h = vc.get("height", 0)
             lines.append(f"  [{i}] {vtype} (name={vname}) at ({x},{y}) size {w}x{h}")
-        return "\n".join(lines)
+        return ToolResponse.ok("\n".join(lines)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
 
@@ -540,7 +541,7 @@ def pbix_get_visual_detail(alias: str, page_index: int, visual_index: int) -> st
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return "No layout found."
+            return ToolResponse.ok("No layout found.").to_text()
 
         sections = layout.get("sections", [])
         if page_index < 0 or page_index >= len(sections):
@@ -572,7 +573,7 @@ def pbix_get_visual_detail(alias: str, page_index: int, visual_index: int) -> st
                 else:
                     result[key] = raw
 
-        return json.dumps(result, indent=2, ensure_ascii=False)
+        return ToolResponse.ok(json.dumps(result, indent=2, ensure_ascii=False)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
 
@@ -595,7 +596,7 @@ def pbix_set_visual_property(
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return "No layout found."
+            return ToolResponse.ok("No layout found.").to_text()
 
         sections = layout.get("sections", [])
         if page_index < 0 or page_index >= len(sections):
@@ -620,7 +621,7 @@ def pbix_set_visual_property(
         vc["config"] = json.dumps(config, ensure_ascii=False)
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
-        return f"Set {property_path} = {value} on page {page_index}, visual {visual_index}"
+        return ToolResponse.ok(f"Set {property_path} = {value} on page {page_index}, visual {visual_index}").to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
 
@@ -641,7 +642,7 @@ def pbix_update_visual_json(
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return "No layout found."
+            return ToolResponse.ok("No layout found.").to_text()
 
         sections = layout.get("sections", [])
         if page_index < 0 or page_index >= len(sections):
@@ -660,7 +661,7 @@ def pbix_update_visual_json(
         containers[visual_index]["config"] = json.dumps(new_config, ensure_ascii=False)
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
-        return f"Updated visual config on page {page_index}, visual {visual_index}"
+        return ToolResponse.ok(f"Updated visual config on page {page_index}, visual {visual_index}").to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
 
@@ -679,7 +680,7 @@ def pbix_add_page(alias: str, display_name: str, width: int = 1280, height: int 
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return "No layout found."
+            return ToolResponse.ok("No layout found.").to_text()
 
         import uuid
         new_section = {
@@ -698,7 +699,7 @@ def pbix_add_page(alias: str, display_name: str, width: int = 1280, height: int 
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
         idx = len(layout["sections"]) - 1
-        return f"Added page '{display_name}' at index {idx} ({width}x{height})"
+        return ToolResponse.ok(f"Added page '{display_name}' at index {idx} ({width}x{height})").to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
 
@@ -715,7 +716,7 @@ def pbix_remove_page(alias: str, page_index: int) -> str:
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return "No layout found."
+            return ToolResponse.ok("No layout found.").to_text()
 
         sections = layout.get("sections", [])
         if page_index < 0 or page_index >= len(sections):
@@ -725,7 +726,7 @@ def pbix_remove_page(alias: str, page_index: int) -> str:
         name = removed.get("displayName", f"Page {page_index}")
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
-        return f"Removed page '{name}' (was index {page_index}). {len(sections)} pages remain."
+        return ToolResponse.ok(f"Removed page '{name}' (was index {page_index}). {len(sections)} pages remain.").to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
 
@@ -792,7 +793,7 @@ def pbix_create(
 
         # Auto-open the created file
         result = pbix_open(abs_path, alias)
-        return f"Created '{abs_path}' ({size:,} bytes) and opened it.\n{result}"
+        return ToolResponse.ok(f"Created '{abs_path}' ({size:,} bytes) and opened it.\n{result}").to_text()
 
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
@@ -873,7 +874,7 @@ def pbix_add_visual(
 
         idx = len(page["visualContainers"]) - 1
         page_name = page.get("displayName", f"Page {page_index}")
-        return f"Added {visual_type} visual at ({x},{y}) {width}x{height} on '{page_name}' (index {idx})"
+        return ToolResponse.ok(f"Added {visual_type} visual at ({x},{y}) {width}x{height} on '{page_name}' (index {idx})").to_text()
 
     except Exception as e:
         return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
@@ -908,7 +909,7 @@ def pbix_remove_visual(alias: str, page_index: int, visual_index: int) -> str:
 
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
-        return f"Removed {vtype} visual (was index {visual_index}). {len(containers)} visuals remain."
+        return ToolResponse.ok(f"Removed {vtype} visual (was index {visual_index}). {len(containers)} visuals remain.").to_text()
 
     except Exception as e:
         return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
@@ -925,8 +926,8 @@ def pbix_get_layout_raw(alias: str) -> str:
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return "No layout found."
-        return json.dumps(layout, indent=2, ensure_ascii=False)
+            return ToolResponse.ok("No layout found.").to_text()
+        return ToolResponse.ok(json.dumps(layout, indent=2, ensure_ascii=False)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
 
@@ -947,7 +948,7 @@ def pbix_set_layout_raw(alias: str, layout_json: str) -> str:
             return ToolResponse.error(f"Invalid JSON: {e}", "LAYOUT_JSON_INVALID").to_text()
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
-        return "Layout updated."
+        return ToolResponse.ok("Layout updated.").to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
 
@@ -964,7 +965,7 @@ def pbix_get_filters(alias: str, page_index: int = -1) -> str:
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return "No layout found."
+            return ToolResponse.ok("No layout found.").to_text()
 
         if page_index == -1:
             # Report-level filters
@@ -984,7 +985,7 @@ def pbix_get_filters(alias: str, page_index: int = -1) -> str:
             filters = filters_raw
 
         level = f"page {page_index}" if page_index >= 0 else "report"
-        return f"Filters ({level}):\n{json.dumps(filters, indent=2, ensure_ascii=False)}"
+        return ToolResponse.ok(f"Filters ({level}):\n{json.dumps(filters, indent=2, ensure_ascii=False)}").to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
 
@@ -1002,7 +1003,7 @@ def pbix_set_filters(alias: str, filters_json: str, page_index: int = -1) -> str
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return "No layout found."
+            return ToolResponse.ok("No layout found.").to_text()
 
         # Validate JSON
         try:
@@ -1021,7 +1022,7 @@ def pbix_set_filters(alias: str, filters_json: str, page_index: int = -1) -> str
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
         level = f"page {page_index}" if page_index >= 0 else "report"
-        return f"Filters updated ({level})."
+        return ToolResponse.ok(f"Filters updated ({level}).").to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
 
@@ -1037,8 +1038,8 @@ def pbix_get_settings(alias: str) -> str:
         info = _ensure_open(alias)
         settings = _read_json_component(info["work_dir"], os.path.join("Report", "Settings"))
         if settings is None:
-            return "No Settings found."
-        return json.dumps(settings, indent=2, ensure_ascii=False)
+            return ToolResponse.ok("No Settings found.").to_text()
+        return ToolResponse.ok(json.dumps(settings, indent=2, ensure_ascii=False)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1059,7 +1060,7 @@ def pbix_set_settings(alias: str, settings_json: str) -> str:
             return ToolResponse.error(f"Invalid JSON: {e}", "LAYOUT_JSON_INVALID").to_text()
         _write_json_component(info["work_dir"], os.path.join("Report", "Settings"), settings)
         info["modified"] = True
-        return "Settings updated."
+        return ToolResponse.ok("Settings updated.").to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1075,7 +1076,7 @@ def pbix_get_bookmarks(alias: str) -> str:
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return "No layout found."
+            return ToolResponse.ok("No layout found.").to_text()
 
         config_str = layout.get("config", "{}")
         if isinstance(config_str, str):
@@ -1088,13 +1089,13 @@ def pbix_get_bookmarks(alias: str) -> str:
 
         bookmarks = config.get("bookmarks", [])
         if not bookmarks:
-            return "No bookmarks found."
+            return ToolResponse.ok("No bookmarks found.").to_text()
 
         lines = [f"Report has {len(bookmarks)} bookmark(s):\n"]
         for i, bm in enumerate(bookmarks):
             name = bm.get("displayName", bm.get("name", f"Bookmark {i}"))
             lines.append(f"  [{i}] {name}")
-        return "\n".join(lines)
+        return ToolResponse.ok("\n".join(lines)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
 
@@ -1119,7 +1120,7 @@ def pbix_get_metadata(alias: str) -> str:
                 total += size
                 lines.append(f"  {rel}: {size:,} bytes")
         lines.append(f"\nTotal: {total:,} bytes")
-        return "\n".join(lines)
+        return ToolResponse.ok("\n".join(lines)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1153,8 +1154,8 @@ def pbix_list_resources(alias: str) -> str:
                         lines.append(f"  {rel} ({size:,} bytes)")
                         found = True
         if not found:
-            return "No resources found."
-        return "\n".join(lines)
+            return ToolResponse.ok("No resources found.").to_text()
+        return ToolResponse.ok("\n".join(lines)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1171,7 +1172,7 @@ def pbix_get_theme(alias: str) -> str:
         work_dir = info["work_dir"]
         theme_dir = os.path.join(work_dir, "Report", "StaticResources", "SharedResources", "BaseThemes")
         if not os.path.isdir(theme_dir):
-            return "No theme directory found."
+            return ToolResponse.ok("No theme directory found.").to_text()
 
         themes = []
         for f in sorted(os.listdir(theme_dir)):
@@ -1181,8 +1182,8 @@ def pbix_get_theme(alias: str) -> str:
                     theme = json.load(fh)
                 themes.append(f"Theme file: {f}\n{json.dumps(theme, indent=2, ensure_ascii=False)}")
         if not themes:
-            return "No theme JSON files found."
-        return "\n\n".join(themes)
+            return ToolResponse.ok("No theme JSON files found.").to_text()
+        return ToolResponse.ok("\n\n".join(themes)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1211,7 +1212,7 @@ def pbix_set_theme(alias: str, theme_json: str, filename: str = "CY24SU11.json")
         with open(fp, "w", encoding="utf-8") as fh:
             json.dump(theme, fh, indent=2, ensure_ascii=False)
         info["modified"] = True
-        return f"Theme saved to {filename}"
+        return ToolResponse.ok(f"Theme saved to {filename}").to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1228,10 +1229,10 @@ def pbix_get_linguistic_schema(alias: str) -> str:
         work_dir = info["work_dir"]
         ls_path = os.path.join(work_dir, "Report", "LinguisticSchema")
         if not os.path.exists(ls_path):
-            return "No linguistic schema found."
+            return ToolResponse.ok("No linguistic schema found.").to_text()
         enc = _detect_encoding(ls_path)
         with open(ls_path, "r", encoding=enc) as f:
-            return f.read()
+            return ToolResponse.ok(f.read()).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1253,7 +1254,7 @@ def pbix_set_linguistic_schema(alias: str, schema_xml: str) -> str:
         with open(ls_path, "wb") as f:
             f.write(schema_xml.encode("utf-16-le"))
         info["modified"] = True
-        return "Linguistic schema updated."
+        return ToolResponse.ok("Linguistic schema updated.").to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1271,8 +1272,8 @@ def pbix_get_m_code(alias: str) -> str:
         info = _ensure_open(alias)
         m_code = _read_datamashup_m_code(info["work_dir"])
         if m_code is None:
-            return "No DataMashup found in this file."
-        return m_code
+            return ToolResponse.ok("No DataMashup found in this file.").to_text()
+        return ToolResponse.ok(m_code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1291,7 +1292,7 @@ def pbix_set_m_code(alias: str, m_code: str) -> str:
         if not ok:
             return ToolResponse.error("Failed to write M code. DataMashup may not exist or be corrupt.", "PBIX_MCP_ERROR").to_text()
         info["modified"] = True
-        return "M code updated in DataMashup."
+        return ToolResponse.ok("M code updated in DataMashup.").to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1310,7 +1311,7 @@ def pbix_get_model_schema(alias: str) -> str:
         from pbixray import PBIXRay
         model = PBIXRay(info["path"])
         schema = model.schema
-        return schema.to_string(max_rows=500, max_colwidth=80)
+        return ToolResponse.ok(schema.to_string(max_rows=500, max_colwidth=80)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -1328,8 +1329,8 @@ def pbix_get_model_measures(alias: str) -> str:
         model = PBIXRay(info["path"])
         measures = model.dax_measures
         if measures is None or (hasattr(measures, 'empty') and measures.empty):
-            return "No DAX measures found."
-        return measures.to_string(max_rows=200, max_colwidth=120)
+            return ToolResponse.ok("No DAX measures found.").to_text()
+        return ToolResponse.ok(measures.to_string(max_rows=200, max_colwidth=120)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -1347,8 +1348,8 @@ def pbix_get_model_relationships(alias: str) -> str:
         model = PBIXRay(info["path"])
         rels = model.relationships
         if rels is None or (hasattr(rels, 'empty') and rels.empty):
-            return "No relationships found."
-        return rels.to_string(max_rows=200, max_colwidth=80)
+            return ToolResponse.ok("No relationships found.").to_text()
+        return ToolResponse.ok(rels.to_string(max_rows=200, max_colwidth=80)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -1369,8 +1370,8 @@ def pbix_get_model_power_query(alias: str) -> str:
         model = PBIXRay(info["path"])
         pq = model.power_query
         if pq is None or (hasattr(pq, 'empty') and pq.empty):
-            return "No Power Query expressions found in model."
-        return pq.to_string(max_rows=200, max_colwidth=200)
+            return ToolResponse.ok("No Power Query expressions found in model.").to_text()
+        return ToolResponse.ok(pq.to_string(max_rows=200, max_colwidth=200)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -1388,8 +1389,8 @@ def pbix_get_model_columns(alias: str) -> str:
         model = PBIXRay(info["path"])
         cols = model.dax_columns
         if cols is None or (hasattr(cols, 'empty') and cols.empty):
-            return "No DAX columns found."
-        return cols.to_string(max_rows=200, max_colwidth=120)
+            return ToolResponse.ok("No DAX columns found.").to_text()
+        return ToolResponse.ok(cols.to_string(max_rows=200, max_colwidth=120)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -1409,8 +1410,8 @@ def pbix_get_table_data(alias: str, table_name: str, max_rows: int = 50) -> str:
         model = PBIXRay(info["path"])
         df = model.get_table(table_name)
         if df is None or (hasattr(df, 'empty') and df.empty):
-            return f"No data found in table '{table_name}'."
-        return df.head(max_rows).to_string(max_rows=max_rows, max_colwidth=60)
+            return ToolResponse.ok(f"No data found in table '{table_name}'.").to_text()
+        return ToolResponse.ok(df.head(max_rows).to_string(max_rows=max_rows, max_colwidth=60)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -1496,11 +1497,11 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
             f.write(new_dm)
 
         info["modified"] = True
-        return (
+        return ToolResponse.ok(
             f"Table '{table_name}' data written: {len(rows)} rows, {len(columns)} columns\n"
             f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes\n"
             f"  ABF: {len(abf):,} → {len(new_abf):,} bytes"
-        )
+        ).to_text()
     except json.JSONDecodeError as e:
         return ToolResponse.error(f"Invalid JSON: {e}", "ABF_REBUILD_FAILED").to_text()
     except Exception as e:
@@ -1586,11 +1587,11 @@ def pbix_update_table_rows(alias: str, table_name: str, rows_json: str) -> str:
 
         info["modified"] = True
         col_names = [c["name"] for c in columns]
-        return (
+        return ToolResponse.ok(
             f"Table '{table_name}' updated: {len(rows)} rows, {len(columns)} columns\n"
             f"  Columns: {', '.join(col_names)}\n"
             f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
-        )
+        ).to_text()
     except json.JSONDecodeError as e:
         return ToolResponse.error(f"Invalid JSON: {e}", "ABF_REBUILD_FAILED").to_text()
     except Exception as e:
@@ -1610,8 +1611,8 @@ def pbix_list_tables(alias: str) -> str:
         model = PBIXRay(info["path"])
         stats = model.statistics
         if stats is None or (hasattr(stats, 'empty') and stats.empty):
-            return "No tables found."
-        return stats.to_string(max_rows=100, max_colwidth=60)
+            return ToolResponse.ok("No tables found.").to_text()
+        return ToolResponse.ok(stats.to_string(max_rows=100, max_colwidth=60)).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -1703,7 +1704,7 @@ def pbix_datamodel_query_metadata(alias: str, sql_query: str) -> str:
             os.remove(tmp)
 
         if not rows:
-            return "Query returned no results."
+            return ToolResponse.ok("Query returned no results.").to_text()
 
         # Format output
         lines = [" | ".join(columns)]
@@ -1713,7 +1714,7 @@ def pbix_datamodel_query_metadata(alias: str, sql_query: str) -> str:
         result = "\n".join(lines)
         if len(rows) > 200:
             result += f"\n... ({len(rows)} total rows, showing first 200)"
-        return result
+        return ToolResponse.ok(result).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "METADATA_SQL_FAILED").to_text()
 
@@ -1744,11 +1745,11 @@ def pbix_datamodel_modify_metadata(alias: str, sql_statement: str) -> str:
 
         dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_sql)
         info["modified"] = True
-        return (
+        return ToolResponse.ok(
             f"SQL executed successfully.\n"
             f"  Changes: {changes[0]}\n"
             f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
-        )
+        ).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "METADATA_SQL_FAILED").to_text()
 
@@ -1797,12 +1798,12 @@ def pbix_datamodel_modify_measure(
 
         dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_modify)
         info["modified"] = True
-        return (
+        return ToolResponse.ok(
             f"Measure '{measure_name}' updated:\n"
             f"  Old: {old_info.get('expression', '?')}\n"
             f"  New: {new_expression}\n"
             f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
-        )
+        ).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "METADATA_SQL_FAILED").to_text()
 
@@ -1859,11 +1860,11 @@ def pbix_datamodel_add_measure(
 
         dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_add)
         info["modified"] = True
-        return (
+        return ToolResponse.ok(
             f"Measure '{measure_name}' added to table '{table_name}':\n"
             f"  Expression: {expression}\n"
             f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
-        )
+        ).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "METADATA_SQL_FAILED").to_text()
 
@@ -1906,11 +1907,11 @@ def pbix_datamodel_remove_measure(alias: str, measure_name: str) -> str:
 
         dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_remove)
         info["modified"] = True
-        return (
+        return ToolResponse.ok(
             f"Measure '{measure_name}' removed from table '{old_info.get('table', '?')}':\n"
             f"  Old expression: {old_info.get('expression', '?')}\n"
             f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
-        )
+        ).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "METADATA_SQL_FAILED").to_text()
 
@@ -1969,11 +1970,11 @@ def pbix_datamodel_modify_column(
 
         dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_modify)
         info["modified"] = True
-        return (
+        return ToolResponse.ok(
             f"Column '{table_name}'.'{column_name}' updated:\n"
             f"  {property_name} = {new_value}\n"
             f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
-        )
+        ).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "METADATA_SQL_FAILED").to_text()
 
@@ -2012,7 +2013,7 @@ def pbix_datamodel_decompress(alias: str) -> str:
         summary.append(f"\nABF contains {len(file_log)} files:")
         for entry in file_log:
             summary.append(f"  {entry['Path']} ({entry['Size']:,} bytes)")
-        return "\n".join(summary)
+        return ToolResponse.ok("\n".join(summary)).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -2070,14 +2071,14 @@ def pbix_datamodel_recompress(alias: str, abf_path: str = "") -> str:
             f.write(new_dm)
 
         info["modified"] = True
-        return (
+        return ToolResponse.ok(
             f"Recompressed ABF -> DataModel:\n"
             f"  ABF size:          {len(abf_bytes):>12,} bytes\n"
             f"  Old DataModel:     {orig_size:>12,} bytes\n"
             f"  New DataModel:     {len(new_dm):>12,} bytes\n"
             f"  XPress9 blocks:    {(len(abf_bytes) + 2097151) // 2097152}\n"
             f"  Saved to: {dm_path}"
-        )
+        ).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "ABF_REBUILD_FAILED").to_text()
 
@@ -2133,13 +2134,13 @@ def pbix_datamodel_replace_file(alias: str, internal_path: str, new_content_path
             f.write(new_dm)
 
         info["modified"] = True
-        return (
+        return ToolResponse.ok(
             f"Replaced '{fname}' in ABF (full rebuild):\n"
             f"  Old file size: {entry['Size']:,} bytes\n"
             f"  New file size: {len(new_content):,} bytes\n"
             f"  ABF: {len(abf):,} -> {len(new_abf):,} bytes\n"
             f"  DataModel recompressed: {len(dm_bytes):,} -> {len(new_dm):,} bytes"
-        )
+        ).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "ABF_REBUILD_FAILED").to_text()
 
@@ -2180,11 +2181,11 @@ def pbix_datamodel_extract_file(alias: str, internal_path: str, output_path: str
         with open(output_path, "wb") as f:
             f.write(content)
 
-        return (
+        return ToolResponse.ok(
             f"Extracted '{entry['Path']}' ({len(content):,} bytes)\n"
             f"  ABF path: {entry['Path']}\n"
             f"  Saved to: {output_path}"
-        )
+        ).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -2214,7 +2215,7 @@ def pbix_datamodel_list_abf_files(alias: str) -> str:
         lines = [f"ABF contains {len(files)} files ({len(abf):,} bytes decompressed):\n"]
         for entry in files:
             lines.append(f"  {entry['Path']} ({entry['Size']:,} bytes)")
-        return "\n".join(lines)
+        return ToolResponse.ok("\n".join(lines)).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -2361,11 +2362,11 @@ def pbix_evaluate_dax(
         ctx = _get_dax_context(alias)
         measure_names = [m.strip() for m in measures.split(',') if m.strip()]
 
-        if filter_context:
-            fc = json.loads(filter_context)
+        parsed_fc = FilterContext.from_json_str(filter_context)
+        if parsed_fc.filters:
+            fc = parsed_fc.filters
         else:
             # Auto-apply default slicer filters from the report layout
-            # so SELECTEDVALUE-based measures return actual values
             fc = ctx.get('default_filters') or None
 
         # Reset unsupported tracker before evaluation
@@ -2429,12 +2430,14 @@ def pbix_evaluate_dax_per_dimension(
 
         ctx = _get_dax_context(alias)
         measure_names = [m.strip() for m in measures.split(',') if m.strip()]
-        base_fc = json.loads(filter_context) if filter_context else {}
+        parsed_fc = FilterContext.from_json_str(filter_context)
+        base_fc = parsed_fc.filters
 
-        parts = dimension.split('.', 1)
-        if len(parts) != 2:
-            return ToolResponse.error("dimension must be 'TableName.ColumnName' format", "DAX_EVAL_FAILED").to_text()
-        dim_table, dim_col = parts
+        try:
+            dim_ref = DimensionRef.parse(dimension)
+        except ValueError as e:
+            return ToolResponse.error(str(e), "DAX_EVAL_FAILED").to_text()
+        dim_table, dim_col = dim_ref.table, dim_ref.column
 
         # Get unique dimension values
         tbl = ctx['tables'].get(dim_table)
@@ -2481,7 +2484,7 @@ def pbix_evaluate_dax_per_dimension(
                     row_str += f"  {str(v):>15s}"
             lines.append(row_str)
 
-        return "\n".join(lines)
+        return ToolResponse.ok("\n".join(lines)).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "DAX_EVAL_FAILED").to_text()
 
@@ -2731,7 +2734,7 @@ def pbix_get_visual_positions(alias: str, page_index: int = 0) -> str:
         info = _ensure_open(alias)
         layout = _get_layout(info["work_dir"])
         if not layout:
-            return "No layout found."
+            return ToolResponse.ok("No layout found.").to_text()
 
         sections = layout.get("sections", [])
         if page_index < 0 or page_index >= len(sections):
@@ -2766,7 +2769,7 @@ def pbix_get_visual_positions(alias: str, page_index: int = 0) -> str:
             else:
                 lines.append(f"  [{i}] {vtype:<30s} at ({x:.0f},{y:.0f}) {w:.0f}x{h:.0f}")
 
-        return "\n".join(lines)
+        return ToolResponse.ok("\n".join(lines)).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "LAYOUT_JSON_INVALID").to_text()
 
@@ -2783,13 +2786,320 @@ def pbix_clear_dax_cache(alias: str = "") -> str:
     global _dax_cache
     if alias:
         _dax_cache.pop(alias, None)
-        return f"DAX cache cleared for '{alias}'"
+        return ToolResponse.ok(f"DAX cache cleared for '{alias}'").to_text()
     else:
         _dax_cache.clear()
-        return "DAX cache cleared for all files"
+        return ToolResponse.ok("DAX cache cleared for all files").to_text()
 
 
-# ---- Section 10: Diagnostics ----
+# ---- Section 10: RLS (Row-Level Security) ----
+
+@mcp.tool()
+def pbix_get_rls_roles(alias: str) -> str:
+    """Get all Row-Level Security roles and their table filter expressions.
+
+    Returns role definitions and the DAX filter expressions that define
+    what data each role can see.
+
+    Args:
+        alias: The alias of the open file
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found", "DATAMODEL_DECOMPRESS_FAILED").to_text()
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        with open(dm_path, "rb") as f:
+            dm = f.read()
+        abf = decompress_datamodel(dm)
+        db_bytes = read_metadata_sqlite(abf)
+
+        import sqlite3
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(db_bytes)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            conn.row_factory = sqlite3.Row
+
+            roles = conn.execute("SELECT * FROM [Role]").fetchall()
+            if not roles:
+                return ToolResponse.ok("No RLS roles defined in this file.").to_text()
+
+            lines = [f"RLS Roles ({len(roles)}):\n"]
+            for role in roles:
+                role_id = role["ID"]
+                role_name = role["Name"] if "Name" in role.keys() else f"Role {role_id}"
+                lines.append(f"  Role: {role_name} (ID={role_id})")
+
+                # Get table permissions for this role
+                perms = conn.execute(
+                    "SELECT * FROM [TablePermission] WHERE RoleID = ?",
+                    (role_id,)
+                ).fetchall()
+                for perm in perms:
+                    table_id = perm["TableID"]
+                    filter_expr = perm.get("FilterExpression", perm.get("QueryExpression", ""))
+                    table_name = conn.execute(
+                        "SELECT Name FROM [Table] WHERE ID = ?", (table_id,)
+                    ).fetchone()
+                    tname = table_name["Name"] if table_name else f"Table {table_id}"
+                    lines.append(f"    {tname}: {filter_expr}")
+
+                # Get role members
+                members = conn.execute(
+                    "SELECT * FROM [RoleMembership] WHERE RoleID = ?",
+                    (role_id,)
+                ).fetchall()
+                if members:
+                    lines.append(f"    Members: {len(members)}")
+
+            conn.close()
+            return ToolResponse.ok("\n".join(lines)).to_text()
+        finally:
+            os.unlink(tmp.name)
+    except Exception as e:
+        return ToolResponse.error(str(e), "METADATA_SQL_FAILED").to_text()
+
+
+@mcp.tool()
+def pbix_set_rls_role(
+    alias: str,
+    role_name: str,
+    table_name: str,
+    filter_expression: str,
+    description: str = "",
+) -> str:
+    """Create or update a Row-Level Security role with a DAX filter expression.
+
+    The filter expression is a DAX boolean expression that determines which
+    rows are visible to the role. For example:
+      'dim-Geo'[Country] = "USA"
+      'Sales'[Amount] > 1000
+
+    Args:
+        alias: The alias of the open file
+        role_name: Name of the RLS role (e.g., "US Sales Only")
+        table_name: Table to apply the filter to
+        filter_expression: DAX filter expression (e.g., 'Sales'[Region] = "West")
+        description: Optional role description
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found", "DATAMODEL_DECOMPRESS_FAILED").to_text()
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite, rebuild_abf_with_replacement
+        from pbix_mcp.formats.datamodel_roundtrip import (
+            compress_datamodel,
+            decompress_datamodel,
+        )
+
+        with open(dm_path, "rb") as f:
+            dm = f.read()
+        abf = decompress_datamodel(dm)
+        db_bytes = read_metadata_sqlite(abf)
+
+        import sqlite3
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(db_bytes)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            conn.row_factory = sqlite3.Row
+
+            # Find or create role
+            role = conn.execute(
+                "SELECT ID FROM [Role] WHERE Name = ?", (role_name,)
+            ).fetchone()
+
+            if role:
+                role_id = role["ID"]
+            else:
+                # Create new role
+                max_id = conn.execute("SELECT MAX(ID) FROM [Role]").fetchone()[0] or 0
+                role_id = max_id + 1
+                conn.execute(
+                    "INSERT INTO [Role] (ID, ModelID, Name, Description) VALUES (?, 1, ?, ?)",
+                    (role_id, role_name, description),
+                )
+
+            # Find table ID
+            table_row = conn.execute(
+                "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
+                (table_name,)
+            ).fetchone()
+            if not table_row:
+                conn.close()
+                return ToolResponse.error(f"Table '{table_name}' not found", "METADATA_SQL_FAILED").to_text()
+            table_id = table_row["ID"]
+
+            # Upsert table permission
+            existing = conn.execute(
+                "SELECT ID FROM [TablePermission] WHERE RoleID = ? AND TableID = ?",
+                (role_id, table_id)
+            ).fetchone()
+
+            if existing:
+                conn.execute(
+                    "UPDATE [TablePermission] SET FilterExpression = ? WHERE ID = ?",
+                    (filter_expression, existing["ID"]),
+                )
+            else:
+                max_perm = conn.execute("SELECT MAX(ID) FROM [TablePermission]").fetchone()[0] or 0
+                conn.execute(
+                    "INSERT INTO [TablePermission] (ID, RoleID, TableID, FilterExpression) VALUES (?, ?, ?, ?)",
+                    (max_perm + 1, role_id, table_id, filter_expression),
+                )
+
+            conn.commit()
+
+            # Read back and rebuild ABF
+            with open(tmp.name, "rb") as f:
+                new_db = f.read()
+            conn.close()
+
+            # Validate: evaluate the filter expression
+            from pbix_mcp.dax import engine as dax_engine
+            eng = dax_engine.DAXEngine()
+            logger.info("RLS role '%s' set on '%s': %s", role_name, table_name, filter_expression)
+
+            new_abf = rebuild_abf_with_replacement(abf, {"metadata.sqlitedb": new_db})
+            new_dm = compress_datamodel(new_abf)
+            with open(dm_path, "wb") as f:
+                f.write(new_dm)
+            info["modified"] = True
+
+            return ToolResponse.ok(f"RLS role '{role_name}' set on '{table_name}' with filter: {filter_expression}").to_text()
+        finally:
+            os.unlink(tmp.name)
+    except Exception as e:
+        return ToolResponse.error(str(e), "METADATA_SQL_FAILED").to_text()
+
+
+@mcp.tool()
+def pbix_evaluate_rls(
+    alias: str,
+    role_name: str,
+    table_name: str,
+    max_rows: int = 10,
+) -> str:
+    """Evaluate an RLS role's filter and show which rows would be visible.
+
+    Uses the DAX engine to evaluate the role's filter expression against
+    actual table data.
+
+    Args:
+        alias: The alias of the open file
+        role_name: Name of the RLS role to evaluate
+        table_name: Table to check visibility for
+        max_rows: Maximum rows to show (default 10)
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found", "DATAMODEL_DECOMPRESS_FAILED").to_text()
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        with open(dm_path, "rb") as f:
+            dm = f.read()
+        abf = decompress_datamodel(dm)
+        db_bytes = read_metadata_sqlite(abf)
+
+        import sqlite3
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(db_bytes)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            conn.row_factory = sqlite3.Row
+
+            role = conn.execute("SELECT ID FROM [Role] WHERE Name = ?", (role_name,)).fetchone()
+            if not role:
+                conn.close()
+                return ToolResponse.error(f"Role '{role_name}' not found", "METADATA_SQL_FAILED").to_text()
+
+            table_row = conn.execute(
+                "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1", (table_name,)
+            ).fetchone()
+            if not table_row:
+                conn.close()
+                return ToolResponse.error(f"Table '{table_name}' not found", "METADATA_SQL_FAILED").to_text()
+
+            perm = conn.execute(
+                "SELECT FilterExpression FROM [TablePermission] WHERE RoleID = ? AND TableID = ?",
+                (role["ID"], table_row["ID"])
+            ).fetchone()
+            conn.close()
+
+            if not perm or not perm["FilterExpression"]:
+                return ToolResponse.ok(f"Role '{role_name}' has no filter on table '{table_name}' — all rows visible.").to_text()
+
+            filter_expr = perm["FilterExpression"]
+
+            # Load table data and evaluate filter
+            ctx = _get_dax_context(alias)
+            tbl = ctx['tables'].get(table_name)
+            if not tbl:
+                return ToolResponse.error(f"Table '{table_name}' has no data", "DAX_EVAL_FAILED").to_text()
+
+            from pbix_mcp.dax import engine as dax_engine
+            eng = dax_engine.DAXEngine()
+
+            total = len(tbl['rows'])
+            visible = 0
+            sample_rows = []
+
+            for row in tbl['rows']:
+                # Build row context
+                row_expr = filter_expr
+                for ci, cn in enumerate(tbl['columns']):
+                    val = row[ci]
+                    for pat in [f"'{table_name}'[{cn}]", f"{table_name}[{cn}]"]:
+                        if pat in row_expr:
+                            if isinstance(val, str):
+                                row_expr = row_expr.replace(pat, f'"{val}"')
+                            elif val is None:
+                                row_expr = row_expr.replace(pat, 'BLANK()')
+                            else:
+                                row_expr = row_expr.replace(pat, str(val))
+
+                eval_ctx = dax_engine.DAXContext(
+                    ctx['tables'], ctx['measure_defs'], None, None, None,
+                    ctx.get('relationships', [])
+                )
+                result = eng._eval_expr(row_expr, eval_ctx)
+                if result is True or result == 1:
+                    visible += 1
+                    if len(sample_rows) < max_rows:
+                        sample_rows.append({tbl['columns'][i]: row[i] for i in range(min(5, len(tbl['columns'])))})
+
+            lines = [
+                f"RLS evaluation for role '{role_name}' on '{table_name}':",
+                f"  Filter: {filter_expr}",
+                f"  Visible: {visible}/{total} rows ({visible/total*100:.1f}%)\n",
+            ]
+            if sample_rows:
+                lines.append(f"  Sample visible rows (first {len(sample_rows)}):")
+                for sr in sample_rows:
+                    lines.append(f"    {sr}")
+
+            return ToolResponse.ok("\n".join(lines)).to_text()
+        finally:
+            os.unlink(tmp.name)
+    except Exception as e:
+        return ToolResponse.error(str(e), "DAX_EVAL_FAILED").to_text()
+
+
+# ---- Section 11: Diagnostics ----
 
 @mcp.tool()
 def pbix_get_password(alias: str) -> str:
@@ -2871,9 +3181,9 @@ def pbix_get_password(alias: str) -> str:
                         results.append(f"  Candidate in measure '{name}': \"{candidate}\"")
 
         if not results:
-            return "No password tables or password-checking measures found in this file."
+            return ToolResponse.ok("No password tables or password-checking measures found in this file.").to_text()
 
-        return "Password analysis:\n" + "\n".join(results)
+        return ToolResponse.ok("Password analysis:\n" + "\n".join(results)).to_text()
 
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
@@ -3020,7 +3330,7 @@ def pbix_doctor(alias: str) -> str:
         return "None"
     _check("Default slicer filters", check_filters)
 
-    return "\n".join(checks)
+    return ToolResponse.ok("\n".join(checks)).to_text()
 
 
 # ---- Section 11: MCP main ----

@@ -42,19 +42,22 @@ class PBIXBuilder:
         self,
         name: str,
         columns: list[dict],
+        rows: list[dict] | None = None,
         hidden: bool = False,
     ) -> "PBIXBuilder":
-        """Add a table definition.
+        """Add a table definition with optional row data.
 
         Args:
             name: Table name
             columns: List of {"name": str, "data_type": str} dicts.
-                     data_type: "String", "Int64", "Double", "DateTime", "Boolean"
+                     data_type: "String", "Int64", "Double", "DateTime", "Decimal"
+            rows: Optional list of row dicts, e.g. [{"Amount": 100, "Product": "Widget"}]
             hidden: Whether the table is hidden (e.g., measure containers)
         """
         self._tables.append({
             "name": name,
             "columns": columns,
+            "rows": rows or [],
             "hidden": hidden,
         })
         return self
@@ -244,8 +247,23 @@ class PBIXBuilder:
         # 1. Build metadata
         sqlite_bytes = self._build_metadata_sqlite()
 
-        # 2. Build ABF
-        abf_bytes = build_abf_from_scratch({"metadata.sqlitedb": sqlite_bytes})
+        # 2. Build ABF with metadata + VertiPaq row data
+        abf_files = {"metadata.sqlitedb": sqlite_bytes}
+
+        # Encode row data for tables that have rows
+        for tdef in self._tables:
+            if tdef.get("rows"):
+                from pbix_mcp.formats.vertipaq_encoder import encode_table_data
+                encoded = encode_table_data(
+                    tdef["name"],
+                    0,  # partition index
+                    [{"name": c["name"], "data_type": c["data_type"], "nullable": True}
+                     for c in tdef["columns"]],
+                    tdef["rows"],
+                )
+                abf_files.update(encoded)
+
+        abf_bytes = build_abf_from_scratch(abf_files)
 
         # 3. Compress to DataModel
         datamodel_bytes = compress_datamodel(abf_bytes)
