@@ -36,6 +36,7 @@ from pbix_mcp.errors import (
     FileNotOpenError,
     InvalidPBIXError,
     LayoutParseError,
+    PBIXMCPError,
 )
 from pbix_mcp.logging_config import logger
 from pbix_mcp.models.requests import DimensionRef, FilterContext
@@ -368,10 +369,43 @@ def pbix_open(file_path: str, alias: str = "") -> str:
         logger.info("Opening %s as '%s'", file_path, alias)
         _extract_pbix(file_path, work_dir)
         logger.debug("Extracted to %s", work_dir)
+    except PBIXMCPError:
+        raise
     except Exception as e:
         logger.error("Failed to extract %s: %s", file_path, e)
         shutil.rmtree(work_dir, ignore_errors=True)
         return ToolResponse.error(f"Extracting: {str(e)}", "SESSION_ERROR").to_text()
+
+    # Detect DirectQuery / composite models by checking for connections in DataModel
+    dm_path = os.path.join(work_dir, "DataModel")
+    if os.path.exists(dm_path):
+        try:
+            from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+            from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+            dm_bytes = open(dm_path, "rb").read()
+            abf = decompress_datamodel(dm_bytes)
+            db_bytes = read_metadata_sqlite(abf)
+            import sqlite3
+            tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp_db.write(db_bytes)
+            tmp_db.close()
+            conn = sqlite3.connect(tmp_db.name)
+            # Check for DirectQuery partitions (Type=4 is M/Import, Type=6 is DirectQuery)
+            dq_partitions = conn.execute(
+                "SELECT COUNT(*) FROM [Partition] WHERE Type = 6"
+            ).fetchone()[0]
+            conn.close()
+            os.unlink(tmp_db.name)
+            if dq_partitions > 0:
+                shutil.rmtree(work_dir, ignore_errors=True)
+                return ToolResponse.error(
+                    f"This file uses DirectQuery ({dq_partitions} DirectQuery partition(s)). "
+                    "pbix-mcp only supports Import mode. DirectQuery, composite models, "
+                    "and live connections are not supported.",
+                    "FORMAT_UNSUPPORTED"
+                ).to_text()
+        except Exception:
+            pass  # If detection fails, continue — the file might still be usable
 
     _open_files[alias] = {
         "path": file_path,
@@ -396,7 +430,7 @@ def pbix_open(file_path: str, alias: str = "") -> str:
 
 
 @mcp.tool()
-def pbix_save(alias: str, output_path: str = "", overwrite: bool = True, backup: bool = True) -> str:
+def pbix_save(alias: str, output_path: str = "", overwrite: bool = False, backup: bool = True) -> str:
     """Save/repack the modified PBIX/PBIT file.
 
     Creates an automatic .bak backup before overwriting (unless backup=False).
@@ -405,7 +439,7 @@ def pbix_save(alias: str, output_path: str = "", overwrite: bool = True, backup:
     Args:
         alias: The alias of the open file
         output_path: Where to save. Empty = overwrite original.
-        overwrite: If False, refuse to overwrite an existing file (default True)
+        overwrite: If False (default), refuse to overwrite an existing file
         backup: If True (default), create a .bak backup before overwriting
     """
     try:
@@ -413,6 +447,7 @@ def pbix_save(alias: str, output_path: str = "", overwrite: bool = True, backup:
         work_dir = info["work_dir"]
         target = output_path or info["path"]
         target = os.path.abspath(target)
+        logger.info("Saving '%s' to %s (overwrite=%s, backup=%s)", alias, target, overwrite, backup)
 
         # Safety: refuse overwrite if explicitly disabled
         if not overwrite and os.path.exists(target) and target != info["path"]:
@@ -427,6 +462,8 @@ def pbix_save(alias: str, output_path: str = "", overwrite: bool = True, backup:
         info["modified"] = False
         size = os.path.getsize(target)
         return ToolResponse.ok(f"Saved '{alias}' to {target} ({size:,} bytes)").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "SESSION_ERROR").to_text()
 
@@ -452,8 +489,11 @@ def pbix_close(alias: str, force: bool = False) -> str:
             ).to_text()
 
         shutil.rmtree(work_dir, ignore_errors=True)
+        logger.info("Closed '%s'", alias)
         del _open_files[alias]
         return ToolResponse.ok(f"Closed '{alias}'.").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "SESSION_ERROR").to_text()
 
@@ -496,6 +536,8 @@ def pbix_get_pages(alias: str) -> str:
             hidden = " [HIDDEN]" if sec.get("config", "").find('"visibility":1') >= 0 else ""
             lines.append(f"  [{i}] {name} — {vis_count} visuals, {width}x{height}{hidden}")
         return ToolResponse.ok("\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
@@ -533,6 +575,8 @@ def pbix_get_page_visuals(alias: str, page_index: int = 0) -> str:
             h = vc.get("height", 0)
             lines.append(f"  [{i}] {vtype} (name={vname}) at ({x},{y}) size {w}x{h}")
         return ToolResponse.ok("\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
@@ -583,6 +627,8 @@ def pbix_get_visual_detail(alias: str, page_index: int, visual_index: int) -> st
                     result[key] = raw
 
         return ToolResponse.ok(json.dumps(result, indent=2, ensure_ascii=False)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
@@ -631,6 +677,8 @@ def pbix_set_visual_property(
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
         return ToolResponse.ok(f"Set {property_path} = {value} on page {page_index}, visual {visual_index}").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
@@ -671,6 +719,8 @@ def pbix_update_visual_json(
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
         return ToolResponse.ok(f"Updated visual config on page {page_index}, visual {visual_index}").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
@@ -709,6 +759,8 @@ def pbix_add_page(alias: str, display_name: str, width: int = 1280, height: int 
         info["modified"] = True
         idx = len(layout["sections"]) - 1
         return ToolResponse.ok(f"Added page '{display_name}' at index {idx} ({width}x{height})").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
@@ -736,6 +788,8 @@ def pbix_remove_page(alias: str, page_index: int) -> str:
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
         return ToolResponse.ok(f"Removed page '{name}' (was index {page_index}). {len(sections)} pages remain.").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
@@ -804,6 +858,8 @@ def pbix_create(
         result = pbix_open(abs_path, alias)
         return ToolResponse.ok(f"Created '{abs_path}' ({size:,} bytes) and opened it.\n{result}").to_text()
 
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -885,6 +941,8 @@ def pbix_add_visual(
         page_name = page.get("displayName", f"Page {page_index}")
         return ToolResponse.ok(f"Added {visual_type} visual at ({x},{y}) {width}x{height} on '{page_name}' (index {idx})").to_text()
 
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
@@ -920,6 +978,8 @@ def pbix_remove_visual(alias: str, page_index: int, visual_index: int) -> str:
         info["modified"] = True
         return ToolResponse.ok(f"Removed {vtype} visual (was index {visual_index}). {len(containers)} visuals remain.").to_text()
 
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
@@ -937,6 +997,8 @@ def pbix_get_layout_raw(alias: str) -> str:
         if not layout:
             return ToolResponse.error("No layout found", LayoutParseError.code).to_text()
         return ToolResponse.ok(json.dumps(layout, indent=2, ensure_ascii=False)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
@@ -958,6 +1020,8 @@ def pbix_set_layout_raw(alias: str, layout_json: str) -> str:
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
         return ToolResponse.ok("Layout updated.").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
@@ -995,6 +1059,8 @@ def pbix_get_filters(alias: str, page_index: int = -1) -> str:
 
         level = f"page {page_index}" if page_index >= 0 else "report"
         return ToolResponse.ok(f"Filters ({level}):\n{json.dumps(filters, indent=2, ensure_ascii=False)}").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
@@ -1032,6 +1098,8 @@ def pbix_set_filters(alias: str, filters_json: str, page_index: int = -1) -> str
         info["modified"] = True
         level = f"page {page_index}" if page_index >= 0 else "report"
         return ToolResponse.ok(f"Filters updated ({level}).").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
@@ -1049,6 +1117,8 @@ def pbix_get_settings(alias: str) -> str:
         if settings is None:
             return ToolResponse.ok("No Settings found.").to_text()
         return ToolResponse.ok(json.dumps(settings, indent=2, ensure_ascii=False)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1070,6 +1140,8 @@ def pbix_set_settings(alias: str, settings_json: str) -> str:
         _write_json_component(info["work_dir"], os.path.join("Report", "Settings"), settings)
         info["modified"] = True
         return ToolResponse.ok("Settings updated.").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1105,6 +1177,8 @@ def pbix_get_bookmarks(alias: str) -> str:
             name = bm.get("displayName", bm.get("name", f"Bookmark {i}"))
             lines.append(f"  [{i}] {name}")
         return ToolResponse.ok("\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), LayoutParseError.code).to_text()
 
@@ -1130,6 +1204,8 @@ def pbix_get_metadata(alias: str) -> str:
                 lines.append(f"  {rel}: {size:,} bytes")
         lines.append(f"\nTotal: {total:,} bytes")
         return ToolResponse.ok("\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1165,6 +1241,8 @@ def pbix_list_resources(alias: str) -> str:
         if not found:
             return ToolResponse.ok("No resources found.").to_text()
         return ToolResponse.ok("\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1193,6 +1271,8 @@ def pbix_get_theme(alias: str) -> str:
         if not themes:
             return ToolResponse.ok("No theme JSON files found.").to_text()
         return ToolResponse.ok("\n\n".join(themes)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1222,6 +1302,8 @@ def pbix_set_theme(alias: str, theme_json: str, filename: str = "CY24SU11.json")
             json.dump(theme, fh, indent=2, ensure_ascii=False)
         info["modified"] = True
         return ToolResponse.ok(f"Theme saved to {filename}").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1242,6 +1324,8 @@ def pbix_get_linguistic_schema(alias: str) -> str:
         enc = _detect_encoding(ls_path)
         with open(ls_path, "r", encoding=enc) as f:
             return ToolResponse.ok(f.read()).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1264,6 +1348,8 @@ def pbix_set_linguistic_schema(alias: str, schema_xml: str) -> str:
             f.write(schema_xml.encode("utf-16-le"))
         info["modified"] = True
         return ToolResponse.ok("Linguistic schema updated.").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1283,6 +1369,8 @@ def pbix_get_m_code(alias: str) -> str:
         if m_code is None:
             return ToolResponse.ok("No DataMashup found in this file.").to_text()
         return ToolResponse.ok(m_code).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1302,6 +1390,8 @@ def pbix_set_m_code(alias: str, m_code: str) -> str:
             return ToolResponse.error("Failed to write M code. DataMashup may not exist or be corrupt.", "PBIX_MCP_ERROR").to_text()
         info["modified"] = True
         return ToolResponse.ok("M code updated in DataMashup.").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -1321,6 +1411,8 @@ def pbix_get_model_schema(alias: str) -> str:
         model = PBIXRay(info["path"])
         schema = model.schema
         return ToolResponse.ok(schema.to_string(max_rows=500, max_colwidth=80)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -1340,6 +1432,8 @@ def pbix_get_model_measures(alias: str) -> str:
         if measures is None or (hasattr(measures, 'empty') and measures.empty):
             return ToolResponse.ok("No DAX measures found.").to_text()
         return ToolResponse.ok(measures.to_string(max_rows=200, max_colwidth=120)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -1359,6 +1453,8 @@ def pbix_get_model_relationships(alias: str) -> str:
         if rels is None or (hasattr(rels, 'empty') and rels.empty):
             return ToolResponse.ok("No relationships found.").to_text()
         return ToolResponse.ok(rels.to_string(max_rows=200, max_colwidth=80)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -1381,6 +1477,8 @@ def pbix_get_model_power_query(alias: str) -> str:
         if pq is None or (hasattr(pq, 'empty') and pq.empty):
             return ToolResponse.ok("No Power Query expressions found in model.").to_text()
         return ToolResponse.ok(pq.to_string(max_rows=200, max_colwidth=200)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -1400,6 +1498,8 @@ def pbix_get_model_columns(alias: str) -> str:
         if cols is None or (hasattr(cols, 'empty') and cols.empty):
             return ToolResponse.ok("No DAX columns found.").to_text()
         return ToolResponse.ok(cols.to_string(max_rows=200, max_colwidth=120)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -1421,6 +1521,8 @@ def pbix_get_table_data(alias: str, table_name: str, max_rows: int = 50) -> str:
         if df is None or (hasattr(df, 'empty') and df.empty):
             return ToolResponse.ok(f"No data found in table '{table_name}'.").to_text()
         return ToolResponse.ok(df.head(max_rows).to_string(max_rows=max_rows, max_colwidth=60)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -1513,6 +1615,8 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
         ).to_text()
     except json.JSONDecodeError as e:
         return ToolResponse.error(f"Invalid JSON: {e}", "ABF_REBUILD_FAILED").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "ABF_REBUILD_FAILED").to_text()
 
@@ -1603,6 +1707,8 @@ def pbix_update_table_rows(alias: str, table_name: str, rows_json: str) -> str:
         ).to_text()
     except json.JSONDecodeError as e:
         return ToolResponse.error(f"Invalid JSON: {e}", "ABF_REBUILD_FAILED").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "ABF_REBUILD_FAILED").to_text()
 
@@ -1622,6 +1728,8 @@ def pbix_list_tables(alias: str) -> str:
         if stats is None or (hasattr(stats, 'empty') and stats.empty):
             return ToolResponse.ok("No tables found.").to_text()
         return ToolResponse.ok(stats.to_string(max_rows=100, max_colwidth=60)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -1724,6 +1832,8 @@ def pbix_datamodel_query_metadata(alias: str, sql_query: str) -> str:
         if len(rows) > 200:
             result += f"\n... ({len(rows)} total rows, showing first 200)"
         return ToolResponse.ok(result).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "METADATA_SQL_FAILED").to_text()
 
@@ -1759,6 +1869,8 @@ def pbix_datamodel_modify_metadata(alias: str, sql_statement: str) -> str:
             f"  Changes: {changes[0]}\n"
             f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
         ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "METADATA_SQL_FAILED").to_text()
 
@@ -1813,6 +1925,8 @@ def pbix_datamodel_modify_measure(
             f"  New: {new_expression}\n"
             f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
         ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "METADATA_SQL_FAILED").to_text()
 
@@ -1874,6 +1988,8 @@ def pbix_datamodel_add_measure(
             f"  Expression: {expression}\n"
             f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
         ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "METADATA_SQL_FAILED").to_text()
 
@@ -1921,6 +2037,8 @@ def pbix_datamodel_remove_measure(alias: str, measure_name: str) -> str:
             f"  Old expression: {old_info.get('expression', '?')}\n"
             f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
         ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "METADATA_SQL_FAILED").to_text()
 
@@ -1984,6 +2102,8 @@ def pbix_datamodel_modify_column(
             f"  {property_name} = {new_value}\n"
             f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
         ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "METADATA_SQL_FAILED").to_text()
 
@@ -2011,7 +2131,9 @@ def pbix_datamodel_decompress(alias: str) -> str:
         with open(dm_path, "rb") as f:
             dm_bytes = f.read()
 
+        logger.info("Decompressing DataModel (%d bytes) for '%s'", len(dm_bytes), alias)
         abf = decompress_datamodel(dm_bytes)
+        logger.debug("Decompressed to %d bytes ABF", len(abf))
         abf_path = dm_path + ".abf"
         with open(abf_path, "wb") as f:
             f.write(abf)
@@ -2023,6 +2145,8 @@ def pbix_datamodel_decompress(alias: str) -> str:
         for entry in file_log:
             summary.append(f"  {entry['Path']} ({entry['Size']:,} bytes)")
         return ToolResponse.ok("\n".join(summary)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -2064,6 +2188,8 @@ def pbix_datamodel_recompress(alias: str, abf_path: str = "") -> str:
         with open(abf_path, "rb") as f:
             abf_bytes = f.read()
 
+        logger.info("Recompressing ABF (%d bytes) for '%s'", len(abf_bytes), alias)
+
         # Validate ABF starts with BOM
         if not abf_bytes[:2] == b"\xff\xfe":
             return ToolResponse.error(
@@ -2088,6 +2214,8 @@ def pbix_datamodel_recompress(alias: str, abf_path: str = "") -> str:
             f"  XPress9 blocks:    {(len(abf_bytes) + 2097151) // 2097152}\n"
             f"  Saved to: {dm_path}"
         ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "ABF_REBUILD_FAILED").to_text()
 
@@ -2150,6 +2278,8 @@ def pbix_datamodel_replace_file(alias: str, internal_path: str, new_content_path
             f"  ABF: {len(abf):,} -> {len(new_abf):,} bytes\n"
             f"  DataModel recompressed: {len(dm_bytes):,} -> {len(new_dm):,} bytes"
         ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "ABF_REBUILD_FAILED").to_text()
 
@@ -2195,6 +2325,8 @@ def pbix_datamodel_extract_file(alias: str, internal_path: str, output_path: str
             f"  ABF path: {entry['Path']}\n"
             f"  Saved to: {output_path}"
         ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -2225,6 +2357,8 @@ def pbix_datamodel_list_abf_files(alias: str) -> str:
         for entry in files:
             lines.append(f"  {entry['Path']} ({entry['Size']:,} bytes)")
         return ToolResponse.ok("\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "DATAMODEL_DECOMPRESS_FAILED").to_text()
 
@@ -2290,6 +2424,13 @@ def _get_dax_context(alias: str) -> dict:
         tables = load_calculated_tables(info["path"], tables, relationships)
     except Exception:
         pass  # If calculated table loading fails, continue without them
+
+    # Performance warning for large tables
+    _LARGE_TABLE_THRESHOLD = 100_000
+    for tname, tdata in tables.items():
+        row_count = len(tdata.get('rows', []))
+        if row_count > _LARGE_TABLE_THRESHOLD:
+            logger.warning("Table '%s' has %d rows — DAX evaluation may be slow", tname, row_count)
 
     # Detect date table — try multiple heuristics
     date_table = None
@@ -2389,15 +2530,21 @@ def pbix_evaluate_dax(
         )
 
         # Build structured response with DAXResult objects
+        unsupported = set(dax_engine._engine.unsupported_functions)
         dax_results = []
         for name, val in results.items():
             if val is not None:
                 dax_results.append(DAXResult(name=name, value=val, status="ok"))
+            elif unsupported:
+                # Value is None and unsupported functions were hit — mark as unsupported
+                dax_results.append(DAXResult(
+                    name=name, value=None, status="unsupported",
+                    error_message=f"Uses unsupported function(s): {', '.join(sorted(unsupported))}",
+                ))
             else:
                 dax_results.append(DAXResult(name=name, value=None, status="blank"))
 
         warnings = []
-        unsupported = dax_engine._engine.unsupported_functions
         if unsupported:
             warnings.append(f"{len(unsupported)} unsupported DAX function(s): {', '.join(sorted(unsupported))}")
 
@@ -2410,6 +2557,8 @@ def pbix_evaluate_dax(
                       sum(1 for r in dax_results if r.status == "ok"),
                       sum(1 for r in dax_results if r.status == "blank"))
         return response.to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "DAX_EVAL_FAILED").to_text()
 
@@ -2494,6 +2643,8 @@ def pbix_evaluate_dax_per_dimension(
             lines.append(row_str)
 
         return ToolResponse.ok("\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "DAX_EVAL_FAILED").to_text()
 
@@ -2724,6 +2875,8 @@ def pbix_get_default_filters(alias: str, page_index: int = 0) -> str:
         lines.append("\nUse as filter_context in pbix_evaluate_dax:")
         lines.append(f"  {json.dumps(filters)}")
         return "\n".join(lines)
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", LayoutParseError.code).to_text()
 
@@ -2779,6 +2932,8 @@ def pbix_get_visual_positions(alias: str, page_index: int = 0) -> str:
                 lines.append(f"  [{i}] {vtype:<30s} at ({x:.0f},{y:.0f}) {w:.0f}x{h:.0f}")
 
         return ToolResponse.ok("\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", LayoutParseError.code).to_text()
 
@@ -2869,6 +3024,8 @@ def pbix_evaluate_calculated_columns(alias: str) -> str:
                 lines.append(f"  ⚠ {tname}[{cname}] = {expr}... (not evaluated)")
 
         return ToolResponse.ok("\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DAX_EVAL_FAILED").to_text()
 
@@ -2943,6 +3100,8 @@ def pbix_get_rls_roles(alias: str) -> str:
             return ToolResponse.ok("\n".join(lines)).to_text()
         finally:
             os.unlink(tmp.name)
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "METADATA_SQL_FAILED").to_text()
 
@@ -3059,6 +3218,8 @@ def pbix_set_rls_role(
             return ToolResponse.ok(f"RLS role '{role_name}' set on '{table_name}' with filter: {filter_expression}").to_text()
         finally:
             os.unlink(tmp.name)
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "METADATA_SQL_FAILED").to_text()
 
@@ -3176,6 +3337,8 @@ def pbix_evaluate_rls(
             return ToolResponse.ok("\n".join(lines)).to_text()
         finally:
             os.unlink(tmp.name)
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "DAX_EVAL_FAILED").to_text()
 
@@ -3266,6 +3429,8 @@ def pbix_get_password(alias: str) -> str:
 
         return ToolResponse.ok("Password analysis:\n" + "\n".join(results)).to_text()
 
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
 
@@ -3294,6 +3459,8 @@ def pbix_doctor(alias: str) -> str:
 
     try:
         info = _ensure_open(alias)
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "SESSION_ERROR").to_text()
 

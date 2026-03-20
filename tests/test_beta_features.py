@@ -10,6 +10,8 @@ import pytest
 
 from pbix_mcp.dax.engine import DAXContext, DAXEngine
 
+pytestmark = [pytest.mark.unit]
+
 # ===========================================================================
 # RLS — Row-Level Security evaluation
 # ===========================================================================

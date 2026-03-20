@@ -70,14 +70,11 @@ pbix-mcp-server --log-level debug
 
 ## Known Limitations
 
-- **DAX engine is best-effort, not a strict runtime** — it returns `None` for unsupported functions, uses heuristics for date-table detection, and returns 0 for circular references. It is designed for practical evaluation, not semantic parity with the Analysis Services engine.
+- **DAX engine is best-effort** — designed for practical evaluation, not semantic parity with Analysis Services. Unsupported functions return `None` with status `"unsupported"` in the response. See [docs/supported-dax.md](docs/supported-dax.md) for full details.
 - **PBIR format** is read-only for filter extraction; layout write requires legacy format
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
-- **VertiPaq write** encodes String, Int64, Double, DateTime, Decimal; Boolean type not yet supported
-- **Created PBIX files** contain valid VertiPaq data but Power BI Desktop may need a refresh to fully index the data
-- **Performance** degrades on large tables (millions of rows) — the DAX engine operates on in-memory Python data
-- **Import mode only** — DirectQuery, composite models, and live connections are not supported
-- **Builder `[Content_Types].xml`** is minimal; Power BI Desktop regenerates it on first open
+- **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
+- **Import mode only** — DirectQuery files are detected on open and rejected with a clear error
 
 ## Tools (60)
 

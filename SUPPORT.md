@@ -35,7 +35,7 @@
 ### Known Limitations
 - DAX engine is best-effort, not a strict runtime (returns None for unsupported functions, 0 for circular refs)
 - PBIR format is read-only for filter extraction (no layout write)
-- VertiPaq Boolean column type not yet supported
+- VertiPaq write supports String, Int64, Double, DateTime, Decimal, Boolean
 - Performance degrades on large tables (millions of rows) — in-memory Python
 - Import mode only — DirectQuery, composite models, live connections not supported
 - Created PBIX files may need a refresh in Power BI Desktop to fully index data

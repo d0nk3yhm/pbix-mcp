@@ -27,9 +27,9 @@ jobs:
       - name: Lint with ruff
         run: ruff check src/ tests/
 
-      - name: Type check with mypy
+      - name: Type check with mypy (non-blocking, ~239 errors)
         run: mypy src/pbix_mcp/ --ignore-missing-imports --no-error-summary || true
-        # mypy runs but does not block CI yet — errors are tracked for gradual cleanup
+        # 239 errors as of v0.1.0 — tracked for gradual cleanup. Will block CI at v0.2.0.
 
       - name: Run unit tests with coverage
         # Coverage threshold: server.py is an MCP server (7% from unit tests alone),
