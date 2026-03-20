@@ -91,13 +91,13 @@ class TestBlankHandling:
         c = ctx(tables, rels, {'M': 'BLANK() + 5'})
         # BLANK() + 5 should be 5 (BLANK acts as 0 in arithmetic)
         result = engine.evaluate_measure('M', c)
-        assert result == 5 or result is None  # Our engine may return None
+        assert result == 5  # BLANK + 5 = 5 (BLANK is 0 in arithmetic)
 
     def test_blank_in_divide(self, engine, tables, rels):
         """DIVIDE with BLANK numerator returns BLANK/0."""
         c = ctx(tables, rels, {'M': 'DIVIDE(BLANK(), 10)'})
         result = engine.evaluate_measure('M', c)
-        assert result == 0 or result is None
+        assert result == 0  # DIVIDE(BLANK, 10) = DIVIDE(0, 10) = 0
 
     def test_if_blank_check(self, engine, tables, rels):
         """IF(ISBLANK(x), ...) pattern."""
@@ -391,7 +391,7 @@ class TestTopN:
         })
         result = engine.evaluate_measure('M', c)
         # Should return 3 (top 3 products)
-        assert result == 3 or result is not None
+        assert result == 3  # TOPN(3, ...) should return exactly 3 rows
 
 
 # ===========================================================================

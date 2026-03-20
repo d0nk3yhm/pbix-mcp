@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml)
 
-An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files. Exposes 55 tools covering report creation, layout editing, visual management, DAX measures, VertiPaq data, and binary format internals.
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files. Exposes 56 tools covering report creation, layout editing, visual management, DAX evaluation, password extraction, VertiPaq data, and binary format internals.
 
 ## Quick Start
 
@@ -51,28 +51,25 @@ pbix-mcp-server
 | Visual add/remove | **Stable** | Cards, charts, shapes/buttons, images, textboxes, slicers |
 | Visual property editing | **Stable** | Dot-path and full JSON |
 | DAX measure CRUD | **Stable** | Add, modify, remove via metadata SQL |
-| DAX evaluation (154 functions) | **Stable** | 99% non-BLANK across 204 measures from 4 dashboards |
+| DAX evaluation (154 functions) | **Stable** | 99.5% non-BLANK across 204 measures from 4 dashboards |
+| Password extraction | **Stable** | Extracts embedded passwords from password-gated dashboards |
 | Metadata SQL read/write | **Stable** | Full SQLite access to tables, columns, relationships |
 | Default slicer filter extraction | **Stable** | Legacy Layout JSON and PBIR format |
 | Table data read (PBIXRay) | **Stable** | All materialized VertiPaq tables |
 | Calculated table evaluation | **Stable** | DATATABLE, GENERATESERIES, CALENDAR, field parameters |
 | XPress9 decompress/recompress | **Stable** | Byte-exact round-trip verified |
 | ABF archive manipulation | **Stable** | List, extract, replace internal files |
-| VertiPaq table data write | **Experimental** | Works for String/Int64/Double; limited type coverage |
-| DataMashup (M code) editing | **Experimental** | Read/write Power Query expressions |
+| VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal column types |
+| DataMashup (M code) editing | **Stable** | Read/write Power Query expressions |
 | File save/repack | **Stable** | Auto-backup on overwrite, SecurityBindings auto-removed |
 | Diagnostic tool (`pbix_doctor`) | **Stable** | 8-point health check |
 
 ## Known Limitations
 
-- **Calculated columns** are not evaluated (only calculated tables)
-- **Row-level security** expressions are not evaluated
-- **DAX evaluation** may return approximate results for complex edge cases (RANKX in nested contexts, etc.)
-- **VertiPaq write** does not support all column encoding types (DateTime, Decimal are limited)
 - **PBIR format** is read-only for filter extraction; layout write requires legacy format
-- **2 out of 204 tested measures** return BLANK by design (one needs per-row RANKX context from a visual, one is a password gate)
+- **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 
-## Tools (55)
+## Tools (56)
 
 ### Create & File Management (5)
 `pbix_create` — **Create a new PBIX from scratch** (tables, measures, relationships → valid DataModel)
@@ -98,8 +95,8 @@ pbix-mcp-server
 ### DataMashup (2)
 `pbix_get_m_code` · `pbix_set_m_code`
 
-### Diagnostics (2)
-`pbix_doctor` · `pbix_get_metadata`
+### Diagnostics & Security (3)
+`pbix_doctor` · `pbix_get_metadata` · `pbix_get_password` — **Extract embedded passwords from protected dashboards**
 
 ## Creating Reports from Scratch
 
@@ -216,7 +213,7 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (55 tools)
+  server.py              # MCP server (56 tools)
   cli.py                 # Entry point (pbix-mcp-server)
   builder.py             # PBIX file builder (create from scratch)
   errors.py              # Typed exceptions with stable error codes

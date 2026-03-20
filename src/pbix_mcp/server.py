@@ -31,7 +31,11 @@ from typing import Any, Callable, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from pbix_mcp.models.responses import ToolResponse
+from pbix_mcp.errors import (
+    FileNotOpenError,
+)
+from pbix_mcp.logging_config import logger
+from pbix_mcp.models.responses import DAXEvalResponse, DAXResult, ToolResponse
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -57,7 +61,7 @@ _open_files: dict[str, dict] = {}
 
 def _ensure_open(alias: str) -> dict:
     if alias not in _open_files:
-        raise ValueError(
+        raise FileNotOpenError(
             f"No file open with alias '{alias}'. "
             f"Open files: {list(_open_files.keys()) or '(none)'}"
         )
@@ -351,8 +355,11 @@ def pbix_open(file_path: str, alias: str = "") -> str:
     os.makedirs(work_dir, exist_ok=True)
 
     try:
+        logger.info("Opening %s as '%s'", file_path, alias)
         _extract_pbix(file_path, work_dir)
+        logger.debug("Extracted to %s", work_dir)
     except Exception as e:
+        logger.error("Failed to extract %s: %s", file_path, e)
         shutil.rmtree(work_dir, ignore_errors=True)
         return ToolResponse.error(f"Extracting: {str(e)}", "SESSION_ERROR").to_text()
 
@@ -2363,6 +2370,7 @@ def pbix_evaluate_dax(
 
         # Reset unsupported tracker before evaluation
         dax_engine._engine.unsupported_functions.clear()
+        logger.info("Evaluating %d measures for '%s'", len(measure_names), alias)
 
         results = dax_engine.evaluate_measures_smart(
             measure_names, ctx['tables'], ctx['measure_defs'],
@@ -2370,28 +2378,28 @@ def pbix_evaluate_dax(
             ctx.get('relationships')
         )
 
-        lines = [f"DAX Evaluation Results ({len(results)} measures):\n"]
+        # Build structured response with DAXResult objects
+        dax_results = []
         for name, val in results.items():
-            if isinstance(val, float):
-                if abs(val) < 2 and abs(val) > 0.001:
-                    lines.append(f"  {name}: {val:.1%}")
-                elif abs(val) >= 1000:
-                    lines.append(f"  {name}: ${val:,.2f}")
-                else:
-                    lines.append(f"  {name}: {val:.4f}")
-            elif isinstance(val, int):
-                lines.append(f"  {name}: {val:,}")
-            elif val is None:
-                lines.append(f"  {name}: (blank)")
+            if val is not None:
+                dax_results.append(DAXResult(name=name, value=val, status="ok"))
             else:
-                lines.append(f"  {name}: {val}")
+                dax_results.append(DAXResult(name=name, value=None, status="blank"))
 
-        # Report unsupported functions as warnings
+        warnings = []
         unsupported = dax_engine._engine.unsupported_functions
         if unsupported:
-            lines.append(f"\nWarning: {len(unsupported)} unsupported DAX function(s) encountered: {', '.join(sorted(unsupported))}")
+            warnings.append(f"{len(unsupported)} unsupported DAX function(s): {', '.join(sorted(unsupported))}")
 
-        return "\n".join(lines)
+        response = DAXEvalResponse(
+            success=True,
+            results=dax_results,
+            warnings=warnings,
+        )
+        logger.debug("DAX eval complete: %d ok, %d blank",
+                      sum(1 for r in dax_results if r.status == "ok"),
+                      sum(1 for r in dax_results if r.status == "blank"))
+        return response.to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "DAX_EVAL_FAILED").to_text()
 

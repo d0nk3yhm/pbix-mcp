@@ -622,31 +622,14 @@ class DAXEngine:
                 return True
             return False
 
-        # Function call: FUNC(args)
-        func_match = re.match(r'([A-Za-z_]\w*)\s*\(', expr)
-        if func_match:
-            func_name = func_match.group(1).upper()
-            # Find matching closing paren
-            args_str = self._extract_args(expr[func_match.end()-1:])
-            if args_str is not None:
-                args_text = args_str[1:-1]  # Strip parens
-                fn = self._func_map.get(func_name)
-                if fn:
-                    return fn(args_text, ctx)
-                # Unknown/unsupported function — track and log
-                self.unsupported_functions.add(func_name)
-                import logging
-                logging.getLogger("pbix_mcp.dax").debug(
-                    "Unsupported DAX function: %s", func_name
-                )
-                return None
-
-        # Binary operations: +, -, *, /
+        # Binary operations: +, -, *, / — check BEFORE function calls
+        # so that FUNC() + expr is parsed as binary, not just FUNC()
         result = self._eval_binary(expr, ctx, var_scope)
         if result is not None:
             return result
 
         # Comparison: <, >, <=, >=, =, <>
+        # (also before function calls for same reason)
         result = self._eval_comparison(expr, ctx, var_scope)
         if result is not None:
             return result
@@ -657,6 +640,24 @@ class DAXEngine:
             if len(parts) > 1:
                 results = [str(self._eval_expr(p.strip(), ctx, var_scope) or '') for p in parts]
                 return ''.join(results)
+
+        # Function call: FUNC(args) — after binary/comparison so FUNC() + expr works
+        func_match = re.match(r'([A-Za-z_]\w*)\s*\(', expr)
+        if func_match:
+            func_name = func_match.group(1).upper()
+            args_str = self._extract_args(expr[func_match.end()-1:])
+            if args_str is not None:
+                args_text = args_str[1:-1]
+                fn = self._func_map.get(func_name)
+                if fn:
+                    return fn(args_text, ctx)
+                # Unknown/unsupported function — track and log
+                self.unsupported_functions.add(func_name)
+                import logging
+                logging.getLogger("pbix_mcp.dax").debug(
+                    "Unsupported DAX function: %s", func_name
+                )
+                return None
 
         return None
 
@@ -816,13 +817,17 @@ class DAXEngine:
         return result
 
     def _eval_binary(self, expr: str, ctx: DAXContext, var_scope: dict = None) -> Any:
-        """Evaluate binary arithmetic: +, -, *, /"""
+        """Evaluate binary arithmetic: +, -, *, /
+        In DAX, BLANK is treated as 0 in arithmetic operations."""
         # Split at lowest precedence first (+ and -)
         for op in ['+', '-']:
             parts = self._split_top_level(expr, f' {op} ')
             if len(parts) > 1:
                 left = self._eval_expr(parts[0].strip(), ctx, var_scope)
                 right = self._eval_expr((' ' + op + ' ').join(parts[1:]).strip(), ctx, var_scope)
+                # DAX: BLANK treated as 0 in arithmetic
+                if left is None: left = 0
+                if right is None: right = 0
                 if isinstance(left, (int, float)) and isinstance(right, (int, float)):
                     return left + right if op == '+' else left - right
                 return None
@@ -833,6 +838,9 @@ class DAXEngine:
             if len(parts) > 1:
                 left = self._eval_expr(parts[0].strip(), ctx, var_scope)
                 right = self._eval_expr((' ' + op + ' ').join(parts[1:]).strip(), ctx, var_scope)
+                # DAX: BLANK treated as 0 in arithmetic
+                if left is None: left = 0
+                if right is None: right = 0
                 if isinstance(left, (int, float)) and isinstance(right, (int, float)):
                     if op == '*':
                         return left * right
@@ -888,6 +896,11 @@ class DAXEngine:
         return 0
 
     def _fn_countrows(self, args_str: str, ctx: DAXContext) -> Any:
+        # Try evaluating as an expression first (handles TOPN, FILTER, etc.)
+        result = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(result, list):
+            return len(result)
+        # Fall back to table name lookup
         table_name = args_str.strip().strip("'")
         rows = ctx.get_filtered_rows(table_name)
         return len(rows)
