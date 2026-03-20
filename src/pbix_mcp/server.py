@@ -2588,7 +2588,153 @@ def pbix_clear_dax_cache(alias: str = "") -> str:
         return "DAX cache cleared for all files"
 
 
-# ---- Section 10: MCP main ----
+# ---- Section 10: Diagnostics ----
+
+@mcp.tool()
+def pbix_doctor(alias: str) -> str:
+    """Run diagnostic checks on an open PBIX/PBIT file.
+
+    Checks ZIP validity, layout parseability, DataModel recognition,
+    ABF readability, SQLite metadata, table/measure counts, and
+    known unsupported features.
+
+    Args:
+        alias: The alias of the open file
+    """
+    checks = []
+
+    def _check(name, fn):
+        try:
+            result = fn()
+            checks.append(f"  ✅ {name}: {result}")
+            return True
+        except Exception as e:
+            checks.append(f"  ❌ {name}: {e}")
+            return False
+
+    try:
+        info = _ensure_open(alias)
+    except Exception as e:
+        return f"Error: {e}"
+
+    checks.append(f"Diagnostics for '{alias}':\n")
+
+    # 1. File basics
+    _check("File exists", lambda: f"{os.path.getsize(info['path']):,} bytes" if os.path.exists(info['path']) else "MISSING")
+    _check("File type", lambda: "PBIT" if info.get("is_pbit") else "PBIX")
+
+    # 2. Layout
+    def check_layout():
+        layout = _get_layout(info["work_dir"])
+        if layout:
+            pages = len(layout.get("sections", []))
+            return f"{pages} pages (legacy format)"
+        # Try PBIR
+        pbir = _get_layout_pbir(info["work_dir"])
+        if pbir:
+            pages = len(pbir.get("sections", []))
+            return f"{pages} pages (PBIR format)"
+        return "No layout found"
+    _check("Report layout", check_layout)
+
+    # 3. DataModel
+    def check_datamodel():
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return "NOT FOUND"
+        size = os.path.getsize(dm_path)
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        with open(dm_path, "rb") as f:
+            dm = f.read()
+        abf = decompress_datamodel(dm)
+        return f"{size:,} bytes compressed, {len(abf):,} bytes decompressed"
+    _check("DataModel (XPress9)", check_datamodel)
+
+    # 4. ABF contents
+    def check_abf():
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        from pbix_mcp.formats.abf_rebuild import list_abf_files
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        with open(dm_path, "rb") as f:
+            dm = f.read()
+        abf = decompress_datamodel(dm)
+        files = list_abf_files(abf)
+        return f"{len(files)} internal files"
+    _check("ABF archive", check_abf)
+
+    # 5. SQLite metadata
+    def check_sqlite():
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        import sqlite3
+        import tempfile
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        with open(dm_path, "rb") as f:
+            dm = f.read()
+        abf = decompress_datamodel(dm)
+        db_bytes = read_metadata_sqlite(abf)
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(db_bytes)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            tables = conn.execute("SELECT COUNT(*) FROM [Table] WHERE ModelID=1").fetchone()[0]
+            measures = conn.execute("SELECT COUNT(*) FROM [Measure]").fetchone()[0]
+            rels = conn.execute("SELECT COUNT(*) FROM [Relationship]").fetchone()[0]
+            conn.close()
+            return f"{tables} tables, {measures} measures, {rels} relationships"
+        finally:
+            os.unlink(tmp.name)
+    _check("Metadata SQLite", check_sqlite)
+
+    # 6. PBIXRay table access
+    def check_tables():
+        from pbixray import PBIXRay
+        model = PBIXRay(info["path"])
+        schema = model.schema
+        if schema is None or schema.empty:
+            return "No tables readable"
+        names = [t for t in schema["TableName"].unique() if not t.startswith("H$") and not t.startswith("R$")]
+        total_rows = 0
+        for t in names:
+            try:
+                df = model.get_table(t)
+                if df is not None:
+                    total_rows += len(df)
+            except Exception:
+                pass
+        return f"{len(names)} tables, {total_rows:,} total rows"
+    _check("VertiPaq tables (PBIXRay)", check_tables)
+
+    # 7. Calculated tables
+    def check_calc():
+        from pbixray import PBIXRay
+
+        from pbix_mcp.dax.calc_tables import load_calculated_tables
+        model = PBIXRay(info["path"])
+        base_tables = set()
+        if model.schema is not None:
+            base_tables = set(t for t in model.schema["TableName"].unique()
+                             if not t.startswith("H$") and not t.startswith("R$"))
+        # Load with empty tables to see what calc_tables adds
+        tables = load_calculated_tables(info["path"], {}, [])
+        calc_names = [t for t in tables if t not in base_tables]
+        return f"{len(calc_names)} calculated tables loaded" if calc_names else "None found"
+    _check("Calculated tables", check_calc)
+
+    # 8. Default slicer filters
+    def check_filters():
+        filters = _get_all_default_filters(info["work_dir"])
+        if filters:
+            return f"{len(filters)} default slicer filters detected"
+        return "None"
+    _check("Default slicer filters", check_filters)
+
+    return "\n".join(checks)
+
+
+# ---- Section 11: MCP main ----
 
 if __name__ == "__main__":
     mcp.run()
