@@ -776,14 +776,19 @@ def build_abf_from_scratch(
     # ---- 5. Patch the BackupLogHeader ----
     total_files = len(files) + 1  # data files + backup log
 
-    hdr_root = ET.Element("BackupLogHeader")
-    ET.SubElement(hdr_root, "Version").text = "1"
+    hdr_root = ET.Element("BackupLog")
+    ET.SubElement(hdr_root, "BackupRestoreSyncVersion").text = "140"
+    ET.SubElement(hdr_root, "Fault").text = "false"
+    ET.SubElement(hdr_root, "faultcode").text = "0"
+    ET.SubElement(hdr_root, "ErrorCode").text = "false"
+    ET.SubElement(hdr_root, "EncryptionFlag").text = "false"
+    ET.SubElement(hdr_root, "EncryptionKey").text = "0"
+    ET.SubElement(hdr_root, "ApplyCompression").text = "false"
     ET.SubElement(hdr_root, "m_cbOffsetHeader").text = str(vdir_offset)
     ET.SubElement(hdr_root, "DataSize").text = str(vdir_size)
-    ET.SubElement(hdr_root, "m_cbOffsetData").text = str(_HEADER_PAGE_SIZE)
     ET.SubElement(hdr_root, "Files").text = str(total_files)
-    ET.SubElement(hdr_root, "DatabaseName").text = "Model"
-    ET.SubElement(hdr_root, "ErrorCode").text = "false"
+    ET.SubElement(hdr_root, "ObjectID").text = str(database_id).upper()
+    ET.SubElement(hdr_root, "m_cbOffsetData").text = str(_HEADER_PAGE_SIZE)
 
     hdr_bytes = _xml_to_utf16_bytes(hdr_root)
     available = _HEADER_PAGE_SIZE - _SIGNATURE_LEN
