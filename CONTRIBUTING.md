@@ -11,11 +11,12 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast unit tests only (~140 pass from fresh clone, ~8 skip without private files)
+# Fast unit tests only (~163 pass from fresh clone, ~8 skip without test corpus)
 pytest -m "not slow"
 
-# All tests (requires private PBIX test files; 19 integration tests)
-pytest -v
+# Download public test corpus, then run integration tests
+python scripts/download_test_corpus.py
+PBIX_TEST_SAMPLES=test_corpus pytest -v
 
 # With coverage
 pytest --cov=src/pbix_mcp --cov-report=term-missing -m "not slow"

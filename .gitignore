@@ -22,3 +22,4 @@ test_samples/*.pbix
 .ruff_cache/
 test_samples/temp_dl/
 .coverage
+test_corpus/

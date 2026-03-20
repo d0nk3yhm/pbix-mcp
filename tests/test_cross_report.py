@@ -84,15 +84,47 @@ def _load_pbix(path):
 # ---------------------------------------------------------------------------
 # Paths to test PBIX files
 # ---------------------------------------------------------------------------
+# Set PBIX_TEST_SAMPLES to a directory containing the 4 test dashboards.
+# Use scripts/download_test_corpus.py to download them automatically.
+# Source: https://github.com/Dashboard-Design/Power-BI-Design-Files (MIT License)
 SAMPLES = os.environ.get("PBIX_TEST_SAMPLES", "")
-_OPENBI = os.environ.get("PBIX_TEST_OPENBI", SAMPLES)
-GEOSALES = os.path.join(_OPENBI, "GeoSales_Dashboard.pbix") if _OPENBI else ""
-AGENTS = os.path.join(SAMPLES, "temp_dl", "Full Dashboards",
-                       "Agents Performance - Dashboard", "Agents Performance - Dashboard.pbix") if SAMPLES else ""
-ECOMMERCE = os.path.join(SAMPLES, "temp_dl", "Full Dashboards",
-                          "Ecommerce Conversion Dashboard", "Ecommerce Conversion Dashboard.pbix") if SAMPLES else ""
-IT_SUPPORT = os.path.join(SAMPLES, "temp_dl", "Full Dashboards",
-                           "IT Support Performance Dashboard", "IT_Support_Ticket_Desk.pbix") if SAMPLES else ""
+
+
+def _find_pbix(name: str, *fallback_paths: str) -> str:
+    """Find a PBIX file by trying the clean name first, then legacy paths."""
+    if not SAMPLES:
+        return ""
+    # Try clean name (from download_test_corpus.py)
+    clean = os.path.join(SAMPLES, name)
+    if os.path.exists(clean):
+        return clean
+    # Try legacy paths (old directory structure)
+    for path in fallback_paths:
+        full = os.path.join(SAMPLES, path)
+        if os.path.exists(full):
+            return full
+    return ""
+
+
+GEOSALES = _find_pbix(
+    "GeoSales_Dashboard.pbix",
+    "GeoSales_Dashboard.pbix",
+)
+AGENTS = _find_pbix(
+    "Agents_Performance.pbix",
+    os.path.join("temp_dl", "Full Dashboards",
+                 "Agents Performance - Dashboard", "Agents Performance - Dashboard.pbix"),
+)
+ECOMMERCE = _find_pbix(
+    "Ecommerce_Conversion.pbix",
+    os.path.join("temp_dl", "Full Dashboards",
+                 "Ecommerce Conversion Dashboard", "Ecommerce Conversion Dashboard.pbix"),
+)
+IT_SUPPORT = _find_pbix(
+    "IT_Support.pbix",
+    os.path.join("temp_dl", "Full Dashboards",
+                 "IT Support Performance Dashboard", "IT_Support_Ticket_Desk.pbix"),
+)
 
 
 # ---------------------------------------------------------------------------

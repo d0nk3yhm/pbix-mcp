@@ -147,15 +147,15 @@ Supported visual types: `card`, `table`, `matrix`, `slicer`, `clusteredBarChart`
 
 ### Accuracy
 
-Tested against 4 real-world Power BI dashboards (204 measures total). **These dashboards are not included in the repo** — they are private test files. The numbers below are from internal testing; they cannot be reproduced from a fresh clone.
+Tested against 4 real-world Power BI dashboards (204 measures total). **All 4 dashboards are publicly available** from [Dashboard-Design/Power-BI-Design-Files](https://github.com/Dashboard-Design/Power-BI-Design-Files) (MIT License, Sajjad Ahmadi). Anyone can download them and reproduce these results.
 
-| Dashboard | Measures | Non-BLANK | Accuracy |
-|-----------|----------|-----------|----------|
-| GeoSales | 71 | 70 | 98.6% |
-| Agents Performance | 42 | 42 | 100% |
-| Ecommerce Conversion | 70 | 70 | 100% |
-| IT Support | 21 | 21 | 100% |
-| **Total** | **204** | **203** | **99.5%** |
+| Dashboard | Source Path | Measures | Non-BLANK | Accuracy |
+|-----------|------------|----------|-----------|----------|
+| GeoSales | `Full Dashboards/GeoSales Dashboard - Azure Map/` | 71 | 70 | 98.6% |
+| Agents Performance | `Full Dashboards/Agents Performance - Dashboard/` | 42 | 42 | 100% |
+| Ecommerce Conversion | `Full Dashboards/Ecommerce Conversion Dashboard/` | 70 | 70 | 100% |
+| IT Support | `Full Dashboards/IT Support Performance Dashboard/` | 21 | 21 | 100% |
+| **Total** | | **204** | **203** | **99.5%** |
 
 The 1 BLANK measure requires per-employee RANKX visual row context that doesn't exist at report level.
 
@@ -183,8 +183,11 @@ The 1 BLANK measure requires per-employee RANKX visual row context that doesn't 
 # Fast tests (no PBIX files needed, runs from fresh clone)
 pytest -m "not slow"
 
-# All tests (requires private PBIX test corpus)
-pytest -v
+# Download public test corpus (4 dashboards, MIT licensed)
+python scripts/download_test_corpus.py --output-dir test_corpus
+
+# Run integration tests against the corpus
+PBIX_TEST_SAMPLES=test_corpus pytest tests/test_cross_report.py -v
 ```
 
 | Suite | Tests | Marker | Needs PBIX? |
@@ -194,9 +197,9 @@ pytest -v
 | `test_golden.py` | 15 | `golden` | 2 skip without private files |
 | `test_fixtures.py` | 18 | `unit` | No (ships with repo) |
 | `test_beta_features.py` | 10 | `unit` | No |
-| `test_cross_report.py` | 19 | `slow`, `integration` | Yes (4 private PBIX files) |
+| `test_cross_report.py` | 19 | `slow`, `integration` | Yes (4 public PBIX dashboards) |
 
-**From a fresh clone: ~140 tests pass, ~8 skip gracefully, 19 integration tests skip.** The skipped tests require private PBIX files not included in the repo. Set `PBIX_TEST_SAMPLES` env var to point to your PBIX test corpus.
+**From a fresh clone: ~163 tests pass, ~8 skip gracefully, 19 integration tests skip.** The skipped tests require the public test corpus. Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus`.
 
 ## Architecture
 
