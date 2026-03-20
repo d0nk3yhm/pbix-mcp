@@ -27,18 +27,17 @@ jobs:
       - name: Lint with ruff
         run: ruff check src/ tests/
 
-      - name: Type check with mypy (baseline: 148 errors)
+      - name: Type check with mypy (baseline 148 errors, fail if new errors added)
+        shell: bash
         run: |
-          error_count=$(mypy src/pbix_mcp/ --ignore-missing-imports --no-error-summary 2>&1 | grep -c "error:" || true)
-          echo "mypy found $error_count errors (baseline: 148)"
-          if [ "$error_count" -gt 148 ]; then
-            echo "::error::mypy error count ($error_count) exceeds baseline (148). Fix new type errors before merging."
+          COUNT=$(mypy src/pbix_mcp/ --ignore-missing-imports --no-error-summary 2>&1 | grep -c "error:" || true)
+          echo "mypy errors: $COUNT (baseline: 148)"
+          if [ "$COUNT" -gt 148 ]; then
+            echo "FAIL: mypy errors ($COUNT) exceed baseline (148)"
             exit 1
           fi
 
       - name: Run unit tests with coverage
-        # 28% baseline — server.py is 6% (MCP tools can't be unit tested easily).
-        # Threshold guards against regression; increase as more tests are added.
         run: pytest -m "not slow and not integration" -v --tb=short --cov=src/pbix_mcp --cov-report=term-missing --cov-fail-under=28
 
       - name: Build package
