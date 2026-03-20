@@ -195,10 +195,10 @@ def build_basic_measures_pbix(base_pbix_path, output_path):
 
 
 if __name__ == "__main__":
-    samples_dir = os.environ.get(
-        "PBIX_TEST_SAMPLES",
-        os.path.join(os.path.dirname(__file__), "..", "..", "OpenBI", "test_samples"),
-    )
+    samples_dir = os.environ.get("PBIX_TEST_SAMPLES", "")
+    if not samples_dir:
+        print("ERROR: Set PBIX_TEST_SAMPLES env var to your test corpus directory")
+        sys.exit(1)
     base = os.path.join(samples_dir, "GeoSales_Dashboard.pbix")
     if not os.path.exists(base):
         print(f"ERROR: Base PBIX not found at {base}")

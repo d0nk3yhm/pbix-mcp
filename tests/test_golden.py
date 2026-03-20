@@ -123,15 +123,14 @@ class TestXPress9RoundTrip:
 
     @pytest.fixture
     def sample_pbix(self):
-        """Find a test PBIX file."""
-        samples_dir = os.environ.get(
-            "PBIX_TEST_SAMPLES",
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "OpenBI", "test_samples"),
-        )
+        """Find a test PBIX file. Set PBIX_TEST_SAMPLES env var to your test corpus."""
+        samples_dir = os.environ.get("PBIX_TEST_SAMPLES", "")
+        if not samples_dir:
+            pytest.skip("PBIX_TEST_SAMPLES env var not set")
         p = os.path.join(samples_dir, "GeoSales_Dashboard.pbix")
         if os.path.exists(p):
             return p
-        pytest.skip("No test PBIX file available (set PBIX_TEST_SAMPLES env var)")
+        pytest.skip(f"GeoSales_Dashboard.pbix not found in {samples_dir}")
 
     def test_decompress_recompress(self, sample_pbix):
         """Decompress DataModel then recompress — result must decompress again."""
@@ -164,14 +163,14 @@ class TestABFMetadata:
 
     @pytest.fixture
     def sample_pbix(self):
-        samples_dir = os.environ.get(
-            "PBIX_TEST_SAMPLES",
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "OpenBI", "test_samples"),
-        )
+        """Find a test PBIX file. Set PBIX_TEST_SAMPLES env var to your test corpus."""
+        samples_dir = os.environ.get("PBIX_TEST_SAMPLES", "")
+        if not samples_dir:
+            pytest.skip("PBIX_TEST_SAMPLES env var not set")
         p = os.path.join(samples_dir, "GeoSales_Dashboard.pbix")
         if os.path.exists(p):
             return p
-        pytest.skip("No test PBIX file available (set PBIX_TEST_SAMPLES env var)")
+        pytest.skip(f"GeoSales_Dashboard.pbix not found in {samples_dir}")
 
     def test_metadata_has_tables_and_measures(self, sample_pbix):
         """Extracted metadata must contain Table and Measure entries."""

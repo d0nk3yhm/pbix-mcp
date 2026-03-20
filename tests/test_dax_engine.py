@@ -440,11 +440,8 @@ class TestEdgeCases:
 # ---------------------------------------------------------------------------
 
 class TestWithPBIX:
-    _samples_dir = os.environ.get(
-        "PBIX_TEST_SAMPLES",
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "OpenBI", "test_samples"),
-    )
-    PBIX_PATH = os.path.join(_samples_dir, "GeoSales_Dashboard.pbix")
+    _samples_dir = os.environ.get("PBIX_TEST_SAMPLES", "")
+    PBIX_PATH = os.path.join(_samples_dir, "GeoSales_Dashboard.pbix") if _samples_dir else ""
 
     @pytest.fixture
     def real_ctx(self):

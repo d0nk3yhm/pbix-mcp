@@ -84,21 +84,15 @@ def _load_pbix(path):
 # ---------------------------------------------------------------------------
 # Paths to test PBIX files
 # ---------------------------------------------------------------------------
-SAMPLES = os.environ.get(
-    "PBIX_TEST_SAMPLES",
-    os.path.join(os.path.dirname(os.path.dirname(__file__)), "test_samples"),
-)
-_OPENBI = os.environ.get(
-    "PBIX_TEST_OPENBI",
-    os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "OpenBI", "test_samples"),
-)
-GEOSALES = os.path.join(_OPENBI, "GeoSales_Dashboard.pbix")
+SAMPLES = os.environ.get("PBIX_TEST_SAMPLES", "")
+_OPENBI = os.environ.get("PBIX_TEST_OPENBI", SAMPLES)
+GEOSALES = os.path.join(_OPENBI, "GeoSales_Dashboard.pbix") if _OPENBI else ""
 AGENTS = os.path.join(SAMPLES, "temp_dl", "Full Dashboards",
-                       "Agents Performance - Dashboard", "Agents Performance - Dashboard.pbix")
+                       "Agents Performance - Dashboard", "Agents Performance - Dashboard.pbix") if SAMPLES else ""
 ECOMMERCE = os.path.join(SAMPLES, "temp_dl", "Full Dashboards",
-                          "Ecommerce Conversion Dashboard", "Ecommerce Conversion Dashboard.pbix")
+                          "Ecommerce Conversion Dashboard", "Ecommerce Conversion Dashboard.pbix") if SAMPLES else ""
 IT_SUPPORT = os.path.join(SAMPLES, "temp_dl", "Full Dashboards",
-                           "IT Support Performance Dashboard", "IT_Support_Ticket_Desk.pbix")
+                           "IT Support Performance Dashboard", "IT_Support_Ticket_Desk.pbix") if SAMPLES else ""
 
 
 # ---------------------------------------------------------------------------
