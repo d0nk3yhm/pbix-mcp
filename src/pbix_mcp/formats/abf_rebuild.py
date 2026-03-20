@@ -755,7 +755,6 @@ def build_abf_from_scratch(
     ET.SubElement(blog_root, "ServerRoot").text = (
         f"Sandboxes\\{database_id}"
     )
-    ET.SubElement(blog_root, "Log")
     file_groups = ET.SubElement(blog_root, "FileGroups")
 
     # FileGroup 0: system (BackupLog itself)
