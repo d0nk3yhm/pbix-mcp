@@ -64,6 +64,7 @@ class DAXContext:
             self.date_table = self._auto_detect_date_table(tables)
         self.filter_context = filter_context or {}
         self.relationships = relationships or []
+        self._current_row = None  # Set during row iteration (SUMX, AVERAGEX, etc.)
         self._measure_cache = {}
         self._eval_stack = set()  # Prevent circular refs
         # Build relationship index: { (fromTable, toTable): { fromCol, toCol } }
@@ -603,11 +604,15 @@ class DAXEngine:
             measure_name = expr[1:-1]
             return self.evaluate_measure(measure_name, ctx)
 
-        # Table[Column] reference
-        col_match = re.match(r"'?([^'\[\]]+)'?\s*\[([^\]]+)\]", expr)
+        # Table[Column] reference — must be the ENTIRE expression (no trailing operators)
+        col_match = re.match(r"'?([^'\[\]]+)'?\s*\[([^\]]+)\]$", expr)
         if col_match and '(' not in expr:
             table_name = col_match.group(1).strip()
             col_name = col_match.group(2).strip()
+            # In row iteration context, resolve directly from current row
+            if ctx._current_row and ctx._current_row.get('__table__') == table_name:
+                if col_name in ctx._current_row:
+                    return ctx._current_row[col_name]
             return (table_name, col_name)  # Return as column ref
 
         # Simple column ref without table: [Column] — only if it's the entire expression
@@ -659,6 +664,20 @@ class DAXEngine:
                     "Unsupported DAX function: %s", func_name
                 )
                 return None
+
+        # Bare table name: resolve to list of full-row dicts for iteration
+        # This enables SUMX(Sales, expr), FILTER(Sales, expr), etc.
+        # Respects current filter context (including cross-table relationships).
+        bare_name = expr.strip().strip("'")
+        tbl = ctx.tables.get(bare_name)
+        if tbl and tbl.get('rows'):
+            cols = tbl['columns']
+            filtered_rows = ctx.get_filtered_rows(bare_name)
+            return [
+                {**{'__table__': bare_name, '__row__': True},
+                 **{cols[i]: row[i] for i in range(min(len(cols), len(row)))}}
+                for row in filtered_rows
+            ]
 
         return None
 
@@ -789,7 +808,7 @@ class DAXEngine:
     def _make_row_context(self, row_item: dict, ctx: 'DAXContext') -> 'DAXContext':
         """Create a filter context from a row dict, filtering on ALL columns of the row.
         This implements the row context → filter context transition."""
-        meta_keys = {'__table__', '__column__', '__value__'}
+        meta_keys = {'__table__', '__column__', '__value__', '__row__'}
         table_name = row_item.get('__table__', '')
         filters = {}
         for k, v in row_item.items():
@@ -801,15 +820,26 @@ class DAXEngine:
         val = row_item.get('__value__')
         if col and val is not None:
             filters[f"{table_name}.{col}"] = [val]
-        return ctx.with_filters(filters)
+        new_ctx = ctx.with_filters(filters)
+        # For full-row iteration (SUMX(Table, expr)), set current_row so
+        # column references like Table[Col] resolve directly without filtering
+        if row_item.get('__row__'):
+            new_ctx._current_row = row_item
+        return new_ctx
 
     def _resolve_row_result(self, result, row_item, row_ctx):
         """Resolve a column reference result in a row iteration context.
         If result is a (table, column) tuple, resolve it to a concrete value."""
         if isinstance(result, tuple) and len(result) == 2:
             if isinstance(row_item, dict) and '__table__' in row_item:
-                if result[0] == row_item['__table__'] and result[1] == row_item['__column__']:
-                    return row_item['__value__']
+                # Full-row dict (from bare table iteration): look up column directly
+                if row_item.get('__row__') and result[0] == row_item['__table__']:
+                    col_name = result[1]
+                    if col_name in row_item:
+                        return row_item[col_name]
+                # Single-column dict (from ALL/VALUES iteration)
+                if result[0] == row_item.get('__table__') and result[1] == row_item.get('__column__'):
+                    return row_item.get('__value__')
             # Different column — get single value from filtered context
             vals = list(set(row_ctx.get_column_data(result[0], result[1])))
             if len(vals) == 1:

@@ -224,10 +224,8 @@ class TestComplexIterators:
             'M': "SUMX(Sales, Sales[Qty] * Sales[Amount])"
         })
         result = engine.evaluate_measure('M', c)
-        # SUMX with infix multiply in row expression — engine returns 0
-        # because row-level arithmetic parsing is limited.
-        # Correct answer would be 6510. This is a known engine limitation.
-        assert result == 0
+        # SUMX with row-level arithmetic: sum of Qty * Amount per row
+        assert result == pytest.approx(6510.0, rel=0.01)
 
     def test_averagex(self, engine, tables, rels):
         """AVERAGEX over a table."""

@@ -34,7 +34,6 @@
 
 ## Known Limitations
 
-- **SUMX with infix arithmetic** (`SUMX(Table, Col1 * Col2)`) — row-level arithmetic parsing is limited
-- **Circular references** return 0 instead of raising an error
-- **Date-table detection** uses heuristics (looks for column named "Date")
-- **Unsupported functions** return `None` and are tracked in `unsupported_functions`
+- **Date-table detection** uses heuristics (looks for columns named "Date" or "Calendar")
+- **Unsupported functions** return `None` with status `"unsupported"` and are tracked in `unsupported_functions`
+- **Circular references** raise `DAXEvaluationError` (caught by graceful degradation → returns `None`)
