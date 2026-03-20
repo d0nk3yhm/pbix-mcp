@@ -40,6 +40,7 @@ from pbix_mcp.errors import (
     LayoutParseError,
     PBIXMCPError,
     SessionError,
+    UnsafeWriteError,
     UnsupportedFormatError,
 )
 from pbix_mcp.logging_config import logger
@@ -375,7 +376,7 @@ def pbix_open(file_path: str, alias: str = "") -> str:
     except Exception as e:
         logger.error("Failed to extract %s: %s", file_path, e)
         shutil.rmtree(work_dir, ignore_errors=True)
-        return ToolResponse.error(f"Extracting: {str(e)}", SessionError.code).to_text()
+        raise InvalidPBIXError(f"Failed to extract: {e}")
 
     # Detect DirectQuery / composite models by checking for connections in DataModel
     dm_path = os.path.join(work_dir, "DataModel")
@@ -452,7 +453,7 @@ def pbix_save(alias: str, output_path: str = "", overwrite: bool = False, backup
 
         # Safety: refuse overwrite if explicitly disabled
         if not overwrite and os.path.exists(target) and target != info["path"]:
-            return ToolResponse.error(f"'{target}' already exists and overwrite=False. Use overwrite=True or choose a different path.", SessionError.code).to_text()
+            raise UnsafeWriteError(f"'{target}' already exists and overwrite=False. Use overwrite=True or choose a different path.")
 
         # If overwriting original, create backup
         if backup and target == info["path"] and os.path.exists(target):
@@ -466,7 +467,7 @@ def pbix_save(alias: str, output_path: str = "", overwrite: bool = False, backup
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), SessionError.code).to_text()
+        raise SessionError(f"Save failed: {e}")
 
 
 @mcp.tool()
@@ -484,10 +485,9 @@ def pbix_close(alias: str, force: bool = False) -> str:
         work_dir = info["work_dir"]
 
         if info.get("modified") and not force:
-            return ToolResponse.error(
-                f"'{alias}' has unsaved changes. Use pbix_save first, or pbix_close with force=True to discard changes.",
-                SessionError.code
-            ).to_text()
+            raise UnsafeWriteError(
+                f"'{alias}' has unsaved changes. Use pbix_save first, or pbix_close with force=True to discard changes."
+            )
 
         shutil.rmtree(work_dir, ignore_errors=True)
         logger.info("Closed '%s'", alias)
@@ -496,7 +496,7 @@ def pbix_close(alias: str, force: bool = False) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), SessionError.code).to_text()
+        raise SessionError(f"Close failed: {e}")
 
 
 @mcp.tool()
@@ -3463,7 +3463,7 @@ def pbix_doctor(alias: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), SessionError.code).to_text()
+        raise SessionError(f"Doctor failed: {e}")
 
     checks.append(f"Diagnostics for '{alias}':\n")
 

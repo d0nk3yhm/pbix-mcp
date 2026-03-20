@@ -21,3 +21,4 @@ test_samples/*.pbix
 .pytest_cache/
 .ruff_cache/
 test_samples/temp_dl/
+.coverage

@@ -409,9 +409,9 @@ class TestEdgeCases:
             {'M1': '[M2]', 'M2': '[M1]'},
             relationships=[]
         )
-        # Should not infinite loop — returns 0 due to circular ref prevention
+        # Should not infinite loop — raises DAXEvaluationError (caught as None by graceful degradation)
         result = engine.evaluate_measure('M1', ctx)
-        assert result == 0
+        assert result is None  # Circular ref detected and handled
 
     def test_missing_measure(self, engine, ctx):
         result = engine.evaluate_measure('NonExistent', ctx)

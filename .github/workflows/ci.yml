@@ -27,14 +27,19 @@ jobs:
       - name: Lint with ruff
         run: ruff check src/ tests/
 
-      - name: Type check with mypy (non-blocking, ~239 errors)
-        run: mypy src/pbix_mcp/ --ignore-missing-imports --no-error-summary || true
-        # 239 errors as of v0.1.0 — tracked for gradual cleanup. Will block CI at v0.2.0.
+      - name: Type check with mypy (baseline: 148 errors)
+        run: |
+          error_count=$(mypy src/pbix_mcp/ --ignore-missing-imports --no-error-summary 2>&1 | grep -c "error:" || true)
+          echo "mypy found $error_count errors (baseline: 148)"
+          if [ "$error_count" -gt 148 ]; then
+            echo "::error::mypy error count ($error_count) exceeds baseline (148). Fix new type errors before merging."
+            exit 1
+          fi
 
       - name: Run unit tests with coverage
-        # Coverage threshold: server.py is an MCP server (7% from unit tests alone),
-        # so overall coverage is low. Threshold will increase as more tests are added.
-        run: pytest -m "not slow and not integration" -v --tb=short --cov=src/pbix_mcp --cov-report=term-missing --cov-fail-under=25
+        # 28% baseline — server.py is 6% (MCP tools can't be unit tested easily).
+        # Threshold guards against regression; increase as more tests are added.
+        run: pytest -m "not slow and not integration" -v --tb=short --cov=src/pbix_mcp --cov-report=term-missing --cov-fail-under=28
 
       - name: Build package
         run: python -m build

@@ -70,7 +70,7 @@ pbix-mcp-server --log-level debug
 
 ## Known Limitations
 
-- **DAX engine is best-effort** — designed for practical evaluation, not semantic parity with Analysis Services. Unsupported functions return `None` with status `"unsupported"` in the response. See [docs/supported-dax.md](docs/supported-dax.md) for full details.
+- **DAX engine is best-effort** — designed for practical evaluation, not semantic parity with Analysis Services. Unsupported functions return `None` with status `"unsupported"`, circular references raise `DAXEvaluationError`. See [docs/supported-dax.md](docs/supported-dax.md) for full details.
 - **PBIR format** is read-only for filter extraction; layout write requires legacy format
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data

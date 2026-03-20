@@ -471,7 +471,8 @@ class DAXEngine:
 
         # Prevent circular references
         if measure_name in ctx._eval_stack:
-            return 0
+            from pbix_mcp.errors import DAXEvaluationError
+            raise DAXEvaluationError(f"Circular reference detected: '{measure_name}' references itself")
         ctx._eval_stack.add(measure_name)
 
         expr = ctx.measures.get(measure_name)
