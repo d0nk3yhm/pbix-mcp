@@ -30,6 +30,7 @@ dependencies = [
     "pbixray>=0.5.0",
     "xpress9",
     "pandas",
+    "pydantic>=2.0",
     "kaitaistruct",
     "apsw",
 ]
@@ -61,7 +62,14 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
-ignore = ["E501"]  # line length handled by formatter
+ignore = [
+    "E501",  # line length handled by formatter
+    "E701",  # multiple statements on one line (colon) — used in compact try/except
+    "E702",  # multiple statements on one line (semicolon) — used in binary format code
+    "E712",  # comparison to True/False — intentional in test assertions
+    "E722",  # bare except — used for resilience in format parsers
+    "F841",  # local variable assigned but unused — some used for documentation
+]
 
 [tool.mypy]
 python_version = "3.10"

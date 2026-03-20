@@ -16,20 +16,18 @@ Architecture:
   - DataModel writing works via ABF round-trip (decompress → modify → recompress)
 """
 
-import json
-import zipfile
-import shutil
-import os
 import io
+import json
+import os
+import shutil
+import sqlite3
 import struct
 import tempfile
-import copy
-import re
-import sqlite3
 import traceback
-from pathlib import Path
+import zipfile
 from datetime import datetime
-from typing import Any, Optional, Callable
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -1240,9 +1238,9 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
         if not columns or not rows:
             return "Error: 'columns' and 'rows' are required and must not be empty."
 
-        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel, compress_datamodel
-        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite, rebuild_abf_with_replacement
-        from pbix_mcp.formats.vertipaq_encoder import encode_table_data, update_table_in_abf
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import compress_datamodel, decompress_datamodel
+        from pbix_mcp.formats.vertipaq_encoder import update_table_in_abf
 
         dm_path = os.path.join(info["work_dir"], "DataModel")
         if not os.path.exists(dm_path):
@@ -1319,10 +1317,11 @@ def pbix_update_table_rows(alias: str, table_name: str, rows_json: str) -> str:
         if not rows:
             return "Error: rows must not be empty."
 
-        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel, compress_datamodel
-        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
-        from pbix_mcp.formats.vertipaq_encoder import update_table_in_abf
         import sqlite3
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import compress_datamodel, decompress_datamodel
+        from pbix_mcp.formats.vertipaq_encoder import update_table_in_abf
 
         dm_path = os.path.join(info["work_dir"], "DataModel")
         if not os.path.exists(dm_path):
@@ -1425,11 +1424,10 @@ def _modify_metadata_sqlite(
     Returns:
         Tuple of (original_dm_bytes, new_dm_bytes, new_abf_bytes)
     """
-    from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel, compress_datamodel
     from pbix_mcp.formats.abf_rebuild import (
-        rebuild_abf_with_modified_sqlite, list_abf_files,
-        read_metadata_sqlite,
+        rebuild_abf_with_modified_sqlite,
     )
+    from pbix_mcp.formats.datamodel_roundtrip import compress_datamodel, decompress_datamodel
 
     with open(dm_path, "rb") as f:
         dm_bytes = f.read()
@@ -1470,8 +1468,8 @@ def pbix_datamodel_query_metadata(alias: str, sql_query: str) -> str:
         if not os.path.exists(dm_path):
             return "Error: No DataModel found in this file."
 
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
         from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
-        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite, list_abf_files
 
         with open(dm_path, "rb") as f:
             dm_bytes = f.read()
@@ -1790,8 +1788,8 @@ def pbix_datamodel_decompress(alias: str) -> str:
         if not os.path.exists(dm_path):
             return "Error: No DataModel found."
 
-        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
         from pbix_mcp.formats.abf_rebuild import list_abf_files
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
 
         with open(dm_path, "rb") as f:
             dm_bytes = f.read()
@@ -1901,10 +1899,12 @@ def pbix_datamodel_replace_file(alias: str, internal_path: str, new_content_path
         if not os.path.exists(new_content_path):
             return f"Error: Replacement file not found: {new_content_path}"
 
-        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel, compress_datamodel
         from pbix_mcp.formats.abf_rebuild import (
-            rebuild_abf_with_replacement, list_abf_files, find_abf_file,
+            find_abf_file,
+            list_abf_files,
+            rebuild_abf_with_replacement,
         )
+        from pbix_mcp.formats.datamodel_roundtrip import compress_datamodel, decompress_datamodel
 
         with open(dm_path, "rb") as f:
             dm_bytes = f.read()
@@ -1952,8 +1952,8 @@ def pbix_datamodel_extract_file(alias: str, internal_path: str, output_path: str
         if not os.path.exists(dm_path):
             return "Error: No DataModel found."
 
+        from pbix_mcp.formats.abf_rebuild import find_abf_file, list_abf_files, read_abf_file
         from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
-        from pbix_mcp.formats.abf_rebuild import list_abf_files, find_abf_file, read_abf_file
 
         with open(dm_path, "rb") as f:
             dm_bytes = f.read()
@@ -1995,8 +1995,8 @@ def pbix_datamodel_list_abf_files(alias: str) -> str:
         if not os.path.exists(dm_path):
             return "Error: No DataModel found."
 
+        from pbix_mcp.formats.abf_rebuild import list_abf_files
         from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
-        from pbix_mcp.formats.abf_rebuild import ABFArchive, list_abf_files
 
         with open(dm_path, "rb") as f:
             dm_bytes = f.read()
@@ -2492,7 +2492,7 @@ def pbix_get_default_filters(alias: str, page_index: int = 0) -> str:
         lines = ["Default slicer filters:\n"]
         for key, vals in filters.items():
             lines.append(f"  {key}: {vals}")
-        lines.append(f"\nUse as filter_context in pbix_evaluate_dax:")
+        lines.append("\nUse as filter_context in pbix_evaluate_dax:")
         lines.append(f"  {json.dumps(filters)}")
         return "\n".join(lines)
     except Exception as e:

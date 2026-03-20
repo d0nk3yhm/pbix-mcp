@@ -3,9 +3,10 @@ Tests for the DAX evaluation engine.
 Run: python -m pytest tests/ -v
 """
 import os
+
 import pytest
 
-from pbix_mcp.dax.engine import DAXEngine, DAXContext, evaluate_measures_batch
+from pbix_mcp.dax.engine import DAXContext, DAXEngine, evaluate_measures_batch
 
 pytestmark = pytest.mark.unit
 

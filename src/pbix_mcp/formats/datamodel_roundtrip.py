@@ -11,10 +11,10 @@ Formats supported:
   - Uncompressed ABF (starts with STREAM_STORAGE_SIGNATURE)
 """
 
-import struct
 import concurrent.futures
-from xpress9 import Xpress9
+import struct
 
+from xpress9 import Xpress9
 
 # ---------------------------------------------------------------------------
 # Constants

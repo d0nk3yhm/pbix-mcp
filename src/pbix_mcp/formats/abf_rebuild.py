@@ -23,14 +23,12 @@ This module provides functions to:
   - Rebuild the ABF after modifying embedded files (e.g. metadata.sqlitedb)
 """
 
-import struct
+import os
 import sqlite3
 import tempfile
-import os
 import xml.etree.ElementTree as ET
 from copy import deepcopy
 from typing import Callable, Optional
-
 
 # ---------------------------------------------------------------------------
 # Constants

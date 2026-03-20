@@ -17,12 +17,11 @@ update_table_in_abf(abf_bytes, table_name, columns, rows, metadata_sqlite_bytes)
 from __future__ import annotations
 
 import math
-import struct
-import sqlite3
-import tempfile
 import os
+import sqlite3
+import struct
+import tempfile
 from typing import Optional
-
 
 # ---------------------------------------------------------------------------
 # Constants & Tag bytes (from IDFMETA Kaitai spec)
@@ -998,7 +997,8 @@ def update_table_in_abf(
     file_log = list_abf_files(abf_bytes)
 
     # --- Get exact IDF filenames for each column from metadata ---
-    import sqlite3, tempfile
+    import sqlite3
+    import tempfile
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.write(metadata_sqlite_bytes)
     tmp.close()
@@ -1372,8 +1372,9 @@ def verify_roundtrip(columns: list[dict], rows: list[dict]) -> bool:
 
     Returns True if the roundtrip succeeds.
     """
-    from kaitaistruct import KaitaiStream
     from io import BytesIO
+
+    from kaitaistruct import KaitaiStream
 
     encoded = encode_table_data("Test", 0, columns, rows)
 

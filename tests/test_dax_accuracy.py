@@ -4,9 +4,10 @@ These test the edge cases that break on real-world reports.
 Run: python -m pytest tests/test_dax_accuracy.py -v
 """
 import math
+
 import pytest
 
-from pbix_mcp.dax.engine import DAXEngine, DAXContext
+from pbix_mcp.dax.engine import DAXContext, DAXEngine
 
 pytestmark = pytest.mark.unit
 

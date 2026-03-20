@@ -1,6 +1,5 @@
 """CLI entry point for pbix-mcp-server."""
 
-import sys
 
 
 def main():

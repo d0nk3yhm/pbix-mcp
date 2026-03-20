@@ -31,15 +31,13 @@ Supports 150+ DAX functions:
 - String concatenation with &
 """
 
-import re
 import math
 import random
+import re
 import statistics
-from datetime import datetime, timedelta, date
-from typing import Any, Optional, List
-from collections import defaultdict
 from calendar import monthrange
-from functools import reduce
+from datetime import date, datetime, timedelta
+from typing import Any, Optional
 
 
 class DAXContext:
@@ -485,7 +483,7 @@ class DAXEngine:
             if cache_key:
                 ctx._measure_cache[cache_key] = result
             return result
-        except Exception as e:
+        except Exception:
             # Graceful degradation
             return None
         finally:

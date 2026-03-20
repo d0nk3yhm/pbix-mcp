@@ -4,12 +4,13 @@ Tests that the engine works generically across different report structures.
 Run: python -m pytest tests/test_cross_report.py -v
 """
 import os
-import zipfile
-import tempfile
 import shutil
+import tempfile
+import zipfile
+
 import pytest
 
-from pbix_mcp.dax.engine import DAXEngine, DAXContext, evaluate_measures_batch, evaluate_measures_smart
+from pbix_mcp.dax.engine import evaluate_measures_batch, evaluate_measures_smart
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 

@@ -8,13 +8,13 @@ This fills the gap where PBIXRay can't read calculated tables because they're
 not materialized in VertiPaq — they exist only as DAX expressions in the metadata.
 """
 
+import os
 import re
 import sqlite3
 import tempfile
-import os
 import zipfile
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 
 
 def load_calculated_tables(
@@ -37,8 +37,8 @@ def load_calculated_tables(
     tables = dict(existing_tables)  # Don't modify the original
 
     try:
-        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
         from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
 
         with zipfile.ZipFile(pbix_path, 'r') as zf:
             dm_data = zf.read('DataModel')
