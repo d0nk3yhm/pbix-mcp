@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml)
 
-An MCP server for reading, writing, and evaluating Power BI `.pbix` and `.pbit` files. Exposes 52 tools covering report layout, DAX measures, VertiPaq data, and binary format internals.
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files. Exposes 55 tools covering report creation, layout editing, visual management, DAX measures, VertiPaq data, and binary format internals.
 
 ## Quick Start
 
@@ -46,7 +46,9 @@ pbix-mcp-server
 
 | Feature | Status | Notes |
 |---------|--------|-------|
+| PBIX creation from scratch | **Stable** | Full DataModel + layout, no Power BI Desktop needed |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
+| Visual add/remove | **Stable** | Cards, charts, shapes/buttons, images, textboxes, slicers |
 | Visual property editing | **Stable** | Dot-path and full JSON |
 | DAX measure CRUD | **Stable** | Add, modify, remove via metadata SQL |
 | DAX evaluation (154 functions) | **Stable** | 99% non-BLANK across 204 measures from 4 dashboards |
@@ -70,12 +72,15 @@ pbix-mcp-server
 - **PBIR format** is read-only for filter extraction; layout write requires legacy format
 - **2 out of 204 tested measures** return BLANK by design (one needs per-row RANKX context from a visual, one is a password gate)
 
-## Tools (52)
+## Tools (55)
 
-### File Management (4)
+### Create & File Management (5)
+`pbix_create` — **Create a new PBIX from scratch** (tables, measures, relationships → valid DataModel)
 `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
 
-### Report Layout (16)
+### Report Layout & Visuals (19)
+`pbix_add_visual` — **Add any visual type** (card, chart, table, shape/button, image, textbox, slicer)
+`pbix_remove_visual` — Remove a visual from a page
 `pbix_get_pages` · `pbix_add_page` · `pbix_remove_page` · `pbix_get_page_visuals` · `pbix_get_visual_detail` · `pbix_get_visual_positions` · `pbix_set_visual_property` · `pbix_update_visual_json` · `pbix_get_layout_raw` · `pbix_set_layout_raw` · `pbix_get_filters` · `pbix_set_filters` · `pbix_get_default_filters` · `pbix_get_settings` · `pbix_set_settings` · `pbix_get_bookmarks`
 
 ### DAX Engine (3)
@@ -95,6 +100,43 @@ pbix-mcp-server
 
 ### Diagnostics (2)
 `pbix_doctor` · `pbix_get_metadata`
+
+## Creating Reports from Scratch
+
+Build a complete PBIX file without Power BI Desktop:
+
+```
+> pbix_create("sales_report.pbix", "sales",
+    tables_json='[{"name": "Sales", "columns": [{"name": "Amount", "data_type": "Double"}, {"name": "Product", "data_type": "String"}]}]',
+    measures_json='[{"table": "Sales", "name": "Total Sales", "expression": "SUM(Sales[Amount])"}]')
+
+Created 'sales_report.pbix' (2,550 bytes) and opened it.
+```
+
+Then add visuals:
+
+```
+> pbix_add_visual("sales", 0, "card", x=20, y=20, width=200, height=150)
+> pbix_add_visual("sales", 0, "clusteredBarChart", x=240, y=20, width=500, height=350)
+> pbix_add_visual("sales", 0, "shape", x=20, y=400, width=150, height=50)
+> pbix_save("sales")
+```
+
+Supported visual types: `card`, `table`, `matrix`, `slicer`, `clusteredBarChart`, `clusteredColumnChart`, `lineChart`, `areaChart`, `pieChart`, `donutChart`, `treemap`, `map`, `filledMap`, `shape` (buttons), `image`, `textbox`, `kpi`, `gauge`, `waterfallChart`, `funnel`, `scatterChart`, and any custom visual type.
+
+For images, use `pbix_add_visual` with `visual_type="image"` and set the image URL via `config_json`:
+
+```
+> pbix_add_visual("sales", 0, "image", x=20, y=20, width=200, height=100,
+    config_json='{"singleVisual": {"objects": {"general": [{"properties": {"imageUrl": {"expr": {"Literal": {"Value": "https://example.com/logo.png"}}}}}]}}}')
+```
+
+For buttons/shapes with text, use `visual_type="shape"`:
+
+```
+> pbix_add_visual("sales", 0, "shape", x=20, y=500, width=200, height=50,
+    config_json='{"singleVisual": {"objects": {"text": [{"properties": {"text": {"expr": {"Literal": {"Value": "Click Me"}}}}}]}}}')
+```
 
 ## DAX Engine
 
@@ -174,8 +216,9 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (52 tools)
+  server.py              # MCP server (55 tools)
   cli.py                 # Entry point (pbix-mcp-server)
+  builder.py             # PBIX file builder (create from scratch)
   errors.py              # Typed exceptions with stable error codes
   logging_config.py      # Diagnostic logging (normal/debug/trace)
   dax/

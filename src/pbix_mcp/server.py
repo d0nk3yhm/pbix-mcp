@@ -724,6 +724,190 @@ def pbix_remove_page(alias: str, page_index: int) -> str:
 
 
 @mcp.tool()
+def pbix_create(
+    file_path: str,
+    alias: str = "",
+    tables_json: str = "",
+    measures_json: str = "",
+    relationships_json: str = "",
+) -> str:
+    """Create a new PBIX file from scratch and open it for editing.
+
+    Builds a valid PBIX with XPress9-compressed DataModel, ABF archive,
+    SQLite metadata, and report layout — every layer constructed from scratch.
+
+    Args:
+        file_path: Where to save the new file (e.g. "my_report.pbix")
+        alias: Alias for the opened file (auto-generated if empty)
+        tables_json: Optional JSON array of tables, e.g.
+            '[{"name": "Sales", "columns": [{"name": "Amount", "data_type": "Double"}]}]'
+        measures_json: Optional JSON array of measures, e.g.
+            '[{"table": "Sales", "name": "Total", "expression": "SUM(Sales[Amount])"}]'
+        relationships_json: Optional JSON array of relationships, e.g.
+            '[{"from_table": "Sales", "from_column": "ProductID",
+              "to_table": "Products", "to_column": "ProductID"}]'
+    """
+    try:
+        from pbix_mcp.builder import PBIXBuilder
+
+        builder = PBIXBuilder()
+
+        if tables_json:
+            for tdef in json.loads(tables_json):
+                builder.add_table(
+                    tdef["name"],
+                    tdef.get("columns", []),
+                    tdef.get("hidden", False),
+                )
+
+        if measures_json:
+            for mdef in json.loads(measures_json):
+                builder.add_measure(
+                    mdef["table"],
+                    mdef["name"],
+                    mdef["expression"],
+                    mdef.get("description", ""),
+                )
+
+        if relationships_json:
+            for rdef in json.loads(relationships_json):
+                builder.add_relationship(
+                    rdef["from_table"],
+                    rdef["from_column"],
+                    rdef["to_table"],
+                    rdef["to_column"],
+                )
+
+        builder.add_page("Page 1")
+
+        abs_path = builder.save(file_path)
+        size = os.path.getsize(abs_path)
+
+        # Auto-open the created file
+        result = pbix_open(abs_path, alias)
+        return f"Created '{abs_path}' ({size:,} bytes) and opened it.\n{result}"
+
+    except Exception as e:
+        return ToolResponse.error(str(e), "PBIX_MCP_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_add_visual(
+    alias: str,
+    page_index: int,
+    visual_type: str,
+    x: int = 0,
+    y: int = 0,
+    width: int = 300,
+    height: int = 200,
+    config_json: str = "",
+) -> str:
+    """Add a new visual to a report page.
+
+    Supports all Power BI visual types: card, table, clusteredBarChart,
+    clusteredColumnChart, lineChart, pieChart, donutChart, shape (buttons),
+    image, slicer, textbox, and any custom visual type.
+
+    Args:
+        alias: The alias of the open file
+        page_index: Zero-based page index
+        visual_type: Visual type (e.g. "card", "clusteredBarChart", "shape", "image", "textbox")
+        x: X position in pixels
+        y: Y position in pixels
+        width: Width in pixels
+        height: Height in pixels
+        config_json: Optional full config JSON to merge (for advanced properties)
+    """
+    try:
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            return ToolResponse.error("No layout found", "LAYOUT_JSON_INVALID").to_text()
+
+        sections = layout.get("sections", [])
+        if page_index < 0 or page_index >= len(sections):
+            return ToolResponse.error(f"Page index {page_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+
+        import uuid
+        visual_name = str(uuid.uuid4()).replace("-", "")[:16]
+
+        config = {
+            "name": visual_name,
+            "singleVisual": {
+                "visualType": visual_type,
+            },
+        }
+
+        # Merge custom config if provided
+        if config_json:
+            try:
+                custom = json.loads(config_json)
+                if isinstance(custom, dict):
+                    for key, val in custom.items():
+                        if key == "singleVisual" and isinstance(val, dict):
+                            config["singleVisual"].update(val)
+                        else:
+                            config[key] = val
+            except json.JSONDecodeError:
+                return ToolResponse.error("Invalid config_json", "LAYOUT_JSON_INVALID").to_text()
+
+        container = {
+            "x": x,
+            "y": y,
+            "width": width,
+            "height": height,
+            "config": json.dumps(config, ensure_ascii=False),
+        }
+
+        page = sections[page_index]
+        page.setdefault("visualContainers", []).append(container)
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+
+        idx = len(page["visualContainers"]) - 1
+        page_name = page.get("displayName", f"Page {page_index}")
+        return f"Added {visual_type} visual at ({x},{y}) {width}x{height} on '{page_name}' (index {idx})"
+
+    except Exception as e:
+        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+
+
+@mcp.tool()
+def pbix_remove_visual(alias: str, page_index: int, visual_index: int) -> str:
+    """Remove a visual from a report page.
+
+    Args:
+        alias: The alias of the open file
+        page_index: Zero-based page index
+        visual_index: Zero-based visual index on the page
+    """
+    try:
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            return ToolResponse.error("No layout found", "LAYOUT_JSON_INVALID").to_text()
+
+        sections = layout.get("sections", [])
+        if page_index < 0 or page_index >= len(sections):
+            return ToolResponse.error(f"Page index {page_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+
+        containers = sections[page_index].get("visualContainers", [])
+        if visual_index < 0 or visual_index >= len(containers):
+            return ToolResponse.error(f"Visual index {visual_index} out of range", "LAYOUT_JSON_INVALID").to_text()
+
+        removed = containers.pop(visual_index)
+        config = _parse_visual_config(removed)
+        vtype = _get_visual_type(config)
+
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+        return f"Removed {vtype} visual (was index {visual_index}). {len(containers)} visuals remain."
+
+    except Exception as e:
+        return ToolResponse.error(str(e), "LAYOUT_JSON_INVALID").to_text()
+
+
+@mcp.tool()
 def pbix_get_layout_raw(alias: str) -> str:
     """Get the raw Report/Layout JSON.
 
