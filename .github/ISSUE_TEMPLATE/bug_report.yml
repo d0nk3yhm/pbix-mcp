@@ -1,0 +1,62 @@
+name: Bug Report
+description: Report a bug in pbix-mcp
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      description: Output of `pip show pbix-mcp`
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      placeholder: "3.12.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+
+  - type: input
+    id: tool
+    attributes:
+      label: MCP tool that failed
+      placeholder: "pbix_evaluate_dax"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the bug and what you expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Error message or log output
+      render: shell
+
+  - type: dropdown
+    id: fixture
+    attributes:
+      label: Reproducible with public fixture?
+      options:
+        - "Yes"
+        - "No — requires private PBIX file"
+        - "Not sure"
