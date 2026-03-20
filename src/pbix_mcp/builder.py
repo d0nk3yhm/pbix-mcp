@@ -271,28 +271,71 @@ class PBIXBuilder:
         # 4. Build layout
         layout_bytes = self._build_layout()
 
-        # 5. Pack into ZIP
+        # 5. Pack into ZIP (OPC package format)
         import io
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            # Version — required by PowerBI Desktop (UTF-16LE)
+            zf.writestr("Version", "1.31".encode("utf-16-le"))
+
+            # Report/Layout — UTF-16LE encoded JSON
             zf.writestr("Report/Layout", layout_bytes)
+
+            # DataModel — XPress9-compressed ABF
             zf.writestr("DataModel", datamodel_bytes)
-            zf.writestr("Settings", json.dumps({"version": "5.0"}))
-            zf.writestr("Metadata", json.dumps({"version": 3}))
+
+            # Settings — UTF-16LE encoded JSON
+            settings = {
+                "Version": 1,
+                "ReportSettings": {},
+                "QueriesSettings": {
+                    "TypeDetectionEnabled": True,
+                    "RelationshipImportEnabled": True,
+                    "Version": "2.81.5831.821",
+                },
+            }
+            zf.writestr("Settings", json.dumps(settings).encode("utf-16-le"))
+
+            # Metadata — UTF-16LE encoded JSON
+            metadata = {
+                "Version": 5,
+                "AutoCreatedRelationships": [],
+                "FileDescription": "",
+                "CreatedFrom": "pbix-mcp",
+                "CreatedFromRelease": "0.1.0",
+            }
+            zf.writestr("Metadata", json.dumps(metadata).encode("utf-16-le"))
+
+            # DiagramLayout — empty but expected
+            zf.writestr("DiagramLayout", "{}".encode("utf-16-le"))
+
+            # Content_Types.xml — OPC content types
             zf.writestr(
                 "[Content_Types].xml",
-                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<?xml version="1.0" encoding="utf-8"?>'
                 '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Default Extension="json" ContentType=""/>'
+                '<Default Extension="xml" ContentType=""/>'
+                '<Override PartName="/Version" ContentType=""/>'
                 '<Override PartName="/DataModel" ContentType=""/>'
-                '<Override PartName="/Report/Layout" ContentType="application/json"/>'
+                '<Override PartName="/DiagramLayout" ContentType=""/>'
+                '<Override PartName="/Report/Layout" ContentType=""/>'
                 '<Override PartName="/Settings" ContentType="application/json"/>'
                 '<Override PartName="/Metadata" ContentType="application/json"/>'
                 "</Types>",
             )
 
-            # Add minimal DataMashup (empty M code container)
-            # Power BI Desktop regenerates this on first open, but having
-            # it present prevents some tooling from complaining
+            # _rels/.rels — OPC relationships
+            zf.writestr(
+                "_rels/.rels",
+                '<?xml version="1.0" encoding="utf-8" standalone="yes"?>'
+                '<Relationships xmlns='
+                '"http://schemas.openxmlformats.org/package/2006/relationships">'
+                "</Relationships>",
+            )
+
+            # DataMashup — empty M code container
+            # Power BI Desktop regenerates this on first open
             zf.writestr("DataMashup", b"")
 
         return buf.getvalue()
