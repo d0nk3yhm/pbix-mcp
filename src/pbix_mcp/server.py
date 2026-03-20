@@ -862,7 +862,7 @@ def pbix_create(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 @mcp.tool()
@@ -1121,7 +1121,7 @@ def pbix_get_settings(alias: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 @mcp.tool()
@@ -1144,7 +1144,7 @@ def pbix_set_settings(alias: str, settings_json: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 @mcp.tool()
@@ -1208,7 +1208,7 @@ def pbix_get_metadata(alias: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 # ---- Section 5: Resources & Theme tools ----
@@ -1245,7 +1245,7 @@ def pbix_list_resources(alias: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 @mcp.tool()
@@ -1275,7 +1275,7 @@ def pbix_get_theme(alias: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 @mcp.tool()
@@ -1306,7 +1306,7 @@ def pbix_set_theme(alias: str, theme_json: str, filename: str = "CY24SU11.json")
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 @mcp.tool()
@@ -1328,7 +1328,7 @@ def pbix_get_linguistic_schema(alias: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 @mcp.tool()
@@ -1352,7 +1352,7 @@ def pbix_set_linguistic_schema(alias: str, schema_xml: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 # ---- Section 6: DataMashup (M Code) tools ----
@@ -1373,7 +1373,7 @@ def pbix_get_m_code(alias: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 @mcp.tool()
@@ -1394,7 +1394,7 @@ def pbix_set_m_code(alias: str, m_code: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 # ---- Section 7: DataModel READ tools (via PBIXRay) ----
@@ -1836,7 +1836,7 @@ def pbix_datamodel_query_metadata(alias: str, sql_query: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", PBIXMCPError.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
 
 
 @mcp.tool()
@@ -1873,7 +1873,7 @@ def pbix_datamodel_modify_metadata(alias: str, sql_statement: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", PBIXMCPError.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
 
 
 @mcp.tool()
@@ -1929,7 +1929,7 @@ def pbix_datamodel_modify_measure(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", PBIXMCPError.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
 
 
 @mcp.tool()
@@ -1992,7 +1992,7 @@ def pbix_datamodel_add_measure(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", PBIXMCPError.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
 
 
 @mcp.tool()
@@ -2041,7 +2041,7 @@ def pbix_datamodel_remove_measure(alias: str, measure_name: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", PBIXMCPError.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
 
 
 @mcp.tool()
@@ -2106,7 +2106,7 @@ def pbix_datamodel_modify_column(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", PBIXMCPError.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
 
 
 @mcp.tool()
@@ -2561,7 +2561,7 @@ def pbix_evaluate_dax(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", PBIXMCPError.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
 
 
 @mcp.tool()
@@ -2595,7 +2595,7 @@ def pbix_evaluate_dax_per_dimension(
         try:
             dim_ref = DimensionRef.parse(dimension)
         except ValueError as e:
-            return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+            return ToolResponse.error(e.message, e.code).to_text()
         dim_table, dim_col = dim_ref.table, dim_ref.column
 
         # Get unique dimension values
@@ -2647,7 +2647,7 @@ def pbix_evaluate_dax_per_dimension(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", PBIXMCPError.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
 
 
 def _get_layout_pbir(work_dir: str) -> dict | None:
@@ -3028,7 +3028,7 @@ def pbix_evaluate_calculated_columns(alias: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 # ---- Section 11: RLS (Row-Level Security) ----
@@ -3104,7 +3104,7 @@ def pbix_get_rls_roles(alias: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 @mcp.tool()
@@ -3222,7 +3222,7 @@ def pbix_set_rls_role(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 @mcp.tool()
@@ -3341,7 +3341,7 @@ def pbix_evaluate_rls(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 # ---- Section 11: Diagnostics ----
@@ -3433,7 +3433,7 @@ def pbix_get_password(alias: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(str(e), PBIXMCPError.code).to_text()
+        return ToolResponse.error(e.message, e.code).to_text()
 
 
 @mcp.tool()

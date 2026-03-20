@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast unit tests only (~130 pass from fresh clone, ~8 skip without private files)
+# Fast unit tests only (~140 pass from fresh clone, ~8 skip without private files)
 pytest -m "not slow"
 
 # All tests (requires private PBIX test files; 19 integration tests)

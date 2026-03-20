@@ -1,6 +1,6 @@
 """
-OpenBI — DAX Engine
-====================
+pbix-mcp — DAX Engine
+=====================
 Evaluates DAX measure expressions against VertiPaq data.
 
 Supports 150+ DAX functions:
