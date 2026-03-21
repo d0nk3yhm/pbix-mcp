@@ -279,10 +279,10 @@ class PBIXBuilder:
                     "INSERT INTO [Table] (ID, ModelID, Name, IsHidden) VALUES (?, 1, ?, ?)",
                     (tid, tdef["name"], 1 if tdef.get("hidden") else 0),
                 )
-                # Add partition — Type=0 (none) avoids M engine dependency.
-                # Power BI Desktop will prompt for a data refresh on first open.
+                # Add partition — Type=2 (calculated) avoids M engine dependency.
+                # Power BI Desktop will show empty tables until data is refreshed.
                 c.execute(
-                    "INSERT OR IGNORE INTO [Partition] (ID, TableID, Name, Type) VALUES (?, ?, ?, 0)",
+                    "INSERT OR IGNORE INTO [Partition] (ID, TableID, Name, Type) VALUES (?, ?, ?, 2)",
                     (tid, tid, f"{tdef['name']}_partition"),
                 )
                 # Add columns
