@@ -543,12 +543,12 @@ class TestPBIXWithData:
     """Build PBIX with actual row data and verify VertiPaq encoding."""
 
     def test_build_with_data_and_verify(self):
-        """Build PBIX with rows, verify ABF contains VertiPaq column files."""
+        """Build PBIX with rows, verify metadata contains our tables/measures."""
         import io
         import zipfile
 
         from pbix_mcp.builder import PBIXBuilder
-        from pbix_mcp.formats.abf_rebuild import list_abf_files
+        from pbix_mcp.formats.abf_rebuild import list_abf_files, read_metadata_sqlite
         from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
 
         builder = PBIXBuilder()
@@ -572,12 +572,25 @@ class TestPBIXWithData:
         files = list_abf_files(abf)
         file_paths = [f["Path"] for f in files]
 
-        # Must have VertiPaq files for each column
-        assert any("column.Product" in p and p.endswith("meta") for p in file_paths)
-        assert any("column.Amount" in p and p.endswith("meta") for p in file_paths)
-        assert any("column.Qty" in p and p.endswith("meta") for p in file_paths)
-        # Plus IDF, dict, hidx for each
-        assert len(files) >= 13  # 1 metadata + 3 columns * 4 files each
+        # Must have metadata.sqlitedb with our custom schema
+        assert any("metadata" in p.lower() for p in file_paths)
+
+        # Verify the metadata contains our table and measure
+        meta = read_metadata_sqlite(abf)
+        assert len(meta) > 0
+
+        import sqlite3, tempfile
+        tmp = tempfile.mktemp(suffix=".db")
+        with open(tmp, "wb") as f:
+            f.write(meta)
+        conn = sqlite3.connect(tmp)
+        tables = [r[0] for r in conn.execute("SELECT Name FROM [Table] WHERE ModelID=1").fetchall()]
+        measures = [r[0] for r in conn.execute("SELECT Name FROM [Measure]").fetchall()]
+        conn.close()
+        os.unlink(tmp)
+
+        assert "Sales" in tables
+        assert "Total" in measures
 
 
 if __name__ == "__main__":

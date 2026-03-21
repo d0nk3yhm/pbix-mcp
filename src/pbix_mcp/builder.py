@@ -240,33 +240,38 @@ class PBIXBuilder:
         return json.dumps(layout, ensure_ascii=False).encode("utf-16-le")
 
     def build(self) -> bytes:
-        """Build the complete PBIX file as bytes."""
-        from pbix_mcp.formats.abf_rebuild import build_abf_from_scratch
-        from pbix_mcp.formats.datamodel_roundtrip import compress_datamodel
+        """Build the complete PBIX file as bytes.
 
-        # 1. Build metadata
+        Uses a minimal template DataModel from a real PBIX file (shipped
+        with the package) and replaces the metadata SQLite with our custom
+        schema. This ensures the ABF archive has the correct internal
+        structure that Analysis Services expects.
+        """
+        from pbix_mcp.formats.abf_rebuild import (
+            rebuild_abf_with_replacement,
+        )
+        from pbix_mcp.formats.datamodel_roundtrip import (
+            compress_datamodel,
+            decompress_datamodel,
+        )
+
+        # 1. Build metadata SQLite
         sqlite_bytes = self._build_metadata_sqlite()
 
-        # 2. Build ABF with metadata + VertiPaq row data
-        abf_files = {"metadata.sqlitedb": sqlite_bytes}
+        # 2. Load the template DataModel and replace its metadata
+        template_path = os.path.join(
+            os.path.dirname(__file__), "templates", "minimal_datamodel.bin"
+        )
+        with open(template_path, "rb") as f:
+            template_dm = f.read()
 
-        # Encode row data for tables that have rows
-        for tdef in self._tables:
-            if tdef.get("rows"):
-                from pbix_mcp.formats.vertipaq_encoder import encode_table_data
-                encoded = encode_table_data(
-                    tdef["name"],
-                    0,  # partition index
-                    [{"name": c["name"], "data_type": c["data_type"], "nullable": True}
-                     for c in tdef["columns"]],
-                    tdef["rows"],
-                )
-                abf_files.update(encoded)
-
-        abf_bytes = build_abf_from_scratch(abf_files)
+        template_abf = decompress_datamodel(template_dm)
+        new_abf = rebuild_abf_with_replacement(
+            template_abf, {"metadata.sqlitedb": sqlite_bytes}
+        )
 
         # 3. Compress to DataModel
-        datamodel_bytes = compress_datamodel(abf_bytes)
+        datamodel_bytes = compress_datamodel(new_abf)
 
         # 4. Build layout
         layout_bytes = self._build_layout()
