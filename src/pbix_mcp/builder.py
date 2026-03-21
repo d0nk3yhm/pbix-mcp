@@ -316,71 +316,23 @@ class PBIXBuilder:
         # 4. Build layout
         layout_bytes = self._build_layout()
 
-        # 5. Pack into ZIP (OPC package format)
+        # 5. Pack into ZIP — use the template PBIX as base, replace DataModel + Layout
+        # This preserves all the OPC packaging that Power BI Desktop expects
+        # (Version, Settings, Metadata, Content_Types, _rels, etc.)
         import io
+        template_pbix_path = os.path.join(
+            os.path.dirname(__file__), "templates", "minimal_template.pbix"
+        )
         buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            # Version — required by PowerBI Desktop (UTF-16LE)
-            zf.writestr("Version", "1.31".encode("utf-16-le"))
-
-            # Report/Layout — UTF-16LE encoded JSON
-            zf.writestr("Report/Layout", layout_bytes)
-
-            # DataModel — XPress9-compressed ABF
-            zf.writestr("DataModel", datamodel_bytes)
-
-            # Settings — UTF-16LE encoded JSON
-            settings = {
-                "Version": 1,
-                "ReportSettings": {},
-                "QueriesSettings": {
-                    "TypeDetectionEnabled": True,
-                    "RelationshipImportEnabled": True,
-                    "Version": "2.81.5831.821",
-                },
-            }
-            zf.writestr("Settings", json.dumps(settings).encode("utf-16-le"))
-
-            # Metadata — UTF-16LE encoded JSON
-            metadata = {
-                "Version": 5,
-                "AutoCreatedRelationships": [],
-                "FileDescription": "",
-                "CreatedFrom": "pbix-mcp",
-                "CreatedFromRelease": "0.1.0",
-            }
-            zf.writestr("Metadata", json.dumps(metadata).encode("utf-16-le"))
-
-            # DiagramLayout — empty but expected
-            zf.writestr("DiagramLayout", "{}".encode("utf-16-le"))
-
-            # Content_Types.xml — OPC content types
-            zf.writestr(
-                "[Content_Types].xml",
-                '<?xml version="1.0" encoding="utf-8"?>'
-                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-                '<Default Extension="json" ContentType=""/>'
-                '<Default Extension="xml" ContentType=""/>'
-                '<Override PartName="/Version" ContentType=""/>'
-                '<Override PartName="/DataModel" ContentType=""/>'
-                '<Override PartName="/DiagramLayout" ContentType=""/>'
-                '<Override PartName="/Report/Layout" ContentType=""/>'
-                '<Override PartName="/Settings" ContentType="application/json"/>'
-                '<Override PartName="/Metadata" ContentType="application/json"/>'
-                "</Types>",
-            )
-
-            # _rels/.rels — OPC relationships
-            zf.writestr(
-                "_rels/.rels",
-                '<?xml version="1.0" encoding="utf-8" standalone="yes"?>'
-                '<Relationships xmlns='
-                '"http://schemas.openxmlformats.org/package/2006/relationships">'
-                "</Relationships>",
-            )
-
-            # No DataMashup — our partitions use Type=0 (no M queries needed).
-            # Power BI Desktop will create the DataMashup on first refresh.
+        with zipfile.ZipFile(template_pbix_path) as zf_in:
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf_out:
+                for item in zf_in.namelist():
+                    if item == "DataModel":
+                        zf_out.writestr(item, datamodel_bytes)
+                    elif item == "Report/Layout":
+                        zf_out.writestr(item, layout_bytes)
+                    else:
+                        zf_out.writestr(item, zf_in.read(item))
 
         return buf.getvalue()
 
