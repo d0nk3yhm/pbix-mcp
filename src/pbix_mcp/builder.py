@@ -210,13 +210,31 @@ class PBIXBuilder:
         return data
 
     def _build_layout(self) -> bytes:
-        """Build the Report/Layout JSON."""
+        """Build the Report/Layout JSON with proper data bindings."""
         pages = self._pages or [{"name": "Page 1", "visuals": []}]
+
+        # Default measure entity — measures are hosted on the first table
+        # (typically "financials" in the template).
+        default_measure_entity = (
+            self._tables[0]["name"] if self._tables else "financials"
+        )
 
         sections = []
         for i, page in enumerate(pages):
             containers = []
             for j, vis in enumerate(page.get("visuals", [])):
+                visual_type = vis.get("type", "card")
+                cfg = vis.get("config", {})
+                single_visual = {"visualType": visual_type}
+
+                # Build data bindings based on visual type and config
+                bindings = self._build_visual_bindings(
+                    visual_type, cfg, default_measure_entity
+                )
+                if bindings:
+                    single_visual["projections"] = bindings["projections"]
+                    single_visual["prototypeQuery"] = bindings["prototypeQuery"]
+
                 containers.append({
                     "x": vis.get("x", 20 + j * 320),
                     "y": vis.get("y", 20),
@@ -224,9 +242,7 @@ class PBIXBuilder:
                     "height": vis.get("height", 200),
                     "config": json.dumps({
                         "name": vis.get("name", f"visual_{j}"),
-                        "singleVisual": {
-                            "visualType": vis.get("type", "card"),
-                        },
+                        "singleVisual": single_visual,
                     }),
                 })
             sections.append({
@@ -238,6 +254,111 @@ class PBIXBuilder:
 
         layout = {"id": 0, "sections": sections}
         return json.dumps(layout, ensure_ascii=False).encode("utf-16-le")
+
+    @staticmethod
+    def _build_visual_bindings(
+        visual_type: str,
+        cfg: dict,
+        default_measure_entity: str,
+    ) -> dict | None:
+        """Build projections + prototypeQuery for a visual config.
+
+        Returns None for visuals that don't need data bindings (e.g. textbox).
+        """
+        # Collect all entities referenced and build From/Select lists
+        from_sources: dict[str, str] = {}  # entity -> alias
+        selects: list[dict] = []
+        projections: dict[str, list[dict]] = {}
+
+        def _alias_for(entity: str) -> str:
+            """Get or create a short alias for a table/entity."""
+            if entity not in from_sources:
+                from_sources[entity] = entity[0].lower()
+                # Handle alias collisions
+                base = from_sources[entity]
+                existing = set(from_sources.values()) - {base}
+                suffix = 0
+                while base in existing:
+                    suffix += 1
+                    base = entity[0].lower() + str(suffix)
+                from_sources[entity] = base
+            return from_sources[entity]
+
+        def _add_measure(measure_name: str) -> str:
+            """Add a measure to selects, return its queryRef."""
+            entity = default_measure_entity
+            alias = _alias_for(entity)
+            query_ref = f"{entity}.{measure_name}"
+            selects.append({
+                "Measure": {
+                    "Expression": {"SourceRef": {"Source": alias}},
+                    "Property": measure_name,
+                },
+                "Name": query_ref,
+            })
+            return query_ref
+
+        def _add_column(table: str, column: str) -> str:
+            """Add a column to selects, return its queryRef."""
+            alias = _alias_for(table)
+            query_ref = f"{table}.{column}"
+            selects.append({
+                "Column": {
+                    "Expression": {"SourceRef": {"Source": alias}},
+                    "Property": column,
+                },
+                "Name": query_ref,
+            })
+            return query_ref
+
+        # --- Card: single measure -----------------------------------------
+        if visual_type == "card" and "measure" in cfg:
+            ref = _add_measure(cfg["measure"])
+            projections["Values"] = [{"queryRef": ref, "active": True}]
+
+        # --- Slicer: single column ----------------------------------------
+        elif visual_type == "slicer" and "column" in cfg:
+            col_cfg = cfg["column"]
+            ref = _add_column(col_cfg["table"], col_cfg["column"])
+            projections["Values"] = [{"queryRef": ref, "active": True}]
+
+        # --- Table / matrix: multiple columns and measures ----------------
+        elif visual_type in ("tableEx", "table", "matrix") and "columns" in cfg:
+            values = []
+            for col_def in cfg["columns"]:
+                if "measure" in col_def:
+                    ref = _add_measure(col_def["measure"])
+                else:
+                    ref = _add_column(col_def["table"], col_def["column"])
+                values.append({"queryRef": ref, "active": True})
+            projections["Values"] = values
+
+        # --- Chart types: category + measure ------------------------------
+        elif "category" in cfg and "measure" in cfg:
+            cat_cfg = cfg["category"]
+            cat_ref = _add_column(cat_cfg["table"], cat_cfg["column"])
+            meas_ref = _add_measure(cfg["measure"])
+            projections["Category"] = [{"queryRef": cat_ref, "active": True}]
+            projections["Y"] = [{"queryRef": meas_ref, "active": True}]
+
+        else:
+            # No data binding needed (textbox, shapes, etc.)
+            return None
+
+        # Assemble the prototypeQuery
+        from_list = [
+            {"Name": alias, "Entity": entity, "Type": 0}
+            for entity, alias in from_sources.items()
+        ]
+
+        return {
+            "projections": projections,
+            "prototypeQuery": {
+                "Version": 2,
+                "From": from_list,
+                "Select": selects,
+            },
+        }
 
     def build(self) -> bytes:
         """Build the complete PBIX file as bytes.
