@@ -1002,7 +1002,7 @@ def _modify_metadata_and_encode(
                     DetailRowsDefinitionID, DataCategory,
                     FormatStringDefinitionID, LineageTag, SourceLineageTag
                 ) VALUES (
-                    ?, ?, ?, ?, 0,
+                    ?, ?, ?, ?, 6,
                     ?, NULL, 0, 1,
                     ?, ?,
                     0, 0, NULL, NULL,
