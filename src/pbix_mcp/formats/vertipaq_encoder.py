@@ -211,9 +211,21 @@ def _dict_type_for_data_type(data_type: str) -> int:
         return DICT_TYPE_LONG
 
 
-def _element_size_for_dict_type(dict_type: int) -> int:
-    """Element size in bytes for numeric dictionary vectors."""
-    return 8  # both int64 and float64 are 8 bytes
+def _element_size_for_dict_type(dict_type: int, unique_values: list = None) -> int:
+    """
+    Element size in bytes for numeric dictionary vectors.
+
+    Bug #10: Use 4 bytes when all integer values fit in signed 32-bit range,
+    8 bytes otherwise (or for floats).
+    """
+    if dict_type == DICT_TYPE_REAL:
+        return 8  # float64 always 8 bytes
+    if dict_type == DICT_TYPE_LONG and unique_values is not None:
+        # Check if all values fit in signed 32-bit
+        s32_min, s32_max = -(1 << 31), (1 << 31) - 1
+        if all(s32_min <= int(v) <= s32_max for v in unique_values):
+            return 4
+    return 8
 
 
 # ---------------------------------------------------------------------------
@@ -223,10 +235,21 @@ def _element_size_for_dict_type(dict_type: int) -> int:
 def _encode_dict_hash_info(unique_values: list, dict_type: int) -> bytes:
     """
     Encode the hash_information block (6 x int32) that appears after
-    dictionary_type.  For simplicity we write zeros -- Power BI reads
-    dictionaries fine with zeroed hash info when HIDX is provided.
+    dictionary_type.
+
+    Bug #9: integers use (-1, 8, 64, 6, -1, -1), floats use (-1, 16, 64, 3, -1, -1)
+    Bug #11: strings use (0, 8, 64, 6, -1, -1)
     """
-    return b"\x00" * 24  # 6 * 4 bytes
+    if dict_type == DICT_TYPE_STRING:
+        # Bug #11: string hash_info = (0, 8, 64, 6, -1, -1)
+        vals = (0, 8, 64, 6, -1, -1)
+    elif dict_type == DICT_TYPE_REAL:
+        # Bug #9: float hash_info = (-1, 16, 64, 3, -1, -1)
+        vals = (-1, 16, 64, 3, -1, -1)
+    else:
+        # Bug #9: integer hash_info = (-1, 8, 64, 6, -1, -1)
+        vals = (-1, 8, 64, 6, -1, -1)
+    return struct.pack("<6i", *vals)
 
 
 def _encode_string_dictionary(unique_strings: list[str]) -> bytes:
@@ -245,8 +268,8 @@ def _encode_string_dictionary(unique_strings: list[str]) -> bytes:
     # dictionary_type
     buf += _s4(DICT_TYPE_STRING)
 
-    # hash_information (6 x int32 = 24 bytes of zeros)
-    buf += b"\x00" * 24
+    # hash_information (Bug #11)
+    buf += _encode_dict_hash_info(unique_strings, DICT_TYPE_STRING)
 
     count = len(unique_strings)
 
@@ -311,10 +334,10 @@ def _encode_string_dictionary(unique_strings: list[str]) -> bytes:
     buf += _u8(count)
     # element_size: uint32 = 8 (each handle is 8 bytes)
     buf += _u4(8)
-    # vector of StringRecordHandle { bit_or_byte_offset: u32, page_id: u32 }
+    # vector of StringRecordHandle { char_offset: u32, page_id: u32 }
     for i, off in enumerate(offsets):
-        buf += _u4(off)   # byte offset in character buffer
-        buf += _u4(0)     # page_id = 0 (single page)
+        buf += _u4(off // 2)   # character offset (Bug #12: byte_offset / 2)
+        buf += _u4(0)          # page_id = 0 (single page)
 
     return bytes(buf)
 
@@ -325,18 +348,18 @@ def _encode_numeric_dictionary(unique_values: list, dict_type: int) -> bytes:
 
     Layout:
       - dictionary_type: int32
-      - hash_information: 6 x int32 (zeros)
+      - hash_information: 6 x int32
       - VectorOfVectors { element_count: u64, element_size: u32, values[] }
     """
     buf = bytearray()
 
     # dictionary_type
     buf += _s4(dict_type)
-    # hash_information
-    buf += b"\x00" * 24
+    # hash_information (Bug #9)
+    buf += _encode_dict_hash_info(unique_values, dict_type)
 
     count = len(unique_values)
-    element_size = 8  # both int64 and float64 are 8 bytes
+    element_size = _element_size_for_dict_type(dict_type, unique_values)  # Bug #10
 
     # VectorOfVectors
     buf += _u8(count)
@@ -345,6 +368,8 @@ def _encode_numeric_dictionary(unique_values: list, dict_type: int) -> bytes:
     for val in unique_values:
         if dict_type == DICT_TYPE_REAL:
             buf += _f8(float(val))
+        elif element_size == 4:
+            buf += _s4(int(val))  # Bug #10: pack as s32 when element_size=4
         else:
             buf += _s8(int(val))
 
@@ -492,8 +517,8 @@ def _encode_idf(indices: list[int], bit_width: int) -> bytes:
     emit an RLE entry.  Collect non-run values into bit-packed batches.
     """
     if not indices:
-        # Empty column: single segment with empty primary + sub
-        return _u8(0) + _u8(0)
+        # Empty column: primary segment is still 16 u64 words (128 bytes, all zeros) + empty sub
+        return _u8(16) + (b"\x00" * 128) + _u8(0)
 
     # Build RLE runs
     runs = []  # list of (value, count)
@@ -570,13 +595,17 @@ def _encode_idf(indices: list[int], bit_width: int) -> bytes:
     # Build the binary IDF
     buf = bytearray()
 
-    # primary_segment_size (count of entries, not bytes)
-    buf += _u8(len(primary_entries))
+    # primary_segment_size: ALWAYS 16 (16 u64 words = 128 bytes, zero-padded)
+    buf += _u8(16)
 
-    # primary_segment entries
+    # primary_segment entries -- always exactly 16 u64 words (128 bytes)
+    # Each entry is (data_value: u32, repeat_value: u32) = 1 u64 word
     for dv, rv in primary_entries:
         buf += _u4(dv)
         buf += _u4(rv)
+    # Zero-pad remaining entries to fill 16 u64 words (128 bytes total)
+    padding_entries = 16 - len(primary_entries)
+    buf += b"\x00" * (padding_entries * 8)
 
     # sub_segment_size (count of uint64 values)
     buf += _u8(len(sub_segment_u64s))
@@ -635,6 +664,9 @@ def _encode_idfmeta(
     sub_segment_count: int,
     sub_segment_bytes: int,
     count_bit_packed: int,
+    nonzero_primary_entries: int = 0,
+    has_dict: bool = True,
+    is_row_number: bool = False,
 ) -> bytes:
     """
     Encode an IDFMETA file.
@@ -684,25 +716,25 @@ def _encode_idfmeta(
 
     # records
     buf += _u8(row_count)
-    # one
-    buf += _u8(1)
+    # one: 0 for RowNumber columns, 1 otherwise (Bug #4)
+    buf += _u8(0 if is_row_number else 1)
     # a_b_a_5_a = 36 - bit_width
     a_b_a_5_a = 36 - bit_width
     buf += _u4(a_b_a_5_a)
     # iterator = 0
     buf += _u4(0)
-    # bookmark_bits_1_2_8 = 128
-    buf += _u8(128)
+    # bookmark_bits: 12 (not 128) (Bug #3)
+    buf += _u8(12)
 
-    # storage_alloc_size: total IDF bytes (primary segment header + entries + sub segment header + entries)
-    idf_total = 8 + primary_segment_bytes + 8 + sub_segment_bytes
-    buf += _u8(idf_total)
-    # storage_used_size
-    buf += _u8(idf_total)
+    # storage_alloc_size: always 32 (Bug #6)
+    buf += _u8(32)
+    # storage_used_size: 2 * (nonzero_primary_entries + has_dict) (Bug #6)
+    storage_used = 2 * (nonzero_primary_entries + (1 if has_dict else 0))
+    buf += _u8(storage_used)
     # segment_needs_resizing
     buf += _u1(0)
-    # compression_info = 0 (uncompressed)
-    buf += _u4(0)
+    # compression_info = 3 (Bug #2)
+    buf += _u4(3)
 
     # --- SS block ---
     buf += TAG_SS_OPEN
@@ -714,7 +746,7 @@ def _encode_idfmeta(
     buf += _u8(row_count)
     buf += _u1(1 if has_nulls else 0)
     buf += _u8(rle_runs)
-    buf += _u8(0)                     # others_r_l_e_runs
+    buf += _u8(1 if has_dict else 0)  # others_r_l_e_runs (Bug #7)
     buf += TAG_SS_CLOSE
 
     # has_bit_packed_sub_seg
@@ -739,14 +771,13 @@ def _encode_idfmeta(
     buf += TAG_CSDOS_OPEN
     # zero_c_s_d_o: uint64 = 0
     buf += _u8(0)
-    # primary_segment_size: uint64 (byte size = count * 8 per entry)
-    buf += _u8(primary_segment_bytes)
+    # primary_segment_size: always 16 (Bug #8)
+    buf += _u8(16)
 
     # CSDOs1 (inner, for sub-segment)
     buf += TAG_CSDOS_OPEN
-    # sub_segment_offset: uint64 (offset from start of IDF data to sub-segment)
-    sub_offset = 8 + primary_segment_bytes + 8  # primary_size_field + primary_data + sub_size_field
-    buf += _u8(8 + primary_segment_bytes)  # offset to sub_segment_size field
+    # sub_segment_offset: always 136 (8 + 128 + 0 = offset to sub_segment) (Bug #8)
+    buf += _u8(136)
     # sub_segment_size: uint64
     buf += _u8(sub_segment_bytes)
     buf += TAG_CSDOS_CLOSE
@@ -767,6 +798,7 @@ def _encode_column(
     data_type: str,
     nullable: bool,
     values: list,
+    is_row_number: bool = False,
 ) -> dict[str, bytes]:
     """
     Encode a single column's data into the VertiPaq binary files.
@@ -826,25 +858,32 @@ def _encode_column(
     idf_bytes = _encode_idf(indices, bit_width)
 
     # Parse IDF to get segment stats for IDFMETA
-    # The IDF we just built: primary_segment_size(u64) + entries + sub_segment_size(u64) + sub entries
-    ps_count = struct.unpack_from("<Q", idf_bytes, 0)[0]
-    primary_segment_bytes = ps_count * 8  # each entry is 8 bytes (u32 + u32)
-    ss_offset = 8 + primary_segment_bytes
+    # The IDF we just built: primary_segment_size(u64=16 always) + 128 bytes + sub_segment_size(u64) + sub entries
+    ps_count = struct.unpack_from("<Q", idf_bytes, 0)[0]  # always 16
+    primary_segment_bytes = ps_count * 8  # 16 * 8 = 128 bytes always
+    ss_offset = 8 + primary_segment_bytes  # = 136
     ss_count = struct.unpack_from("<Q", idf_bytes, ss_offset)[0]
     sub_segment_bytes = ss_count * 8  # each uint64 is 8 bytes
 
-    # Count RLE runs and bit-packed count
+    # Count RLE runs and bit-packed count from the actual (non-zero-padded) entries
     rle_runs = 0
     count_bit_packed = 0
+    nonzero_primary_entries = 0
     offset = 8  # skip primary_segment_size
     for _ in range(ps_count):
         dv = struct.unpack_from("<I", idf_bytes, offset)[0]
         rv = struct.unpack_from("<I", idf_bytes, offset + 4)[0]
+        if dv == 0 and rv == 0:
+            break  # hit zero-padding
+        nonzero_primary_entries += 1
         if dv == 0xFFFFFFFF:
             count_bit_packed += rv
         else:
             rle_runs += 1
         offset += 8
+
+    # Determine if this column has a dictionary (non-RowNumber columns with values)
+    has_dict = len(unique_sorted) > 0
 
     # --- Encode IDFMETA ---
     idfmeta_bytes = _encode_idfmeta(
@@ -860,6 +899,9 @@ def _encode_column(
         sub_segment_count=ss_count,
         sub_segment_bytes=sub_segment_bytes,
         count_bit_packed=count_bit_packed,
+        nonzero_primary_entries=nonzero_primary_entries,
+        has_dict=has_dict,
+        is_row_number=is_row_number,
     )
 
     # --- Encode Dictionary ---
@@ -931,9 +973,10 @@ def encode_table_data(
 
         # Extract column values from rows
         values = [row.get(col_name) for row in rows]
+        is_rn = col_def.get("is_row_number", False)
 
         # Encode the column
-        encoded = _encode_column(col_name, data_type, nullable, values)
+        encoded = _encode_column(col_name, data_type, nullable, values, is_row_number=is_rn)
 
         # Build file paths
         idf_path = f"{base_path}\\column.{col_name}"
@@ -1080,7 +1123,7 @@ def update_table_in_abf(
         # Generate system column data
         if is_rn:
             # RowNumber: sequential 0-based integers
-            sys_col_def = [{"name": sc_name, "data_type": "Int64", "nullable": False}]
+            sys_col_def = [{"name": sc_name, "data_type": "Int64", "nullable": False, "is_row_number": True}]
             sys_rows = [{sc_name: i} for i in range(row_count)]
         else:
             # Other system columns (Format String, etc.): all nulls
