@@ -580,7 +580,7 @@ def _modify_metadata_and_encode(
                     DataCoverageDefinitionID, SchemaName
                 ) VALUES (
                     ?, ?, ?, NULL, 0,
-                    NULL, 1, 4, ?,
+                    NULL, 1, 2, ?,
                     0, 3, ?, ?,
                     0, NULL, 0,
                     0.0, 0.0, -1, NULL,
