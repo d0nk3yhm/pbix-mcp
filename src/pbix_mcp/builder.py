@@ -279,9 +279,10 @@ class PBIXBuilder:
                     "INSERT INTO [Table] (ID, ModelID, Name, IsHidden) VALUES (?, 1, ?, ?)",
                     (tid, tdef["name"], 1 if tdef.get("hidden") else 0),
                 )
-                # Add partition (required — Type=4 for M/Import)
+                # Add partition — Type=0 (none) avoids M engine dependency.
+                # Power BI Desktop will prompt for a data refresh on first open.
                 c.execute(
-                    "INSERT OR IGNORE INTO [Partition] (ID, TableID, Name, Type) VALUES (?, ?, ?, 4)",
+                    "INSERT OR IGNORE INTO [Partition] (ID, TableID, Name, Type) VALUES (?, ?, ?, 0)",
                     (tid, tid, f"{tdef['name']}_partition"),
                 )
                 # Add columns
@@ -422,9 +423,8 @@ class PBIXBuilder:
                 "</Relationships>",
             )
 
-            # DataMashup — empty M code container
-            # Power BI Desktop regenerates this on first open
-            zf.writestr("DataMashup", b"")
+            # No DataMashup — our partitions use Type=0 (no M queries needed).
+            # Power BI Desktop will create the DataMashup on first refresh.
 
         return buf.getvalue()
 
