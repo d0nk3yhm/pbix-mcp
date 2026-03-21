@@ -265,26 +265,30 @@ class PBIXBuilder:
             """Modify the template's metadata to contain our custom schema."""
             c = conn.cursor()
 
-            # Clear existing data (keep schema intact for AS compatibility)
-            c.execute("DELETE FROM [Measure]")
-            c.execute("DELETE FROM [Relationship]")
-            c.execute("DELETE FROM [Column] WHERE TableID IN (SELECT ID FROM [Table] WHERE ModelID=1)")
-            c.execute("DELETE FROM [Partition] WHERE TableID IN (SELECT ID FROM [Table] WHERE ModelID=1)")
-            c.execute("DELETE FROM [Table] WHERE ModelID=1")
+            # Keep template's existing tables intact (the .db.xml references them).
+            # Add our new tables with high IDs that don't conflict.
+            max_table_id = c.execute("SELECT COALESCE(MAX(ID), 0) FROM [Table]").fetchone()[0]
+            max_col_id = c.execute("SELECT COALESCE(MAX(ID), 0) FROM [Column]").fetchone()[0]
+            max_part_id = c.execute("SELECT COALESCE(MAX(ID), 0) FROM [Partition]").fetchone()[0]
 
-            # Add our tables
-            col_id = 1
-            for tid, tdef in enumerate(tables, start=1):
+            # Add our tables starting after the highest existing IDs
+            col_id = max_col_id + 1
+            part_id = max_part_id + 1
+            # Build mapping from table name -> assigned ID
+            table_id_map = {}
+            for idx, tdef in enumerate(tables):
+                tid = max_table_id + idx + 1
+                table_id_map[tdef["name"]] = tid
                 c.execute(
                     "INSERT INTO [Table] (ID, ModelID, Name, IsHidden) VALUES (?, 1, ?, ?)",
                     (tid, tdef["name"], 1 if tdef.get("hidden") else 0),
                 )
-                # Add partition — Type=2 (calculated) avoids M engine dependency.
-                # Power BI Desktop will show empty tables until data is refreshed.
+                # Add partition — Type=2 (calculated) avoids M engine dependency
                 c.execute(
                     "INSERT OR IGNORE INTO [Partition] (ID, TableID, Name, Type) VALUES (?, ?, ?, 2)",
-                    (tid, tid, f"{tdef['name']}_partition"),
+                    (part_id, tid, f"{tdef['name']}_partition"),
                 )
+                part_id += 1
                 # Add columns
                 for ci, col_def in enumerate(tdef["columns"]):
                     c.execute(
@@ -302,13 +306,10 @@ class PBIXBuilder:
                 col_id += 1
 
             # Add our measures
-            for mid, mdef in enumerate(measures, start=1):
-                # Find table ID
-                table_id = None
-                for tid, tdef in enumerate(tables, start=1):
-                    if tdef["name"] == mdef["table"]:
-                        table_id = tid
-                        break
+            max_measure_id = c.execute("SELECT COALESCE(MAX(ID), 0) FROM [Measure]").fetchone()[0]
+            for mid_offset, mdef in enumerate(measures):
+                mid = max_measure_id + mid_offset + 1
+                table_id = table_id_map.get(mdef["table"])
                 if table_id:
                     c.execute(
                         "INSERT INTO [Measure] (ID, TableID, Name, Expression, Description) "
@@ -317,28 +318,28 @@ class PBIXBuilder:
                          mdef.get("description", "")),
                     )
 
-            # Add our relationships
-            for rid, rdef in enumerate(relationships, start=1):
-                from_tid = from_cid = to_tid = to_cid = None
-                for tid, tdef in enumerate(tables, start=1):
-                    if tdef["name"] == rdef["from_table"]:
-                        from_tid = tid
-                        for ci, col in enumerate(tdef["columns"]):
-                            if col["name"] == rdef["from_column"]:
-                                # Find column ID (cumulative)
-                                from_cid = sum(len(tables[j]["columns"]) + 1 for j in range(tid - 1)) + ci + 1
-                    if tdef["name"] == rdef["to_table"]:
-                        to_tid = tid
-                        for ci, col in enumerate(tdef["columns"]):
-                            if col["name"] == rdef["to_column"]:
-                                to_cid = sum(len(tables[j]["columns"]) + 1 for j in range(tid - 1)) + ci + 1
-                if all(v is not None for v in [from_tid, from_cid, to_tid, to_cid]):
-                    c.execute(
-                        "INSERT INTO [Relationship] (ID, ModelID, FromTableID, FromColumnID, "
-                        "FromCardinality, ToTableID, ToColumnID, ToCardinality, IsActive) "
-                        "VALUES (?, 1, ?, ?, 2, ?, ?, 1, 1)",
-                        (rid, from_tid, from_cid, to_tid, to_cid),
-                    )
+            # Add our relationships — look up column IDs from what we inserted
+            max_rel_id = c.execute("SELECT COALESCE(MAX(ID), 0) FROM [Relationship]").fetchone()[0]
+            for rid_offset, rdef in enumerate(relationships):
+                rid = max_rel_id + rid_offset + 1
+                from_tid = table_id_map.get(rdef["from_table"])
+                to_tid = table_id_map.get(rdef["to_table"])
+                if from_tid and to_tid:
+                    from_cid = c.execute(
+                        "SELECT ID FROM [Column] WHERE TableID=? AND ExplicitName=?",
+                        (from_tid, rdef["from_column"])
+                    ).fetchone()
+                    to_cid = c.execute(
+                        "SELECT ID FROM [Column] WHERE TableID=? AND ExplicitName=?",
+                        (to_tid, rdef["to_column"])
+                    ).fetchone()
+                    if from_cid and to_cid:
+                        c.execute(
+                            "INSERT INTO [Relationship] (ID, ModelID, FromTableID, FromColumnID, "
+                            "FromCardinality, ToTableID, ToColumnID, ToCardinality, IsActive) "
+                            "VALUES (?, 1, ?, ?, 2, ?, ?, 1, 1)",
+                            (rid, from_tid, from_cid[0], to_tid, to_cid[0]),
+                        )
 
             conn.commit()
 
