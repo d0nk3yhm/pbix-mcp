@@ -826,10 +826,10 @@ def _modify_metadata_and_encode(
                         ?, 0, NULL, NULL,
                         1, 0, 0,
                         ?, ?, 31240512000000000,
-                        0, 0, ?,
+                        1, 0, ?,
                         NULL, NULL, NULL,
                         0, 0, 0,
-                        ?, NULL, 0
+                        ?, NULL, 1
                     )""",
                     (col_id, table_id, col_name,
                      amo_type, amo_type,
