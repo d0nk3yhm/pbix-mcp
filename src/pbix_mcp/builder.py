@@ -262,84 +262,39 @@ class PBIXBuilder:
         relationships = self._relationships
 
         def _modify_metadata(conn: sqlite3.Connection) -> None:
-            """Modify the template's metadata to contain our custom schema."""
+            """Add measures to the template's existing model.
+
+            We only add measures (safe — no Storage entries needed).
+            Tables, columns, and relationships are NOT added to the
+            metadata because AS requires corresponding entries in
+            ~10 Storage tables that we can't easily generate.
+
+            The template's existing tables remain. Our measures reference
+            our table names; Power BI Desktop will show them as errors
+            until the user connects actual data sources.
+            """
             c = conn.cursor()
 
-            # Keep template's existing tables intact (the .db.xml references them).
-            # Add our new tables with high IDs that don't conflict.
-            max_table_id = c.execute("SELECT COALESCE(MAX(ID), 0) FROM [Table]").fetchone()[0]
-            max_col_id = c.execute("SELECT COALESCE(MAX(ID), 0) FROM [Column]").fetchone()[0]
-            max_part_id = c.execute("SELECT COALESCE(MAX(ID), 0) FROM [Partition]").fetchone()[0]
+            # Find the first existing table to attach measures to
+            first_table = c.execute(
+                "SELECT ID FROM [Table] WHERE ModelID=1 LIMIT 1"
+            ).fetchone()
+            if not first_table:
+                return
+            host_table_id = first_table[0]
 
-            # Add our tables starting after the highest existing IDs
-            col_id = max_col_id + 1
-            part_id = max_part_id + 1
-            # Build mapping from table name -> assigned ID
-            table_id_map = {}
-            for idx, tdef in enumerate(tables):
-                tid = max_table_id + idx + 1
-                table_id_map[tdef["name"]] = tid
+            # Add our measures — attach to the first existing table
+            max_measure_id = c.execute(
+                "SELECT COALESCE(MAX(ID), 0) FROM [Measure]"
+            ).fetchone()[0]
+            for idx, mdef in enumerate(measures):
+                mid = max_measure_id + idx + 1
                 c.execute(
-                    "INSERT INTO [Table] (ID, ModelID, Name, IsHidden) VALUES (?, 1, ?, ?)",
-                    (tid, tdef["name"], 1 if tdef.get("hidden") else 0),
+                    "INSERT INTO [Measure] (ID, TableID, Name, Expression, Description) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (mid, host_table_id, mdef["name"], mdef["expression"],
+                     mdef.get("description", "")),
                 )
-                # Add partition — Type=2 (calculated) avoids M engine dependency
-                c.execute(
-                    "INSERT OR IGNORE INTO [Partition] (ID, TableID, Name, Type) VALUES (?, ?, ?, 2)",
-                    (part_id, tid, f"{tdef['name']}_partition"),
-                )
-                part_id += 1
-                # Add columns
-                for ci, col_def in enumerate(tdef["columns"]):
-                    c.execute(
-                        "INSERT INTO [Column] (ID, TableID, ExplicitName, InferredName, Type) "
-                        "VALUES (?, ?, ?, ?, 1)",
-                        (col_id, tid, col_def["name"], col_def["name"]),
-                    )
-                    col_id += 1
-                # Add RowNumber column (required by AS)
-                c.execute(
-                    "INSERT INTO [Column] (ID, TableID, ExplicitName, InferredName, Type, IsHidden) "
-                    "VALUES (?, ?, ?, ?, 3, 1)",
-                    (col_id, tid, f"RowNumber-{tdef['name']}", f"RowNumber-{tdef['name']}"),
-                )
-                col_id += 1
-
-            # Add our measures
-            max_measure_id = c.execute("SELECT COALESCE(MAX(ID), 0) FROM [Measure]").fetchone()[0]
-            for mid_offset, mdef in enumerate(measures):
-                mid = max_measure_id + mid_offset + 1
-                table_id = table_id_map.get(mdef["table"])
-                if table_id:
-                    c.execute(
-                        "INSERT INTO [Measure] (ID, TableID, Name, Expression, Description) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (mid, table_id, mdef["name"], mdef["expression"],
-                         mdef.get("description", "")),
-                    )
-
-            # Add our relationships — look up column IDs from what we inserted
-            max_rel_id = c.execute("SELECT COALESCE(MAX(ID), 0) FROM [Relationship]").fetchone()[0]
-            for rid_offset, rdef in enumerate(relationships):
-                rid = max_rel_id + rid_offset + 1
-                from_tid = table_id_map.get(rdef["from_table"])
-                to_tid = table_id_map.get(rdef["to_table"])
-                if from_tid and to_tid:
-                    from_cid = c.execute(
-                        "SELECT ID FROM [Column] WHERE TableID=? AND ExplicitName=?",
-                        (from_tid, rdef["from_column"])
-                    ).fetchone()
-                    to_cid = c.execute(
-                        "SELECT ID FROM [Column] WHERE TableID=? AND ExplicitName=?",
-                        (to_tid, rdef["to_column"])
-                    ).fetchone()
-                    if from_cid and to_cid:
-                        c.execute(
-                            "INSERT INTO [Relationship] (ID, ModelID, FromTableID, FromColumnID, "
-                            "FromCardinality, ToTableID, ToColumnID, ToCardinality, IsActive) "
-                            "VALUES (?, 1, ?, ?, 2, ?, ?, 1, 1)",
-                            (rid, from_tid, from_cid[0], to_tid, to_cid[0]),
-                        )
 
             conn.commit()
 
