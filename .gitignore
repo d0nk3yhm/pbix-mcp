@@ -12,6 +12,10 @@ build/
 venv/
 test_samples/*.pbix
 !test_samples/.gitkeep
+# Generated PBIX files (keep templates and fixtures)
+*.pbix
+!src/pbix_mcp/templates/*.pbix
+!tests/fixtures/pbix/*.pbix
 *.abf
 *.tmp
 *.bak
