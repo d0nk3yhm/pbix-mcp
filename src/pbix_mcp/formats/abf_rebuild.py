@@ -725,23 +725,14 @@ def build_abf_from_scratch(
     )
     _PARTITIONS_CONTENT = b'<Partitions />'
 
-    # CryptKey.bin — minimal 144-byte crypto key structure required by AS
-    # when SvrEncryptPwdFlag=true (which is the server default).
-    # This is a valid unencrypted key (encryption disabled in our backup).
+    # CryptKey.bin — 144-byte crypto key extracted from a valid PBIX.
+    # Required by AS when SvrEncryptPwdFlag=true (server default).
     _CRYPTKEY_CONTENT = bytes.fromhex(
-        "00000000000000000000000000000000"  # 16 bytes zeroed header
-        "04000000"  # algorithm id
-        "30000000"  # key length
-        "50000000"  # data offset
-        "10000000"  # data length
-        "01000000"  # version
-        "07000000"  # flags
-        "ffffffff"  # reserved
-        "00000000"  # padding
-        "01020000"  # more header
-        "03660000"  # parameters
-        "00a40000"  # ...
-        "80" + "00" * 63  # 64 bytes key data (zeroed = no encryption)
+        "98bc215d2d8de64ea8e5d038aac94441"
+        "040000003000000050000000100000000100000007000000ffffffff00000000"
+        "010200000366000000a40000805bf7b37f703bf7ef3b7fb6299d1adab316e67c"
+        "80ab58310051a5c7d76097fba0aba4c09cc73a2b165781ea68aa644bcc2bba09"
+        "012e44fdfde63ed5221b02000000000098bc215d2d8de64ea8e5d038aac94441"
     )
 
     # Collect flat-name -> content, preserving required ordering.
