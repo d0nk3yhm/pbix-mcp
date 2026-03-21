@@ -732,8 +732,8 @@ def _encode_idfmeta(
     buf += _u8(storage_used)
     # segment_needs_resizing
     buf += _u1(0)
-    # compression_info = 3 (Bug #2)
-    buf += _u4(3)
+    # compression_info = bit_width (must match XMRENoSplitCompressionInfo<N>)
+    buf += _u4(bit_width)
 
     # --- SS block ---
     buf += TAG_SS_OPEN
