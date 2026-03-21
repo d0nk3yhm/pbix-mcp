@@ -390,10 +390,20 @@ class PBIXBuilder:
             """
             c = conn.cursor()
 
-            # Get existing measure IDs in order
-            existing = c.execute(
-                "SELECT ID, TableID FROM [Measure] ORDER BY ID"
-            ).fetchall()
+            # Get existing measure IDs — only those on the '# Measures' table
+            # (measures on other tables like 'Date' must not be overwritten)
+            measures_table_id = c.execute(
+                "SELECT ID FROM [Table] WHERE Name='# Measures' AND ModelID=1"
+            ).fetchone()
+            if measures_table_id:
+                existing = c.execute(
+                    "SELECT ID, TableID FROM [Measure] WHERE TableID=? ORDER BY ID",
+                    (measures_table_id[0],)
+                ).fetchall()
+            else:
+                existing = c.execute(
+                    "SELECT ID, TableID FROM [Measure] ORDER BY ID"
+                ).fetchall()
 
             if not existing:
                 return
