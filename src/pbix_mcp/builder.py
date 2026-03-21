@@ -243,22 +243,105 @@ class PBIXBuilder:
         """Build the complete PBIX file as bytes.
 
         Uses a minimal template DataModel from a real PBIX file (shipped
-        with the package) and replaces the metadata SQLite with our custom
-        schema. This ensures the ABF archive has the correct internal
-        structure that Analysis Services expects.
+        with the package) and modifies its metadata SQLite to contain our
+        custom tables, measures, and relationships. The template's .db.xml
+        and internal ABF structure are preserved so Analysis Services can
+        load it correctly.
         """
         from pbix_mcp.formats.abf_rebuild import (
-            rebuild_abf_with_replacement,
+            rebuild_abf_with_modified_sqlite,
         )
         from pbix_mcp.formats.datamodel_roundtrip import (
             compress_datamodel,
             decompress_datamodel,
         )
 
-        # 1. Build metadata SQLite
-        sqlite_bytes = self._build_metadata_sqlite()
+        # Capture builder state for the modifier closure
+        tables = self._tables
+        measures = self._measures
+        relationships = self._relationships
 
-        # 2. Load the template DataModel and replace its metadata
+        def _modify_metadata(conn: sqlite3.Connection) -> None:
+            """Modify the template's metadata to contain our custom schema."""
+            c = conn.cursor()
+
+            # Clear existing data (keep schema intact for AS compatibility)
+            c.execute("DELETE FROM [Measure]")
+            c.execute("DELETE FROM [Relationship]")
+            c.execute("DELETE FROM [Column] WHERE TableID IN (SELECT ID FROM [Table] WHERE ModelID=1)")
+            c.execute("DELETE FROM [Partition] WHERE TableID IN (SELECT ID FROM [Table] WHERE ModelID=1)")
+            c.execute("DELETE FROM [Table] WHERE ModelID=1")
+
+            # Add our tables
+            col_id = 1
+            for tid, tdef in enumerate(tables, start=1):
+                c.execute(
+                    "INSERT INTO [Table] (ID, ModelID, Name, IsHidden) VALUES (?, 1, ?, ?)",
+                    (tid, tdef["name"], 1 if tdef.get("hidden") else 0),
+                )
+                # Add partition (required — Type=4 for M/Import)
+                c.execute(
+                    "INSERT OR IGNORE INTO [Partition] (ID, TableID, Name, Type) VALUES (?, ?, ?, 4)",
+                    (tid, tid, f"{tdef['name']}_partition"),
+                )
+                # Add columns
+                for ci, col_def in enumerate(tdef["columns"]):
+                    c.execute(
+                        "INSERT INTO [Column] (ID, TableID, ExplicitName, InferredName, Type) "
+                        "VALUES (?, ?, ?, ?, 1)",
+                        (col_id, tid, col_def["name"], col_def["name"]),
+                    )
+                    col_id += 1
+                # Add RowNumber column (required by AS)
+                c.execute(
+                    "INSERT INTO [Column] (ID, TableID, ExplicitName, InferredName, Type, IsHidden) "
+                    "VALUES (?, ?, ?, ?, 3, 1)",
+                    (col_id, tid, f"RowNumber-{tdef['name']}", f"RowNumber-{tdef['name']}"),
+                )
+                col_id += 1
+
+            # Add our measures
+            for mid, mdef in enumerate(measures, start=1):
+                # Find table ID
+                table_id = None
+                for tid, tdef in enumerate(tables, start=1):
+                    if tdef["name"] == mdef["table"]:
+                        table_id = tid
+                        break
+                if table_id:
+                    c.execute(
+                        "INSERT INTO [Measure] (ID, TableID, Name, Expression, Description) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (mid, table_id, mdef["name"], mdef["expression"],
+                         mdef.get("description", "")),
+                    )
+
+            # Add our relationships
+            for rid, rdef in enumerate(relationships, start=1):
+                from_tid = from_cid = to_tid = to_cid = None
+                for tid, tdef in enumerate(tables, start=1):
+                    if tdef["name"] == rdef["from_table"]:
+                        from_tid = tid
+                        for ci, col in enumerate(tdef["columns"]):
+                            if col["name"] == rdef["from_column"]:
+                                # Find column ID (cumulative)
+                                from_cid = sum(len(tables[j]["columns"]) + 1 for j in range(tid - 1)) + ci + 1
+                    if tdef["name"] == rdef["to_table"]:
+                        to_tid = tid
+                        for ci, col in enumerate(tdef["columns"]):
+                            if col["name"] == rdef["to_column"]:
+                                to_cid = sum(len(tables[j]["columns"]) + 1 for j in range(tid - 1)) + ci + 1
+                if all(v is not None for v in [from_tid, from_cid, to_tid, to_cid]):
+                    c.execute(
+                        "INSERT INTO [Relationship] (ID, ModelID, FromTableID, FromColumnID, "
+                        "FromCardinality, ToTableID, ToColumnID, ToCardinality, IsActive) "
+                        "VALUES (?, 1, ?, ?, 2, ?, ?, 1, 1)",
+                        (rid, from_tid, from_cid, to_tid, to_cid),
+                    )
+
+            conn.commit()
+
+        # 1. Load the template DataModel
         template_path = os.path.join(
             os.path.dirname(__file__), "templates", "minimal_datamodel.bin"
         )
@@ -266,9 +349,9 @@ class PBIXBuilder:
             template_dm = f.read()
 
         template_abf = decompress_datamodel(template_dm)
-        new_abf = rebuild_abf_with_replacement(
-            template_abf, {"metadata.sqlitedb": sqlite_bytes}
-        )
+
+        # 2. Modify the template's metadata in-place
+        new_abf = rebuild_abf_with_modified_sqlite(template_abf, _modify_metadata)
 
         # 3. Compress to DataModel
         datamodel_bytes = compress_datamodel(new_abf)
