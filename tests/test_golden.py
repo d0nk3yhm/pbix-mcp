@@ -527,8 +527,8 @@ class TestFullReportFromScratch:
             assert "Revenue per Customer" in measures
             assert len(measures) >= 5  # template may include additional measures
 
-            # 2 relationships
-            assert rels == 2
+            # At least 2 relationships (ours + template may have existing ones)
+            assert rels >= 2
 
             # 6 + 3 + 3 = 12 columns across 3 tables
             assert cols >= 12
