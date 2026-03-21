@@ -725,6 +725,25 @@ def build_abf_from_scratch(
     )
     _PARTITIONS_CONTENT = b'<Partitions />'
 
+    # CryptKey.bin — minimal 144-byte crypto key structure required by AS
+    # when SvrEncryptPwdFlag=true (which is the server default).
+    # This is a valid unencrypted key (encryption disabled in our backup).
+    _CRYPTKEY_CONTENT = bytes.fromhex(
+        "00000000000000000000000000000000"  # 16 bytes zeroed header
+        "04000000"  # algorithm id
+        "30000000"  # key length
+        "50000000"  # data offset
+        "10000000"  # data length
+        "01000000"  # version
+        "07000000"  # flags
+        "ffffffff"  # reserved
+        "00000000"  # padding
+        "01020000"  # more header
+        "03660000"  # parameters
+        "00a40000"  # ...
+        "80" + "00" * 63  # 64 bytes key data (zeroed = no encryption)
+    )
+
     # Collect flat-name -> content, preserving required ordering.
     ordered_files: list[tuple[str, bytes]] = []
 
@@ -734,11 +753,14 @@ def build_abf_from_scratch(
     # (b) PARTITIONS -- always second
     ordered_files.append(("PARTITIONS", _PARTITIONS_CONTENT))
 
-    # (c) metadata.sqlitedb
+    # (c) CryptKey.bin -- required by AS for password encryption validation
+    ordered_files.append(("2.CryptKey.bin", _CRYPTKEY_CONTENT))
+
+    # (d) metadata.sqlitedb
     ordered_files.append(("metadata.sqlitedb", files["metadata.sqlitedb"]))
 
     # (d) Any remaining user-supplied files (VertiPaq data, etc.)
-    _SKIP = {"metadata.sqlitedb", "ADDITIONAL_LOG", "PARTITIONS", "LOG"}
+    _SKIP = {"metadata.sqlitedb", "ADDITIONAL_LOG", "PARTITIONS", "LOG", "2.CryptKey.bin"}
     for fname, content in files.items():
         if fname not in _SKIP:
             ordered_files.append((fname, content))
@@ -761,7 +783,7 @@ def build_abf_from_scratch(
     blog_root = ET.Element("BackupLog")
     ET.SubElement(blog_root, "BackupRestoreSyncVersion").text = "11.53"
     ET.SubElement(blog_root, "ServerRoot").text = db_path
-    ET.SubElement(blog_root, "SvrEncryptPwdFlag").text = "false"
+    ET.SubElement(blog_root, "SvrEncryptPwdFlag").text = "true"
     ET.SubElement(blog_root, "ServerEnableBinaryXML").text = "false"
     ET.SubElement(blog_root, "ServerEnableCompression").text = "false"
     ET.SubElement(blog_root, "CompressionFlag").text = "false"
