@@ -855,7 +855,19 @@ def _encode_column(
     bit_width = _align_bit_width(bit_width_raw)
 
     # --- Encode IDF ---
-    idf_bytes = _encode_idf(indices, bit_width)
+    if is_row_number:
+        # RowNumber columns: minimal IDF with sub_size=0 (values are implicit sequential)
+        idf_buf = bytearray()
+        idf_buf += _u8(16)  # primary_segment_size = 16 (ALWAYS)
+        # First entry: bit-packed marker with row count
+        idf_buf += _u4(0xFFFFFFFF) + _u4(row_count)
+        # Remaining 15 entries: zero-padded
+        idf_buf += b'\x00' * (15 * 8)
+        # Sub-segment: size = 0 (no actual data needed)
+        idf_buf += _u8(0)
+        idf_bytes = bytes(idf_buf)
+    else:
+        idf_bytes = _encode_idf(indices, bit_width)
 
     # Parse IDF to get segment stats for IDFMETA
     # The IDF we just built: primary_segment_size(u64=16 always) + 128 bytes + sub_segment_size(u64) + sub entries
