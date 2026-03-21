@@ -733,7 +733,9 @@ def _encode_idfmeta(
     # segment_needs_resizing
     buf += _u1(0)
     # compression_info = bit_width (must match XMRENoSplitCompressionInfo<N>)
-    buf += _u4(bit_width)
+    # Valid values: 1-32. For RowNumber or empty columns (bit_width=0), use 3 (default)
+    ci = bit_width if bit_width >= 1 else 3
+    buf += _u4(ci)
 
     # --- SS block ---
     buf += TAG_SS_OPEN
