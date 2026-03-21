@@ -771,8 +771,8 @@ def build_abf_from_scratch(
     ET.SubElement(blog_root, "Write").text = "ReadWrite"
     ET.SubElement(blog_root, "OlapInfo").text = "false"
     ET.SubElement(blog_root, "IsTabular").text = "true"
-    ET.SubElement(blog_root, "Collations").text = "None"
-    ET.SubElement(blog_root, "Languages").text = "None"
+    ET.SubElement(blog_root, "Collations")
+    ET.SubElement(blog_root, "Languages")
     file_groups = ET.SubElement(blog_root, "FileGroups")
 
     # FileGroup: Class 100002 = database (contains all our files)
