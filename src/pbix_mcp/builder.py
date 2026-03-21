@@ -213,11 +213,9 @@ class PBIXBuilder:
         """Build the Report/Layout JSON with proper data bindings."""
         pages = self._pages or [{"name": "Page 1", "visuals": []}]
 
-        # Default measure entity — measures are hosted on the first table
-        # (typically "financials" in the template).
-        default_measure_entity = (
-            self._tables[0]["name"] if self._tables else "financials"
-        )
+        # Default measure entity — measures in the template are hosted on
+        # "# Measures" table (that's where Power BI puts auto-generated measures).
+        default_measure_entity = "# Measures"
 
         sections = []
         for i, page in enumerate(pages):
