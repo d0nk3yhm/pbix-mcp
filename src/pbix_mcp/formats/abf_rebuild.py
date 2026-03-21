@@ -750,31 +750,47 @@ def build_abf_from_scratch(
         buf.extend(content)
 
     # ---- 3. LOG (BackupLog data) -- always last data entry ----
+    # Must match Analysis Services backup schema exactly:
+    # BackupLog > { BackupRestoreSyncVersion, ServerRoot, flags, ObjectName,
+    #               ObjectId, Write, OlapInfo, IsTabular, FileGroups }
+    # FileGroup > { Class, ID, Name, ObjectVersion, PersistLocation,
+    #               PersistLocationPath, StorageLocationPath, ObjectID, FileList }
+    db_path = f"Sandboxes\\{database_id}"
+    obj_id = database_id.upper()
+
     blog_root = ET.Element("BackupLog")
     ET.SubElement(blog_root, "BackupRestoreSyncVersion").text = "11.53"
-    ET.SubElement(blog_root, "ServerRoot").text = (
-        f"Sandboxes\\{database_id}"
-    )
+    ET.SubElement(blog_root, "ServerRoot").text = db_path
+    ET.SubElement(blog_root, "SvrEncryptPwdFlag").text = "false"
+    ET.SubElement(blog_root, "ServerEnableBinaryXML").text = "false"
+    ET.SubElement(blog_root, "ServerEnableCompression").text = "false"
+    ET.SubElement(blog_root, "CompressionFlag").text = "false"
+    ET.SubElement(blog_root, "EncryptionFlag").text = "false"
+    ET.SubElement(blog_root, "ObjectName").text = database_id
+    ET.SubElement(blog_root, "ObjectId").text = database_id
+    ET.SubElement(blog_root, "Write").text = "ReadWrite"
+    ET.SubElement(blog_root, "OlapInfo").text = "false"
+    ET.SubElement(blog_root, "IsTabular").text = "true"
+    ET.SubElement(blog_root, "Collations").text = "None"
+    ET.SubElement(blog_root, "Languages").text = "None"
     file_groups = ET.SubElement(blog_root, "FileGroups")
 
-    # FileGroup 0: system (BackupLog itself)
-    fg0 = ET.SubElement(file_groups, "FileGroup")
-    ET.SubElement(fg0, "Index").text = "0"
-    ET.SubElement(fg0, "PersistLocationPath")
-
-    # FileGroup 1: database files
+    # FileGroup: Class 100002 = database (contains all our files)
     fg1 = ET.SubElement(file_groups, "FileGroup")
-    ET.SubElement(fg1, "Index").text = "1"
-    ET.SubElement(fg1, "PersistLocationPath").text = (
-        f"Sandboxes\\{database_id}"
-    )
+    ET.SubElement(fg1, "Class").text = "100002"
+    ET.SubElement(fg1, "ID").text = database_id
+    ET.SubElement(fg1, "Name").text = database_id
+    ET.SubElement(fg1, "ObjectVersion").text = "2"
+    ET.SubElement(fg1, "PersistLocation").text = "2"
+    ET.SubElement(fg1, "PersistLocationPath").text = f"{db_path}.2.db"
+    ET.SubElement(fg1, "StorageLocationPath")
+    ET.SubElement(fg1, "ObjectID").text = obj_id
     file_list = ET.SubElement(fg1, "FileList")
     for flat_name, _offset, size in file_records:
         bf = ET.SubElement(file_list, "BackupFile")
-        ET.SubElement(bf, "Path").text = (
-            f"Sandboxes\\{database_id}\\{flat_name}"
-        )
+        ET.SubElement(bf, "Path").text = f"{db_path}.2.db\\{flat_name}"
         ET.SubElement(bf, "StoragePath").text = flat_name
+        ET.SubElement(bf, "LastWriteTime").text = str(timestamp)
         ET.SubElement(bf, "Size").text = str(size)
 
     blog_bytes = _xml_to_utf16_bytes(blog_root)
