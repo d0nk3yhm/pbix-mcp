@@ -833,7 +833,7 @@ def _modify_metadata_and_encode(
                     )""",
                     (col_id, table_id, col_name,
                      amo_type, amo_type,
-                     0 if data_type == "String" else 1,  # SummarizeBy: 0=None for strings, 1=Sum for numbers
+                     2,  # SummarizeBy: 2=None (default for all user columns)
                      cs_id,
                      col_name,  # SourceColumn
                      _FIXED_TIMESTAMP, _FIXED_TIMESTAMP,
