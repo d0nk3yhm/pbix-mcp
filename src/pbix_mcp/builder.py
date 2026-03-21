@@ -262,38 +262,39 @@ class PBIXBuilder:
         relationships = self._relationships
 
         def _modify_metadata(conn: sqlite3.Connection) -> None:
-            """Add measures to the template's existing model.
+            """Overwrite template measures with our custom ones.
 
-            We only add measures (safe — no Storage entries needed).
-            Tables, columns, and relationships are NOT added to the
-            metadata because AS requires corresponding entries in
-            ~10 Storage tables that we can't easily generate.
-
-            The template's existing tables remain. Our measures reference
-            our table names; Power BI Desktop will show them as errors
-            until the user connects actual data sources.
+            The .db.xml defines exactly N measures — we can't add beyond
+            that count. So we REPLACE existing measure names/expressions
+            rather than INSERT new rows. The template has ~49 measures;
+            we overwrite the first len(measures) of them.
             """
             c = conn.cursor()
 
-            # Find the first existing table to attach measures to
-            first_table = c.execute(
-                "SELECT ID FROM [Table] WHERE ModelID=1 LIMIT 1"
-            ).fetchone()
-            if not first_table:
-                return
-            host_table_id = first_table[0]
+            # Get existing measure IDs in order
+            existing = c.execute(
+                "SELECT ID, TableID FROM [Measure] ORDER BY ID"
+            ).fetchall()
 
-            # Add our measures — attach to the first existing table
-            max_measure_id = c.execute(
-                "SELECT COALESCE(MAX(ID), 0) FROM [Measure]"
-            ).fetchone()[0]
+            if not existing:
+                return
+
+            # Overwrite existing measures with our custom ones
             for idx, mdef in enumerate(measures):
-                mid = max_measure_id + idx + 1
+                if idx < len(existing):
+                    mid, tid = existing[idx]
+                    c.execute(
+                        "UPDATE [Measure] SET Name=?, Expression=?, Description=? WHERE ID=?",
+                        (mdef["name"], mdef["expression"],
+                         mdef.get("description", ""), mid),
+                    )
+
+            # Hide remaining template measures (rename to avoid confusion)
+            for idx in range(len(measures), len(existing)):
+                mid, tid = existing[idx]
                 c.execute(
-                    "INSERT INTO [Measure] (ID, TableID, Name, Expression, Description) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (mid, host_table_id, mdef["name"], mdef["expression"],
-                     mdef.get("description", "")),
+                    "UPDATE [Measure] SET Name=?, Expression=? WHERE ID=?",
+                    (f"_unused_{idx}", "0", mid),
                 )
 
             conn.commit()
