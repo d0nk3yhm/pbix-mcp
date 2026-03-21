@@ -632,7 +632,7 @@ def _modify_metadata_and_encode(
             # StorageFile for IDFMETA (OwnerType=24 -> SegmentStorage)
             rn_meta_file_id = alloc.next()
 
-            rn_cs_name = f"{rn_name} ({rn_col_id})"
+            rn_cs_name = f"{rn_name.replace('-', ' ')} ({rn_col_id})"
             idf_fname = f"0.{tname} ({table_id}).{rn_cs_name}.0.idf"
             meta_fname = f"0.{tname} ({table_id}).{rn_cs_name}.0.idfmeta"
 
