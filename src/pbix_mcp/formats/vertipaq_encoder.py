@@ -718,13 +718,12 @@ def _encode_idfmeta(
     buf += _u8(row_count)
     # one: 0 for RowNumber columns, 1 otherwise (Bug #4)
     buf += _u8(0 if is_row_number else 1)
-    # a_b_a_5_a = 36 - bit_width
-    a_b_a_5_a = 36 - bit_width
-    buf += _u4(a_b_a_5_a)
-    # iterator = 0
+    # u32_a: 1 for data columns, 0 for RowNumber
+    buf += _u4(0 if is_row_number else 1)
+    # u32_b: always 0
     buf += _u4(0)
-    # bookmark_bits: 12 (not 128) (Bug #3)
-    buf += _u8(12)
+    # bookmark_bits: 24 for RowNumber, 12 for data columns (Bug #3)
+    buf += _u8(24 if is_row_number else 12)
 
     # storage_alloc_size: always 32 (Bug #6)
     buf += _u8(32)
