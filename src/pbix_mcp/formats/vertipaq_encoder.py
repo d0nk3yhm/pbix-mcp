@@ -117,14 +117,19 @@ def _next_power_of_2(n: int) -> int:
 
 def _align_bit_width(bw: int) -> int:
     """
-    VertiPaq bit-widths must divide evenly into 64 for the bit-packing.
-    Valid widths: 1,2,4,8,16,32,64.  Round up to the nearest valid width.
+    VertiPaq bit-widths correspond to XMRENoSplitCompressionInfo<N> template
+    instantiations in xmsrv.dll. The engine auto-detects N from the data range
+    (max_data_id - min_data_id). Bit-packing uses floor(64/N) values per u64
+    word — N does NOT need to be a power of 2.
+
+    Valid N values (from xmsrv.dll Ghidra analysis):
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16, 21, 32
     """
-    valid = [1, 2, 4, 8, 16, 32, 64]
+    valid = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16, 21, 32]
     for v in valid:
         if bw <= v:
             return v
-    return 64
+    return 32
 
 
 # ---------------------------------------------------------------------------
@@ -281,8 +286,8 @@ def _encode_string_dictionary(unique_strings: list[str]) -> bytes:
         encoded = (s + "\x00").encode("utf-16-le")
         char_buf += encoded
 
-    # Find longest string (in characters, including null)
-    longest = max((len(s) + 1 for s in unique_strings), default=1)
+    # Find longest string (in characters, EXCLUDING null terminator - matching AS format)
+    longest = max((len(s) for s in unique_strings), default=0)
 
     # allocation_size for the character buffer -- use actual size
     alloc_size = len(char_buf)
@@ -294,8 +299,8 @@ def _encode_string_dictionary(unique_strings: list[str]) -> bytes:
     # --- PageLayout ---
     # store_string_count: int64
     buf += _s8(count)
-    # f_store_compressed: int8 = 0 (uncompressed)
-    buf += _u1(0)
+    # f_store_compressed: int8 = 1 (string store present, uncompressed)
+    buf += _u1(1)
     # store_longest_string: int64 (in characters)
     buf += _s8(longest)
     # store_page_count: int64
@@ -531,62 +536,57 @@ def _encode_idf(indices: list[int], bit_width: int) -> bytes:
         runs.append((val, count))
         i += count
 
-    # Decide which runs to RLE-encode vs bit-pack.
-    # For simplicity: RLE all runs of length >= 3, bit-pack the rest.
-    # But actually, the simplest correct approach is:
-    #   - If all values are the same, use a single RLE entry
-    #   - Otherwise, bit-pack everything with a single 0xFFFFFFFF marker
-    # This is always valid and Power BI reads it fine.
+    # Strategy: The primary segment is FIXED at 16 entries (128 bytes).
+    # We MUST NOT exceed 16 entries or we overflow into the sub-segment area.
+    #
+    # The template uses a simple strategy:
+    #   - Find the longest single-value run → 1 RLE entry
+    #   - Bit-pack everything else → 1 bitpacked entry
+    #   - Total: 2 primary entries (fits easily in 16 slots)
+    #
+    # This is safe, efficient, and matches real Power BI output.
 
-    # Check if we can use pure RLE (all runs are long enough or single-valued)
-    # For maximum compatibility, use this strategy:
-    # Build primary_segment entries and accumulate bit-packed values.
-
-    primary_entries = []     # list of (data_value_u32, repeat_value_u32)
-    bitpacked_values = []    # values that go into the sub_segment
-
-    for val, count in runs:
-        if count >= 3:
-            # If we have pending bit-packed values, flush them first
-            if bitpacked_values:
-                primary_entries.append((0xFFFFFFFF, len(bitpacked_values)))
-            # RLE entry
-            primary_entries.append((val, count))
-        else:
-            # Add to bit-packed batch
-            for _ in range(count):
-                bitpacked_values.append(val)
-
-    # If there are remaining bit-packed values, flush
-    # We need to re-scan because the above only flushes when hitting an RLE run.
-    # Let's redo this more carefully.
+    # Find the single longest run
+    best_run_idx = -1
+    best_run_len = 0
+    for ri, (val, count) in enumerate(runs):
+        if count > best_run_len:
+            best_run_len = count
+            best_run_idx = ri
 
     primary_entries = []
     bitpacked_values = []
-    pending_bp = []  # pending bit-packed values not yet flushed
 
-    for val, count in runs:
-        if count >= 3:
-            # Flush any pending bit-packed values
-            if pending_bp:
-                primary_entries.append((0xFFFFFFFF, len(pending_bp)))
-                bitpacked_values.extend(pending_bp)
-                pending_bp = []
-            # RLE entry
-            primary_entries.append((val, count))
-        else:
-            # Accumulate for bit-packing
-            pending_bp.extend([val] * count)
+    if best_run_len >= 3 and len(runs) > 1:
+        # Use 1 RLE entry for the longest run, bitpack everything else
+        # Collect values before the best run
+        for ri, (val, count) in enumerate(runs):
+            if ri == best_run_idx:
+                # Flush any pending bit-packed values first
+                if bitpacked_values:
+                    primary_entries.append((0xFFFFFFFF, len(bitpacked_values)))
+                # RLE entry for the longest run
+                primary_entries.append((runs[best_run_idx][0], runs[best_run_idx][1]))
+            else:
+                # Accumulate for bit-packing
+                bitpacked_values.extend([val] * count)
 
-    # Flush remaining
-    if pending_bp:
-        primary_entries.append((0xFFFFFFFF, len(pending_bp)))
-        bitpacked_values.extend(pending_bp)
-        pending_bp = []
-
-    # If there are no entries at all (shouldn't happen with non-empty indices)
-    if not primary_entries:
+        # Flush remaining bit-packed values
+        if bitpacked_values:
+            primary_entries.append((0xFFFFFFFF, len(bitpacked_values)))
+    elif len(runs) == 1 and runs[0][1] == len(indices) and runs[0][0] != 0:
+        # All values are the same AND value != 0 → single RLE entry
+        # NOTE: dv=0 is the end-of-entries sentinel, so value 0 MUST be bit-packed
+        primary_entries.append((runs[0][0], runs[0][1]))
+    else:
+        # No good RLE candidate → bitpack everything
         primary_entries.append((0xFFFFFFFF, len(indices)))
+        bitpacked_values = list(indices)
+
+    # Safety check: must never exceed 16 primary entries
+    if len(primary_entries) > 16:
+        # Fallback: bitpack everything
+        primary_entries = [(0xFFFFFFFF, len(indices))]
         bitpacked_values = list(indices)
 
     # Encode the sub_segment (bit-packed uint64 array)
@@ -662,47 +662,44 @@ def _encode_idfmeta(
     primary_segment_count: int,
     primary_segment_bytes: int,
     sub_segment_count: int,
-    sub_segment_bytes: int,
+    sub_segment_words: int,
     count_bit_packed: int,
     nonzero_primary_entries: int = 0,
     has_dict: bool = True,
     is_row_number: bool = False,
+    u32_a: int = 0,
+    u32_b: int = 0,
 ) -> bytes:
     """
-    Encode an IDFMETA file.
+    Encode an IDFMETA file (264 bytes for standard column segments).
 
     The IDFMETA has a tagged binary format with nested blocks:
       CP > CS0 > SS, CS1
-      [optional: SDOs > CSDOs > CSDOs1]
+      SDOs > CSDOs > CSDOs1
 
-    Fields in CS0:
+    Format matches the real Power BI Analysis Services backup format.
+
+    Key fields in CS0:
       records: uint64              -- row_count
-      one: uint64                  -- always 1
-      a_b_a_5_a: uint32            -- 36 - bit_width (with iterator=0)
-      iterator: uint32             -- 0
-      bookmark_bits_1_2_8: uint64  -- 128
-      storage_alloc_size: uint64   -- allocated size of the IDF data
-      storage_used_size: uint64    -- used size of the IDF data
+      one: uint64                  -- 0 for RowNumber, 1 for data columns
+      u32_a: uint32                -- AS runtime ID (same for all columns in table)
+      u32_b: uint32                -- AS runtime ID (varies per column)
+      bookmark_bits: uint64        -- 24 for RowNumber, 12 for data columns
+      storage_alloc_size: uint64   -- always 32
+      storage_used_size: uint64    -- 2 * (nonzero_primary_entries + has_dict)
       segment_needs_resizing: uint8 -- 0
-      compression_info: uint32     -- 0 (no compression)
-      SS block
-      has_bit_packed_sub_seg: uint8
-      CS1 block
+      compression_info: uint32     -- 3 = XMHybridRLECompressionInfo (always)
 
-    Fields in SS:
-      distinct_states: uint64
-      min_data_id: uint32
-      max_data_id: uint32
-      original_min_segment_data_id: uint32
-      r_l_e_sort_order: int64
+    Key fields in SS:
+      distinct_states: uint64      -- always 0 (engine computes at load time)
+      min_data_id: uint32          -- actual_min_index + 3
+      max_data_id: uint32          -- actual_max_index + 3
+      original_min: uint32         -- usually 2
+      r_l_e_sort_order: int64      -- -1 (unsorted)
       row_count: uint64
       has_nulls: uint8
       r_l_e_runs: uint64
-      others_r_l_e_runs: uint64
-
-    Fields in CS1:
-      count_bit_packed: uint64
-      blob_with9_zeros: 9 bytes of zeros
+      others_r_l_e_runs: uint64    -- 0 for RowNumber, 1+ for data columns
     """
     buf = bytearray()
 
@@ -716,42 +713,58 @@ def _encode_idfmeta(
 
     # records
     buf += _u8(row_count)
-    # one: 0 for RowNumber columns, 1 otherwise (Bug #4)
+    # one: 0 for RowNumber columns, 1 for data columns
     buf += _u8(0 if is_row_number else 1)
-    # u32_a: 1 for data columns, 0 for RowNumber
-    buf += _u4(0 if is_row_number else 1)
-    # u32_b: always 0
-    buf += _u4(0)
-    # bookmark_bits: 24 for RowNumber, 12 for data columns (Bug #3)
+    # u32_a: Compression family class ID
+    #   0xABA5A = XMHybridRLECompressionInfo (standard for data columns)
+    #   0xABA5B = XM123CompressionInfo (used for RowNumber)
+    buf += _u4(u32_a)
+    # u32_b: Inner compression class ID (bit width selector)
+    #   0xABA36 + N = XMRENoSplitCompressionInfo<N> where N is the aligned bit width
+    #   0xABA5B = XM123CompressionInfo (for RowNumber)
+    buf += _u4(u32_b)
+    # bookmark_bits: 24 for RowNumber, 12 for data columns
     buf += _u8(24 if is_row_number else 12)
 
-    # storage_alloc_size: always 32 (Bug #6)
+    # storage_alloc_size: always 32
     buf += _u8(32)
-    # storage_used_size: 2 * (nonzero_primary_entries + has_dict) (Bug #6)
+    # storage_used_size: 2 * (nonzero_primary_entries + has_dict)
     storage_used = 2 * (nonzero_primary_entries + (1 if has_dict else 0))
     buf += _u8(storage_used)
     # segment_needs_resizing
     buf += _u1(0)
-    # compression_info = bit_width (must match XMRENoSplitCompressionInfo<N>)
-    # Valid values: 1-32. For RowNumber or empty columns (bit_width=0), use 3 (default)
-    ci = bit_width if bit_width >= 1 else 3
-    buf += _u4(ci)
+    # compression_info: ALWAYS 3 = XMHybridRLECompressionInfo
+    # The engine auto-detects actual bit width from min/max data IDs.
+    # Valid compression types: 3=hybrid RLE (standard for all column segments)
+    buf += _u4(3)
 
     # --- SS block ---
     buf += TAG_SS_OPEN
-    buf += _u8(distinct_states)
+    # distinct_states: always 0 (engine recalculates at load time)
+    buf += _u8(0)
+    # min_data_id: offset by +3 from actual stored indices
     buf += _u4(min_data_id)
+    # max_data_id: offset by +3 from actual max stored index
     buf += _u4(max_data_id)
-    buf += _u4(min_data_id)          # original_min_segment_data_id
-    buf += _s8(-1)                    # r_l_e_sort_order (-1 = unsorted)
+    # original_min_segment_data_id: usually 2 (= min_data_id - 1)
+    buf += _u4(2)
+    # r_l_e_sort_order: -1 = unsorted
+    buf += _s8(-1)
+    # row_count (in SS)
     buf += _u8(row_count)
+    # has_nulls
     buf += _u1(1 if has_nulls else 0)
+    # r_l_e_runs
     buf += _u8(rle_runs)
-    buf += _u8(1 if has_dict else 0)  # others_r_l_e_runs (Bug #7)
+    # others_r_l_e_runs: 0 for RowNumber, 1 for data columns (even if no RLE)
+    if is_row_number:
+        buf += _u8(0)
+    else:
+        buf += _u8(max(1, rle_runs) if has_dict else 0)
     buf += TAG_SS_CLOSE
 
-    # has_bit_packed_sub_seg
-    buf += _u1(1 if count_bit_packed > 0 else 0)
+    # has_bit_packed_sub_seg: 1 if there are bit-packed entries, also 1 for RowNumber
+    buf += _u1(1)
 
     # --- CS1 block ---
     buf += TAG_CS_OPEN
@@ -772,15 +785,15 @@ def _encode_idfmeta(
     buf += TAG_CSDOS_OPEN
     # zero_c_s_d_o: uint64 = 0
     buf += _u8(0)
-    # primary_segment_size: always 16 (Bug #8)
+    # primary_segment_size: always 16 (in u64 word count, matching IDF header)
     buf += _u8(16)
 
     # CSDOs1 (inner, for sub-segment)
     buf += TAG_CSDOS_OPEN
-    # sub_segment_offset: always 136 (8 + 128 + 0 = offset to sub_segment) (Bug #8)
+    # sub_segment_offset: byte offset from start of IDF = 8 + 128 = 136
     buf += _u8(136)
-    # sub_segment_size: uint64
-    buf += _u8(sub_segment_bytes)
+    # sub_segment_size: in u64 WORD count (matching IDF sub_segment_size field)
+    buf += _u8(sub_segment_words)
     buf += TAG_CSDOS_CLOSE
 
     buf += TAG_CSDOS_CLOSE
@@ -800,6 +813,8 @@ def _encode_column(
     nullable: bool,
     values: list,
     is_row_number: bool = False,
+    u32_a: int = 0,
+    u32_b: int = 0,
 ) -> dict[str, bytes]:
     """
     Encode a single column's data into the VertiPaq binary files.
@@ -843,17 +858,36 @@ def _encode_column(
     # Cardinality (distinct states) includes NULL as a state
     distinct_states = len(unique_sorted) + (1 if has_nulls else 0)
 
-    # min/max data IDs
-    if has_nulls:
-        min_data_id = 0
-        max_data_id = len(unique_sorted)  # null=0, values=1..N
+    # min/max data IDs (IDFMETA convention: offset by +3 from actual stored indices)
+    # IDF stores 0-indexed values, but IDFMETA reports them with +3 offset.
+    # For RowNumber: IDF is implicit, min=3, max=row_count+2
+    # For data columns: IDF stores 0..N-1, IDFMETA reports 3..N+2
+    # Special case: zero rows → min=max=2 (matching template Measures RowNumber)
+    _DATA_ID_OFFSET = 3
+    if row_count == 0:
+        # Zero rows: use min=max=2 (template convention for empty segments)
+        min_data_id = 2
+        max_data_id = 2
+    elif is_row_number:
+        min_data_id = _DATA_ID_OFFSET
+        max_data_id = _DATA_ID_OFFSET + max(row_count - 1, 0)
+    elif has_nulls:
+        min_data_id = _DATA_ID_OFFSET
+        max_data_id = _DATA_ID_OFFSET + len(unique_sorted)  # null=0, values=1..N
     else:
-        min_data_id = 0
-        max_data_id = max(len(unique_sorted) - 1, 0)
+        min_data_id = _DATA_ID_OFFSET
+        max_data_id = _DATA_ID_OFFSET + max(len(unique_sorted) - 1, 0)
 
     # Bit width for encoding indices
-    bit_width_raw = _required_bits(distinct_states)
-    bit_width = _align_bit_width(bit_width_raw)
+    # CRITICAL: bit width must match what the engine computes from max_data_id.
+    # The engine uses max_data_id (from IDFMETA) to determine how many bits
+    # each value occupies in the IDF sub-segment. We must encode with the
+    # SAME bit width, which is ceil(log2(max_data_id + 1)).
+    if max_data_id <= 1:
+        bit_width_raw = 1
+    else:
+        bit_width_raw = math.ceil(math.log2(max_data_id + 1))
+    bit_width = _align_bit_width(max(1, bit_width_raw))
 
     # --- Encode IDF ---
     if is_row_number:
@@ -875,8 +909,8 @@ def _encode_column(
     ps_count = struct.unpack_from("<Q", idf_bytes, 0)[0]  # always 16
     primary_segment_bytes = ps_count * 8  # 16 * 8 = 128 bytes always
     ss_offset = 8 + primary_segment_bytes  # = 136
-    ss_count = struct.unpack_from("<Q", idf_bytes, ss_offset)[0]
-    sub_segment_bytes = ss_count * 8  # each uint64 is 8 bytes
+    ss_count = struct.unpack_from("<Q", idf_bytes, ss_offset)[0]  # u64 word count
+    sub_segment_words = ss_count  # CSDOs stores word count, NOT byte count
 
     # Count RLE runs and bit-packed count from the actual (non-zero-padded) entries
     rle_runs = 0
@@ -895,13 +929,13 @@ def _encode_column(
             rle_runs += 1
         offset += 8
 
-    # Determine if this column has a dictionary (non-RowNumber columns with values)
-    has_dict = len(unique_sorted) > 0
+    # RowNumber columns do NOT have a dictionary — their values are implicit
+    has_dict = (not is_row_number) and len(unique_sorted) > 0
 
     # --- Encode IDFMETA ---
     idfmeta_bytes = _encode_idfmeta(
         row_count=row_count,
-        distinct_states=distinct_states,
+        distinct_states=0,  # Always 0 - engine recalculates at load time
         min_data_id=min_data_id,
         max_data_id=max_data_id,
         has_nulls=has_nulls,
@@ -910,11 +944,13 @@ def _encode_column(
         primary_segment_count=ps_count,
         primary_segment_bytes=primary_segment_bytes,
         sub_segment_count=ss_count,
-        sub_segment_bytes=sub_segment_bytes,
+        sub_segment_words=sub_segment_words,
         count_bit_packed=count_bit_packed,
         nonzero_primary_entries=nonzero_primary_entries,
         has_dict=has_dict,
         is_row_number=is_row_number,
+        u32_a=u32_a,
+        u32_b=u32_b,
     )
 
     # --- Encode Dictionary ---
@@ -947,6 +983,8 @@ def encode_table_data(
     partition_num: int,
     columns: list[dict],
     rows: list[dict],
+    u32_a: int = 0,
+    u32_b_start: int = 0,
 ) -> dict[str, bytes]:
     """
     Encode table data into VertiPaq column files.
@@ -964,6 +1002,10 @@ def encode_table_data(
           - nullable: bool
     rows : list[dict]
         Row data. Each dict maps column name -> value.
+    u32_a : int
+        AS runtime table ID (from template IDFMETA, same for all columns).
+    u32_b_start : int
+        Starting AS runtime column ID (incremented per column).
 
     Returns
     -------
@@ -979,6 +1021,11 @@ def encode_table_data(
 
     base_path = f"{table_name}.tbl\\{partition_num}.prt"
 
+    # Compression class ID constants (from xmsrv.dll RE):
+    _HYBRID_RLE_FAMILY = 0xABA5A    # XMHybridRLECompressionInfo
+    _NOSPLIT_BASE = 0xABA36          # + N = XMRENoSplitCompressionInfo<N>
+    _XM123_CLASS = 0xABA5B           # XM123CompressionInfo (for RowNumber)
+
     for col_def in columns:
         col_name = col_def["name"]
         data_type = col_def["data_type"]
@@ -988,8 +1035,39 @@ def encode_table_data(
         values = [row.get(col_name) for row in rows]
         is_rn = col_def.get("is_row_number", False)
 
-        # Encode the column
-        encoded = _encode_column(col_name, data_type, nullable, values, is_row_number=is_rn)
+        # Compute correct compression class IDs:
+        if is_rn:
+            # RowNumber uses XM123CompressionInfo
+            col_u32_a = _HYBRID_RLE_FAMILY
+            col_u32_b = u32_b_start if u32_b_start != 0 else _XM123_CLASS
+        else:
+            # Data columns use XMHybridRLECompressionInfo<XMRENoSplitCompressionInfo<N>>
+            # where N = aligned bit width computed from max_data_id
+            # The encoder computes bit_width internally, but we need it here for u32_b
+            non_null = [v for v in values if v is not None]
+            unique_count = len(set(non_null))
+            _DATA_ID_OFFSET = 3
+            if len(values) == 0:
+                max_did = 2
+            elif nullable and any(v is None for v in values):
+                max_did = _DATA_ID_OFFSET + unique_count
+            else:
+                max_did = _DATA_ID_OFFSET + max(unique_count - 1, 0)
+            if max_did <= 1:
+                bw = 1
+            else:
+                bw = math.ceil(math.log2(max_did + 1))
+            bw = _align_bit_width(max(1, bw))
+            col_u32_a = _HYBRID_RLE_FAMILY
+            col_u32_b = _NOSPLIT_BASE + bw
+
+        # Encode the column with correct compression class IDs
+        encoded = _encode_column(
+            col_name, data_type, nullable, values,
+            is_row_number=is_rn,
+            u32_a=col_u32_a,
+            u32_b=col_u32_b,
+        )
 
         # Build file paths
         idf_path = f"{base_path}\\column.{col_name}"

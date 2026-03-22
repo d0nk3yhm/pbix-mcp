@@ -332,9 +332,14 @@ class PBIXBuilder:
         # 2. Extract the metadata SQLite
         sqlite_bytes = read_metadata_sqlite(template_abf)
 
+        # 2b. Extract u32_a/u32_b from template IDFMETA files for AS runtime IDs
+        template_u32_a, template_max_u32_b = _extract_template_runtime_ids(template_abf)
+
         # 3. Modify metadata and collect VertiPaq files
         new_sqlite_bytes, vertipaq_files = _modify_metadata_and_encode(
-            sqlite_bytes, tables, measures, relationships
+            sqlite_bytes, tables, measures, relationships,
+            template_u32_a=template_u32_a,
+            template_max_u32_b=template_max_u32_b,
         )
 
         # 4. Build the replacement dict for the ABF
@@ -446,11 +451,49 @@ def _get_max_id_across_tables(conn: sqlite3.Connection) -> int:
     return max_id
 
 
+def _extract_template_runtime_ids(template_abf: bytes) -> tuple[int, int]:
+    """Extract AS runtime IDs (u32_a, max u32_b) from template IDFMETA files.
+
+    These values are embedded in every IDFMETA at fixed offsets:
+      offset 36: u32_a (4 bytes, same for all columns)
+      offset 40: u32_b (4 bytes, varies per column)
+
+    Returns (u32_a, max_u32_b) to use as a base for generating new column IDs.
+    """
+    from pbix_mcp.formats.abf_rebuild import list_abf_files, read_abf_file
+
+    file_log = list_abf_files(template_abf)
+    idfmeta_files = [f for f in file_log
+                     if f.get("FileName", "").endswith(".0.idfmeta")
+                     and f.get("Size", 0) == 264
+                     and "H$" not in f.get("FileName", "")]
+
+    u32_a = 703066  # default from known template
+    max_u32_b = 703067  # default
+
+    for mf in idfmeta_files:
+        try:
+            data = read_abf_file(template_abf, mf)
+            if len(data) >= 44:
+                a = struct.unpack_from("<I", data, 36)[0]
+                b = struct.unpack_from("<I", data, 40)[0]
+                if a > 0:
+                    u32_a = a
+                if b > max_u32_b:
+                    max_u32_b = b
+        except Exception:
+            continue
+
+    return u32_a, max_u32_b
+
+
 def _modify_metadata_and_encode(
     sqlite_bytes: bytes,
     tables: list[dict],
     measures: list[dict],
     relationships: list[dict],
+    template_u32_a: int = 703066,
+    template_max_u32_b: int = 703067,
 ) -> tuple[bytes, dict[str, bytes]]:
     """Modify the template metadata SQLite and encode VertiPaq data.
 
@@ -691,7 +734,7 @@ def _modify_metadata_and_encode(
                     ?, ?, ?, 0, ?,
                     1, 31, NULL, NULL,
                     1033, 0,
-                    ?, 3, ?,
+                    ?, ?, ?,
                     2, -1, ?,
                     0, 0,
                     0, 3,
@@ -702,8 +745,9 @@ def _modify_metadata_and_encode(
                     NULL
                 )""",
                 (rn_cs_id, rn_col_id, rn_cs_name, rn_ds_id,
-                 row_count,  # distinct states
-                 row_count + 2,  # max data id
+                 max(row_count, 1),  # distinct states (at least 1, matching template)
+                 2 if row_count == 0 else 3,  # min data id (2 for empty, 3 otherwise)
+                 2 if row_count == 0 else (row_count + 2),  # max data id
                  row_count),  # row count
             )
 
@@ -791,14 +835,10 @@ def _modify_metadata_and_encode(
                 # StorageFile for dictionary (OwnerType=22 -> DictionaryStorage)
                 dict_file_id = alloc.next()
 
-                # StorageFile for HIDX (OwnerType=27)
-                hidx_file_id = alloc.next()
-
                 cs_name = f"{col_name} ({col_id})"
                 col_idf_fname = f"0.{tname} ({table_id}).{cs_name}.0.idf"
                 col_meta_fname = f"0.{tname} ({table_id}).{cs_name}.0.idfmeta"
                 col_dict_fname = f"0.{tname} ({table_id}).{cs_name}.dictionary"
-                col_hidx_fname = f"1.H${tname} ({table_id})${cs_name}.hidx"
 
                 # Insert Column row
                 c.execute(
@@ -841,7 +881,9 @@ def _modify_metadata_and_encode(
                      str(uuid.uuid4())),
                 )
 
-                # Insert AttributeHierarchy for this column
+                # Create AttributeHierarchy entries for the column.
+                # Use MaterializationType=3 (no H$ tables needed) and SystemTableID=0
+                # to avoid requiring H$ binary files in the ABF.
                 ah_id = alloc.next()
                 c.execute(
                     """INSERT INTO AttributeHierarchy (
@@ -850,14 +892,10 @@ def _modify_metadata_and_encode(
                     ) VALUES (?, ?, 1, 0, ?, ?)""",
                     (ah_id, col_id, _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
                 )
-
-                # Update the Column to reference the AttributeHierarchy
                 c.execute(
                     "UPDATE [Column] SET AttributeHierarchyID = ? WHERE ID = ?",
                     (ah_id, col_id),
                 )
-
-                # Insert AttributeHierarchyStorage
                 ahs_id = alloc.next()
                 c.execute(
                     """INSERT INTO AttributeHierarchyStorage (
@@ -866,11 +904,9 @@ def _modify_metadata_and_encode(
                         ColumnDataToPosition, DistinctDataCount,
                         DataVersion, StorageFileID, SystemTableID,
                         HasStatistics, MinValue, MaxValue, StringValueMaxLength
-                    ) VALUES (?, ?, 0, 0, 3, -1, -1, 0, 1, 0, 0, 0, NULL, NULL, 0)""",
+                    ) VALUES (?, ?, 0, 0, 2, -1, -1, 0, 1, 0, 0, 0, NULL, NULL, 0)""",
                     (ahs_id, ah_id),
                 )
-
-                # Update AttributeHierarchy to reference AttributeHierarchyStorage
                 c.execute(
                     "UPDATE AttributeHierarchy SET AttributeHierarchyStorageID = ? WHERE ID = ?",
                     (ahs_id, ah_id),
@@ -894,20 +930,28 @@ def _modify_metadata_and_encode(
                         FramedSourceColumn
                     ) VALUES (
                         ?, ?, ?, ?, ?,
-                        1, 3, NULL, NULL,
+                        1, 8, NULL, NULL,
                         1033, 0,
                         0, 0,
                         0, 0,
                         -1, 0,
                         0, 0,
-                        0, 0,
-                        0, 0,
+                        0, ?,
+                        ?, ?,
                         0, 0,
                         0, 0,
                         NULL, -1,
                         NULL
                     )""",
-                    (cs_id, col_id, cs_name, col_idx + 1, ds_id),
+                    (cs_id, col_id, cs_name, col_idx + 1, ds_id,
+                     3,  # Statistics_Usage (always 3 for data columns)
+                     # Statistics_DBType: maps AMO data type to OLE DB type
+                     {2: 130, 6: 20, 8: 5, 9: 7, 10: 14, 11: 11}.get(
+                         _TYPE_NAME_TO_AMO.get(col_def.get("data_type", "String"), 2), 130),
+                     # Statistics_XMType: maps AMO data type to XM internal type
+                     {2: 2, 6: 0, 8: 1, 9: 1, 10: 1, 11: 0}.get(
+                         _TYPE_NAME_TO_AMO.get(col_def.get("data_type", "String"), 2), 2),
+                    ),
                 )
 
                 # DictionaryStorage (Type=1 = external, with file)
@@ -916,8 +960,11 @@ def _modify_metadata_and_encode(
                         ID, ColumnStorageID, Type, DataType, DataVersion,
                         BaseId, Magnitude, LastId, IsNullable, IsUnique,
                         IsOperatingOn32, DictionaryFlags, StorageFileID, Size
-                    ) VALUES (?, ?, 1, ?, 0, 2, 0.0, 0, 0, 0, 0, 0, ?, 0)""",
-                    (ds_id, cs_id, amo_type, dict_file_id),
+                    ) VALUES (?, ?, 1, ?, 0, 2, 0.0, ?, ?, 0, 1, 0, ?, 0)""",
+                    (ds_id, cs_id, amo_type,
+                     0,  # LastId - will be updated by _update_column_storage_stats or set later
+                     1 if col_def.get("nullable", True) else 0,  # IsNullable
+                     dict_file_id),
                 )
 
                 # ColumnPartitionStorage
@@ -961,13 +1008,11 @@ def _modify_metadata_and_encode(
                     (dict_file_id, ds_id, tbl_folder_id, col_dict_fname),
                 )
 
-                # StorageFile for HIDX (OwnerType=27)
-                c.execute(
-                    """INSERT INTO StorageFile (
-                        ID, OwnerID, OwnerType, StorageFolderID, FileName
-                    ) VALUES (?, ?, 27, ?, ?)""",
-                    (hidx_file_id, ds_id, tbl_folder_id, col_hidx_fname),
-                )
+                # NOTE: HIDX StorageFile (OwnerType=27) is intentionally NOT
+                # created for new columns. Without AttributeHierarchy entries,
+                # there are no H$ table structures to reference HIDX files.
+                # Adding orphaned HIDX files to the ABF causes AS to throw
+                # PFE_FILESTORE_CORRUPTION errors.
 
                 col_storage_info[tname][col_name] = {
                     "col_name": col_name,
@@ -979,7 +1024,7 @@ def _modify_metadata_and_encode(
                     "idf_fname": col_idf_fname,
                     "meta_fname": col_meta_fname,
                     "dict_fname": col_dict_fname,
-                    "hidx_fname": col_hidx_fname,
+                    "hidx_fname": None,  # No HIDX without AttributeHierarchy
                 }
 
         # ============================================================
@@ -1109,7 +1154,14 @@ def _modify_metadata_and_encode(
                     "nullable": col_def.get("nullable", True),
                 })
 
-            encoded_files = encode_table_data(tname, part_id, encoder_columns, rows)
+            # Compression class IDs (from xmsrv.dll reverse engineering):
+            #   u32_a = 0xABA5A = XMHybridRLECompressionInfo family
+            #   u32_b = 0xABA36 + aligned_bit_width (computed per column by encoder)
+            # These are NOT runtime IDs - they're fixed class selectors!
+            encoded_files = encode_table_data(
+                tname, part_id, encoder_columns, rows,
+                u32_a=0xABA5A, u32_b_start=0,  # u32_b computed per-column in encoder
+            )
 
             # Map the encoded files to our ABF path naming convention
             tbl_folder = f"{tname} ({table_id}).tbl"
@@ -1131,8 +1183,6 @@ def _modify_metadata_and_encode(
                 abf_idf_path = f"{prt_folder}\\{info['idf_fname']}"
                 abf_meta_path = f"{prt_folder}\\{info['meta_fname']}"
                 abf_dict_path = f"{tbl_folder}\\{info['dict_fname']}"
-                abf_hidx_path = f"{tbl_folder}\\{info['hidx_fname']}"
-
                 if idf_key in encoded_files:
                     vertipaq_files[abf_idf_path] = encoded_files[idf_key]
                 if meta_key in encoded_files:
@@ -1144,20 +1194,33 @@ def _modify_metadata_and_encode(
                         "UPDATE DictionaryStorage SET Size = ? WHERE ID = ?",
                         (len(encoded_files[dict_key]), info["ds_id"]),
                     )
-                if hidx_key in encoded_files:
-                    vertipaq_files[abf_hidx_path] = encoded_files[hidx_key]
+                # NOTE: HIDX files are NOT added to ABF (no AH = no H$ structures)
 
                 # Update ColumnStorage statistics from the IDFMETA
                 if meta_key in encoded_files:
                     _update_column_storage_stats(
                         c, info["cs_id"], encoded_files[meta_key], row_count
                     )
+                    # Update DictionaryStorage.LastId with max_data_id from IDFMETA
+                    try:
+                        idfm = encoded_files[meta_key]
+                        max_did = struct.unpack_from("<I", idfm, 91)[0]  # max_data_id at offset 91
+                        c.execute(
+                            "UPDATE DictionaryStorage SET LastId = ? WHERE ID = ?",
+                            (max_did, info["ds_id"]),
+                        )
+                    except (struct.error, KeyError):
+                        pass
 
             # Encode RowNumber column
+            # RowNumber uses u32_a=0xABA5A, u32_b=0xABA5B (XM123CompressionInfo)
             rn_info = col_storage_info[tname]["__rownumber__"]
-            rn_col_def = [{"name": "RowNumber", "data_type": "Int64", "nullable": False}]
+            rn_col_def = [{"name": "RowNumber", "data_type": "Int64", "nullable": False, "is_row_number": True}]
             rn_rows = [{"RowNumber": i} for i in range(row_count)]
-            rn_encoded = encode_table_data(tname, part_id, rn_col_def, rn_rows)
+            rn_encoded = encode_table_data(
+                tname, part_id, rn_col_def, rn_rows,
+                u32_a=0xABA5A, u32_b_start=0xABA5B,  # XM123CompressionInfo for RowNumber
+            )
 
             rn_base = f"{tname}.tbl\\{part_id}.prt"
             rn_idf_key = f"{rn_base}\\column.RowNumber"
@@ -1297,11 +1360,14 @@ def _rebuild_abf_with_new_files(
 
     # ---- 2b. NEW files (VertiPaq data) ----
     # These don't exist in the original ABF. We add them as new VDir entries.
-    new_file_records: list[tuple[str, int, int]] = []  # (path, offset, size)
+    # Generate random hex StoragePaths matching template format (20-char uppercase hex)
+    import secrets
+    new_file_records: list[tuple[str, str, int, int]] = []  # (fpath, storage_path, offset, size)
     for fpath, content in new_files.items():
         offset = len(buf)
         size = len(content)
-        new_file_records.append((fpath, offset, size))
+        storage_path = secrets.token_hex(10).upper()
+        new_file_records.append((fpath, storage_path, offset, size))
         buf.extend(content)
 
     # ---- 3. BackupLog ----
@@ -1317,7 +1383,6 @@ def _rebuild_abf_with_new_files(
                     size_elem.text = str(new_sizes[sp])
 
     # Add new files to the BackupLog FileGroup
-    # Find the database FileGroup (the one with Class=100002 or the last one)
     file_groups = blog_root.findall("FileGroups/FileGroup")
     db_fg = file_groups[-1] if file_groups else None
     if db_fg is not None:
@@ -1328,10 +1393,10 @@ def _rebuild_abf_with_new_files(
         persist_path = db_fg.findtext("PersistLocationPath", "")
         timestamp = 134002835794032078
 
-        for fpath, offset, size in new_file_records:
+        for fpath, storage_path, offset, size in new_file_records:
             bf = ET.SubElement(file_list, "BackupFile")
             ET.SubElement(bf, "Path").text = f"{persist_path}\\{fpath}"
-            ET.SubElement(bf, "StoragePath").text = fpath
+            ET.SubElement(bf, "StoragePath").text = storage_path
             ET.SubElement(bf, "LastWriteTime").text = str(timestamp)
             ET.SubElement(bf, "Size").text = str(size)
 
@@ -1348,7 +1413,7 @@ def _rebuild_abf_with_new_files(
 
     timestamp = 134002835794032078
 
-    # Existing entries
+    # Existing entries (use their original StoragePaths)
     for ve in abf_struct.data_entries:
         bf_elem = ET.SubElement(vdir_root_new, "BackupFile")
         ET.SubElement(bf_elem, "Path").text = ve.path
@@ -1359,10 +1424,10 @@ def _rebuild_abf_with_new_files(
         ET.SubElement(bf_elem, "Access").text = str(ve.access)
         ET.SubElement(bf_elem, "LastWriteTime").text = str(ve.last_write_time)
 
-    # New VertiPaq file entries
-    for fpath, offset, size in new_file_records:
+    # New VertiPaq file entries — use the SAME random hex StoragePaths as BackupLog
+    for fpath, storage_path, offset, size in new_file_records:
         bf_elem = ET.SubElement(vdir_root_new, "BackupFile")
-        ET.SubElement(bf_elem, "Path").text = fpath
+        ET.SubElement(bf_elem, "Path").text = storage_path  # Random hex, NOT fpath!
         ET.SubElement(bf_elem, "Size").text = str(size)
         ET.SubElement(bf_elem, "m_cbOffsetHeader").text = str(offset)
         ET.SubElement(bf_elem, "Delete").text = "false"
