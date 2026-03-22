@@ -429,6 +429,41 @@ class _IDAllocator:
         return val
 
 
+def _build_m_expression(table_name: str, columns: list[dict]) -> str:
+    """Build a valid M expression for a table partition.
+
+    Every partition needs a QueryDefinition — even import partitions.
+    Without it, the TOM model's Partition.Source is null, causing NullRef
+    at RunModelSchemaValidation.
+    """
+    # Map data types to M types
+    _M_TYPES = {
+        "String": "Text.Type",
+        "Int64": "Int64.Type",
+        "Float64": "Number.Type",
+        "DateTime": "DateTime.Type",
+        "Decimal": "Number.Type",
+        "Boolean": "Logical.Type",
+    }
+
+    if not columns:
+        # Empty table — use minimal M expression (like Measures table)
+        return 'let\n    Source = #table(type table [placeholder = text], {})\nin\n    Source'
+
+    # Build column type list
+    col_defs = []
+    for col in columns:
+        m_type = _M_TYPES.get(col.get("data_type", "String"), "Text.Type")
+        col_name = col["name"]
+        # Escape column names with special characters
+        if " " in col_name or any(c in col_name for c in "[](){}#"):
+            col_name = f"#\"{col_name}\""
+        col_defs.append(f"[{col_name} = {m_type}]")
+
+    cols_str = ", ".join(col_defs)
+    return f'let\n    Source = #table(type table {cols_str}, {{}})\nin\n    Source'
+
+
 def _get_max_id_across_tables(conn: sqlite3.Connection) -> int:
     """Find the maximum ID across ALL tables that have an ID column."""
     c = conn.cursor()
@@ -631,7 +666,7 @@ def _modify_metadata_and_encode(
                     0, NULL
                 )""",
                 (part_id, table_id, tname,
-                 f'let\n    Source = #table(type table[placeholder=text], {{}})\nin\n    Source',
+                 _build_m_expression(tname, tdef.get("columns", [])),
                  ps_id,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
             )
