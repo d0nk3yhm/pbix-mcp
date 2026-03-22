@@ -623,14 +623,16 @@ def _modify_metadata_and_encode(
                     DataCoverageDefinitionID, SchemaName
                 ) VALUES (
                     ?, ?, ?, NULL, 0,
-                    NULL, 1, 2, ?,
+                    ?, 1, 4, ?,
                     0, 3, ?, ?,
                     0, NULL, 0,
                     0.0, 0.0, -1, NULL,
                     0, 0, NULL,
                     0, NULL
                 )""",
-                (part_id, table_id, tname, ps_id,
+                (part_id, table_id, tname,
+                 f'let\n    Source = #table(type table[placeholder=text], {{}})\nin\n    Source',
+                 ps_id,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
             )
 
@@ -866,7 +868,7 @@ def _modify_metadata_and_encode(
                         ?, 0, NULL, NULL,
                         1, 0, 0,
                         ?, ?, 31240512000000000,
-                        1, 0, ?,
+                        0, 0, ?,
                         NULL, NULL, NULL,
                         0, 0, 0,
                         ?, NULL, 1
@@ -904,8 +906,10 @@ def _modify_metadata_and_encode(
                         ColumnDataToPosition, DistinctDataCount,
                         DataVersion, StorageFileID, SystemTableID,
                         HasStatistics, MinValue, MaxValue, StringValueMaxLength
-                    ) VALUES (?, ?, 0, 0, 2, -1, -1, 0, 1, 0, 0, 0, NULL, NULL, 0)""",
-                    (ahs_id, ah_id),
+                    ) VALUES (?, ?, 0, 0, 3, -1, -1, ?, 1, 0, 0, 0, NULL, NULL, 0)""",
+                    (ahs_id, ah_id,
+                     len(set(v for v in [row.get(col_def["name"]) for row in tdef["rows"]] if v is not None)),  # DistinctDataCount
+                    ),
                 )
                 c.execute(
                     "UPDATE AttributeHierarchy SET AttributeHierarchyStorageID = ? WHERE ID = ?",
