@@ -75,6 +75,10 @@ pbix-mcp-server --log-level debug
 | Calculated column evaluation | **Beta** | Per-row DAX expression evaluation; tested with synthetic data |
 | Password extraction | **Beta** | Regex scan of DAX measures for embedded passwords |
 | Row-Level Security (RLS) | **Beta** | Read/write roles, evaluate filter expressions against data |
+| Bookmark creation | **Beta** | Create/remove bookmarks with page targeting and visual visibility state |
+| Field Parameters | **Beta** | Create slicer-driven column/measure switchers via `pbix_datamodel_add_field_parameter` |
+| Calculation Groups | **Beta** | Dynamic measure modifiers (YTD, QTD, PY) via `pbix_datamodel_add_calculation_group` |
+| TMDL Export | **Beta** | Export data model as Git-friendly TMDL text files via `pbix_export_tmdl` |
 | Diagnostic tool (`pbix_doctor`) | **Beta** | 8-point health check |
 
 ## Known Limitations

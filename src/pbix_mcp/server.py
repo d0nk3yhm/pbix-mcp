@@ -1205,6 +1205,197 @@ def pbix_get_bookmarks(alias: str) -> str:
 
 
 @mcp.tool()
+def pbix_add_bookmark(
+    alias: str,
+    display_name: str,
+    target_page: str = "",
+    hidden_visuals: str = "",
+    report_filter_json: str = "",
+) -> str:
+    """Create a report bookmark that captures page and visual state.
+
+    Args:
+        alias: The alias of the open file
+        display_name: Name for the bookmark (e.g. "Sales Overview", "Q4 Filter")
+        target_page: Optional page displayName or index to navigate to when bookmark is applied.
+                     If empty, bookmark targets the first page.
+        hidden_visuals: Optional comma-separated list of visual names to hide when
+                        bookmark is applied (e.g. "visual_0,visual_2"). Other visuals
+                        stay visible.
+        report_filter_json: Optional JSON array of report-level filters to apply
+                            when bookmark is activated, e.g.
+                            '[{"target":{"table":"Sales","column":"Region"},"operator":"In","values":["West"]}]'
+    """
+    import uuid as _uuid
+
+    try:
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError("No layout found")
+
+        sections = layout.get("sections", [])
+        if not sections:
+            raise LayoutParseError("Report has no pages")
+
+        # Resolve target page
+        target_section = None
+        if target_page:
+            # Try numeric index first
+            try:
+                idx = int(target_page)
+                if 0 <= idx < len(sections):
+                    target_section = sections[idx]
+            except ValueError:
+                pass
+            # Try display name match
+            if not target_section:
+                for sec in sections:
+                    if sec.get("displayName", "").lower() == target_page.lower():
+                        target_section = sec
+                        break
+            if not target_section:
+                raise LayoutParseError(
+                    f"Page '{target_page}' not found. "
+                    f"Available: {[s.get('displayName') for s in sections]}"
+                )
+        else:
+            target_section = sections[0]
+
+        section_name = target_section.get("name", "ReportSection1")
+
+        # Build visual state — all visuals visible unless in hidden list
+        hidden_set = set()
+        if hidden_visuals:
+            hidden_set = {v.strip() for v in hidden_visuals.split(",") if v.strip()}
+
+        visual_states = {}
+        for vc in target_section.get("visualContainers", []):
+            vc_config_str = vc.get("config", "{}")
+            try:
+                vc_config = json.loads(vc_config_str) if isinstance(vc_config_str, str) else vc_config_str
+            except json.JSONDecodeError:
+                continue
+            vname = vc_config.get("name", "")
+            if vname:
+                visual_states[vname] = {
+                    "visualType": vc_config.get("singleVisual", {}).get("visualType", "unknown"),
+                    "display": {"mode": "hidden" if vname in hidden_set else "visible"},
+                }
+
+        # Build bookmark object
+        bookmark_id = str(_uuid.uuid4()).replace("-", "")[:20]
+        bookmark = {
+            "displayName": display_name,
+            "name": f"Bookmark{bookmark_id}",
+            "explorationState": {
+                "version": "1.2",
+                "activeSection": section_name,
+                "filters": {
+                    "byExpr": [],
+                    "byColumn": [],
+                },
+            },
+            "options": {
+                "targetVisualNames": list(visual_states.keys()) if visual_states else [],
+            },
+        }
+
+        # Add visual display states if any visuals hidden
+        if hidden_set:
+            bookmark["explorationState"]["sections"] = {
+                section_name: {
+                    "visualContainers": {
+                        vname: {"singleVisual": {"display": state["display"]}}
+                        for vname, state in visual_states.items()
+                    }
+                }
+            }
+
+        # Add report-level filters if provided
+        if report_filter_json:
+            try:
+                filters = json.loads(report_filter_json)
+                bookmark["explorationState"]["filters"]["byExpr"] = filters
+            except json.JSONDecodeError:
+                raise LayoutParseError("Invalid report_filter_json — must be valid JSON array")
+
+        # Insert into layout config
+        config_str = layout.get("config", "{}")
+        if isinstance(config_str, str):
+            try:
+                config = json.loads(config_str)
+            except json.JSONDecodeError:
+                config = {}
+        else:
+            config = config_str
+
+        config.setdefault("bookmarks", []).append(bookmark)
+        layout["config"] = json.dumps(config, ensure_ascii=False)
+
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+
+        hidden_msg = f", hiding: {hidden_visuals}" if hidden_visuals else ""
+        return ToolResponse.ok(
+            f"Created bookmark '{display_name}' → page '{target_section.get('displayName')}'"
+            f"{hidden_msg}. Total bookmarks: {len(config['bookmarks'])}"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
+
+
+@mcp.tool()
+def pbix_remove_bookmark(alias: str, bookmark_index: int) -> str:
+    """Remove a bookmark by index.
+
+    Args:
+        alias: The alias of the open file
+        bookmark_index: Zero-based index of the bookmark to remove (from pbix_get_bookmarks)
+    """
+    try:
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError("No layout found")
+
+        config_str = layout.get("config", "{}")
+        if isinstance(config_str, str):
+            try:
+                config = json.loads(config_str)
+            except json.JSONDecodeError:
+                config = {}
+        else:
+            config = config_str
+
+        bookmarks = config.get("bookmarks", [])
+        if not bookmarks:
+            return ToolResponse.ok("No bookmarks to remove.").to_text()
+
+        if bookmark_index < 0 or bookmark_index >= len(bookmarks):
+            raise LayoutParseError(
+                f"Index {bookmark_index} out of range (0–{len(bookmarks) - 1})"
+            )
+
+        removed = bookmarks.pop(bookmark_index)
+        name = removed.get("displayName", removed.get("name", "?"))
+        config["bookmarks"] = bookmarks
+        layout["config"] = json.dumps(config, ensure_ascii=False)
+
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Removed bookmark '{name}'. Remaining: {len(bookmarks)}"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
+
+
+@mcp.tool()
 def pbix_get_metadata(alias: str) -> str:
     """Get file metadata — component inventory and sizes.
 
@@ -2063,6 +2254,244 @@ def pbix_datamodel_remove_measure(alias: str, measure_name: str) -> str:
             f"Measure '{measure_name}' removed from table '{old_info.get('table', '?')}':\n"
             f"  Old expression: {old_info.get('expression', '?')}\n"
             f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+
+
+@mcp.tool()
+def pbix_datamodel_add_field_parameter(
+    alias: str, parameter_name: str, fields_json: str
+) -> str:
+    """Create a field parameter — a slicer-driven column/measure switcher.
+
+    Field parameters let users dynamically choose which column or measure
+    to display in a visual via a slicer.
+
+    Args:
+        alias: The alias of the open file
+        parameter_name: Name for the field parameter table (e.g. "Metric Selector")
+        fields_json: JSON array of fields to include, e.g.
+            '[{"display": "Revenue", "ref": "Sales[Revenue]"},
+              {"display": "Profit",  "ref": "Sales[Profit]"},
+              {"display": "Units",   "ref": "Sales[Units]"}]'
+            Each entry has "display" (label shown in slicer) and "ref"
+            (table[column] or table[measure] reference).
+    """
+    try:
+        fields = json.loads(fields_json)
+        if not fields or not isinstance(fields, list):
+            raise ValueError("fields_json must be a non-empty JSON array")
+
+        for f in fields:
+            if "display" not in f or "ref" not in f:
+                raise ValueError("Each field must have 'display' and 'ref' keys")
+
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
+
+        # Build DAX expression: { ("Display", NAMEOF('Table'[Column]), 0), ... }
+        rows = []
+        for i, f in enumerate(fields):
+            ref = f["ref"]
+            display = f["display"].replace('"', '""')
+            # Ensure ref is in 'Table'[Column] format
+            if "'" not in ref and "[" in ref:
+                # Convert Sales[Revenue] → 'Sales'[Revenue]
+                tbl = ref.split("[")[0]
+                col = ref.split("[")[1].rstrip("]")
+                ref = f"'{tbl}'[{col}]"
+            rows.append(f'    ("{display}", NAMEOF({ref}), {i})')
+        dax_expr = "{\n" + ",\n".join(rows) + "\n}"
+
+        def _do_add(conn: sqlite3.Connection):
+            c = conn.cursor()
+
+            # Get next table ID
+            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM [Table]")
+            table_id = c.fetchone()[0]
+
+            # Insert calculated table (Type is not stored; calculated tables use
+            # partition type 4 = "Calculated")
+            c.execute(
+                "INSERT INTO [Table] (ID, ModelID, Name, IsHidden, "
+                "ModifiedTime, StructureModifiedTime, SystemFlags, "
+                "ShowAsVariationsOnly, IsPrivate, "
+                "CalculationGroupID, ExcludeFromModelRefresh) "
+                "VALUES (?, 1, ?, 0, datetime('now'), datetime('now'), 0, 0, 0, 0, 0)",
+                (table_id, parameter_name)
+            )
+
+            # Get next column ID
+            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM [Column]")
+            col_base_id = c.fetchone()[0]
+
+            # Column 1: Parameter (display name) — String
+            c.execute(
+                "INSERT INTO [Column] (ID, TableID, ExplicitName, ExplicitDataType, "
+                "Type, IsHidden, IsAvailableInMDX, ModifiedTime, StructureModifiedTime) "
+                "VALUES (?, ?, ?, 2, 2, 0, 1, datetime('now'), datetime('now'))",
+                (col_base_id, table_id, parameter_name)
+            )
+
+            # Column 2: Parameter Fields (NAMEOF result) — String
+            c.execute(
+                "INSERT INTO [Column] (ID, TableID, ExplicitName, ExplicitDataType, "
+                "Type, IsHidden, IsAvailableInMDX, ModifiedTime, StructureModifiedTime) "
+                "VALUES (?, ?, ?, 2, 2, 1, 0, datetime('now'), datetime('now'))",
+                (col_base_id + 1, table_id, f"{parameter_name} Fields")
+            )
+
+            # Column 3: Parameter Order — Int64
+            c.execute(
+                "INSERT INTO [Column] (ID, TableID, ExplicitName, ExplicitDataType, "
+                "Type, IsHidden, IsAvailableInMDX, ModifiedTime, StructureModifiedTime) "
+                "VALUES (?, ?, ?, 6, 2, 1, 0, datetime('now'), datetime('now'))",
+                (col_base_id + 2, table_id, f"{parameter_name} Order")
+            )
+
+            # Get next partition ID
+            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM [Partition]")
+            part_id = c.fetchone()[0]
+
+            # Insert calculated partition (Type=4 for calculated table)
+            c.execute(
+                "INSERT INTO [Partition] (ID, TableID, Name, "
+                "Type, Mode, State, ModifiedTime, RefreshedTime, "
+                "QueryDefinition) "
+                "VALUES (?, ?, ?, 4, 0, 1, datetime('now'), datetime('now'), ?)",
+                (part_id, table_id, parameter_name, dax_expr)
+            )
+
+            conn.commit()
+
+        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_add)
+        info["modified"] = True
+
+        field_list = ", ".join(f["display"] for f in fields)
+        return ToolResponse.ok(
+            f"Field parameter '{parameter_name}' created with {len(fields)} fields: {field_list}\n"
+            f"  DAX: {dax_expr}\n"
+            f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes\n"
+            f"Use as a slicer to let users switch between these fields in visuals."
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+
+
+@mcp.tool()
+def pbix_datamodel_add_calculation_group(
+    alias: str, group_name: str, items_json: str, precedence: int = 0
+) -> str:
+    """Create a calculation group — dynamic measure modifiers (YTD, QTD, PY, etc.).
+
+    Calculation groups apply DAX transformations to any measure used in a visual.
+    For example, a "Time Intelligence" group with items "Current", "YTD", "PY"
+    lets users switch between time calculations via a slicer.
+
+    Args:
+        alias: The alias of the open file
+        group_name: Name for the calculation group table (e.g. "Time Intelligence")
+        items_json: JSON array of calculation items, e.g.
+            '[{"name": "Current", "expression": "SELECTEDMEASURE()"},
+              {"name": "YTD", "expression": "CALCULATE(SELECTEDMEASURE(), DATESYTD(''Date''[Date]))"},
+              {"name": "PY",  "expression": "CALCULATE(SELECTEDMEASURE(), SAMEPERIODLASTYEAR(''Date''[Date]))"}]'
+            Each item has "name" (display label) and "expression" (DAX using SELECTEDMEASURE()).
+        precedence: Evaluation order when multiple calc groups exist (default 0)
+    """
+    try:
+        items = json.loads(items_json)
+        if not items or not isinstance(items, list):
+            raise ValueError("items_json must be a non-empty JSON array")
+        for item in items:
+            if "name" not in item or "expression" not in item:
+                raise ValueError("Each item must have 'name' and 'expression' keys")
+
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
+
+        def _do_add(conn: sqlite3.Connection):
+            c = conn.cursor()
+
+            # Check if group name already exists
+            c.execute("SELECT ID FROM [Table] WHERE Name = ?", (group_name,))
+            if c.fetchone():
+                raise ValueError(f"Table '{group_name}' already exists")
+
+            # Get next IDs
+            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM [Table]")
+            table_id = c.fetchone()[0]
+
+            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM CalculationGroup")
+            cg_id = c.fetchone()[0]
+
+            # Create CalculationGroup
+            c.execute(
+                "INSERT INTO CalculationGroup (ID, TableID, Precedence, "
+                "ModifiedTime) VALUES (?, ?, ?, datetime('now'))",
+                (cg_id, table_id, precedence)
+            )
+
+            # Create the table with CalculationGroupID set
+            c.execute(
+                "INSERT INTO [Table] (ID, ModelID, Name, IsHidden, "
+                "ModifiedTime, StructureModifiedTime, SystemFlags, "
+                "ShowAsVariationsOnly, IsPrivate, "
+                "CalculationGroupID, ExcludeFromModelRefresh) "
+                "VALUES (?, 1, ?, 0, datetime('now'), datetime('now'), 0, 0, 0, ?, 0)",
+                (table_id, group_name, cg_id)
+            )
+
+            # Create the Name column (shows item names in slicers)
+            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM [Column]")
+            col_id = c.fetchone()[0]
+
+            c.execute(
+                "INSERT INTO [Column] (ID, TableID, ExplicitName, ExplicitDataType, "
+                "Type, IsHidden, IsAvailableInMDX, ModifiedTime, StructureModifiedTime) "
+                "VALUES (?, ?, 'Name', 2, 2, 0, 1, datetime('now'), datetime('now'))",
+                (col_id, table_id)
+            )
+
+            # Create Ordinal column (for sorting)
+            c.execute(
+                "INSERT INTO [Column] (ID, TableID, ExplicitName, ExplicitDataType, "
+                "Type, IsHidden, IsAvailableInMDX, ModifiedTime, StructureModifiedTime) "
+                "VALUES (?, ?, 'Ordinal', 6, 2, 1, 0, datetime('now'), datetime('now'))",
+                (col_id + 1, table_id)
+            )
+
+            # Create CalculationItems
+            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM CalculationItem")
+            item_base_id = c.fetchone()[0]
+
+            for i, item in enumerate(items):
+                c.execute(
+                    "INSERT INTO CalculationItem (ID, CalculationGroupID, Name, "
+                    "Expression, Ordinal, ModifiedTime) "
+                    "VALUES (?, ?, ?, ?, ?, datetime('now'))",
+                    (item_base_id + i, cg_id, item["name"], item["expression"], i)
+                )
+
+            conn.commit()
+
+        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_add)
+        info["modified"] = True
+
+        item_list = ", ".join(item["name"] for item in items)
+        return ToolResponse.ok(
+            f"Calculation group '{group_name}' created with {len(items)} items: {item_list}\n"
+            f"  Precedence: {precedence}\n"
+            f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes\n"
+            f"Add to a slicer — measures in visuals will be modified by the selected item."
         ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
@@ -3614,6 +4043,272 @@ def pbix_doctor(alias: str) -> str:
     _check("Default slicer filters", check_filters)
 
     return ToolResponse.ok("\n".join(checks)).to_text()
+
+
+# ---- Section 10b: TMDL Export ----
+
+
+def _tmdl_escape(value: str) -> str:
+    """Escape a string value for TMDL format."""
+    if not value:
+        return ""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
+    """Export metadata SQLite to TMDL folder structure.
+
+    Returns dict with counts of exported objects.
+    """
+    c = conn.cursor()
+    stats = {"tables": 0, "columns": 0, "measures": 0, "relationships": 0, "roles": 0}
+
+    # ---- database.tmdl ----
+    c.execute("SELECT Name, Culture FROM Model LIMIT 1")
+    model_row = c.fetchone()
+    db_name = model_row[0] if model_row else "Model"
+    compat = 1567  # Default PBI compatibility level
+
+    with open(os.path.join(output_dir, "database.tmdl"), "w", encoding="utf-8") as f:
+        f.write(f"database {db_name}\n")
+        f.write(f"\tcompatibilityLevel: {compat}\n")
+
+    # ---- model.tmdl ----
+    culture = model_row[1] if model_row and model_row[1] else "en-US"
+
+    with open(os.path.join(output_dir, "model.tmdl"), "w", encoding="utf-8") as f:
+        f.write(f"model Model\n")
+        f.write(f"\tculture: {culture}\n")
+
+    # ---- tables/ ----
+    tables_dir = os.path.join(output_dir, "tables")
+    os.makedirs(tables_dir, exist_ok=True)
+
+    c.execute("SELECT ID, Name, Description, IsHidden FROM [Table] ORDER BY ID")
+    tables = c.fetchall()
+
+    for table_id, table_name, table_desc, is_hidden in tables:
+        # Skip internal system tables (H$=hierarchy, R$=relationship, U$=user hierarchy)
+        if table_name.startswith(("H$", "R$", "U$")):
+            continue
+        lines = [f"table '{_tmdl_escape(table_name)}'"]
+        if table_desc:
+            lines.append(f"\tdescription: {table_desc}")
+        if is_hidden:
+            lines.append(f"\tisHidden")
+        lines.append("")
+
+        # Columns
+        c.execute(
+            "SELECT ExplicitName, InferredName, ExplicitDataType, InferredDataType, "
+            "IsHidden, IsKey, SourceColumn, Expression, FormatString, Description, Type "
+            "FROM [Column] WHERE TableID = ? ORDER BY ID",
+            (table_id,)
+        )
+        _dtype_map = {
+            2: "string", 6: "int64", 8: "double", 9: "dateTime", 10: "decimal", 11: "boolean"
+        }
+        for col in c.fetchall():
+            col_name = col[0] or col[1] or "?"
+            dtype_id = col[2] if col[2] else (col[3] if col[3] else 2)
+            dtype = _dtype_map.get(dtype_id, "string")
+            is_col_hidden = col[4]
+            is_key = col[5]
+            source_col = col[6]
+            expression = col[7]
+            fmt_str = col[8]
+            col_desc = col[9]
+            col_type = col[10]  # 1=data, 2=calculated, 3=rowNumber
+
+            if col_type == 3:
+                continue  # Skip RowNumber system columns
+
+            if expression and col_type == 2:
+                lines.append(f"\tcolumn '{_tmdl_escape(col_name)}' = {expression}")
+            else:
+                lines.append(f"\tcolumn '{_tmdl_escape(col_name)}'")
+
+            lines.append(f"\t\tdataType: {dtype}")
+            if source_col:
+                lines.append(f"\t\tsourceColumn: {source_col}")
+            if is_col_hidden:
+                lines.append(f"\t\tisHidden")
+            if is_key:
+                lines.append(f"\t\tisKey")
+            if fmt_str:
+                lines.append(f"\t\tformatString: {fmt_str}")
+            if col_desc:
+                lines.append(f"\t\tdescription: {col_desc}")
+            lines.append("")
+            stats["columns"] += 1
+
+        # Measures
+        c.execute(
+            "SELECT Name, Expression, FormatString, Description, IsHidden, DisplayFolder "
+            "FROM Measure WHERE TableID = ? ORDER BY ID",
+            (table_id,)
+        )
+        for meas in c.fetchall():
+            m_name, m_expr, m_fmt, m_desc, m_hidden, m_folder = meas
+            lines.append(f"\tmeasure '{_tmdl_escape(m_name)}' = {m_expr}")
+            if m_fmt:
+                lines.append(f"\t\tformatString: {m_fmt}")
+            if m_desc:
+                lines.append(f"\t\tdescription: {m_desc}")
+            if m_hidden:
+                lines.append(f"\t\tisHidden")
+            if m_folder:
+                lines.append(f"\t\tdisplayFolder: {m_folder}")
+            lines.append("")
+            stats["measures"] += 1
+
+        # Partitions
+        c.execute(
+            "SELECT Name, QueryDefinition, Mode, Type FROM [Partition] "
+            "WHERE TableID = ? ORDER BY ID",
+            (table_id,)
+        )
+        for part in c.fetchall():
+            p_name, p_query, p_mode, p_type = part
+            if p_query:
+                mode_str = "directQuery" if p_mode == 1 else "import"
+                if p_type == 4:
+                    # Calculated partition
+                    lines.append(f"\tpartition '{_tmdl_escape(p_name)}' = calculated")
+                else:
+                    lines.append(f"\tpartition '{_tmdl_escape(p_name)}' = m")
+                    lines.append(f"\t\tmode: {mode_str}")
+                lines.append(f"\t\tsource =")
+                for qline in p_query.split("\n"):
+                    lines.append(f"\t\t\t{qline}")
+                lines.append("")
+
+        # Write table TMDL
+        safe_name = table_name.replace("/", "_").replace("\\", "_").replace(":", "_")
+        with open(os.path.join(tables_dir, f"{safe_name}.tmdl"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        stats["tables"] += 1
+
+    # ---- relationships.tmdl ----
+    c.execute(
+        "SELECT r.Name, r.IsActive, r.CrossFilteringBehavior, "
+        "ft.Name, fc.ExplicitName, tt.Name, tc.ExplicitName "
+        "FROM [Relationship] r "
+        "JOIN [Table] ft ON r.FromTableID = ft.ID "
+        "JOIN [Column] fc ON r.FromColumnID = fc.ID "
+        "JOIN [Table] tt ON r.ToTableID = tt.ID "
+        "JOIN [Column] tc ON r.ToColumnID = tc.ID "
+        "ORDER BY r.ID"
+    )
+    rels = c.fetchall()
+    if rels:
+        lines = []
+        for rel in rels:
+            r_name, is_active, cross_filter, from_tbl, from_col, to_tbl, to_col = rel
+            lines.append(f"relationship {r_name or ''}")
+            lines.append(f"\tfromColumn: '{_tmdl_escape(from_tbl)}'.'{_tmdl_escape(from_col)}'")
+            lines.append(f"\ttoColumn: '{_tmdl_escape(to_tbl)}'.'{_tmdl_escape(to_col)}'")
+            if not is_active:
+                lines.append(f"\tisActive: false")
+            cfb_map = {0: "oneDirection", 1: "bothDirections", 2: "automatic"}
+            if cross_filter in cfb_map:
+                lines.append(f"\tcrossFilteringBehavior: {cfb_map[cross_filter]}")
+            lines.append("")
+            stats["relationships"] += 1
+
+        with open(os.path.join(output_dir, "relationships.tmdl"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    # ---- roles/ ----
+    c.execute("SELECT ID, Name, Description FROM Role ORDER BY ID")
+    roles = c.fetchall()
+    if roles:
+        roles_dir = os.path.join(output_dir, "roles")
+        os.makedirs(roles_dir, exist_ok=True)
+        for role_id, role_name, role_desc in roles:
+            lines = [f"role '{_tmdl_escape(role_name)}'"]
+            if role_desc:
+                lines.append(f"\tdescription: {role_desc}")
+
+            c.execute(
+                "SELECT t.Name, tp.FilterExpression FROM TablePermission tp "
+                "JOIN [Table] t ON tp.TableID = t.ID "
+                "WHERE tp.RoleID = ? ORDER BY tp.ID",
+                (role_id,)
+            )
+            for tbl_name, filter_expr in c.fetchall():
+                lines.append(f"\ttablePermission '{_tmdl_escape(tbl_name)}'")
+                if filter_expr:
+                    lines.append(f"\t\tfilterExpression: {filter_expr}")
+            lines.append("")
+
+            safe_name = role_name.replace("/", "_").replace("\\", "_")
+            with open(os.path.join(roles_dir, f"{safe_name}.tmdl"), "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            stats["roles"] += 1
+
+    return stats
+
+
+@mcp.tool()
+def pbix_export_tmdl(alias: str, output_path: str = "") -> str:
+    """Export the data model as TMDL (Tabular Model Definition Language) files.
+
+    TMDL is a human-readable, Git-friendly text format for Power BI models.
+    Creates a folder with .tmdl files for tables, relationships, roles, etc.
+
+    Args:
+        alias: The alias of the open file
+        output_path: Output directory path. Defaults to <pbix_dir>/<alias>_tmdl/
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
+
+        # Determine output directory
+        if not output_path:
+            pbix_dir = os.path.dirname(info.get("original_path", info["work_dir"]))
+            output_path = os.path.join(pbix_dir, f"{alias}_tmdl")
+
+        os.makedirs(output_path, exist_ok=True)
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        with open(dm_path, "rb") as f:
+            dm_bytes = f.read()
+
+        abf = decompress_datamodel(dm_bytes)
+        db_bytes = read_metadata_sqlite(abf)
+
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(db_bytes)
+        tmp.close()
+
+        try:
+            conn = sqlite3.connect(tmp.name)
+            stats = _export_tmdl_from_sqlite(conn, output_path)
+            conn.close()
+        finally:
+            os.unlink(tmp.name)
+
+        summary = (
+            f"TMDL exported to: {output_path}\n"
+            f"  Tables: {stats['tables']}\n"
+            f"  Columns: {stats['columns']}\n"
+            f"  Measures: {stats['measures']}\n"
+            f"  Relationships: {stats['relationships']}\n"
+            f"  Roles: {stats['roles']}\n"
+            f"Files are Git-friendly text — diff, merge, and version control your model."
+        )
+        return ToolResponse.ok(summary).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
 
 
 # ---- Section 11: MCP main ----
