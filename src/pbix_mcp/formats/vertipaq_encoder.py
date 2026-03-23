@@ -668,6 +668,7 @@ def _encode_idfmeta(
     nonzero_primary_entries: int = 0,
     has_dict: bool = True,
     is_row_number: bool = False,
+    is_system: bool = False,
     u32_a: int = 0,
     u32_b: int = 0,
 ) -> bytes:
@@ -714,8 +715,8 @@ def _encode_idfmeta(
 
     # records
     buf += _u8(row_count)
-    # one: 0 for RowNumber columns, 1 for data columns
-    buf += _u8(0 if is_row_number else 1)
+    # one: 0 for RowNumber/system columns, 1 for data columns
+    buf += _u8(0 if (is_row_number or is_system) else 1)
     # u32_a: Compression family class ID
     #   0xABA5A = XMHybridRLECompressionInfo (standard for data columns)
     #   0xABA5B = XM123CompressionInfo (used for RowNumber)
@@ -814,6 +815,7 @@ def _encode_column(
     nullable: bool,
     values: list,
     is_row_number: bool = False,
+    is_system: bool = False,
     u32_a: int = 0,
     u32_b: int = 0,
 ) -> dict[str, bytes]:
@@ -950,6 +952,7 @@ def _encode_column(
         nonzero_primary_entries=nonzero_primary_entries,
         has_dict=has_dict,
         is_row_number=is_row_number,
+        is_system=is_system,
         u32_a=u32_a,
         u32_b=u32_b,
     )
@@ -986,6 +989,7 @@ def encode_table_data(
     rows: list[dict],
     u32_a: int = 0,
     u32_b_start: int = 0,
+    is_system: bool = False,
 ) -> dict[str, bytes]:
     """
     Encode table data into VertiPaq column files.
@@ -1066,6 +1070,7 @@ def encode_table_data(
         encoded = _encode_column(
             col_name, data_type, nullable, values,
             is_row_number=is_rn,
+            is_system=is_system,
             u32_a=col_u32_a,
             u32_b=col_u32_b,
         )

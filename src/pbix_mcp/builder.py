@@ -1878,16 +1878,17 @@ def _modify_metadata_and_encode(
                 (r_cs_id, r_col_id, r_cs_name, r_ds_id),
             )
 
-            # R$ DictionaryStorage (Type=1, DataType=6 Int64, IsOperatingOn32=1)
-            r_dict_file_id = alloc.next()
-            r_dict_fname = f"0.{r_table_name}.{r_cs_name}.dictionary"
+            # R$ DictionaryStorage (Type=0, DataType=19 — no dictionary, raw values)
+            # Must match template exactly: no external dictionary file
+            r_dict_file_id = alloc.next()  # consumed but unused
+            r_dict_fname = None  # no dictionary file for R$ INDEX
             c.execute(
                 """INSERT INTO DictionaryStorage (
                     ID, ColumnStorageID, Type, DataType, DataVersion,
                     BaseId, Magnitude, LastId, IsNullable, IsUnique,
                     IsOperatingOn32, DictionaryFlags, StorageFileID, Size
-                ) VALUES (?, ?, 1, 6, 0, 2, 0.0, 0, 0, 0, 1, 0, ?, 0)""",
-                (r_ds_id, r_cs_id, r_dict_file_id),
+                ) VALUES (?, ?, 0, 19, 0, 0, 0.0, 0, 0, 0, 0, 0, 0, 0)""",
+                (r_ds_id, r_cs_id),
             )
 
             # R$ ColumnPartitionStorage (State=3)
@@ -1923,13 +1924,7 @@ def _modify_metadata_and_encode(
                 (r_meta_file_id, r_ss_id, r_prt_folder_id, r_meta_fname),
             )
 
-            # StorageFile for dictionary (OwnerType=22)
-            c.execute(
-                """INSERT INTO StorageFile (
-                    ID, OwnerID, OwnerType, StorageFolderID, FileName
-                ) VALUES (?, ?, 22, ?, ?)""",
-                (r_dict_file_id, r_ds_id, r_tbl_folder_id, r_dict_fname),
-            )
+            # No StorageFile for dictionary — R$ INDEX uses Type=0 (no dict)
 
             # Update RelationshipIndexStorage with SystemTableID and RecordCount
             c.execute(
@@ -1945,6 +1940,7 @@ def _modify_metadata_and_encode(
             r_encoded = encode_table_data(
                 r_table_name, r_part_id, r_encoder_cols, r_enc_rows,
                 u32_a=0xABA5A, u32_b_start=0,
+                is_system=True,  # R$ INDEX: one=0 in IDFMETA
             )
 
             # Map encoded files to ABF paths
@@ -1955,35 +1951,27 @@ def _modify_metadata_and_encode(
 
             r_abf_idf_path = f"{r_prt_folder_path}\\{r_idf_fname}"
             r_abf_meta_path = f"{r_prt_folder_path}\\{r_meta_fname}"
-            r_abf_dict_path = f"{r_tbl_folder_path}\\{r_dict_fname}"
+            # No dictionary file for R$ INDEX (Type=0)
 
             if r_idf_key in r_encoded:
                 vertipaq_files[r_abf_idf_path] = r_encoded[r_idf_key]
             if r_meta_key in r_encoded:
                 vertipaq_files[r_abf_meta_path] = r_encoded[r_meta_key]
-            if r_dict_key in r_encoded:
-                vertipaq_files[r_abf_dict_path] = r_encoded[r_dict_key]
-                # Update DictionaryStorage.Size with actual dict size
-                c.execute(
-                    "UPDATE DictionaryStorage SET Size = ? WHERE ID = ?",
-                    (len(r_encoded[r_dict_key]), r_ds_id),
-                )
+            # Skip dictionary file — R$ INDEX uses Type=0 (no external dict)
 
-            # Update ColumnStorage statistics from the IDFMETA
-            if r_meta_key in r_encoded:
-                _update_column_storage_stats(
-                    c, r_cs_id, r_encoded[r_meta_key], from_row_count
-                )
-                # Update DictionaryStorage.LastId with max_data_id from IDFMETA
-                try:
-                    r_idfm = r_encoded[r_meta_key]
-                    r_max_did = struct.unpack_from("<I", r_idfm, 91)[0]
-                    c.execute(
-                        "UPDATE DictionaryStorage SET LastId = ? WHERE ID = ?",
-                        (r_max_did, r_ds_id),
-                    )
-                except (struct.error, KeyError):
-                    pass
+            # Override ColumnStorage stats to match template (Type=0 pattern)
+            c.execute(
+                """UPDATE ColumnStorage SET
+                    Statistics_DistinctStates = 1,
+                    Statistics_MinDataID = 2,
+                    Statistics_MaxDataID = 2,
+                    Statistics_OriginalMinSegmentDataID = 2,
+                    Statistics_RLESortOrder = -1,
+                    Statistics_RowCount = 0,
+                    Statistics_Usage = 3
+                WHERE ID = ?""",
+                (r_cs_id,),
+            )
 
         conn.commit()
         conn.close()
