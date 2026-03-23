@@ -393,9 +393,10 @@ def pbix_open(file_path: str, alias: str = "") -> str:
             tmp_db.write(db_bytes)
             tmp_db.close()
             conn = sqlite3.connect(tmp_db.name)
-            # Check for DirectQuery partitions (Type=4 is M/Import, Type=6 is DirectQuery)
+            # Check for DirectQuery partitions (Mode=1 is DirectQuery, Mode=0 is Import)
+            # Note: Type=4 for both Import and DirectQuery; Mode distinguishes them
             dq_partitions = conn.execute(
-                "SELECT COUNT(*) FROM [Partition] WHERE Type = 6"
+                "SELECT COUNT(*) FROM [Partition] WHERE Mode = 1"
             ).fetchone()[0]
             conn.close()
             os.unlink(tmp_db.name)

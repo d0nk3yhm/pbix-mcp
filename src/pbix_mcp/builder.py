@@ -675,44 +675,58 @@ def _modify_metadata_and_encode(
                 # DirectQuery table — metadata only, NO VertiPaq storage
                 # ============================================================
 
-                # Create or reuse a DataSource for this connection
-                source_db = tdef.get("source_db") or {}
-                ds_key = f"{source_db.get('type', '')}|{source_db.get('server', '')}|{source_db.get('database', '')}|{source_db.get('port', '')}"
-                if ds_key not in datasource_id_map:
-                    ds_id = alloc.next()
-                    datasource_id_map[ds_key] = ds_id
-                    db_type = source_db.get("type", "mysql").lower()
-                    server = source_db.get("server", "localhost")
-                    database = source_db.get("database", "")
-                    port = source_db.get("port", 3306)
+                # DirectQuery: NO DataSource entry — avoids PFE_DECRYPT_DATA.
+                # The M expression in QueryDefinition handles the connection.
+                # PBI Desktop will prompt for credentials on first open.
+                data_source_id = 0
 
-                    if db_type == "mysql":
-                        conn_string = f"Provider=MSDASQL;Driver={{MySQL ODBC 8.0 Unicode Driver}};Server={server};Port={port};Database={database}"
-                    else:
-                        conn_string = f"Provider=MSDASQL;Server={server};Database={database}"
-
-                    c.execute(
-                        """INSERT INTO [DataSource] (
-                            ID, ModelID, Name, Description, Type,
-                            ConnectionString, ImpersonationMode,
-                            Account, Password, MaxConnections, Isolation,
-                            Timeout, ModifiedTime
-                        ) VALUES (
-                            ?, 1, ?, NULL, 0,
-                            ?, 2,
-                            NULL, NULL, 0, 2,
-                            0, ?
-                        )""",
-                        (ds_id, f"MySQL {server}/{database}",
-                         conn_string, _FIXED_TIMESTAMP),
-                    )
-                data_source_id = datasource_id_map[ds_key]
-
-                # Partition (no storage)
+                # Create full storage chain but with State=2 (unprocessed)
+                # so the engine doesn't try to load/validate segment data
+                ts_id = alloc.next()
+                sf_tbl_id = alloc.next()
                 part_id = alloc.next()
                 partition_id_map[tname] = part_id
+                ps_id = alloc.next()
+                sf_prt_id = alloc.next()
+                sms_id = alloc.next()
 
-                # Insert Table row with TableStorageID=0 (no storage)
+                # StorageFolder for table
+                c.execute(
+                    "INSERT INTO StorageFolder (ID, OwnerID, OwnerType, Path) VALUES (?, ?, 18, ?)",
+                    (sf_tbl_id, ts_id, f"{tname} ({table_id}).tbl"),
+                )
+                # TableStorage
+                c.execute(
+                    """INSERT INTO TableStorage (
+                        ID, TableID, Name, Version, Settings,
+                        RIViolationCount, StorageFolderID
+                    ) VALUES (?, ?, ?, 1, 4, 0, ?)""",
+                    (ts_id, table_id, tname, sf_tbl_id),
+                )
+                # StorageFolder for partition
+                c.execute(
+                    "INSERT INTO StorageFolder (ID, OwnerID, OwnerType, Path) VALUES (?, ?, 20, ?)",
+                    (sf_prt_id, ps_id, f"{tname} ({table_id}).tbl\\{part_id}.prt"),
+                )
+                # PartitionStorage
+                c.execute(
+                    """INSERT INTO PartitionStorage (
+                        ID, PartitionID, Name, StoragePosition,
+                        SegmentMapStorageID, DataObjectId, StorageFolderID,
+                        DeltaTableMetadataStorageID
+                    ) VALUES (?, ?, ?, 0, ?, 0, ?, 0)""",
+                    (ps_id, part_id, tname, sms_id, sf_prt_id),
+                )
+                # SegmentMapStorage (empty)
+                c.execute(
+                    """INSERT INTO SegmentMapStorage (
+                        ID, PartitionStorageID, Type, RecordCount,
+                        SegmentCount, RecordsPerSegment
+                    ) VALUES (?, ?, 3, 0, 0, 0)""",
+                    (sms_id, ps_id),
+                )
+
+                # Insert Table row with valid TableStorageID
                 c.execute(
                     """INSERT INTO [Table] (
                         ID, ModelID, Name, DataCategory, Description, IsHidden,
@@ -724,19 +738,19 @@ def _modify_metadata_and_encode(
                         ExcludeFromAutomaticAggregations
                     ) VALUES (
                         ?, 1, ?, NULL, NULL, ?,
-                        0, ?, ?,
+                        ?, ?, ?,
                         0, 0, 0,
                         0, 0,
                         0, 0, 0,
                         ?, NULL, 0,
                         0
                     )""",
-                    (table_id, tname, 1 if tdef["hidden"] else 0,
+                    (table_id, tname, 1 if tdef["hidden"] else 0, ts_id,
                      _FIXED_TIMESTAMP, _FIXED_TIMESTAMP,
                      str(uuid.uuid4())),
                 )
 
-                # Insert Partition row: Type=6 (DirectQuery), Mode=1, PartitionStorageID=0
+                # Insert Partition row: Type=4 (M partition), Mode=1 (DirectQuery)
                 c.execute(
                     """INSERT INTO [Partition] (
                         ID, TableID, Name, Description, DataSourceID,
@@ -748,7 +762,7 @@ def _modify_metadata_and_encode(
                         DataCoverageDefinitionID, SchemaName
                     ) VALUES (
                         ?, ?, ?, NULL, ?,
-                        ?, 1, 6, 0,
+                        ?, 2, 4, ?,
                         1, 3, ?, ?,
                         0, NULL, 0,
                         0.0, 0.0, -1, NULL,
@@ -758,6 +772,7 @@ def _modify_metadata_and_encode(
                     (part_id, table_id, tname, data_source_id,
                      _build_m_expression(tname, tdef.get("columns", []),
                                          tdef.get("source_csv"), tdef.get("source_db")),
+                     ps_id,
                      _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
                 )
 
