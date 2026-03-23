@@ -616,7 +616,7 @@ def _build_m_expression(
             return (
                 "let\n"
                 f'    Source = MySQL.Database("{server}:{port}", "{database}"),\n'
-                f'    Data = Source{{[Schema="{database}",Name="{db_table}"]}}[Data],\n'
+                f'    Data = Source{{[Schema="{database}",Item="{db_table}"]}}[Data],\n'
                 f"    TypedColumns = Table.TransformColumnTypes(Data, {{{transforms}}})\n"
                 "in\n"
                 "    TypedColumns"
@@ -641,7 +641,7 @@ def _build_m_expression(
             return (
                 "let\n"
                 f'    Source = PostgreSQL.Database("{server}:{port}", "{database}"),\n'
-                f'    Data = Source{{[Schema="{schema}",Name="{db_table}"]}}[Data],\n'
+                f'    Data = Source{{[Schema="{schema}",Item="{db_table}"]}}[Data],\n'
                 f"    TypedColumns = Table.TransformColumnTypes(Data, {{{transforms}}})\n"
                 "in\n"
                 "    TypedColumns"
