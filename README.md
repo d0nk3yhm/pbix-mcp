@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml)
 
-An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files. Exposes 60 tools covering report creation from scratch (with actual row data, cross-table relationships, and DAX measures), layout editing, visual management, DAX evaluation, RLS security, password extraction, VertiPaq data, and binary format internals.
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files. Exposes 60 tools covering report creation from scratch (with all 6 data types, cross-table relationships, refreshable CSV sources, and DAX measures), layout editing, visual management, DAX evaluation, RLS security, password extraction, VertiPaq data, and binary format internals.
 
 ## Quick Start
 
@@ -48,9 +48,10 @@ pbix-mcp-server --log-level debug
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| PBIX creation from scratch | **Stable** | Multi-table with String/Int64/Double data, relationships, H$ hierarchies, measures — loads in PBI Desktop |
+| PBIX creation from scratch | **Stable** | Multi-table with all 6 data types, relationships, H$ hierarchies, measures — loads in PBI Desktop |
 | Cross-table relationships | **Stable** | R$ system tables with NoSplit INDEX encoding; RELATED() and cross-table filtering work |
-| VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal column types with correct dictionary encoding |
+| Refreshable CSV sources | **Stable** | `source_csv` parameter creates M expressions referencing external CSV files; click Refresh in PBI Desktop to re-import |
+| VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal, Boolean column types with correct dictionary encoding |
 | H$ attribute hierarchies | **Stable** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities; MaterializationType=0 |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
 | Visual add/remove | **Stable** | Cards, charts, shapes/buttons, images, textboxes, slicers |
@@ -152,6 +153,35 @@ builder.save('sales_report.pbix')
 ```
 
 Opens in Power BI Desktop with full interactivity — slicers, cross-filtering, and all DAX measures work.
+
+### Refreshable CSV Sources
+
+Point tables at external CSV files so data can be refreshed in Power BI Desktop:
+
+```python
+builder.add_table('Sales', [
+    {'name': 'OrderID',   'data_type': 'Int64'},
+    {'name': 'ProductID', 'data_type': 'Int64'},
+    {'name': 'Qty',       'data_type': 'Int64'},
+], rows=sales_data,
+   source_csv=r'C:\Data\sales.csv')  # M expression references this CSV
+```
+
+The initial data snapshot is embedded in the PBIX. When opened in Power BI Desktop, clicking **Refresh** re-imports from the CSV file. Edit the CSV → Refresh → data updates live.
+
+### Via MCP Tool
+
+```json
+{
+  "tool": "pbix_create",
+  "arguments": {
+    "file_path": "report.pbix",
+    "tables_json": "[{\"name\": \"Sales\", \"columns\": [{\"name\": \"Amount\", \"data_type\": \"Double\"}], \"rows\": [{\"Amount\": 100}], \"source_csv\": \"C:/Data/sales.csv\"}]",
+    "measures_json": "[{\"table\": \"Sales\", \"name\": \"Total\", \"expression\": \"SUM(Sales[Amount])\"}]",
+    "relationships_json": "[{\"from_table\": \"Sales\", \"from_column\": \"ProductID\", \"to_table\": \"Products\", \"to_column\": \"ProductID\"}]"
+  }
+}
+```
 
 ### Supported Data Types
 

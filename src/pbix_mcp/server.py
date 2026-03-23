@@ -819,6 +819,8 @@ def pbix_create(
               {"name": "Product", "data_type": "String"}],
               "rows": [{"Amount": 100.0, "Product": "Widget"}]}]'
             Supported data_type values: String, Int64, Double, DateTime, Decimal, Boolean
+            Each table can optionally include "source_csv": "/path/to/data.csv" to make
+            the table refreshable from a CSV file in Power BI Desktop.
         measures_json: Optional JSON array of measures, e.g.
             '[{"table": "Sales", "name": "Total", "expression": "SUM(Sales[Amount])"}]'
         relationships_json: Optional JSON array of relationships, e.g.
@@ -837,6 +839,7 @@ def pbix_create(
                     tdef.get("columns", []),
                     rows=tdef.get("rows"),
                     hidden=tdef.get("hidden", False),
+                    source_csv=tdef.get("source_csv"),
                 )
 
         if measures_json:
