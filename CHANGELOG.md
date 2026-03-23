@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **DirectQuery mode**: `mode='directquery'` creates live database connections (SQL Server verified with LocalDB)
 - **SQL Server data source**: `source_db={'type': 'sqlserver', ...}` for Import and DirectQuery
 - **SQLite data source**: `source_db={'type': 'sqlite', ...}` with ODBC driver
-- **MySQL data source**: `source_db={'type': 'mysql', ...}` (same M pattern as SQL Server)
+- **MySQL data source**: `source_db={'type': 'mysql', ...}` — verified with MySQL 9.6
+- **PostgreSQL data source**: `source_db={'type': 'postgresql', ...}` — verified with PostgreSQL 16
 - **CSV refreshable sources**: `source_csv` parameter creates M expressions for Refresh in PBI Desktop
 - **Boolean data type**: full support (IsOperatingOn32=1, 0/1 values)
 - **Decimal data type**: full support (value × 10000, IsOperatingOn32=1)

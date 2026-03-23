@@ -82,8 +82,14 @@ class PBIXBuilder:
                        {"type": "sqlite", "path": "/path/to/db.sqlite", "table": "orders"}
                        {"type": "mysql", "server": "host", "database": "mydb",
                         "table": "orders", "port": 3306}
+                       {"type": "postgresql", "server": "host", "database": "mydb",
+                        "table": "orders", "port": 5432, "schema": "public"}
                        {"type": "sqlserver", "server": "host", "database": "mydb",
                         "table": "orders"}
+                       {"type": "excel", "path": "C:/data.xlsx", "sheet": "Sheet1"}
+                       {"type": "json", "url": "https://api.example.com/data"}
+                       {"type": "azuresql", "server": "host.database.windows.net",
+                        "database": "mydb", "table": "orders"}
                        The rows parameter provides the initial data snapshot.
             mode: Storage mode — "import" (default) or "directquery". Both modes
                   embed full VertiPaq data. DirectQuery sets Partition.Mode=1 instead

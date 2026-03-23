@@ -55,7 +55,7 @@ pbix-mcp-server --log-level debug
 | Cross-table relationships | **Stable** | R$ system tables with NoSplit INDEX encoding; RELATED() and cross-table filtering work |
 | Refreshable CSV sources | **Stable** | `source_csv` parameter creates M expressions referencing external CSV files; click Refresh in PBI Desktop to re-import |
 | SQLite database sources | **Stable** | `source_db` with ODBC driver; data imported at build, Refresh re-reads from DB |
-| SQL Server / MySQL database sources | **Stable** | `source_db` with Import or DirectQuery; SQL Server verified with LocalDB, MySQL uses same pattern |
+| SQL Server / MySQL / PostgreSQL database sources | **Stable** | `source_db` with Import or DirectQuery; SQL Server verified with LocalDB, MySQL 9.6 and PostgreSQL 16 verified |
 | DirectQuery mode | **Stable** | `mode='directquery'` with SQL Server — live database queries, no refresh needed |
 | VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal, Boolean column types with correct dictionary encoding |
 | H$ attribute hierarchies | **Stable** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities; MaterializationType=0 |
@@ -176,7 +176,7 @@ builder.add_table('Sales', [
 
 The initial data snapshot is embedded in the PBIX. When opened in Power BI Desktop, clicking **Refresh** re-imports from the CSV file. Edit the CSV → Refresh → data updates live.
 
-### Database Sources (SQL Server / SQLite / MySQL)
+### Database Sources (SQL Server / SQLite / MySQL / PostgreSQL)
 
 Connect tables to databases so data can be refreshed from the DB:
 
@@ -196,13 +196,21 @@ builder.add_table('Orders', [
 ], rows=orders_data,
    source_db={'type': 'sqlite', 'path': r'C:\Data\mydb.sqlite', 'table': 'orders'})
 
-# MySQL (built-in PBI connector, requires MySQL server)
+# MySQL (built-in PBI connector — verified with MySQL 9.6)
 builder.add_table('Orders', [
     {'name': 'OrderID', 'data_type': 'Int64'},
     {'name': 'Qty',     'data_type': 'Int64'},
 ], rows=orders_data,
    source_db={'type': 'mysql', 'server': 'localhost', 'database': 'mydb',
               'table': 'orders', 'port': 3306})
+
+# PostgreSQL (built-in PBI connector — verified with PostgreSQL 16)
+builder.add_table('Orders', [
+    {'name': 'order_id', 'data_type': 'Int64'},
+    {'name': 'qty',      'data_type': 'Int64'},
+], rows=orders_data,
+   source_db={'type': 'postgresql', 'server': 'localhost', 'database': 'mydb',
+              'table': 'orders', 'port': 5432, 'schema': 'public'})
 ```
 
 Data is **Import mode** — a snapshot is embedded in the PBIX at build time. Clicking **Refresh** in Power BI Desktop re-reads from the database. The report works offline between refreshes.
@@ -223,7 +231,7 @@ builder.add_table('Orders', [
 
 DirectQuery creates a PBIX with `Partition.Mode=1` and a `Sql.Database()` M expression. Power BI Desktop queries the database live — INSERT/UPDATE/DELETE in the database is reflected instantly without clicking Refresh.
 
-> **Note:** DirectQuery requires a running database server. Tested with SQL Server (including LocalDB). The `rows` parameter provides an initial data snapshot embedded in the PBIX.
+> **Note:** DirectQuery requires a running database server. Tested with SQL Server (including LocalDB). MySQL and PostgreSQL support Import mode with verified Refresh. The `rows` parameter provides an initial data snapshot embedded in the PBIX.
 
 ### Via MCP Tool
 

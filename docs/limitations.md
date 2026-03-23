@@ -33,8 +33,8 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 | CSV files | ✅ | N/A | `source_csv` — Refresh re-imports from CSV |
 | SQLite | ✅ | N/A | `source_db` — requires SQLite3 ODBC driver |
 | SQL Server | ✅ | ✅ | `source_db` — verified with LocalDB |
-| MySQL | ✅ | Untested | `source_db` — same M pattern as SQL Server |
-| PostgreSQL | ✅ | Untested | `source_db` — uses `PostgreSQL.Database()` M expression |
+| MySQL | ✅ | Untested | `source_db` — verified with MySQL 9.6, requires MySQL Connector/NET |
+| PostgreSQL | ✅ | Untested | `source_db` — verified with PostgreSQL 16, uses `PostgreSQL.Database()` |
 
 ## Supported Data Types
 
