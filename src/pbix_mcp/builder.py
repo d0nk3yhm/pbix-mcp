@@ -536,7 +536,12 @@ def _modify_metadata_and_encode(
         (new_sqlite_bytes, vertipaq_files) where vertipaq_files maps
         ABF internal paths to binary content.
     """
-    from pbix_mcp.formats.vertipaq_encoder import encode_table_data
+    from pbix_mcp.formats.vertipaq_encoder import (
+        _align_bit_width,
+        encode_nosplit_idf,
+        encode_nosplit_idfmeta,
+        encode_table_data,
+    )
 
     # Write SQLite to temp file
     fd, tmp_path = tempfile.mkstemp(suffix=".sqlitedb")
@@ -1934,30 +1939,28 @@ def _modify_metadata_and_encode(
                 (r_table_id, from_row_count, ris_id),
             )
 
-            # Encode the INDEX column data using encode_table_data
-            r_encoder_cols = [{"name": "INDEX", "data_type": "Int64", "nullable": False}]
-            r_enc_rows = [{"INDEX": v} for v in index_values]
-            r_encoded = encode_table_data(
-                r_table_name, r_part_id, r_encoder_cols, r_enc_rows,
-                u32_a=0xABA5A, u32_b_start=0,
-                is_system=True,  # R$ INDEX: one=0 in IDFMETA
-            )
+            # Encode R$ INDEX using direct NoSplit<N> encoding
+            # Compute bit width from max row index value
+            import math as _math
+            max_row_idx = max(index_values) if index_values else 0
+            if max_row_idx <= 0:
+                r_bit_width = 1
+            else:
+                r_bit_width = max(1, _math.ceil(_math.log2(max_row_idx + 1)))
+            r_bit_width = _align_bit_width(r_bit_width)
+
+            # Single segment for R$ INDEX
+            r_records_per_seg = [from_row_count]
+            r_idf_bytes = encode_nosplit_idf(index_values, r_bit_width, r_records_per_seg)
+            r_idfmeta_bytes = encode_nosplit_idfmeta(r_records_per_seg, r_bit_width, is_relationship=True)
 
             # Map encoded files to ABF paths
-            r_base = f"{r_table_name}.tbl\\{r_part_id}.prt"
-            r_idf_key = f"{r_base}\\column.INDEX"
-            r_meta_key = f"{r_base}\\column.INDEXmeta"
-            r_dict_key = f"{r_base}\\column.INDEX.dict"
-
             r_abf_idf_path = f"{r_prt_folder_path}\\{r_idf_fname}"
             r_abf_meta_path = f"{r_prt_folder_path}\\{r_meta_fname}"
-            # No dictionary file for R$ INDEX (Type=0)
 
-            if r_idf_key in r_encoded:
-                vertipaq_files[r_abf_idf_path] = r_encoded[r_idf_key]
-            if r_meta_key in r_encoded:
-                vertipaq_files[r_abf_meta_path] = r_encoded[r_meta_key]
-            # Skip dictionary file — R$ INDEX uses Type=0 (no external dict)
+            vertipaq_files[r_abf_idf_path] = r_idf_bytes
+            vertipaq_files[r_abf_meta_path] = r_idfmeta_bytes
+            # No dictionary file for R$ INDEX (Type=0)
 
             # Override ColumnStorage stats to match template (Type=0 pattern)
             c.execute(

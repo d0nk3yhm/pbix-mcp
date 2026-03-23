@@ -668,7 +668,6 @@ def _encode_idfmeta(
     nonzero_primary_entries: int = 0,
     has_dict: bool = True,
     is_row_number: bool = False,
-    is_system: bool = False,
     u32_a: int = 0,
     u32_b: int = 0,
 ) -> bytes:
@@ -716,7 +715,7 @@ def _encode_idfmeta(
     # records
     buf += _u8(row_count)
     # one: 0 for RowNumber/system columns, 1 for data columns
-    buf += _u8(0 if (is_row_number or is_system) else 1)
+    buf += _u8(0 if is_row_number else 1)
     # u32_a: Compression family class ID
     #   0xABA5A = XMHybridRLECompressionInfo (standard for data columns)
     #   0xABA5B = XM123CompressionInfo (used for RowNumber)
@@ -806,6 +805,105 @@ def _encode_idfmeta(
 
 
 # ---------------------------------------------------------------------------
+# NoSplit IDF / IDFMETA encoder (for R$ INDEX and H$ tables)
+# ---------------------------------------------------------------------------
+
+def encode_nosplit_idf(values: list[int], bit_width: int, records_per_segment: list[int]) -> bytes:
+    """
+    Encode values using the NoSplit<N> format (no RLE layer, pure bit-packed).
+
+    This is the native format for R$ INDEX columns and H$ hierarchy tables.
+    Each segment is a sequence of uint64 words with bit-packed values.
+
+    Parameters
+    ----------
+    values : list[int]
+        Flat list of integer values across all segments.
+    bit_width : int
+        Bit width N for packing (must be a valid NoSplit N).
+    records_per_segment : list[int]
+        Number of records in each segment.
+
+    Returns
+    -------
+    bytes
+        The encoded IDF blob.
+    """
+    vpw = 64 // bit_width
+    mask = (1 << bit_width) - 1
+    buf = bytearray()
+    val_idx = 0
+    for seg_records in records_per_segment:
+        wc = (seg_records + vpw) // vpw
+        buf += struct.pack('<Q', wc)
+        seg_vals = values[val_idx:val_idx + seg_records]
+        val_idx += seg_records
+        vi = 0
+        for w in range(wc):
+            word = 0
+            for j in range(vpw):
+                if vi < len(seg_vals):
+                    word |= (seg_vals[vi] & mask) << (j * bit_width)
+                    vi += 1
+            buf += struct.pack('<Q', word)
+    return bytes(buf)
+
+
+def encode_nosplit_idfmeta(records_per_seg: list[int], bit_width: int,
+                           is_relationship: bool = False) -> bytes:
+    """
+    Encode an IDFMETA blob for NoSplit<N> encoded columns.
+
+    This produces the tagged binary metadata that describes the segment
+    layout for NoSplit-encoded IDF files (R$ INDEX, H$ tables).
+
+    Parameters
+    ----------
+    records_per_seg : list[int]
+        Number of records in each segment.
+    bit_width : int
+        Bit width N used in the IDF encoding.
+    is_relationship : bool
+        If True, sets the mystery field to -1 (R$ INDEX pattern).
+        If False, sets it to 0 (H$ table pattern).
+
+    Returns
+    -------
+    bytes
+        The encoded IDFMETA blob.
+    """
+    CP_O  = b"\x3C\x31\x3A\x43\x50\x00"; CP_C  = b"\x43\x50\x3A\x31\x3E\x00"
+    CS_O  = b"\x3C\x31\x3A\x43\x53\x00"; CS_C  = b"\x43\x53\x3A\x31\x3E\x00"
+    SS_O  = b"\x3C\x31\x3A\x53\x53\x00"; SS_C  = b"\x53\x53\x3A\x31\x3E\x00"
+    SDO_O = b"\x3C\x31\x3A\x53\x44\x4F\x73\x00"
+    SDO_C = b"\x53\x44\x4F\x73\x3A\x31\x3E\x00"
+    CSD_O = b"\x3C\x31\x3A\x43\x53\x44\x4F\x73\x00"
+    CSD_C = b"\x43\x53\x44\x4F\x73\x3A\x31\x3E\x00"
+    u32_a = 0xABA36 + bit_width
+    mystery = -1 if is_relationship else 0
+    vpw = 64 // bit_width
+    buf = bytearray()
+    buf += CP_O + struct.pack('<Q', len(records_per_seg))
+    for rec in records_per_seg:
+        buf += CS_O
+        buf += struct.pack('<Q', rec) + struct.pack('<Q', 0)
+        buf += struct.pack('<I', u32_a) + struct.pack('<I', 1) + struct.pack('<i', mystery)
+        buf += SS_O
+        buf += struct.pack('<Q', 0) + struct.pack('<I', 2) + struct.pack('<I', 2)
+        buf += struct.pack('<I', 2) + struct.pack('<q', -1) + struct.pack('<Q', 0)
+        buf += struct.pack('B', 0) + struct.pack('<Q', 0) + struct.pack('<Q', 0)
+        buf += SS_C + struct.pack('B', 0) + CS_C
+    buf += CP_C + SDO_O
+    off = 0
+    for rec in records_per_seg:
+        wc = (rec + vpw) // vpw
+        buf += CSD_O + struct.pack('<Q', off) + struct.pack('<Q', wc) + CSD_C
+        off += 8 + wc * 8
+    buf += SDO_C
+    return bytes(buf)
+
+
+# ---------------------------------------------------------------------------
 # Column encoder (combines all pieces)
 # ---------------------------------------------------------------------------
 
@@ -815,7 +913,6 @@ def _encode_column(
     nullable: bool,
     values: list,
     is_row_number: bool = False,
-    is_system: bool = False,
     u32_a: int = 0,
     u32_b: int = 0,
 ) -> dict[str, bytes]:
@@ -952,7 +1049,6 @@ def _encode_column(
         nonzero_primary_entries=nonzero_primary_entries,
         has_dict=has_dict,
         is_row_number=is_row_number,
-        is_system=is_system,
         u32_a=u32_a,
         u32_b=u32_b,
     )
@@ -989,7 +1085,6 @@ def encode_table_data(
     rows: list[dict],
     u32_a: int = 0,
     u32_b_start: int = 0,
-    is_system: bool = False,
 ) -> dict[str, bytes]:
     """
     Encode table data into VertiPaq column files.
@@ -1070,7 +1165,6 @@ def encode_table_data(
         encoded = _encode_column(
             col_name, data_type, nullable, values,
             is_row_number=is_rn,
-            is_system=is_system,
             u32_a=col_u32_a,
             u32_b=col_u32_b,
         )

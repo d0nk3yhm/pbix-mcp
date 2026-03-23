@@ -75,8 +75,8 @@ pbix-mcp-server --log-level debug
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
 - **Import mode only** — DirectQuery files are detected on open and rejected with a clear error
-- **From-scratch tables** — String, Int64, and Double columns work with arbitrary cardinalities; cross-table relationship queries need NoSplit IDF encoding (R$ system tables load but join queries fail)
-- **Relationships** — metadata and R$ tables are created correctly (file opens, both tables visible), but cross-table DAX (RELATED, filtering across tables) requires NoSplit<N> binary encoding for the R$ INDEX column
+- **From-scratch tables** — String, Int64, and Double columns work with arbitrary cardinalities and cross-table relationships (RELATED, filtering)
+- **H$ hierarchy tables** — columns with >2 distinct values use MatType=3 (no sorted dimension browsing); full H$ NoSplit encoding is implemented but not yet wired up for arbitrary cardinalities
 
 ## Tools (60)
 
