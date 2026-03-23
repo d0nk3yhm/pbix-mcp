@@ -825,6 +825,7 @@ def pbix_create(
             - "source_db": {"type": "sqlserver", "server": "localhost", "database": "mydb",
               "table": "orders"} — M expression references database for Refresh/DirectQuery.
               Supported types: "sqlserver", "mysql", "sqlite", "postgresql",
+              "mariadb" (MySQL DirectQuery via MariaDB adapter),
               "excel" (needs path+sheet), "json"/"web"/"api" (needs url),
               "azuresql"/"azure" (same as sqlserver for Azure SQL)
             - "mode": "directquery" — live database queries (default: "import").

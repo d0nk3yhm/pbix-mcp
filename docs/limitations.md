@@ -33,7 +33,7 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 | CSV files | ✅ | N/A | `source_csv` — Refresh re-imports from CSV |
 | SQLite | ✅ | N/A | `source_db` — requires SQLite3 ODBC driver |
 | SQL Server | ✅ | ✅ | `source_db` — verified with LocalDB |
-| MySQL | ✅ | ❌ N/A | `source_db` — verified with MySQL 9.6. DirectQuery not supported by built-in MySQL connector (use MariaDB adapter) |
+| MySQL | ✅ | ✅ (via MariaDB) | `source_db` type `mariadb` — verified with MySQL 9.6 via MariaDB ODBC 3.1 connector |
 | PostgreSQL | ✅ | ✅ | `source_db` — verified with PostgreSQL 16. Import and DirectQuery both working |
 
 ## Supported Data Types

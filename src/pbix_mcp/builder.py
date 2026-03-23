@@ -704,6 +704,18 @@ def _build_m_expression(
                 "in\n"
                 "    Data"
             )
+        elif db_type == "mariadb":
+            server = source_db.get("server", "localhost")
+            database = source_db.get("database", "")
+            port = source_db.get("port", 3306)
+            # MariaDB.Contents supports DirectQuery (unlike MySQL.Database)
+            return (
+                "let\n"
+                f'    Source = MariaDB.Contents("{server}:{port}", "{database}"),\n'
+                f'    Data = Source{{[Name="{db_table}"]}}[Data]\n'
+                "in\n"
+                "    Data"
+            )
 
     # Default: empty typed table (data embedded in VertiPaq)
     field_defs = []
