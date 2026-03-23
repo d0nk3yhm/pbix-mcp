@@ -811,8 +811,11 @@ def pbix_create(
     Args:
         file_path: Where to save the new file (e.g. "my_report.pbix")
         alias: Alias for the opened file (auto-generated if empty)
-        tables_json: Optional JSON array of tables, e.g.
-            '[{"name": "Sales", "columns": [{"name": "Amount", "data_type": "Double"}]}]'
+        tables_json: Optional JSON array of tables with columns and rows, e.g.
+            '[{"name": "Sales", "columns": [{"name": "Amount", "data_type": "Double"},
+              {"name": "Product", "data_type": "String"}],
+              "rows": [{"Amount": 100.0, "Product": "Widget"}]}]'
+            Supported data_type values: String, Int64, Double, DateTime, Decimal, Boolean
         measures_json: Optional JSON array of measures, e.g.
             '[{"table": "Sales", "name": "Total", "expression": "SUM(Sales[Amount])"}]'
         relationships_json: Optional JSON array of relationships, e.g.
@@ -829,7 +832,8 @@ def pbix_create(
                 builder.add_table(
                     tdef["name"],
                     tdef.get("columns", []),
-                    tdef.get("hidden", False),
+                    rows=tdef.get("rows"),
+                    hidden=tdef.get("hidden", False),
                 )
 
         if measures_json:
