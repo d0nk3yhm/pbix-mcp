@@ -553,6 +553,7 @@ def _build_m_expression(
     columns: list[dict],
     source_csv: str | None = None,
     source_db: dict | None = None,
+    is_directquery: bool = False,
 ) -> str:
     """Build a valid M expression for a table partition.
 
@@ -619,6 +620,15 @@ def _build_m_expression(
             server = source_db.get("server", "localhost")
             database = source_db.get("database", "")
             port = source_db.get("port", 3306)
+            if is_directquery:
+                # DirectQuery: skip TransformColumnTypes for query folding
+                return (
+                    "let\n"
+                    f'    Source = MySQL.Database("{server}:{port}", "{database}"),\n'
+                    f'    Data = Source{{[Schema="{database}",Item="{db_table}"]}}[Data]\n'
+                    "in\n"
+                    "    Data"
+                )
             return (
                 "let\n"
                 f'    Source = MySQL.Database("{server}:{port}", "{database}"),\n'
@@ -644,6 +654,15 @@ def _build_m_expression(
             database = source_db.get("database", "")
             port = source_db.get("port", 5432)
             schema = source_db.get("schema", "public")
+            if is_directquery:
+                # DirectQuery: skip TransformColumnTypes for query folding
+                return (
+                    "let\n"
+                    f'    Source = PostgreSQL.Database("{server}:{port}", "{database}"),\n'
+                    f'    Data = Source{{[Schema="{schema}",Item="{db_table}"]}}[Data]\n'
+                    "in\n"
+                    "    Data"
+                )
             return (
                 "let\n"
                 f'    Source = PostgreSQL.Database("{server}:{port}", "{database}"),\n'
@@ -922,7 +941,8 @@ def _modify_metadata_and_encode(
                 )""",
                 (part_id, table_id, tname,
                  _build_m_expression(tname, tdef.get("columns", []),
-                                     tdef.get("source_csv"), tdef.get("source_db")),
+                                     tdef.get("source_csv"), tdef.get("source_db"),
+                                     is_directquery=is_directquery),
                  ps_id,
                  partition_mode,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
