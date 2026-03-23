@@ -4473,6 +4473,231 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
 
 
 @mcp.tool()
+def pbix_set_incremental_refresh(
+    alias: str,
+    table_name: str,
+    archive_periods: int = 36,
+    archive_granularity: str = "month",
+    refresh_periods: int = 12,
+    refresh_granularity: str = "month",
+    detect_changes_column: str = "",
+    mode: str = "import",
+) -> str:
+    """Configure incremental refresh policy for a table.
+
+    Incremental refresh partitions a table by date range so only recent
+    data is refreshed, dramatically reducing refresh time for large datasets.
+
+    Requires the table's M expression to filter on RangeStart/RangeEnd parameters.
+    These DateTime parameters are automatically created if they don't exist.
+
+    Args:
+        alias: The alias of the open file
+        table_name: Table to apply the refresh policy to
+        archive_periods: Number of periods to keep as historical (default 36)
+        archive_granularity: Granularity for archive window — "day", "month",
+                             "quarter", or "year" (default "month")
+        refresh_periods: Number of periods to refresh each time (default 12)
+        refresh_granularity: Granularity for refresh window — "day", "month",
+                             "quarter", or "year" (default "month")
+        detect_changes_column: Optional column name for change detection
+                               (e.g. "ModifiedDate"). If set, only partitions
+                               where this column changed will be refreshed.
+        mode: "import" (default) or "hybrid". Hybrid adds a DirectQuery
+              partition for real-time data on top of import partitions.
+    """
+    try:
+        _GRAN_MAP = {"day": 1, "month": 2, "quarter": 3, "year": 4}
+        _MODE_MAP = {"import": 0, "hybrid": 1}
+
+        if archive_granularity not in _GRAN_MAP:
+            raise ValueError(f"archive_granularity must be one of {list(_GRAN_MAP.keys())}")
+        if refresh_granularity not in _GRAN_MAP:
+            raise ValueError(f"refresh_granularity must be one of {list(_GRAN_MAP.keys())}")
+        if mode not in _MODE_MAP:
+            raise ValueError(f"mode must be 'import' or 'hybrid'")
+
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
+
+        policy_info = {}
+
+        def _do_set(conn: sqlite3.Connection):
+            c = conn.cursor()
+
+            # Find table
+            c.execute("SELECT ID FROM [Table] WHERE Name = ?", (table_name,))
+            trow = c.fetchone()
+            if not trow:
+                raise ValueError(f"Table '{table_name}' not found")
+            table_id = trow[0]
+
+            # Ensure RangeStart and RangeEnd expressions exist
+            for param_name in ("RangeStart", "RangeEnd"):
+                c.execute("SELECT ID FROM Expression WHERE Name = ?", (param_name,))
+                if not c.fetchone():
+                    c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM Expression")
+                    expr_id = c.fetchone()[0]
+                    # Kind=2 = M parameter
+                    c.execute(
+                        "INSERT INTO Expression (ID, ModelID, Name, Kind, "
+                        "Expression, ModifiedTime) "
+                        "VALUES (?, 1, ?, 2, ?, datetime('now'))",
+                        (expr_id, param_name,
+                         f'#datetime(2020, 1, 1, 0, 0, 0) meta [IsParameterQuery=true, '
+                         f'Type="DateTime", IsParameterQueryRequired=true]')
+                    )
+
+            # Build polling expression for change detection
+            polling_expr = ""
+            if detect_changes_column:
+                polling_expr = (
+                    f"let\n"
+                    f"    Source = {table_name},\n"
+                    f"    MaxDate = List.Max(Source[{detect_changes_column}])\n"
+                    f"in\n"
+                    f"    MaxDate"
+                )
+
+            # Check for existing policy
+            c.execute(
+                "SELECT ID FROM RefreshPolicy WHERE TableID = ?",
+                (table_id,)
+            )
+            existing = c.fetchone()
+
+            if existing:
+                # Update existing policy
+                policy_id = existing[0]
+                c.execute(
+                    "UPDATE RefreshPolicy SET "
+                    "PolicyType=1, RollingWindowGranularity=?, RollingWindowPeriods=?, "
+                    "IncrementalGranularity=?, IncrementalPeriods=?, "
+                    "IncrementalPeriodsOffset=?, PollingExpression=?, Mode=? "
+                    "WHERE ID=?",
+                    (_GRAN_MAP[archive_granularity], archive_periods,
+                     _GRAN_MAP[refresh_granularity], refresh_periods,
+                     -1 if mode == "hybrid" else 0,
+                     polling_expr, _MODE_MAP[mode], policy_id)
+                )
+            else:
+                # Create new policy
+                c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM RefreshPolicy")
+                policy_id = c.fetchone()[0]
+                c.execute(
+                    "INSERT INTO RefreshPolicy (ID, TableID, PolicyType, "
+                    "RollingWindowGranularity, RollingWindowPeriods, "
+                    "IncrementalGranularity, IncrementalPeriods, "
+                    "IncrementalPeriodsOffset, PollingExpression, Mode) "
+                    "VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
+                    (policy_id, table_id,
+                     _GRAN_MAP[archive_granularity], archive_periods,
+                     _GRAN_MAP[refresh_granularity], refresh_periods,
+                     -1 if mode == "hybrid" else 0,
+                     polling_expr, _MODE_MAP[mode])
+                )
+
+            # Link table to policy
+            c.execute(
+                "UPDATE [Table] SET RefreshPolicyID = ? WHERE ID = ?",
+                (policy_id, table_id)
+            )
+
+            conn.commit()
+            policy_info["policy_id"] = policy_id
+            policy_info["mode"] = mode
+
+        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_set)
+        info["modified"] = True
+
+        detect_msg = f"\n  Change detection: {detect_changes_column}" if detect_changes_column else ""
+        return ToolResponse.ok(
+            f"Incremental refresh policy set on '{table_name}':\n"
+            f"  Archive: {archive_periods} {archive_granularity}(s)\n"
+            f"  Refresh: {refresh_periods} {refresh_granularity}(s)\n"
+            f"  Mode: {mode}{detect_msg}\n"
+            f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes\n\n"
+            f"The table's M expression must filter on RangeStart/RangeEnd parameters.\n"
+            f"Power BI will automatically create date-based partitions on first refresh."
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+
+
+@mcp.tool()
+def pbix_get_incremental_refresh(alias: str) -> str:
+    """Get incremental refresh policies for all tables.
+
+    Args:
+        alias: The alias of the open file
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        import tempfile
+
+        with open(dm_path, "rb") as f:
+            dm_bytes = f.read()
+
+        abf = decompress_datamodel(dm_bytes)
+        db_bytes = read_metadata_sqlite(abf)
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(db_bytes)
+        tmp.close()
+
+        try:
+            conn = sqlite3.connect(tmp.name)
+            c = conn.cursor()
+
+            _GRAN_NAMES = {1: "day", 2: "month", 3: "quarter", 4: "year"}
+            _MODE_NAMES = {0: "import", 1: "hybrid"}
+
+            c.execute(
+                "SELECT rp.ID, t.Name, rp.PolicyType, "
+                "rp.RollingWindowGranularity, rp.RollingWindowPeriods, "
+                "rp.IncrementalGranularity, rp.IncrementalPeriods, "
+                "rp.IncrementalPeriodsOffset, rp.PollingExpression, rp.Mode "
+                "FROM RefreshPolicy rp "
+                "JOIN [Table] t ON rp.TableID = t.ID "
+                "ORDER BY rp.ID"
+            )
+            policies = c.fetchall()
+            conn.close()
+        finally:
+            os.unlink(tmp.name)
+
+        if not policies:
+            return ToolResponse.ok("No incremental refresh policies configured.").to_text()
+
+        lines = [f"Incremental refresh policies ({len(policies)}):\n"]
+        for p in policies:
+            pid, tbl, ptype, rw_gran, rw_periods, inc_gran, inc_periods, offset, polling, pmode = p
+            lines.append(f"  Table: {tbl}")
+            lines.append(f"    Archive: {rw_periods} {_GRAN_NAMES.get(rw_gran, '?')}(s)")
+            lines.append(f"    Refresh: {inc_periods} {_GRAN_NAMES.get(inc_gran, '?')}(s)")
+            lines.append(f"    Mode: {_MODE_NAMES.get(pmode, '?')}")
+            if polling:
+                lines.append(f"    Change detection: enabled")
+            lines.append("")
+
+        return ToolResponse.ok("\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+
+
+@mcp.tool()
 def pbix_export_tmdl(alias: str, output_path: str = "") -> str:
     """Export the data model as TMDL (Tabular Model Definition Language) files.
 
