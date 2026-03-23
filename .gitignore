@@ -28,3 +28,6 @@ test_samples/temp_dl/
 .coverage
 test_corpus/
 tools/
+*.dll
+*.exe
+test_data/

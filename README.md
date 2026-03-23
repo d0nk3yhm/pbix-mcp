@@ -408,6 +408,26 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for project conventions, [SUPPORT.md](SUP
 - **Composite models** — mixed Import + DirectQuery tables in the same report
 - **PBIR layout write** — write reports in the new PBIR format alongside legacy
 
+## Architecture Notes
+
+### Incremental vs Full Rebuild
+
+The builder currently **rebuilds the entire DataModel** from scratch each time. This is the safest approach for binary format integrity — all offsets, checksums, and cross-references are recomputed from a known-good state.
+
+For **modifying existing PBIX files** (adding a measure, changing a visual), the MCP server operates differently: it opens the file, modifies the specific layer (SQLite metadata for measures, JSON for layout), and repacks — **without touching the VertiPaq binary data**. This is true incremental editing.
+
+| Operation | Approach | Why |
+|-----------|----------|-----|
+| Create from scratch | Full build | All binary layers constructed together |
+| Add/modify measure | Incremental | Only SQLite metadata modified |
+| Edit visual/layout | Incremental | Only Report/Layout JSON modified |
+| Add table to existing file | Full DataModel rebuild | VertiPaq offsets change |
+| Change M code | Incremental | Only DataMashup modified |
+
+### No Microsoft Dependencies
+
+This project is **100% Python** with zero Microsoft DLLs or SDKs. All binary format handling is independently implemented. The `tools/` directory (gitignored) contains local development utilities that are not part of the package.
+
 ## Purpose & Interoperability
 
 This project is an **independent, clean-room implementation** of the Power BI `.pbix` file specification, created for the sole purpose of **interoperability** — enabling AI agents, automation tools, and non-Windows platforms to create, read, and write Power BI files.
