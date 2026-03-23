@@ -1013,7 +1013,9 @@ def _modify_metadata_and_encode(
                 # DictionaryFlags: 3 for string columns, 0 for numeric (matches template)
                 # IsOperatingOn32: 1 for Int64 (4-byte elements), 0 for String/Double/DateTime
                 dict_flags = 3 if data_type == "String" else 0
-                is_op32 = 1 if amo_type == 6 else 0  # AMO 6=Int64 → 4-byte dict entries
+                # IsOperatingOn32: 1 for integer types (4-byte dict entries), 0 for string/float
+                # AMO 6=Int64, 10=Decimal (stored as int64×10000), 11=Boolean (0/1)
+                is_op32 = 1 if amo_type in (6, 10, 11) else 0
                 c.execute(
                     """INSERT INTO DictionaryStorage (
                         ID, ColumnStorageID, Type, DataType, DataVersion,
