@@ -840,6 +840,7 @@ def pbix_create(
                     rows=tdef.get("rows"),
                     hidden=tdef.get("hidden", False),
                     source_csv=tdef.get("source_csv"),
+                    source_db=tdef.get("source_db"),
                 )
 
         if measures_json:

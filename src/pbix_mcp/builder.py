@@ -63,6 +63,7 @@ class PBIXBuilder:
         rows: list[dict] | None = None,
         hidden: bool = False,
         source_csv: str | None = None,
+        source_db: dict | None = None,
     ) -> "PBIXBuilder":
         """Add a table definition with optional row data.
 
@@ -76,6 +77,11 @@ class PBIXBuilder:
                         reference this file, so clicking "Refresh" in PBI Desktop
                         re-imports from the CSV. The rows parameter provides the
                         initial data snapshot embedded in the PBIX.
+            source_db: Optional database connection dict for Refresh in PBI Desktop.
+                       {"type": "sqlite", "path": "/path/to/db.sqlite", "table": "orders"}
+                       {"type": "mysql", "server": "host", "database": "mydb",
+                        "table": "orders", "port": 3306}
+                       The rows parameter provides the initial data snapshot.
         """
         self._tables.append({
             "name": name,
@@ -83,6 +89,7 @@ class PBIXBuilder:
             "rows": rows or [],
             "hidden": hidden,
             "source_csv": source_csv,
+            "source_db": source_db,
         })
         return self
 
@@ -433,7 +440,10 @@ class _IDAllocator:
 
 
 def _build_m_expression(
-    table_name: str, columns: list[dict], source_csv: str | None = None
+    table_name: str,
+    columns: list[dict],
+    source_csv: str | None = None,
+    source_db: dict | None = None,
 ) -> str:
     """Build a valid M expression for a table partition.
 
@@ -442,7 +452,8 @@ def _build_m_expression(
     at RunModelSchemaValidation.
 
     If source_csv is provided, the M expression reads from that CSV file.
-    Clicking "Refresh" in PBI Desktop will re-import from the CSV.
+    If source_db is provided, the M expression connects to the database.
+    Clicking "Refresh" in PBI Desktop will re-import from the source.
     """
     # Map data types to M types
     _M_TYPES = {
@@ -467,7 +478,6 @@ def _build_m_expression(
 
     if source_csv:
         # M expression that reads from a CSV file
-        # Escape backslashes in the path for M code
         escaped_path = source_csv.replace("\\", "\\\\")
         transforms = ", ".join(col_transforms)
         return (
@@ -479,6 +489,35 @@ def _build_m_expression(
             "in\n"
             "    TypedColumns"
         )
+
+    if source_db:
+        db_type = source_db.get("type", "").lower()
+        db_table = source_db.get("table", table_name)
+        transforms = ", ".join(col_transforms)
+
+        if db_type == "sqlite":
+            db_path = source_db.get("path", "").replace("\\", "\\\\")
+            return (
+                "let\n"
+                f'    Source = Odbc.DataSource("Driver={{SQLite3 ODBC Driver}};'
+                f'Database={db_path}", [HierarchicalNavigation=true]),\n'
+                f'    Data = Source{{[Name="{db_table}",Kind="Table"]}}[Data],\n'
+                f"    TypedColumns = Table.TransformColumnTypes(Data, {{{transforms}}})\n"
+                "in\n"
+                "    TypedColumns"
+            )
+        elif db_type == "mysql":
+            server = source_db.get("server", "localhost")
+            database = source_db.get("database", "")
+            port = source_db.get("port", 3306)
+            return (
+                "let\n"
+                f'    Source = MySQL.Database("{server}:{port}", "{database}"),\n'
+                f'    Data = Source{{[Schema="{database}",Name="{db_table}"]}}[Data],\n'
+                f"    TypedColumns = Table.TransformColumnTypes(Data, {{{transforms}}})\n"
+                "in\n"
+                "    TypedColumns"
+            )
 
     # Default: empty typed table (data embedded in VertiPaq)
     field_defs = []
@@ -707,7 +746,8 @@ def _modify_metadata_and_encode(
                     0, NULL
                 )""",
                 (part_id, table_id, tname,
-                 _build_m_expression(tname, tdef.get("columns", []), tdef.get("source_csv")),
+                 _build_m_expression(tname, tdef.get("columns", []),
+                                     tdef.get("source_csv"), tdef.get("source_db")),
                  ps_id,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
             )
