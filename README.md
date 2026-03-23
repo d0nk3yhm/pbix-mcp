@@ -77,7 +77,7 @@ pbix-mcp-server --log-level debug
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
 - **Import mode only** — DirectQuery files are detected on open and rejected with a clear error
-- **DateTime columns** — not yet tested for from-scratch creation (Int64/Double/String are fully verified)
+- **Decimal/Boolean columns** — not yet tested for from-scratch creation (String/Int64/Double/DateTime are verified)
 
 ## Tools (60)
 
@@ -160,7 +160,7 @@ Opens in Power BI Desktop with full interactivity — slicers, cross-filtering, 
 | `String` | ✅ Stable | External UTF-16LE with hash table |
 | `Int64` | ✅ Stable | External 32-bit entries (IsOperatingOn32=1) |
 | `Double` | ✅ Stable | External 64-bit IEEE 754 entries |
-| `DateTime` | ⚠️ Untested | Should work (same encoding as Double) |
+| `DateTime` | ✅ Stable | External 64-bit entries (same encoding as Double) |
 | `Decimal` | ⚠️ Untested | Should work (encoded as Int64 internally) |
 | `Boolean` | ⚠️ Untested | Should work (encoded as Int64 internally) |
 
