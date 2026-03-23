@@ -1169,7 +1169,8 @@ def _modify_metadata_and_encode(
                 (rs_id, rel_id, rs_name, ris_id),
             )
 
-            # RelationshipIndexStorage
+            # RelationshipIndexStorage (SystemTableID and RecordCount updated later
+            # when R$ table is created)
             c.execute(
                 """INSERT INTO RelationshipIndexStorage (
                     ID, RelationshipStorageID, IndexType, Flags,
@@ -1179,6 +1180,12 @@ def _modify_metadata_and_encode(
                 ) VALUES (?, ?, 1, 0, 0, 0, 0, 0, 0, 0)""",
                 (ris_id, rs_id),
             )
+
+            # Store relationship info for R$ table creation later
+            rdef["_rel_id"] = rel_id
+            rdef["_rel_name"] = rel_name
+            rdef["_rs_id"] = rs_id
+            rdef["_ris_id"] = ris_id
 
         conn.commit()
 
@@ -1644,6 +1651,339 @@ def _modify_metadata_and_encode(
                     (ahs_id, ah_id, distinct, h_table_id,
                      min_val, max_val, max_strlen),
                 )
+
+        # ============================================================
+        # Create R$ system tables for each relationship
+        # ============================================================
+        for rdef in relationships:
+            # Skip relationships that weren't fully resolved
+            if "_rel_id" not in rdef:
+                continue
+
+            rel_id = rdef["_rel_id"]
+            rel_name = rdef["_rel_name"]
+            rs_id = rdef["_rs_id"]
+            ris_id = rdef["_ris_id"]
+
+            from_tname = rdef["from_table"]
+            to_tname = rdef["to_table"]
+            from_tid = table_id_map[from_tname]
+            to_tid = table_id_map[to_tname]
+            from_col_name = rdef["from_column"]
+            to_col_name = rdef["to_column"]
+
+            # Find the "from" table definition to get row data
+            from_tdef = next(t for t in tables if t["name"] == from_tname)
+            to_tdef = next(t for t in tables if t["name"] == to_tname)
+            from_rows = from_tdef["rows"]
+            to_rows = to_tdef["rows"]
+            from_row_count = len(from_rows)
+
+            # Compute the INDEX column: for each row in "from" table,
+            # find the row index in "to" table where the key matches
+            to_key_index: dict[object, int] = {}
+            for idx, row in enumerate(to_rows):
+                key_val = row.get(to_col_name)
+                if key_val is not None and key_val not in to_key_index:
+                    to_key_index[key_val] = idx
+
+            index_values: list[int] = []
+            for row in from_rows:
+                fk_val = row.get(from_col_name)
+                matched_idx = to_key_index.get(fk_val, 0)  # default 0 if no match
+                index_values.append(matched_idx)
+
+            # R$ table naming: table name does NOT include .tbl suffix
+            rel_name_spaced = rel_name.replace("-", " ")
+            r_table_name = (
+                f"R${from_tname} ({from_tid})"
+                f"${rel_name_spaced} ({rel_id})"
+            )
+
+            # Allocate IDs for R$ table
+            r_table_id = alloc.next()
+            r_ts_id = alloc.next()
+            r_tbl_folder_id = alloc.next()
+            r_tbl_folder_path = f"R${from_tname} ({from_tid})${rel_name_spaced} ({rel_id})$({to_tid}).tbl"
+
+            # R$ Table (ModelID=0, SystemFlags=1, IsHidden=1)
+            c.execute(
+                """INSERT INTO [Table] (
+                    ID, ModelID, Name, DataCategory, Description, IsHidden,
+                    TableStorageID, ModifiedTime, StructureModifiedTime,
+                    SystemFlags, ShowAsVariationsOnly, IsPrivate,
+                    DefaultDetailRowsDefinitionID, AlternateSourcePrecedence,
+                    RefreshPolicyID, CalculationGroupID, ExcludeFromModelRefresh,
+                    LineageTag, SourceLineageTag, SystemManaged,
+                    ExcludeFromAutomaticAggregations
+                ) VALUES (
+                    ?, 0, ?, NULL, NULL, 1,
+                    ?, ?, ?,
+                    1, 0, 0,
+                    0, 0,
+                    0, 0, 0,
+                    NULL, NULL, 0,
+                    0
+                )""",
+                (r_table_id, r_table_name, r_ts_id,
+                 _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
+            )
+
+            # R$ TableStorage (Version=0, Settings=2)
+            c.execute(
+                """INSERT INTO TableStorage (
+                    ID, TableID, Name, Version, Settings, RIViolationCount, StorageFolderID
+                ) VALUES (?, ?, ?, 0, 2, 0, ?)""",
+                (r_ts_id, r_table_id, r_table_name, r_tbl_folder_id),
+            )
+
+            # StorageFolder for R$ table (OwnerType=18)
+            c.execute(
+                "INSERT INTO StorageFolder (ID, OwnerID, OwnerType, Path) VALUES (?, ?, 18, ?)",
+                (r_tbl_folder_id, r_ts_id, r_tbl_folder_path),
+            )
+
+            # R$ Partition (Type=3, Mode=2, State=1, SystemFlags=1, DataView=3)
+            r_part_id = alloc.next()
+            r_ps_id = alloc.next()
+            r_sms_id = alloc.next()
+            r_prt_folder_id = alloc.next()
+            r_prt_folder_path = f"{r_tbl_folder_path}\\{r_part_id}.prt"
+
+            c.execute(
+                """INSERT INTO [Partition] (
+                    ID, TableID, Name, Description, DataSourceID,
+                    QueryDefinition, State, Type, PartitionStorageID,
+                    Mode, DataView, ModifiedTime, RefreshedTime,
+                    SystemFlags, ErrorMessage, RetainDataTillForceCalculate,
+                    RangeStart, RangeEnd, RangeGranularity, RefreshBookmark,
+                    QueryGroupID, ExpressionSourceID, MAttributes,
+                    DataCoverageDefinitionID, SchemaName
+                ) VALUES (
+                    ?, ?, ?, NULL, 0,
+                    NULL, 1, 3, ?,
+                    2, 3, ?, ?,
+                    1, NULL, 0,
+                    0.0, 0.0, -1, NULL,
+                    0, 0, NULL,
+                    0, NULL
+                )""",
+                (r_part_id, r_table_id, r_table_name, r_ps_id,
+                 _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
+            )
+
+            c.execute(
+                """INSERT INTO PartitionStorage (
+                    ID, PartitionID, Name, StoragePosition,
+                    SegmentMapStorageID, DataObjectId, StorageFolderID,
+                    DeltaTableMetadataStorageID
+                ) VALUES (?, ?, ?, 0, ?, 0, ?, 0)""",
+                (r_ps_id, r_part_id, r_table_name, r_sms_id, r_prt_folder_id),
+            )
+
+            # StorageFolder for R$ partition (OwnerType=20)
+            c.execute(
+                "INSERT INTO StorageFolder (ID, OwnerID, OwnerType, Path) VALUES (?, ?, 20, ?)",
+                (r_prt_folder_id, r_ps_id, r_prt_folder_path),
+            )
+
+            # SegmentMapStorage (Type=3, RecordCount=from_row_count, SegmentCount=1)
+            c.execute(
+                """INSERT INTO SegmentMapStorage (
+                    ID, PartitionStorageID, Type, RecordCount,
+                    SegmentCount, RecordsPerSegment
+                ) VALUES (?, ?, 3, ?, 1, ?)""",
+                (r_sms_id, r_ps_id, from_row_count, from_row_count),
+            )
+
+            # R$ INDEX column (ExplicitDataType=6, InferredDataType=19, SystemFlags=1)
+            r_col_id = alloc.next()
+            r_cs_id = alloc.next()
+            r_ds_id = alloc.next()
+            r_cps_id = alloc.next()
+            r_ss_id = alloc.next()
+            r_idf_file_id = alloc.next()
+            r_meta_file_id = alloc.next()
+
+            r_cs_name = f"INDEX ({r_col_id})"
+            r_idf_fname = f"0.{r_table_name}.{r_cs_name}.0.idf"
+            r_meta_fname = f"0.{r_table_name}.{r_cs_name}.0.idfmeta"
+
+            c.execute(
+                """INSERT INTO [Column] (
+                    ID, TableID, ExplicitName, InferredName,
+                    ExplicitDataType, InferredDataType,
+                    DataCategory, Description, IsHidden, State,
+                    IsUnique, IsKey, IsNullable, Alignment,
+                    TableDetailPosition, IsDefaultLabel, IsDefaultImage,
+                    SummarizeBy, ColumnStorageID, Type,
+                    SourceColumn, ColumnOriginID, Expression, FormatString,
+                    IsAvailableInMDX, SortByColumnID, AttributeHierarchyID,
+                    ModifiedTime, StructureModifiedTime, RefreshedTime,
+                    SystemFlags, KeepUniqueRows, DisplayOrdinal,
+                    ErrorMessage, SourceProviderType, DisplayFolder,
+                    EncodingHint, RelatedColumnDetailsID, AlternateOfID,
+                    LineageTag, SourceLineageTag, EvaluationBehavior
+                ) VALUES (
+                    ?, ?, 'INDEX', NULL,
+                    6, 19,
+                    NULL, NULL, 0, 1,
+                    0, 0, 1, 1,
+                    -1, 0, 0,
+                    1, ?, 1,
+                    NULL, 0, NULL, NULL,
+                    1, 0, 0,
+                    ?, ?, 31240512000000000,
+                    1, 0, 0,
+                    NULL, NULL, NULL,
+                    0, 0, 0,
+                    NULL, NULL, 1
+                )""",
+                (r_col_id, r_table_id,
+                 r_cs_id,
+                 _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
+            )
+
+            # R$ ColumnStorage (Settings=3)
+            c.execute(
+                """INSERT INTO ColumnStorage (
+                    ID, ColumnID, Name, StoragePosition, DictionaryStorageID,
+                    Settings, ColumnFlags, Collation, OrderByColumn,
+                    Locale, BinaryCharacters,
+                    Statistics_DistinctStates, Statistics_MinDataID,
+                    Statistics_MaxDataID, Statistics_OriginalMinSegmentDataID,
+                    Statistics_RLESortOrder, Statistics_RowCount,
+                    Statistics_HasNulls, Statistics_RLERuns,
+                    Statistics_OthersRLERuns, Statistics_Usage,
+                    Statistics_DBType, Statistics_XMType,
+                    Statistics_CompressionType, Statistics_CompressionParam,
+                    Statistics_EncodingHint, IsDeltaPartitionColumn,
+                    DeltaColumnMappingPhysicalName, DeltaColumnMappingId,
+                    FramedSourceColumn
+                ) VALUES (
+                    ?, ?, ?, 0, ?,
+                    3, 0, NULL, NULL,
+                    0, 0,
+                    1, 2,
+                    2, 2,
+                    -1, 0,
+                    0, 0,
+                    0, 3,
+                    0, 0,
+                    0, 0,
+                    0, 0,
+                    NULL, -1,
+                    NULL
+                )""",
+                (r_cs_id, r_col_id, r_cs_name, r_ds_id),
+            )
+
+            # R$ DictionaryStorage (Type=1, DataType=6 Int64, IsOperatingOn32=1)
+            r_dict_file_id = alloc.next()
+            r_dict_fname = f"0.{r_table_name}.{r_cs_name}.dictionary"
+            c.execute(
+                """INSERT INTO DictionaryStorage (
+                    ID, ColumnStorageID, Type, DataType, DataVersion,
+                    BaseId, Magnitude, LastId, IsNullable, IsUnique,
+                    IsOperatingOn32, DictionaryFlags, StorageFileID, Size
+                ) VALUES (?, ?, 1, 6, 0, 2, 0.0, 0, 0, 0, 1, 0, ?, 0)""",
+                (r_ds_id, r_cs_id, r_dict_file_id),
+            )
+
+            # R$ ColumnPartitionStorage (State=3)
+            c.execute(
+                """INSERT INTO ColumnPartitionStorage (
+                    ID, ColumnStorageID, PartitionStorageID,
+                    DataVersion, State, SegmentStorageID, StorageFileID
+                ) VALUES (?, ?, ?, 0, 3, ?, ?)""",
+                (r_cps_id, r_cs_id, r_ps_id, r_ss_id, r_idf_file_id),
+            )
+
+            # R$ SegmentStorage (SegmentCount=1)
+            c.execute(
+                """INSERT INTO SegmentStorage (
+                    ID, ColumnPartitionStorageID, SegmentCount, StorageFileID
+                ) VALUES (?, ?, 1, ?)""",
+                (r_ss_id, r_cps_id, r_meta_file_id),
+            )
+
+            # StorageFile for IDF (OwnerType=23)
+            c.execute(
+                """INSERT INTO StorageFile (
+                    ID, OwnerID, OwnerType, StorageFolderID, FileName
+                ) VALUES (?, ?, 23, ?, ?)""",
+                (r_idf_file_id, r_cps_id, r_prt_folder_id, r_idf_fname),
+            )
+
+            # StorageFile for IDFMETA (OwnerType=24)
+            c.execute(
+                """INSERT INTO StorageFile (
+                    ID, OwnerID, OwnerType, StorageFolderID, FileName
+                ) VALUES (?, ?, 24, ?, ?)""",
+                (r_meta_file_id, r_ss_id, r_prt_folder_id, r_meta_fname),
+            )
+
+            # StorageFile for dictionary (OwnerType=22)
+            c.execute(
+                """INSERT INTO StorageFile (
+                    ID, OwnerID, OwnerType, StorageFolderID, FileName
+                ) VALUES (?, ?, 22, ?, ?)""",
+                (r_dict_file_id, r_ds_id, r_tbl_folder_id, r_dict_fname),
+            )
+
+            # Update RelationshipIndexStorage with SystemTableID and RecordCount
+            c.execute(
+                """UPDATE RelationshipIndexStorage
+                   SET SystemTableID = ?, RecordCount = ?
+                   WHERE ID = ?""",
+                (r_table_id, from_row_count, ris_id),
+            )
+
+            # Encode the INDEX column data using encode_table_data
+            r_encoder_cols = [{"name": "INDEX", "data_type": "Int64", "nullable": False}]
+            r_enc_rows = [{"INDEX": v} for v in index_values]
+            r_encoded = encode_table_data(
+                r_table_name, r_part_id, r_encoder_cols, r_enc_rows,
+                u32_a=0xABA5A, u32_b_start=0,
+            )
+
+            # Map encoded files to ABF paths
+            r_base = f"{r_table_name}.tbl\\{r_part_id}.prt"
+            r_idf_key = f"{r_base}\\column.INDEX"
+            r_meta_key = f"{r_base}\\column.INDEXmeta"
+            r_dict_key = f"{r_base}\\column.INDEX.dict"
+
+            r_abf_idf_path = f"{r_prt_folder_path}\\{r_idf_fname}"
+            r_abf_meta_path = f"{r_prt_folder_path}\\{r_meta_fname}"
+            r_abf_dict_path = f"{r_tbl_folder_path}\\{r_dict_fname}"
+
+            if r_idf_key in r_encoded:
+                vertipaq_files[r_abf_idf_path] = r_encoded[r_idf_key]
+            if r_meta_key in r_encoded:
+                vertipaq_files[r_abf_meta_path] = r_encoded[r_meta_key]
+            if r_dict_key in r_encoded:
+                vertipaq_files[r_abf_dict_path] = r_encoded[r_dict_key]
+                # Update DictionaryStorage.Size with actual dict size
+                c.execute(
+                    "UPDATE DictionaryStorage SET Size = ? WHERE ID = ?",
+                    (len(r_encoded[r_dict_key]), r_ds_id),
+                )
+
+            # Update ColumnStorage statistics from the IDFMETA
+            if r_meta_key in r_encoded:
+                _update_column_storage_stats(
+                    c, r_cs_id, r_encoded[r_meta_key], from_row_count
+                )
+                # Update DictionaryStorage.LastId with max_data_id from IDFMETA
+                try:
+                    r_idfm = r_encoded[r_meta_key]
+                    r_max_did = struct.unpack_from("<I", r_idfm, 91)[0]
+                    c.execute(
+                        "UPDATE DictionaryStorage SET LastId = ? WHERE ID = ?",
+                        (r_max_did, r_ds_id),
+                    )
+                except (struct.error, KeyError):
+                    pass
 
         conn.commit()
         conn.close()
