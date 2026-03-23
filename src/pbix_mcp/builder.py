@@ -540,6 +540,19 @@ def _build_m_expression(
                 "in\n"
                 "    Data"
             )
+        elif db_type in ("postgresql", "postgres"):
+            server = source_db.get("server", "localhost")
+            database = source_db.get("database", "")
+            port = source_db.get("port", 5432)
+            schema = source_db.get("schema", "public")
+            return (
+                "let\n"
+                f'    Source = PostgreSQL.Database("{server}:{port}", "{database}"),\n'
+                f'    Data = Source{{[Schema="{schema}",Name="{db_table}"]}}[Data],\n'
+                f"    TypedColumns = Table.TransformColumnTypes(Data, {{{transforms}}})\n"
+                "in\n"
+                "    TypedColumns"
+            )
 
     # Default: empty typed table (data embedded in VertiPaq)
     field_defs = []

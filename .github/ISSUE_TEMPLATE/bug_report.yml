@@ -1,62 +1,63 @@
 name: Bug Report
-description: Report a bug in pbix-mcp
+description: Report something that isn't working correctly
 labels: ["bug"]
 body:
-  - type: input
-    id: version
+  - type: markdown
     attributes:
-      label: Package version
-      description: Output of `pip show pbix-mcp`
-      placeholder: "0.1.0"
-    validations:
-      required: true
-
-  - type: input
-    id: python-version
-    attributes:
-      label: Python version
-      placeholder: "3.12.1"
-    validations:
-      required: true
-
-  - type: dropdown
-    id: os
-    attributes:
-      label: Operating system
-      options:
-        - Windows
-        - macOS
-        - Linux
-    validations:
-      required: true
-
-  - type: input
-    id: tool
-    attributes:
-      label: MCP tool that failed
-      placeholder: "pbix_evaluate_dax"
-    validations:
-      required: true
+      value: |
+        Thanks for taking the time to report a bug!
 
   - type: textarea
     id: description
     attributes:
       label: What happened?
-      description: Describe the bug and what you expected.
+      description: Describe what went wrong. Include error messages if any.
     validations:
       required: true
 
   - type: textarea
-    id: error
+    id: expected
     attributes:
-      label: Error message or log output
-      render: shell
+      label: What did you expect?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Create a PBIX with ...
+        2. Call pbix_create with ...
+        3. Open in PBI Desktop ...
+    validations:
+      required: true
 
   - type: dropdown
-    id: fixture
+    id: category
     attributes:
-      label: Reproducible with public fixture?
+      label: Category
       options:
-        - "Yes"
-        - "No — requires private PBIX file"
-        - "Not sure"
+        - PBIX Creation (builder)
+        - Data Sources (CSV/SQLite/SQL Server/MySQL/PostgreSQL)
+        - DirectQuery
+        - DAX Evaluation
+        - Report Layout / Visuals
+        - DataModel Read/Write
+        - File Open/Save
+        - MCP Server
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: pbix-mcp version
+      placeholder: "0.2.0"
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12"

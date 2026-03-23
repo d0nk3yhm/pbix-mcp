@@ -1,12 +1,41 @@
 name: Feature Request
-description: Suggest a new feature or improvement
+description: Suggest an improvement or new capability
 labels: ["enhancement"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea to make pbix-mcp better? We'd love to hear it!
+
   - type: textarea
     id: description
     attributes:
       label: What would you like?
-      description: Describe the feature and the problem it solves.
+      description: Describe the feature or improvement.
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: How would you use this? What problem does it solve?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      options:
+        - New data source type
+        - New DAX function
+        - New data type
+        - Report creation / builder
+        - MCP tool
+        - Performance
+        - Documentation
+        - Other
     validations:
       required: true
 
@@ -14,16 +43,4 @@ body:
     id: alternatives
     attributes:
       label: Alternatives considered
-      description: What workarounds or alternative approaches have you tried?
-
-  - type: dropdown
-    id: area
-    attributes:
-      label: Area
-      options:
-        - DAX engine
-        - MCP tools
-        - File format support
-        - CLI / packaging
-        - Documentation
-        - Other
+      description: Have you tried any workarounds?

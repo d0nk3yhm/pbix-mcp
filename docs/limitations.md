@@ -34,7 +34,7 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 | SQLite | ✅ | N/A | `source_db` — requires SQLite3 ODBC driver |
 | SQL Server | ✅ | ✅ | `source_db` — verified with LocalDB |
 | MySQL | ✅ | Untested | `source_db` — same M pattern as SQL Server |
-| PostgreSQL | Not yet | Not yet | Needs `PostgreSQL.Database()` M expression |
+| PostgreSQL | ✅ | Untested | `source_db` — uses `PostgreSQL.Database()` M expression |
 
 ## Supported Data Types
 

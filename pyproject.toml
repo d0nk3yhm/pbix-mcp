@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pbix-mcp"
-version = "0.1.0"
-description = "MCP server for full read/write access to Power BI .pbix/.pbit files with a built-in DAX evaluation engine"
+version = "0.2.0"
+description = "MCP server for creating, reading, writing, and evaluating Power BI .pbix/.pbit files — no Power BI Desktop required"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

@@ -1,6 +1,9 @@
 # pbix-mcp
 
 [![CI](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/pbix-mcp)](https://pypi.org/project/pbix-mcp/)
+[![Python](https://img.shields.io/pypi/pyversions/pbix-mcp)](https://pypi.org/project/pbix-mcp/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required for creation**. Exposes 60 tools covering report creation from scratch (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL data sources, DirectQuery live database connections, and DAX measures), layout editing, visual management, DAX evaluation, RLS security, and binary format internals.
 
@@ -393,8 +396,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for project conventions, [SUPPORT.md](SUP
 | Script | What it does |
 |--------|-------------|
 | [`create_from_csv.py`](examples/create_from_csv.py) | Build a report from CSV files with Refresh support |
+| [`create_from_sqlite.py`](examples/create_from_sqlite.py) | Build a report connected to SQLite database |
 | [`create_directquery.py`](examples/create_directquery.py) | Live DirectQuery report connected to SQL Server |
-| [`create_all_types.py`](examples/create_all_types.py) | Demonstrate all 6 data types (String, Int64, Double, DateTime, Decimal, Boolean) |
+| [`create_star_schema.py`](examples/create_star_schema.py) | Multi-relationship star schema (3 dimensions + 1 fact) |
+| [`create_all_types.py`](examples/create_all_types.py) | Demonstrate all 6 data types |
 
 ## License
 
