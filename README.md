@@ -5,7 +5,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/pbix-mcp)](https://pypi.org/project/pbix-mcp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required for creation**. Exposes 60 tools covering report creation from scratch (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL data sources, DirectQuery live database connections, and DAX measures), layout editing, visual management, DAX evaluation, RLS security, and binary format internals.
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required for creation**. Exposes 69 tools covering report creation from scratch (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL data sources, DirectQuery live database connections, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation, RLS security, and binary format internals.
 
 ## Quick Start
 
@@ -93,13 +93,13 @@ pbix-mcp-server --log-level debug
 - **Creating DirectQuery files** — fully working with SQL Server (tested with LocalDB); requires a running database server and initial data snapshot
 
 
-## Tools (60)
+## Tools (69)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
 
-### Report Layout & Visuals (18)
-`pbix_add_visual` · `pbix_remove_visual` · `pbix_get_pages` · `pbix_add_page` · `pbix_remove_page` · `pbix_get_page_visuals` · `pbix_get_visual_detail` · `pbix_get_visual_positions` · `pbix_set_visual_property` · `pbix_update_visual_json` · `pbix_get_layout_raw` · `pbix_set_layout_raw` · `pbix_get_filters` · `pbix_set_filters` · `pbix_get_default_filters` · `pbix_get_settings` · `pbix_set_settings` · `pbix_get_bookmarks`
+### Report Layout & Visuals (20)
+`pbix_add_visual` · `pbix_remove_visual` · `pbix_get_pages` · `pbix_add_page` · `pbix_remove_page` · `pbix_get_page_visuals` · `pbix_get_visual_detail` · `pbix_get_visual_positions` · `pbix_set_visual_property` · `pbix_update_visual_json` · `pbix_get_layout_raw` · `pbix_set_layout_raw` · `pbix_get_filters` · `pbix_set_filters` · `pbix_get_default_filters` · `pbix_get_settings` · `pbix_set_settings` · `pbix_get_bookmarks` · `pbix_add_bookmark` · `pbix_remove_bookmark`
 
 ### DAX Engine (4)
 `pbix_evaluate_dax` · `pbix_evaluate_dax_per_dimension` · `pbix_evaluate_calculated_columns` · `pbix_clear_dax_cache`
@@ -107,17 +107,20 @@ pbix-mcp-server --log-level debug
 ### DataModel Read (8)
 `pbix_get_model_schema` · `pbix_get_model_measures` · `pbix_get_model_relationships` · `pbix_get_model_power_query` · `pbix_get_model_columns` · `pbix_get_table_data` · `pbix_list_tables` · `pbix_get_metadata`
 
-### DataModel Write (13)
-`pbix_datamodel_query_metadata` · `pbix_datamodel_modify_metadata` · `pbix_datamodel_add_measure` · `pbix_datamodel_modify_measure` · `pbix_datamodel_remove_measure` · `pbix_datamodel_modify_column` · `pbix_datamodel_decompress` · `pbix_datamodel_recompress` · `pbix_datamodel_replace_file` · `pbix_datamodel_extract_file` · `pbix_datamodel_list_abf_files` · `pbix_set_table_data` · `pbix_update_table_rows`
+### DataModel Write (16)
+`pbix_datamodel_query_metadata` · `pbix_datamodel_modify_metadata` · `pbix_datamodel_add_measure` · `pbix_datamodel_modify_measure` · `pbix_datamodel_remove_measure` · `pbix_datamodel_modify_column` · `pbix_datamodel_decompress` · `pbix_datamodel_recompress` · `pbix_datamodel_replace_file` · `pbix_datamodel_extract_file` · `pbix_datamodel_list_abf_files` · `pbix_set_table_data` · `pbix_update_table_rows` · `pbix_datamodel_add_field_parameter` · `pbix_datamodel_add_calculation_group` · `pbix_export_tmdl`
 
-### Resources & Theme (5)
-`pbix_list_resources` · `pbix_get_theme` · `pbix_set_theme` · `pbix_get_linguistic_schema` · `pbix_set_linguistic_schema`
+### Resources, Themes & Custom Visuals (7)
+`pbix_list_resources` · `pbix_get_theme` · `pbix_set_theme` · `pbix_get_linguistic_schema` · `pbix_set_linguistic_schema` · `pbix_add_custom_visual` · `pbix_remove_custom_visual`
 
 ### DataMashup (2)
 `pbix_get_m_code` · `pbix_set_m_code`
 
 ### Row-Level Security (3)
 `pbix_get_rls_roles` · `pbix_set_rls_role` · `pbix_evaluate_rls`
+
+### Incremental Refresh (2)
+`pbix_set_incremental_refresh` · `pbix_get_incremental_refresh`
 
 ### Diagnostics & Security (2)
 `pbix_doctor` · `pbix_get_password`
@@ -217,9 +220,18 @@ builder.add_table('Orders', [
 ], rows=orders_data,
    source_db={'type': 'postgresql', 'server': 'localhost', 'database': 'mydb',
               'table': 'orders', 'port': 5432, 'schema': 'public'})
+
+# MariaDB adapter (for MySQL DirectQuery — requires MariaDB ODBC 3.1 Driver)
+builder.add_table('Orders', [
+    {'name': 'OrderID', 'data_type': 'Int64'},
+    {'name': 'Qty',     'data_type': 'Int64'},
+], rows=orders_data,
+   mode='directquery',
+   source_db={'type': 'mariadb', 'server': 'localhost', 'database': 'mydb',
+              'table': 'orders', 'port': 3306})
 ```
 
-Data is **Import mode** — a snapshot is embedded in the PBIX at build time. Clicking **Refresh** in Power BI Desktop re-reads from the database. The report works offline between refreshes.
+Data is **Import mode** by default — a snapshot is embedded in the PBIX at build time. Clicking **Refresh** in Power BI Desktop re-reads from the database. The report works offline between refreshes.
 
 ### DirectQuery (Live Database Queries)
 

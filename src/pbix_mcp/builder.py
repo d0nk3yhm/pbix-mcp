@@ -2257,20 +2257,40 @@ def _modify_metadata_and_encode(
             )
 
         # Neutralize template partition M expressions that reference external
-        # files (e.g., financials → Financial Sample.xlsx). Replace with empty
-        # table expressions so Refresh doesn't fail on missing files.
+        # files (e.g., financials → Financial Sample.xlsx) or template-specific
+        # tables (e.g., DateAutoTemplate → references 'financials'[Date]).
+        # Replace with empty table expressions so Refresh doesn't fail.
         # Only touch partitions from the TEMPLATE (IDs below our new ID range).
+        _empty_m = 'let\n    Source = #table(type table [x = text], {})\nin\n    Source'
+        user_table_names = {t["name"] for t in tables}
         c = conn.cursor()
         template_partitions = c.execute(
-            "SELECT ID, QueryDefinition FROM [Partition] WHERE QueryDefinition IS NOT NULL"
+            "SELECT p.ID, p.QueryDefinition, t.Name FROM [Partition] p "
+            "JOIN [Table] t ON p.TableID = t.ID "
+            "WHERE p.QueryDefinition IS NOT NULL"
         ).fetchall()
-        for pid, qd in template_partitions:
-            if pid < (max_id + 1000) and qd and "File.Contents" in qd:
-                # This partition references an external file — neutralize it
-                c.execute(
-                    "UPDATE [Partition] SET QueryDefinition = ? WHERE ID = ?",
-                    ('let\n    Source = #table(type table [x = text], {})\nin\n    Source', pid),
-                )
+        for pid, qd, tname in template_partitions:
+            if tname in user_table_names:
+                continue  # Don't touch user-created tables
+            if pid < (max_id + 1000) and qd:
+                if "File.Contents" in qd:
+                    # References an external file — neutralize
+                    c.execute(
+                        "UPDATE [Partition] SET QueryDefinition = ? WHERE ID = ?",
+                        (_empty_m, pid),
+                    )
+                elif tname == "DateAutoTemplate" and "financials" in qd:
+                    # Template date table references template data — neutralize
+                    c.execute(
+                        "UPDATE [Partition] SET QueryDefinition = ? WHERE ID = ?",
+                        (_empty_m, pid),
+                    )
+                elif tname == "Date" and qd.strip() == "DateAutoTemplate":
+                    # Date table references DateAutoTemplate — neutralize
+                    c.execute(
+                        "UPDATE [Partition] SET QueryDefinition = ? WHERE ID = ?",
+                        (_empty_m, pid),
+                    )
 
         conn.commit()
         conn.close()
