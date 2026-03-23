@@ -82,10 +82,13 @@ class PBIXBuilder:
                        {"type": "sqlite", "path": "/path/to/db.sqlite", "table": "orders"}
                        {"type": "mysql", "server": "host", "database": "mydb",
                         "table": "orders", "port": 3306}
+                       {"type": "sqlserver", "server": "host", "database": "mydb",
+                        "table": "orders"}
                        The rows parameter provides the initial data snapshot.
-            mode: Storage mode — "import" (default) embeds data with VertiPaq,
-                  "directquery" creates metadata-only tables that query the source
-                  database at runtime. DirectQuery requires source_db with connection info.
+            mode: Storage mode — "import" (default) or "directquery". Both modes
+                  embed full VertiPaq data. DirectQuery sets Partition.Mode=1 instead
+                  of Mode=0, and the M expression points to the source database.
+                  Rows provide the embedded data snapshot for both modes.
         """
         if mode not in ("import", "directquery"):
             raise ValueError(f"mode must be 'import' or 'directquery', got {mode!r}")
@@ -525,6 +528,18 @@ def _build_m_expression(
                 "in\n"
                 "    TypedColumns"
             )
+        elif db_type == "sqlserver":
+            server = source_db.get("server", "localhost")
+            database = source_db.get("database", "")
+            schema = source_db.get("schema", "dbo")
+            # Simple M expression without TransformColumnTypes for query folding
+            return (
+                "let\n"
+                f'    Source = Sql.Database("{server}", "{database}"),\n'
+                f'    Data = Source{{[Schema="{schema}",Item="{db_table}"]}}[Data]\n'
+                "in\n"
+                "    Data"
+            )
 
     # Default: empty typed table (data embedded in VertiPaq)
     field_defs = []
@@ -660,9 +675,6 @@ def _modify_metadata_and_encode(
         # ============================================================
         # INSERT Tables
         # ============================================================
-        # Track DataSource IDs created for DirectQuery tables
-        datasource_id_map: dict[str, int] = {}  # connection_key -> DataSourceID
-
         for tdef in tables:
             tname = tdef["name"]
             is_directquery = tdef.get("mode") == "directquery"
@@ -670,247 +682,9 @@ def _modify_metadata_and_encode(
             table_id_map[tname] = table_id
             column_id_map[tname] = {}
 
-            if is_directquery:
-                # ============================================================
-                # DirectQuery table — metadata only, NO VertiPaq storage
-                # ============================================================
-
-                # DirectQuery: NO DataSource entry — avoids PFE_DECRYPT_DATA.
-                # The M expression in QueryDefinition handles the connection.
-                # PBI Desktop will prompt for credentials on first open.
-                data_source_id = 0
-
-                # Create full storage chain but with State=2 (unprocessed)
-                # so the engine doesn't try to load/validate segment data
-                ts_id = alloc.next()
-                sf_tbl_id = alloc.next()
-                part_id = alloc.next()
-                partition_id_map[tname] = part_id
-                ps_id = alloc.next()
-                sf_prt_id = alloc.next()
-                sms_id = alloc.next()
-
-                # StorageFolder for table
-                c.execute(
-                    "INSERT INTO StorageFolder (ID, OwnerID, OwnerType, Path) VALUES (?, ?, 18, ?)",
-                    (sf_tbl_id, ts_id, f"{tname} ({table_id}).tbl"),
-                )
-                # TableStorage
-                c.execute(
-                    """INSERT INTO TableStorage (
-                        ID, TableID, Name, Version, Settings,
-                        RIViolationCount, StorageFolderID
-                    ) VALUES (?, ?, ?, 1, 4, 0, ?)""",
-                    (ts_id, table_id, tname, sf_tbl_id),
-                )
-                # StorageFolder for partition
-                c.execute(
-                    "INSERT INTO StorageFolder (ID, OwnerID, OwnerType, Path) VALUES (?, ?, 20, ?)",
-                    (sf_prt_id, ps_id, f"{tname} ({table_id}).tbl\\{part_id}.prt"),
-                )
-                # PartitionStorage
-                c.execute(
-                    """INSERT INTO PartitionStorage (
-                        ID, PartitionID, Name, StoragePosition,
-                        SegmentMapStorageID, DataObjectId, StorageFolderID,
-                        DeltaTableMetadataStorageID
-                    ) VALUES (?, ?, ?, 0, ?, 0, ?, 0)""",
-                    (ps_id, part_id, tname, sms_id, sf_prt_id),
-                )
-                # SegmentMapStorage (empty)
-                c.execute(
-                    """INSERT INTO SegmentMapStorage (
-                        ID, PartitionStorageID, Type, RecordCount,
-                        SegmentCount, RecordsPerSegment
-                    ) VALUES (?, ?, 3, 0, 0, 0)""",
-                    (sms_id, ps_id),
-                )
-
-                # Insert Table row with valid TableStorageID
-                c.execute(
-                    """INSERT INTO [Table] (
-                        ID, ModelID, Name, DataCategory, Description, IsHidden,
-                        TableStorageID, ModifiedTime, StructureModifiedTime,
-                        SystemFlags, ShowAsVariationsOnly, IsPrivate,
-                        DefaultDetailRowsDefinitionID, AlternateSourcePrecedence,
-                        RefreshPolicyID, CalculationGroupID, ExcludeFromModelRefresh,
-                        LineageTag, SourceLineageTag, SystemManaged,
-                        ExcludeFromAutomaticAggregations
-                    ) VALUES (
-                        ?, 1, ?, NULL, NULL, ?,
-                        ?, ?, ?,
-                        0, 0, 0,
-                        0, 0,
-                        0, 0, 0,
-                        ?, NULL, 0,
-                        0
-                    )""",
-                    (table_id, tname, 1 if tdef["hidden"] else 0, ts_id,
-                     _FIXED_TIMESTAMP, _FIXED_TIMESTAMP,
-                     str(uuid.uuid4())),
-                )
-
-                # Insert Partition row: Type=4 (M partition), Mode=1 (DirectQuery)
-                c.execute(
-                    """INSERT INTO [Partition] (
-                        ID, TableID, Name, Description, DataSourceID,
-                        QueryDefinition, State, Type, PartitionStorageID,
-                        Mode, DataView, ModifiedTime, RefreshedTime,
-                        SystemFlags, ErrorMessage, RetainDataTillForceCalculate,
-                        RangeStart, RangeEnd, RangeGranularity, RefreshBookmark,
-                        QueryGroupID, ExpressionSourceID, MAttributes,
-                        DataCoverageDefinitionID, SchemaName
-                    ) VALUES (
-                        ?, ?, ?, NULL, ?,
-                        ?, 2, 4, ?,
-                        1, 3, ?, ?,
-                        0, NULL, 0,
-                        0.0, 0.0, -1, NULL,
-                        0, 0, NULL,
-                        0, NULL
-                    )""",
-                    (part_id, table_id, tname, data_source_id,
-                     _build_m_expression(tname, tdef.get("columns", []),
-                                         tdef.get("source_csv"), tdef.get("source_db")),
-                     ps_id,
-                     _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
-                )
-
-                # ============================================================
-                # INSERT RowNumber column for DirectQuery (still needed, but no storage)
-                # ============================================================
-                rn_col_id = alloc.next()
-                rn_name = f"RowNumber-{str(uuid.uuid4()).upper()}"
-                column_id_map[tname]["__rownumber__"] = rn_col_id
-
-                c.execute(
-                    """INSERT INTO [Column] (
-                        ID, TableID, ExplicitName, InferredName,
-                        ExplicitDataType, InferredDataType,
-                        DataCategory, Description, IsHidden, State,
-                        IsUnique, IsKey, IsNullable, Alignment,
-                        TableDetailPosition, IsDefaultLabel, IsDefaultImage,
-                        SummarizeBy, ColumnStorageID, Type,
-                        SourceColumn, ColumnOriginID, Expression, FormatString,
-                        IsAvailableInMDX, SortByColumnID, AttributeHierarchyID,
-                        ModifiedTime, StructureModifiedTime, RefreshedTime,
-                        SystemFlags, KeepUniqueRows, DisplayOrdinal,
-                        ErrorMessage, SourceProviderType, DisplayFolder,
-                        EncodingHint, RelatedColumnDetailsID, AlternateOfID,
-                        LineageTag, SourceLineageTag, EvaluationBehavior
-                    ) VALUES (
-                        ?, ?, ?, NULL,
-                        6, 19,
-                        NULL, NULL, 1, 2,
-                        1, 1, 0, 1,
-                        -1, 0, 0,
-                        1, 0, 3,
-                        NULL, 0, NULL, NULL,
-                        1, 0, 0,
-                        ?, ?, 31240512000000000,
-                        0, 0, 0,
-                        NULL, NULL, NULL,
-                        0, 0, 0,
-                        NULL, NULL, 1
-                    )""",
-                    (rn_col_id, table_id, rn_name,
-                     _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
-                )
-
-                # AttributeHierarchy for RowNumber (no storage)
-                rn_ah_id = alloc.next()
-                c.execute(
-                    "UPDATE [Column] SET AttributeHierarchyID = ? WHERE ID = ?",
-                    (rn_ah_id, rn_col_id),
-                )
-                c.execute(
-                    """INSERT INTO AttributeHierarchy (
-                        ID, ColumnID, State, AttributeHierarchyStorageID,
-                        ModifiedTime, RefreshedTime
-                    ) VALUES (?, ?, 2, 0,
-                        ?, 31240512000000000)""",
-                    (rn_ah_id, rn_col_id, _FIXED_TIMESTAMP),
-                )
-
-                # ============================================================
-                # INSERT user columns for DirectQuery (ColumnStorageID=0, State=2)
-                # ============================================================
-                col_storage_info[tname] = {}
-
-                for col_idx, col_def in enumerate(tdef["columns"]):
-                    col_name = col_def["name"]
-                    data_type = col_def.get("data_type", "String")
-                    amo_type = _TYPE_NAME_TO_AMO.get(data_type, 2)
-
-                    col_id = alloc.next()
-                    column_id_map[tname][col_name] = col_id
-
-                    c.execute(
-                        """INSERT INTO [Column] (
-                            ID, TableID, ExplicitName, InferredName,
-                            ExplicitDataType, InferredDataType,
-                            DataCategory, Description, IsHidden, State,
-                            IsUnique, IsKey, IsNullable, Alignment,
-                            TableDetailPosition, IsDefaultLabel, IsDefaultImage,
-                            SummarizeBy, ColumnStorageID, Type,
-                            SourceColumn, ColumnOriginID, Expression, FormatString,
-                            IsAvailableInMDX, SortByColumnID, AttributeHierarchyID,
-                            ModifiedTime, StructureModifiedTime, RefreshedTime,
-                            SystemFlags, KeepUniqueRows, DisplayOrdinal,
-                            ErrorMessage, SourceProviderType, DisplayFolder,
-                            EncodingHint, RelatedColumnDetailsID, AlternateOfID,
-                            LineageTag, SourceLineageTag, EvaluationBehavior
-                        ) VALUES (
-                            ?, ?, ?, NULL,
-                            ?, ?,
-                            NULL, NULL, 0, 2,
-                            0, 0, 1, 1,
-                            -1, 0, 0,
-                            ?, 0, 1,
-                            ?, 0, NULL, NULL,
-                            0, 0, 0,
-                            ?, ?, 31240512000000000,
-                            0, 0, ?,
-                            NULL, NULL, NULL,
-                            0, 0, 0,
-                            ?, NULL, 1
-                        )""",
-                        (col_id, table_id, col_name,
-                         amo_type, amo_type,
-                         2,  # SummarizeBy: 2=None
-                         col_name,  # SourceColumn
-                         _FIXED_TIMESTAMP, _FIXED_TIMESTAMP,
-                         col_idx,  # DisplayOrdinal
-                         str(uuid.uuid4())),
-                    )
-
-                    # AttributeHierarchy for user column (needed for DAX, no storage)
-                    ah_id = alloc.next()
-                    c.execute(
-                        "UPDATE [Column] SET AttributeHierarchyID = ? WHERE ID = ?",
-                        (ah_id, col_id),
-                    )
-                    c.execute(
-                        """INSERT INTO AttributeHierarchy (
-                            ID, ColumnID, State, AttributeHierarchyStorageID,
-                            ModifiedTime, RefreshedTime
-                        ) VALUES (?, ?, 2, 0,
-                            ?, 31240512000000000)""",
-                        (ah_id, col_id, _FIXED_TIMESTAMP),
-                    )
-
-                    col_storage_info[tname][col_name] = {
-                        "col_name": col_name,
-                        "col_id": col_id,
-                        "data_type": data_type,
-                        "amo_type": amo_type,
-                    }
-
-                # DirectQuery table done — skip to next table
-                continue
-
             # ==============================================================
-            # Import mode table — full VertiPaq storage (existing code below)
+            # Full VertiPaq storage (used for both Import and DirectQuery)
+            # DirectQuery is identical to Import except Partition.Mode=1
             # ==============================================================
 
             # TableStorage
@@ -981,6 +755,8 @@ def _modify_metadata_and_encode(
             )
 
             # Insert Partition row
+            # Mode=0 for Import, Mode=1 for DirectQuery
+            partition_mode = 1 if is_directquery else 0
             c.execute(
                 """INSERT INTO [Partition] (
                     ID, TableID, Name, Description, DataSourceID,
@@ -993,7 +769,7 @@ def _modify_metadata_and_encode(
                 ) VALUES (
                     ?, ?, ?, NULL, 0,
                     ?, 1, 4, ?,
-                    0, 3, ?, ?,
+                    ?, 3, ?, ?,
                     0, NULL, 0,
                     0.0, 0.0, -1, NULL,
                     0, 0, NULL,
@@ -1003,6 +779,7 @@ def _modify_metadata_and_encode(
                  _build_m_expression(tname, tdef.get("columns", []),
                                      tdef.get("source_csv"), tdef.get("source_db")),
                  ps_id,
+                 partition_mode,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
             )
 
@@ -1461,40 +1238,7 @@ def _modify_metadata_and_encode(
             rel_id = alloc.next()
             rel_name = str(uuid.uuid4())
 
-            # Check if this is a DirectQuery relationship (either side is DQ)
-            from_mode = next((t.get("mode", "import") for t in tables if t["name"] == rdef["from_table"]), "import")
-            to_mode = next((t.get("mode", "import") for t in tables if t["name"] == rdef["to_table"]), "import")
-            is_dq_rel = (from_mode == "directquery" or to_mode == "directquery")
-
-            if is_dq_rel:
-                # DirectQuery relationship — no storage entries, just metadata
-                c.execute(
-                    """INSERT INTO [Relationship] (
-                        ID, ModelID, Name, IsActive, Type,
-                        CrossFilteringBehavior, JoinOnDateBehavior,
-                        RelyOnReferentialIntegrity,
-                        FromTableID, FromColumnID, FromCardinality,
-                        ToTableID, ToColumnID, ToCardinality,
-                        State, RelationshipStorageID, RelationshipStorage2ID,
-                        ModifiedTime, RefreshedTime, SecurityFilteringBehavior
-                    ) VALUES (
-                        ?, 1, ?, 1, 1,
-                        1, 1,
-                        0,
-                        ?, ?, 2,
-                        ?, ?, 1,
-                        1, 0, 0,
-                        ?, ?, 1
-                    )""",
-                    (rel_id, rel_name,
-                     from_tid, from_col_id,
-                     to_tid, to_col_id,
-                     _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
-                )
-                # No R$ table needed — skip storing info for R$ creation
-                continue
-
-            # Import relationship — full storage entries
+            # Full storage entries (same for Import and DirectQuery)
             # RelationshipStorage
             rs_id = alloc.next()
             # RelationshipIndexStorage
@@ -1562,11 +1306,6 @@ def _modify_metadata_and_encode(
 
         for tdef in tables:
             tname = tdef["name"]
-
-            # Skip VertiPaq encoding entirely for DirectQuery tables
-            if tdef.get("mode") == "directquery":
-                continue
-
             table_id = table_id_map[tname]
             part_id = partition_id_map[tname]
             rows = tdef["rows"]
@@ -2024,23 +1763,13 @@ def _modify_metadata_and_encode(
         # ============================================================
         # Create R$ system tables for each relationship
         # ============================================================
-        # Build a lookup for table modes (import vs directquery)
-        table_mode_map: dict[str, str] = {
-            t["name"]: t.get("mode", "import") for t in tables
-        }
-
         for rdef in relationships:
             # Skip relationships that weren't fully resolved
             if "_rel_id" not in rdef:
                 continue
 
-            # Skip R$ table creation for DirectQuery relationships —
-            # if either table is DirectQuery, there's no VertiPaq data to index
             from_tname = rdef["from_table"]
             to_tname = rdef["to_table"]
-            if (table_mode_map.get(from_tname) == "directquery"
-                    or table_mode_map.get(to_tname) == "directquery"):
-                continue
 
             rel_id = rdef["_rel_id"]
             rel_name = rdef["_rel_name"]
