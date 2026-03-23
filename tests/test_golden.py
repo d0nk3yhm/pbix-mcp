@@ -568,7 +568,8 @@ class TestPBIXWithData:
         meta = read_metadata_sqlite(abf)
         assert len(meta) > 0
 
-        import sqlite3, tempfile
+        import sqlite3
+        import tempfile
         tmp = tempfile.mktemp(suffix=".db")
         with open(tmp, "wb") as f:
             f.write(meta)

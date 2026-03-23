@@ -31,7 +31,6 @@ import tempfile
 import uuid
 import zipfile
 
-
 # AMO data-type codes used in metadata.sqlitedb
 _TYPE_NAME_TO_AMO = {
     "String": 2,
@@ -304,16 +303,14 @@ class PBIXBuilder:
           8. Compress to DataModel, build layout, package into PBIX ZIP
         """
         from pbix_mcp.formats.abf_rebuild import (
-            rebuild_abf_with_replacement,
-            read_metadata_sqlite,
-            list_abf_files,
             find_abf_file,
+            list_abf_files,
+            read_metadata_sqlite,
         )
         from pbix_mcp.formats.datamodel_roundtrip import (
             compress_datamodel,
             decompress_datamodel,
         )
-        from pbix_mcp.formats.vertipaq_encoder import encode_table_data
 
         # Capture builder state
         tables = self._tables
@@ -358,7 +355,7 @@ class PBIXBuilder:
         # build_abf_from_scratch function which accepts arbitrary files.
         #
         # Strategy: extract all existing ABF files, add our new ones, rebuild.
-        from pbix_mcp.formats.abf_rebuild import _ABFStructure, _rebuild_abf
+        from pbix_mcp.formats.abf_rebuild import _ABFStructure
 
         abf_struct = _ABFStructure(template_abf)
 
@@ -546,7 +543,7 @@ def _modify_metadata_and_encode(
     try:
         os.write(fd, sqlite_bytes)
         os.close(fd)
-        fd = None
+        fd = -1  # sentinel: already closed
 
         conn = sqlite3.connect(tmp_path)
         conn.row_factory = sqlite3.Row
@@ -1308,7 +1305,7 @@ def _modify_metadata_and_encode(
 
                 # Get distinct count and dict order from encoded data
                 raw_vals = [row.get(col_name) for row in rows]
-                seen = {}
+                seen: dict[object, int] = {}
                 for v in raw_vals:
                     if v is not None and v not in seen:
                         seen[v] = len(seen)  # dict_index in insertion order
@@ -1318,7 +1315,7 @@ def _modify_metadata_and_encode(
 
                 # Sort values to get POS_TO_ID mapping
                 try:
-                    sorted_vals = sorted(dict_values)
+                    sorted_vals = sorted(dict_values, key=str)
                 except TypeError:
                     sorted_vals = sorted(dict_values, key=str)
 
@@ -1640,7 +1637,7 @@ def _modify_metadata_and_encode(
             new_sqlite_bytes = f.read()
 
     finally:
-        if fd is not None:
+        if fd >= 0:
             os.close(fd)
         try:
             os.unlink(tmp_path)
@@ -1726,10 +1723,11 @@ def _rebuild_abf_with_new_files(
     """
     import xml.etree.ElementTree as ET
     from copy import deepcopy
+
     from pbix_mcp.formats.abf_rebuild import (
-        STREAM_STORAGE_SIGNATURE,
         _HEADER_PAGE_SIZE,
         _SIGNATURE_LEN,
+        STREAM_STORAGE_SIGNATURE,
         _xml_to_utf16_bytes,
     )
 

@@ -48,7 +48,7 @@ pbix-mcp-server --log-level debug
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| PBIX creation from scratch | **Stable** | Full DataModel + layout + VertiPaq row data |
+| PBIX creation from scratch | **Stable** | Arbitrary tables with row data, measures, H$ hierarchies — loads in PBI Desktop |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
 | Visual add/remove | **Stable** | Cards, charts, shapes/buttons, images, textboxes, slicers |
 | Visual property editing | **Stable** | Dot-path and full JSON |
@@ -75,6 +75,7 @@ pbix-mcp-server --log-level debug
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
 - **Import mode only** — DirectQuery files are detected on open and rejected with a clear error
+- **From-scratch tables** — currently limited to 2 distinct values per column (H$ hierarchy templates are hardcoded for this cardinality); expanding to arbitrary cardinalities is the next milestone
 
 ## Tools (60)
 
