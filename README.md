@@ -51,6 +51,8 @@ pbix-mcp-server --log-level debug
 | PBIX creation from scratch | **Stable** | Multi-table with all 6 data types, relationships, H$ hierarchies, measures — loads in PBI Desktop |
 | Cross-table relationships | **Stable** | R$ system tables with NoSplit INDEX encoding; RELATED() and cross-table filtering work |
 | Refreshable CSV sources | **Stable** | `source_csv` parameter creates M expressions referencing external CSV files; click Refresh in PBI Desktop to re-import |
+| SQLite database sources | **Stable** | `source_db` with ODBC driver; data imported at build, Refresh re-reads from DB |
+| MySQL database sources | **Beta** | `source_db` generates MySQL.Database M expression; untested (requires MySQL server) |
 | VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal, Boolean column types with correct dictionary encoding |
 | H$ attribute hierarchies | **Stable** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities; MaterializationType=0 |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
@@ -168,6 +170,31 @@ builder.add_table('Sales', [
 ```
 
 The initial data snapshot is embedded in the PBIX. When opened in Power BI Desktop, clicking **Refresh** re-imports from the CSV file. Edit the CSV → Refresh → data updates live.
+
+### Database Sources (SQLite / MySQL)
+
+Connect tables to databases so data can be refreshed from the DB:
+
+```python
+# SQLite (requires SQLite3 ODBC Driver — http://www.ch-werner.de/sqliteodbc/)
+builder.add_table('Orders', [
+    {'name': 'OrderID', 'data_type': 'Int64'},
+    {'name': 'Qty',     'data_type': 'Int64'},
+], rows=orders_data,
+   source_db={'type': 'sqlite', 'path': r'C:\Data\mydb.sqlite', 'table': 'orders'})
+
+# MySQL (built-in PBI connector, requires MySQL server)
+builder.add_table('Orders', [
+    {'name': 'OrderID', 'data_type': 'Int64'},
+    {'name': 'Qty',     'data_type': 'Int64'},
+], rows=orders_data,
+   source_db={'type': 'mysql', 'server': 'localhost', 'database': 'mydb',
+              'table': 'orders', 'port': 3306})
+```
+
+Data is **Import mode** — a snapshot is embedded in the PBIX at build time. Clicking **Refresh** in Power BI Desktop re-reads from the database. The report works offline between refreshes.
+
+> **Note:** True DirectQuery (no data stored in PBIX, live queries to DB) is not yet supported.
 
 ### Via MCP Tool
 
