@@ -646,6 +646,39 @@ def _build_m_expression(
                 "in\n"
                 "    TypedColumns"
             )
+        elif db_type == "excel":
+            file_path = source_db.get("path", "").replace("\\", "\\\\")
+            sheet = source_db.get("sheet", db_table)
+            return (
+                "let\n"
+                f'    Source = Excel.Workbook(File.Contents("{file_path}"), null, true),\n'
+                f'    Data = Source{{[Item="{sheet}",Kind="Sheet"]}}[Data],\n'
+                '    PromotedHeaders = Table.PromoteHeaders(Data, [PromoteAllScalars=true]),\n'
+                f"    TypedColumns = Table.TransformColumnTypes(PromotedHeaders, {{{transforms}}})\n"
+                "in\n"
+                "    TypedColumns"
+            )
+        elif db_type in ("json", "web", "api"):
+            url = source_db.get("url", "")
+            return (
+                "let\n"
+                f'    Source = Json.Document(Web.Contents("{url}")),\n'
+                "    Data = Table.FromRecords(Source),\n"
+                f"    TypedColumns = Table.TransformColumnTypes(Data, {{{transforms}}})\n"
+                "in\n"
+                "    TypedColumns"
+            )
+        elif db_type in ("azuresql", "azure"):
+            server = source_db.get("server", "")
+            database = source_db.get("database", "")
+            schema = source_db.get("schema", "dbo")
+            return (
+                "let\n"
+                f'    Source = Sql.Database("{server}", "{database}"),\n'
+                f'    Data = Source{{[Schema="{schema}",Item="{db_table}"]}}[Data]\n'
+                "in\n"
+                "    Data"
+            )
 
     # Default: empty typed table (data embedded in VertiPaq)
     field_defs = []

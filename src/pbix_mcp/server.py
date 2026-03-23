@@ -824,7 +824,9 @@ def pbix_create(
             - "source_csv": "/path/to/data.csv" — M expression references CSV for Refresh
             - "source_db": {"type": "sqlserver", "server": "localhost", "database": "mydb",
               "table": "orders"} — M expression references database for Refresh/DirectQuery.
-              Supported types: "sqlserver", "mysql", "sqlite"
+              Supported types: "sqlserver", "mysql", "sqlite", "postgresql",
+              "excel" (needs path+sheet), "json"/"web"/"api" (needs url),
+              "azuresql"/"azure" (same as sqlserver for Azure SQL)
             - "mode": "directquery" — live database queries (default: "import").
               DirectQuery requires source_db and a running database server.
         measures_json: Optional JSON array of measures, e.g.
