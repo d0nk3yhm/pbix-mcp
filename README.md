@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml)
 
-An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files. Exposes 60 tools covering report creation from scratch (with actual row data), layout editing, visual management, DAX evaluation, RLS security, password extraction, VertiPaq data, and binary format internals.
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files. Exposes 60 tools covering report creation from scratch (with actual row data, cross-table relationships, and DAX measures), layout editing, visual management, DAX evaluation, RLS security, password extraction, VertiPaq data, and binary format internals.
 
 ## Quick Start
 
@@ -48,7 +48,10 @@ pbix-mcp-server --log-level debug
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| PBIX creation from scratch | **Stable** | Arbitrary tables with row data, measures, H$ hierarchies — loads in PBI Desktop |
+| PBIX creation from scratch | **Stable** | Multi-table with String/Int64/Double data, relationships, H$ hierarchies, measures — loads in PBI Desktop |
+| Cross-table relationships | **Stable** | R$ system tables with NoSplit INDEX encoding; RELATED() and cross-table filtering work |
+| VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal column types with correct dictionary encoding |
+| H$ attribute hierarchies | **Stable** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities; MaterializationType=0 |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
 | Visual add/remove | **Stable** | Cards, charts, shapes/buttons, images, textboxes, slicers |
 | Visual property editing | **Stable** | Dot-path and full JSON |
@@ -60,7 +63,6 @@ pbix-mcp-server --log-level debug
 | Calculated table evaluation | **Stable** | DATATABLE, GENERATESERIES, CALENDAR, field parameters |
 | XPress9 decompress/recompress | **Stable** | Byte-exact round-trip verified |
 | ABF archive manipulation | **Stable** | List, extract, replace internal files |
-| VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal column types |
 | DataMashup (M code) editing | **Stable** | Read/write Power Query expressions |
 | File save/repack | **Stable** | Auto-backup on overwrite, SecurityBindings auto-removed |
 | Calculated column evaluation | **Beta** | Per-row DAX expression evaluation; tested with synthetic data |
@@ -75,8 +77,7 @@ pbix-mcp-server --log-level debug
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
 - **Import mode only** — DirectQuery files are detected on open and rejected with a clear error
-- **From-scratch tables** — String, Int64, and Double columns work with arbitrary cardinalities and cross-table relationships (RELATED, filtering)
-- **H$ hierarchy tables** — columns with >2 distinct values use MatType=3 (no sorted dimension browsing); full H$ NoSplit encoding is implemented but not yet wired up for arbitrary cardinalities
+- **DateTime columns** — not yet tested for from-scratch creation (Int64/Double/String are fully verified)
 
 ## Tools (60)
 
@@ -109,26 +110,72 @@ pbix-mcp-server --log-level debug
 
 ## Creating Reports from Scratch
 
-Build a complete PBIX file without Power BI Desktop:
+Build a complete multi-table PBIX with relationships and cross-table DAX — no Power BI Desktop needed:
 
+```python
+from pbix_mcp.builder import PBIXBuilder
+
+builder = PBIXBuilder()
+
+# Dimension table
+builder.add_table('Products', [
+    {'name': 'ProductID', 'data_type': 'Int64'},
+    {'name': 'Product',   'data_type': 'String'},
+    {'name': 'UnitPrice', 'data_type': 'Double'},
+], rows=[
+    {'ProductID': 1, 'Product': 'Widget A',    'UnitPrice': 29.99},
+    {'ProductID': 2, 'Product': 'Widget B',    'UnitPrice': 49.99},
+    {'ProductID': 3, 'Product': 'Gadget X',    'UnitPrice': 14.99},
+])
+
+# Fact table
+builder.add_table('Sales', [
+    {'name': 'OrderID',   'data_type': 'Int64'},
+    {'name': 'ProductID', 'data_type': 'Int64'},
+    {'name': 'Qty',       'data_type': 'Int64'},
+    {'name': 'Region',    'data_type': 'String'},
+], rows=[
+    {'OrderID': 1001, 'ProductID': 1, 'Qty': 5,  'Region': 'North'},
+    {'OrderID': 1002, 'ProductID': 2, 'Qty': 3,  'Region': 'South'},
+    {'OrderID': 1003, 'ProductID': 3, 'Qty': 20, 'Region': 'East'},
+])
+
+# Cross-table relationship
+builder.add_relationship('Sales', 'ProductID', 'Products', 'ProductID')
+
+# Measures (including cross-table RELATED)
+builder.add_measure('Sales', 'Total Qty', 'SUM(Sales[Qty])')
+builder.add_measure('Sales', 'Total Revenue',
+    'SUMX(Sales, Sales[Qty] * RELATED(Products[UnitPrice]))')
+
+builder.save('sales_report.pbix')
 ```
-> pbix_create("sales_report.pbix", "sales",
-    tables_json='[{"name": "Sales", "columns": [{"name": "Amount", "data_type": "Double"}, {"name": "Product", "data_type": "String"}]}]',
-    measures_json='[{"table": "Sales", "name": "Total Sales", "expression": "SUM(Sales[Amount])"}]')
 
-Created 'sales_report.pbix' (2,550 bytes) and opened it.
-```
+Opens in Power BI Desktop with full interactivity — slicers, cross-filtering, and all DAX measures work.
 
-Then add visuals:
+### Supported Data Types
 
-```
-> pbix_add_visual("sales", 0, "card", x=20, y=20, width=200, height=150)
-> pbix_add_visual("sales", 0, "clusteredBarChart", x=240, y=20, width=500, height=350)
-> pbix_add_visual("sales", 0, "shape", x=20, y=400, width=150, height=50)
-> pbix_save("sales")
-```
+| Type | Status | Dictionary Format |
+|------|--------|-------------------|
+| `String` | ✅ Stable | External UTF-16LE with hash table |
+| `Int64` | ✅ Stable | External 32-bit entries (IsOperatingOn32=1) |
+| `Double` | ✅ Stable | External 64-bit IEEE 754 entries |
+| `DateTime` | ⚠️ Untested | Should work (same encoding as Double) |
+| `Decimal` | ⚠️ Untested | Should work (encoded as Int64 internally) |
+| `Boolean` | ⚠️ Untested | Should work (encoded as Int64 internally) |
 
-Supported visual types: `card`, `table`, `matrix`, `slicer`, `clusteredBarChart`, `clusteredColumnChart`, `lineChart`, `areaChart`, `pieChart`, `donutChart`, `treemap`, `map`, `filledMap`, `shape` (buttons), `image`, `textbox`, `kpi`, `gauge`, `waterfallChart`, `funnel`, `scatterChart`, and any custom visual type.
+### VertiPaq Binary Format (Reverse-Engineered)
+
+The from-scratch builder implements the complete VertiPaq binary stack:
+
+- **IDF** — RLE + bit-packed hybrid encoding for data columns (XMHybridRLECompressionInfo)
+- **IDFMETA** — Segment statistics with tagged CP/CS/SS/SDOs blocks
+- **Dictionary** — Type-specific encoding (Long/Real/String) with hash tables
+- **H$ system tables** — Attribute hierarchy POS_TO_ID + ID_TO_POS using NoSplit<32> encoding
+- **R$ system tables** — Relationship join INDEX using NoSplit<N> encoding
+- **Compression class IDs** — Fully reverse-engineered from xmsrv.dll via Ghidra (u32_a/u32_b selectors)
+- **XPress9** — Byte-exact round-trip compression/decompression
+- **ABF** — Full archive manipulation with BackupLog and VirtualDirectory XML
 
 ## DAX Engine
 
@@ -216,7 +263,9 @@ PBIX file (ZIP)
 │   ├── *.tbl\*.prt\*.idf  ← VertiPaq: column data (RLE + bit-packed)
 │   ├── *.idfmeta          ← Segment statistics
 │   ├── *.dict             ← Dictionary encoding
-│   └── *.hidx             ← Hash index
+│   ├── *.hidx             ← Hash index
+│   ├── H$*.tbl\...        ← Attribute hierarchy tables (NoSplit<32>)
+│   └── R$*.tbl\...        ← Relationship index tables (NoSplit<N>)
 ├── Settings               ← JSON
 ├── Metadata               ← JSON
 └── [Content_Types].xml    ← Package manifest
@@ -237,7 +286,7 @@ src/pbix_mcp/
   formats/
     abf_rebuild.py       # ABF archive format
     datamodel_roundtrip.py  # XPress9 compress/decompress
-    vertipaq_encoder.py  # VertiPaq column encoding
+    vertipaq_encoder.py  # VertiPaq column encoding + NoSplit<N> encoder
   models/
     responses.py         # Pydantic response models
     requests.py          # Pydantic request models
