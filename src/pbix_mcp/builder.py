@@ -1360,25 +1360,7 @@ def _modify_metadata_and_encode(
                     (ah_id, col_id, ahs_id, _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
                 )
 
-                # H$ tables only supported for exactly 2 distinct values currently
-                # For other cardinalities, fall back to MatType=3 (no hierarchy)
-                if distinct != 2:
-                    c.execute(
-                        """INSERT INTO AttributeHierarchyStorage (
-                            ID, AttributeHierarchyID, SortOrder, OptimizationLevel,
-                            MaterializationType, ColumnPositionToData, ColumnDataToPosition,
-                            DistinctDataCount, DataVersion, StorageFileID,
-                            SystemTableID, HasStatistics, MinValue, MaxValue,
-                            StringValueMaxLength
-                        ) VALUES (?, ?, 0, 0,
-                            3, -1, -1,
-                            ?, 1, 0,
-                            0, 1, ?, ?, ?)""",
-                        (ahs_id, ah_id, distinct, min_val, max_val, max_strlen),
-                    )
-                    continue
-
-                # Build H$ table metadata (only for distinct==2)
+                # Build H$ table metadata for ALL cardinalities
                 h_table_name = f"H${tname} ({table_id})${col_name} ({col_id})"
                 h_table_id = alloc.next()
                 h_ts_id = alloc.next()
@@ -1464,33 +1446,48 @@ def _modify_metadata_and_encode(
                     (h_prt_folder_id, h_ps_id, h_prt_folder_path),
                 )
 
-                # --- Build H$ binary data from hardcoded templates ---
-                # For 2 distinct values, template uses:
-                #   RecordCount=5 (distinct+3), SegCount=3, RecPerSeg=2
-                #   3 segments with records: 2, 2, 1
-                h_record_count = distinct + 3  # 5 for 2 distinct
-                h_seg_count = 3
-                h_rec_per_seg = 2
+                # For empty columns (distinct==0), use MatType=3 (no H$ table)
+                if distinct == 0:
+                    c.execute(
+                        """INSERT INTO AttributeHierarchyStorage (
+                            ID, AttributeHierarchyID, SortOrder, OptimizationLevel,
+                            MaterializationType, ColumnPositionToData, ColumnDataToPosition,
+                            DistinctDataCount, DataVersion, StorageFileID,
+                            SystemTableID, HasStatistics, MinValue, MaxValue,
+                            StringValueMaxLength
+                        ) VALUES (?, ?, 0, 0,
+                            3, -1, -1,
+                            0, 1, 0,
+                            0, 1, ?, ?, ?)""",
+                        (ahs_id, ah_id, min_val, max_val, max_strlen),
+                    )
+                    continue
 
-                # Use EXACT template binary files from DateWithTransactions H$
-                # (2 distinct values, data_ids [3,4], sorted [4,3] in template)
-                # Template POS_TO_ID IDF: position 0→data_id 4, position 1→data_id 3
-                # Template ID_TO_POS IDF: corresponding inverse mapping
-                import base64
-                _H_POS_IDF_TEMPLATE = base64.b64decode("AgAAAAAAAAAEAAAAAwAAAAAAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAA==")
-                _H_POS_META_TEMPLATE = base64.b64decode("PDE6Q1AAAwAAAAAAAAA8MTpDUwACAAAAAAAAAAAAAAAAAAAAVroKAAEAAAAAAAAAPDE6U1MAAAAAAAAAAAACAAAAAgAAAAIAAAD//////////wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABTUzoxPgAAQ1M6MT4APDE6Q1MAAgAAAAAAAAAAAAAAAAAAAFa6CgABAAAAAAAAADwxOlNTAAAAAAAAAAAAAgAAAAIAAAACAAAA//////////8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAU1M6MT4AAENTOjE+ADwxOkNTAAEAAAAAAAAAAAAAAAAAAABWugoAAQAAAAAAAAA8MTpTUwAAAAAAAAAAAAIAAAACAAAAAgAAAP//////////AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFNTOjE+AABDUzoxPgBDUDoxPgA8MTpTRE9zADwxOkNTRE9zAAAAAAAAAAAAAgAAAAAAAABDU0RPczoxPgA8MTpDU0RPcwAYAAAAAAAAAAIAAAAAAAAAQ1NET3M6MT4APDE6Q1NET3MAMAAAAAAAAAABAAAAAAAAAENTRE9zOjE+AFNET3M6MT4A")
-                _H_ITP_IDF_TEMPLATE = base64.b64decode("AgAAAAAAAAAAAAAAAgAAAAAAAAAAAAAAAgAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAA==")
+                # --- Build H$ binary data using dynamic NoSplit encoding ---
+                import math as _math_h
+                h_record_count = distinct + 3
+                h_rec_per_seg = distinct
+                h_seg_count = _math_h.ceil(h_record_count / h_rec_per_seg)
+                h_rps = []
+                remaining = h_record_count
+                for _ in range(h_seg_count):
+                    seg_rec = min(h_rec_per_seg, remaining)
+                    h_rps.append(seg_rec)
+                    remaining -= seg_rec
 
-                # Use exact template bytes — sort order [4,3] is self-consistent
-                # and passes DBCC. The MDNaiveCoordCell error is separate.
-                pos_idf_bytes = bytes(_H_POS_IDF_TEMPLATE)
-                itp_idf_bytes = bytes(_H_ITP_IDF_TEMPLATE)
+                # POS_TO_ID values: sorted data_ids + padding to RecordCount
+                p2id_vals = list(pos_to_id)  # distinct sorted data_ids
+                p2id_vals.extend([2] + [0] * (h_record_count - distinct - 1))
 
-                # Use exact template IDFMETA bytes (456 bytes, identical for
-                # both POS_TO_ID and ID_TO_POS with 2 distinct values)
-                h_idfmeta_bytes = _H_POS_META_TEMPLATE
+                # ID_TO_POS values (already computed, length = h_record_count)
+                i2p_vals = list(id_to_pos_full)
 
-                # SegmentMapStorage: RecordCount=5, SegCount=3, RecPerSeg=2
+                pos_idf_bytes = encode_nosplit_idf(p2id_vals, 32, h_rps)
+                pos_meta_bytes = encode_nosplit_idfmeta(h_rps, 32, is_relationship=False)
+                itp_idf_bytes = encode_nosplit_idf(i2p_vals, 32, h_rps)
+                itp_meta_bytes = encode_nosplit_idfmeta(h_rps, 32, is_relationship=False)
+
+                # SegmentMapStorage
                 c.execute(
                     """INSERT INTO SegmentMapStorage (
                         ID, PartitionStorageID, Type, RecordCount,
@@ -1501,6 +1498,7 @@ def _modify_metadata_and_encode(
 
                 # Two H$ columns: POS_TO_ID and ID_TO_POS
                 h_idf_map = {"POS_TO_ID": pos_idf_bytes, "ID_TO_POS": itp_idf_bytes}
+                h_meta_map = {"POS_TO_ID": pos_meta_bytes, "ID_TO_POS": itp_meta_bytes}
                 for h_col_idx, (h_col_name, h_settings, h_stor_pos) in enumerate([
                     ("POS_TO_ID", 7, 0),
                     ("ID_TO_POS", 5, 1),
@@ -1611,12 +1609,12 @@ def _modify_metadata_and_encode(
                         (h_cps_id, h_cs_id, h_ps_id, h_ss_id, h_idf_file_id),
                     )
 
-                    # SegmentStorage (SegmentCount=3, matching template)
+                    # SegmentStorage
                     c.execute(
                         """INSERT INTO SegmentStorage (
                             ID, ColumnPartitionStorageID, SegmentCount, StorageFileID
-                        ) VALUES (?, ?, 3, ?)""",
-                        (h_ss_id, h_cps_id, h_meta_file_id),
+                        ) VALUES (?, ?, ?, ?)""",
+                        (h_ss_id, h_cps_id, h_seg_count, h_meta_file_id),
                     )
 
                     # StorageFile for IDF (OwnerType=23)
@@ -1642,7 +1640,7 @@ def _modify_metadata_and_encode(
                     h_abf_meta = f"{h_prt_folder_path}\\{h_meta_fname}"
 
                     vertipaq_files[h_abf_idf] = h_idf_map[h_col_name]
-                    vertipaq_files[h_abf_meta] = h_idfmeta_bytes
+                    vertipaq_files[h_abf_meta] = h_meta_map[h_col_name]
 
                 # AHS: MaterializationType=0, SystemTableID=h_table_id
                 c.execute(
