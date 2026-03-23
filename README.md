@@ -80,8 +80,8 @@ pbix-mcp-server --log-level debug
 - **PBIR format** is read-only for filter extraction; layout write requires legacy format
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
-- **DirectQuery files** — open in read-only mode (layout, measures, metadata work); data operations (table reads, DAX evaluation) return clear errors since data lives in the remote source
-- **DirectQuery** requires a running database server (SQL Server tested; MySQL/PostgreSQL may work with appropriate M expressions)
+- **Opening existing DirectQuery files** — layout, measures, and metadata editing work; DAX evaluation and table reads return clear errors since data lives in the remote source (this is inherent to DirectQuery — the data isn't in the file)
+- **Creating DirectQuery files** — fully working with SQL Server (tested with LocalDB); requires a running database server and initial data snapshot
 
 
 ## Tools (60)
