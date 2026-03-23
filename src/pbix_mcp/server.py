@@ -1460,6 +1460,228 @@ def pbix_list_resources(alias: str) -> str:
 
 
 @mcp.tool()
+def pbix_add_custom_visual(alias: str, pbiviz_path: str) -> str:
+    """Import a custom visual (.pbiviz) into the report.
+
+    Extracts the .pbiviz package, embeds the visual files into the PBIX,
+    and registers it in the layout's resourcePackages. After importing,
+    use pbix_add_visual with the returned visual_type to place it on a page.
+
+    Args:
+        alias: The alias of the open file
+        pbiviz_path: Absolute path to the .pbiviz file
+    """
+    import zipfile as _zf
+    import shutil
+
+    try:
+        info = _ensure_open(alias)
+        work_dir = info["work_dir"]
+
+        if not os.path.exists(pbiviz_path):
+            raise LayoutParseError(f"File not found: {pbiviz_path}")
+
+        # .pbiviz is a ZIP — extract and parse manifest
+        if not _zf.is_zipfile(pbiviz_path):
+            raise LayoutParseError("Not a valid .pbiviz file (not a ZIP archive)")
+
+        with _zf.ZipFile(pbiviz_path, "r") as zf:
+            names = zf.namelist()
+
+            # Find pbiviz.json or package.json for metadata
+            manifest = None
+            manifest_name = None
+            for candidate in ["pbiviz.json", "package.json"]:
+                if candidate in names:
+                    manifest_name = candidate
+                    raw = zf.read(candidate)
+                    manifest = json.loads(raw)
+                    break
+
+            if not manifest and manifest_name != "package.json":
+                # Try to find it in a subdirectory
+                for n in names:
+                    if n.endswith("pbiviz.json"):
+                        manifest_name = n
+                        raw = zf.read(n)
+                        manifest = json.loads(raw)
+                        break
+
+            if not manifest:
+                raise LayoutParseError(
+                    "No pbiviz.json or package.json found in .pbiviz file. "
+                    f"Contents: {names[:10]}"
+                )
+
+            # Extract visual metadata
+            if manifest_name and "pbiviz" in manifest_name:
+                visual_info = manifest.get("visual", {})
+                visual_guid = visual_info.get("guid", "")
+                visual_name = visual_info.get("name", "CustomVisual")
+                display_name = visual_info.get("displayName", visual_name)
+                version = visual_info.get("version", "1.0.0.0")
+                api_version = manifest.get("apiVersion", "2.6.0")
+            else:
+                # package.json fallback
+                visual_name = manifest.get("name", "CustomVisual")
+                display_name = manifest.get("displayName", visual_name)
+                visual_guid = manifest.get("guid", "")
+                version = manifest.get("version", "1.0.0.0")
+                api_version = manifest.get("apiVersion", "2.6.0")
+
+            if not visual_guid:
+                # Generate a GUID if not present
+                import uuid as _uuid
+                visual_guid = visual_name + _uuid.uuid4().hex[:32].upper()
+
+            # Create CustomVisuals directory in the PBIX work dir
+            cv_dir = os.path.join(work_dir, "Report", "CustomVisuals", visual_name)
+            os.makedirs(cv_dir, exist_ok=True)
+
+            # Extract all files into the custom visual directory
+            resource_files = []
+            for name in names:
+                # Skip directories and manifest files at root
+                if name.endswith("/"):
+                    continue
+
+                # Determine target path inside cv_dir
+                # .pbiviz files may have files at root or in resources/
+                target = os.path.join(cv_dir, name)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+
+                with zf.open(name) as src:
+                    with open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+
+                resource_files.append(name)
+
+        # Find the main JS file for registration
+        main_js = None
+        for rf in resource_files:
+            if rf.endswith(".js") and ("visual" in rf.lower() or "prod" in rf.lower()):
+                main_js = rf
+                break
+        if not main_js:
+            # Fallback: first JS file
+            for rf in resource_files:
+                if rf.endswith(".js"):
+                    main_js = rf
+                    break
+
+        # Register in layout's resourcePackages
+        layout = _get_layout(work_dir)
+        if not layout:
+            raise LayoutParseError("No layout found")
+
+        # Parse existing resourcePackages
+        resource_packages = layout.get("resourcePackages", [])
+
+        # Build resource items list
+        items = []
+        for rf in resource_files:
+            # Determine type code
+            if rf.endswith(".js"):
+                item_type = 5  # JavaScript
+            elif rf.endswith(".css"):
+                item_type = 6  # CSS
+            elif rf.endswith(".png") or rf.endswith(".svg") or rf.endswith(".jpg"):
+                item_type = 3  # Image
+            elif rf.endswith(".json"):
+                item_type = 4  # JSON config
+            else:
+                item_type = 0  # Other
+
+            items.append({
+                "type": item_type,
+                "path": f"{visual_name}/{rf}",
+                "name": os.path.splitext(os.path.basename(rf))[0],
+            })
+
+        # Check if this visual is already registered
+        existing_idx = None
+        for i, rp in enumerate(resource_packages):
+            pkg = rp.get("resourcePackage", rp)
+            if pkg.get("name") == visual_name:
+                existing_idx = i
+                break
+
+        new_package = {
+            "resourcePackage": {
+                "name": visual_name,
+                "type": 7,  # Custom visual type
+                "items": items,
+                "disabled": False,
+            }
+        }
+
+        if existing_idx is not None:
+            resource_packages[existing_idx] = new_package
+        else:
+            resource_packages.append(new_package)
+
+        layout["resourcePackages"] = resource_packages
+        _set_layout(work_dir, layout)
+        info["modified"] = True
+
+        # The visual type used in pbix_add_visual
+        visual_type = visual_guid
+
+        return ToolResponse.ok(
+            f"Custom visual '{display_name}' imported successfully!\n"
+            f"  GUID: {visual_guid}\n"
+            f"  Version: {version}\n"
+            f"  Files: {len(resource_files)} extracted to Report/CustomVisuals/{visual_name}/\n"
+            f"  Main JS: {main_js or 'N/A'}\n\n"
+            f"To place on a page, use:\n"
+            f"  pbix_add_visual(alias, page_index, visual_type=\"{visual_type}\", ...)"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
+
+
+@mcp.tool()
+def pbix_remove_custom_visual(alias: str, visual_name: str) -> str:
+    """Remove a custom visual package from the report.
+
+    Args:
+        alias: The alias of the open file
+        visual_name: Name of the custom visual (from pbix_list_resources)
+    """
+    import shutil
+
+    try:
+        info = _ensure_open(alias)
+        work_dir = info["work_dir"]
+
+        # Remove files
+        cv_dir = os.path.join(work_dir, "Report", "CustomVisuals", visual_name)
+        if os.path.isdir(cv_dir):
+            shutil.rmtree(cv_dir)
+
+        # Remove from resourcePackages
+        layout = _get_layout(work_dir)
+        if layout:
+            resource_packages = layout.get("resourcePackages", [])
+            layout["resourcePackages"] = [
+                rp for rp in resource_packages
+                if rp.get("resourcePackage", rp).get("name") != visual_name
+            ]
+            _set_layout(work_dir, layout)
+
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Custom visual '{visual_name}' removed from report."
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
+
+
+@mcp.tool()
 def pbix_get_theme(alias: str) -> str:
     """Get the current report theme JSON.
 

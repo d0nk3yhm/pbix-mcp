@@ -79,6 +79,7 @@ pbix-mcp-server --log-level debug
 | Field Parameters | **Beta** | Create slicer-driven column/measure switchers via `pbix_datamodel_add_field_parameter` |
 | Calculation Groups | **Beta** | Dynamic measure modifiers (YTD, QTD, PY) via `pbix_datamodel_add_calculation_group` |
 | TMDL Export | **Beta** | Export data model as Git-friendly TMDL text files via `pbix_export_tmdl` |
+| Custom Visuals | **Beta** | Import .pbiviz packages via `pbix_add_custom_visual`, place with `pbix_add_visual` |
 | Diagnostic tool (`pbix_doctor`) | **Beta** | 8-point health check |
 
 ## Known Limitations
