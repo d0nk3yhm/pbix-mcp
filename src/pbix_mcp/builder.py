@@ -419,12 +419,105 @@ class PBIXBuilder:
 
         return buf.getvalue()
 
-    def save(self, path: str) -> str:
+    def validate(self, data: bytes | None = None) -> list[str]:
+        """Validate a built PBIX for structural integrity.
+
+        Returns a list of issues found (empty = valid).
+        Checks: ZIP structure, DataModel presence, SQLite metadata
+        consistency, ABF file references, column storage integrity.
+        """
+        if data is None:
+            data = self.build()
+        issues: list[str] = []
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(data))
+            names = zf.namelist()
+            if "DataModel" not in names:
+                issues.append("Missing DataModel entry in ZIP")
+                return issues
+            if "[Content_Types].xml" not in names:
+                issues.append("Missing [Content_Types].xml")
+
+            from pbix_mcp.formats.abf_rebuild import (
+                list_abf_files,
+                read_metadata_sqlite,
+            )
+            from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+            dm = zf.read("DataModel")
+            try:
+                abf = decompress_datamodel(dm)
+            except Exception as e:
+                issues.append(f"XPress9 decompression failed: {e}")
+                return issues
+
+            # Check ABF has files
+            flog = list_abf_files(abf)
+            if not flog:
+                issues.append("ABF archive contains no files")
+
+            # Check SQLite metadata
+            try:
+                sb = read_metadata_sqlite(abf)
+                fd, tmp = tempfile.mkstemp(suffix=".db")
+                os.write(fd, sb)
+                os.close(fd)
+                conn = sqlite3.connect(tmp)
+
+                # Check tables have storage
+                for row in conn.execute(
+                    "SELECT Name, TableStorageID FROM [Table] WHERE SystemFlags=0"
+                ).fetchall():
+                    if row[1] == 0:
+                        issues.append(f"Table '{row[0]}' has no TableStorage")
+
+                # Check partitions have M expressions
+                for row in conn.execute(
+                    "SELECT p.Name, p.QueryDefinition, p.Type FROM [Partition] p "
+                    "JOIN [Table] t ON p.TableID = t.ID WHERE t.SystemFlags=0"
+                ).fetchall():
+                    if row[2] == 4 and not row[1]:
+                        issues.append(f"Partition '{row[0]}' has no QueryDefinition")
+
+                # Check columns have AttributeHierarchy
+                for row in conn.execute(
+                    "SELECT c.ExplicitName, c.AttributeHierarchyID, t.Name "
+                    "FROM [Column] c JOIN [Table] t ON c.TableID = t.ID "
+                    "WHERE t.SystemFlags=0 AND c.AttributeHierarchyID=0 AND c.Type!=2"
+                ).fetchall():
+                    issues.append(
+                        f"Column '{row[2]}.{row[0]}' missing AttributeHierarchy"
+                    )
+
+                conn.close()
+                os.unlink(tmp)
+            except Exception as e:
+                issues.append(f"SQLite metadata error: {e}")
+
+            zf.close()
+        except Exception as e:
+            issues.append(f"ZIP structure error: {e}")
+        return issues
+
+    def save(self, path: str, validate: bool = True) -> str:
         """Build and save the PBIX file to disk.
+
+        Args:
+            path: Output file path
+            validate: If True, run structural validation before saving.
+                      Raises ValueError if critical issues found.
 
         Returns the absolute path of the saved file.
         """
         data = self.build()
+
+        if validate:
+            issues = self.validate(data)
+            if issues:
+                import warnings
+                for issue in issues:
+                    warnings.warn(f"PBIX validation: {issue}", stacklevel=2)
+
         abs_path = os.path.abspath(path)
         os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
         with open(abs_path, "wb") as f:

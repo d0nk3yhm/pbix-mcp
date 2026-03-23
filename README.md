@@ -401,6 +401,23 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for project conventions, [SUPPORT.md](SUP
 | [`create_star_schema.py`](examples/create_star_schema.py) | Multi-relationship star schema (3 dimensions + 1 fact) |
 | [`create_all_types.py`](examples/create_all_types.py) | Demonstrate all 6 data types |
 
+## Roadmap
+
+- **TMDL (Tabular Model Definition Language)** — import/export models as human-readable TMDL files for Git-friendly version control and CI/CD pipelines
+- **PostgreSQL DirectQuery** — verify and test DirectQuery with PostgreSQL
+- **Composite models** — mixed Import + DirectQuery tables in the same report
+- **PBIR layout write** — write reports in the new PBIR format alongside legacy
+
+## Purpose & Interoperability
+
+This project is an **independent, clean-room implementation** of the Power BI `.pbix` file specification, created for the sole purpose of **interoperability** — enabling AI agents, automation tools, and non-Windows platforms to create, read, and write Power BI files.
+
+- **No Microsoft source code** was used. All binary format knowledge was derived through independent analysis of file structures and publicly observable behavior.
+- **Interoperability rights**: In both the [EU (Directive 2009/24/EC, Article 6)](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=celex%3A32009L0024) and [US (DMCA §1201(f))](https://www.law.cornell.edu/uscode/text/17/1201), reverse engineering for interoperability purposes is a protected right that supersedes contractual restrictions.
+- **Functional specification**: The binary format documentation in [`docs/vertipaq-spec.md`](docs/vertipaq-spec.md) describes functional information (data layouts, compression formats, metadata schemas) necessary for cross-platform compatibility.
+
+This project is not affiliated with, endorsed by, or associated with Microsoft Corporation. "Power BI" and "PBIX" are trademarks of Microsoft.
+
 ## License
 
 MIT
