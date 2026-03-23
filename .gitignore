@@ -27,3 +27,4 @@ test_samples/*.pbix
 test_samples/temp_dl/
 .coverage
 test_corpus/
+tools/

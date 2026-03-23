@@ -1336,7 +1336,37 @@ def _modify_metadata_and_encode(
                     if did < h_record_count_pre:
                         id_to_pos_full[did] = sorted_pos
 
-                # Build H$ table metadata
+                # Always create the AttributeHierarchy row (required for ALL columns)
+                min_val = str(sorted_vals[0]) if sorted_vals else ""
+                max_val = str(sorted_vals[-1]) if sorted_vals else ""
+                max_strlen = max((len(str(v)) for v in sorted_vals), default=0)
+                c.execute(
+                    """INSERT INTO AttributeHierarchy (
+                        ID, ColumnID, State, AttributeHierarchyStorageID,
+                        ModifiedTime, RefreshedTime
+                    ) VALUES (?, ?, 1, ?, ?, ?)""",
+                    (ah_id, col_id, ahs_id, _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
+                )
+
+                # H$ tables only supported for exactly 2 distinct values currently
+                # For other cardinalities, fall back to MatType=3 (no hierarchy)
+                if distinct != 2:
+                    c.execute(
+                        """INSERT INTO AttributeHierarchyStorage (
+                            ID, AttributeHierarchyID, SortOrder, OptimizationLevel,
+                            MaterializationType, ColumnPositionToData, ColumnDataToPosition,
+                            DistinctDataCount, DataVersion, StorageFileID,
+                            SystemTableID, HasStatistics, MinValue, MaxValue,
+                            StringValueMaxLength
+                        ) VALUES (?, ?, 0, 0,
+                            3, -1, -1,
+                            ?, 1, 0,
+                            0, 1, ?, ?, ?)""",
+                        (ahs_id, ah_id, distinct, min_val, max_val, max_strlen),
+                    )
+                    continue
+
+                # Build H$ table metadata (only for distinct==2)
                 h_table_name = f"H${tname} ({table_id})${col_name} ({col_id})"
                 h_table_id = alloc.next()
                 h_ts_id = alloc.next()
@@ -1602,21 +1632,7 @@ def _modify_metadata_and_encode(
                     vertipaq_files[h_abf_idf] = h_idf_map[h_col_name]
                     vertipaq_files[h_abf_meta] = h_idfmeta_bytes
 
-                # Now insert AttributeHierarchy and AttributeHierarchyStorage
-                # AH: State=1
-                c.execute(
-                    """INSERT INTO AttributeHierarchy (
-                        ID, ColumnID, State, AttributeHierarchyStorageID,
-                        ModifiedTime, RefreshedTime
-                    ) VALUES (?, ?, 1, ?, ?, ?)""",
-                    (ah_id, col_id, ahs_id, _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
-                )
-
                 # AHS: MaterializationType=0, SystemTableID=h_table_id
-                # Compute min/max string values for HasStatistics
-                min_val = str(sorted_vals[0]) if sorted_vals else ""
-                max_val = str(sorted_vals[-1]) if sorted_vals else ""
-                max_strlen = max((len(str(v)) for v in sorted_vals), default=0)
                 c.execute(
                     """INSERT INTO AttributeHierarchyStorage (
                         ID, AttributeHierarchyID, SortOrder, OptimizationLevel,

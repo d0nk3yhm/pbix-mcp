@@ -75,7 +75,8 @@ pbix-mcp-server --log-level debug
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
 - **Import mode only** — DirectQuery files are detected on open and rejected with a clear error
-- **From-scratch tables** — currently limited to 2 distinct values per column (H$ hierarchy templates are hardcoded for this cardinality); expanding to arbitrary cardinalities is the next milestone
+- **From-scratch tables** — String and Int64 columns work with arbitrary cardinalities; Double/DateTime columns and cross-table relationships (R$ system tables) are not yet supported
+- **Workaround for Double** — store currency as Int64 cents (e.g., 2999 instead of 29.99)
 
 ## Tools (60)
 
