@@ -55,7 +55,7 @@ pbix-mcp-server --log-level debug
 | Cross-table relationships | **Stable** | R$ system tables with NoSplit INDEX encoding; RELATED() and cross-table filtering work |
 | Refreshable CSV sources | **Stable** | `source_csv` parameter creates M expressions referencing external CSV files; click Refresh in PBI Desktop to re-import |
 | SQLite database sources | **Stable** | `source_db` with ODBC driver; data imported at build, Refresh re-reads from DB |
-| SQL Server / MySQL / PostgreSQL database sources | **Stable** | `source_db` with Import or DirectQuery; SQL Server verified with LocalDB, MySQL 9.6 and PostgreSQL 16 verified |
+| SQL Server / MySQL / PostgreSQL database sources | **Stable** | `source_db` Import for all; DirectQuery for SQL Server only. MySQL 9.6 and PostgreSQL 16 Import verified |
 | DirectQuery mode | **Stable** | `mode='directquery'` with SQL Server — live database queries, no refresh needed |
 | VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal, Boolean column types with correct dictionary encoding |
 | H$ attribute hierarchies | **Stable** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities; MaterializationType=0 |
