@@ -76,7 +76,7 @@ pbix-mcp-server --log-level debug
 - **PBIR format** is read-only for filter extraction; layout write requires legacy format
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
-- **Import mode only** — DirectQuery files are detected on open and rejected with a clear error
+- **DirectQuery files** — open in read-only mode (layout, measures, metadata work); data operations (table reads, DAX evaluation) return clear errors since data lives in the remote source
 
 
 ## Tools (60)

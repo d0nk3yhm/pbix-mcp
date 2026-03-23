@@ -379,6 +379,7 @@ def pbix_open(file_path: str, alias: str = "") -> str:
         raise InvalidPBIXError(f"Failed to extract: {e}")
 
     # Detect DirectQuery / composite models by checking for connections in DataModel
+    _dq_flag = False
     dm_path = os.path.join(work_dir, "DataModel")
     if os.path.exists(dm_path):
         try:
@@ -399,13 +400,13 @@ def pbix_open(file_path: str, alias: str = "") -> str:
             conn.close()
             os.unlink(tmp_db.name)
             if dq_partitions > 0:
-                shutil.rmtree(work_dir, ignore_errors=True)
-                return ToolResponse.error(
-                    f"This file uses DirectQuery ({dq_partitions} DirectQuery partition(s)). "
-                    "pbix-mcp only supports Import mode. DirectQuery, composite models, "
-                    "and live connections are not supported.",
-                    UnsupportedFormatError.code
-                ).to_text()
+                _dq_flag = True
+                logger.warning(
+                    "DirectQuery detected: %d DirectQuery partition(s). "
+                    "Data operations (table reads, DAX evaluation) will not work. "
+                    "Layout, measures, and metadata operations are still available.",
+                    dq_partitions,
+                )
         except Exception:
             pass  # If detection fails, continue — the file might still be usable
 
@@ -414,6 +415,7 @@ def pbix_open(file_path: str, alias: str = "") -> str:
         "work_dir": work_dir,
         "is_pbit": ext == ".pbit",
         "modified": False,
+        "is_directquery": _dq_flag,
     }
 
     # Inventory
@@ -426,7 +428,8 @@ def pbix_open(file_path: str, alias: str = "") -> str:
 
     return ToolResponse.ok(
         f"Opened '{file_path}' as '{alias}'\n"
-        f"Type: {'PBIT template' if ext == '.pbit' else 'PBIX report'}\n"
+        f"Type: {'PBIT template' if ext == '.pbit' else 'PBIX report'}"
+        f"{' ⚠️ DirectQuery detected — data operations unavailable, layout/measures/metadata OK' if _dq_flag else ''}\n"
         f"Components:\n" + "\n".join(sorted(components))
     ).to_text()
 
@@ -1520,6 +1523,12 @@ def pbix_get_table_data(alias: str, table_name: str, max_rows: int = 50) -> str:
     """
     try:
         info = _ensure_open(alias)
+        if info.get("is_directquery"):
+            return ToolResponse.error(
+                "This file uses DirectQuery — table data is not stored locally. "
+                "Use layout, measure, and metadata tools instead.",
+                UnsupportedFormatError.code,
+            ).to_text()
         from pbixray import PBIXRay
         model = PBIXRay(info["path"])
         df = model.get_table(table_name)
@@ -2512,6 +2521,14 @@ def pbix_evaluate_dax(
         filter_context: Optional JSON filter context, e.g. '{"dim-Date.Year": [2015]}'
     """
     try:
+        info = _ensure_open(alias)
+        if info.get("is_directquery"):
+            return ToolResponse.error(
+                "This file uses DirectQuery — DAX evaluation requires local data. "
+                "Use layout, measure, and metadata tools instead.",
+                UnsupportedFormatError.code,
+            ).to_text()
+
         from pbix_mcp.dax import engine as dax_engine
 
         ctx = _get_dax_context(alias)
