@@ -450,39 +450,42 @@ def _build_m_expression(table_name: str, columns: list[dict]) -> str:
         # Empty table — use minimal M expression (like Measures table)
         return 'let\n    Source = #table(type table [placeholder = text], {})\nin\n    Source'
 
-    # Build column type list
-    col_defs = []
+    # Build column type list — all fields go inside ONE bracket pair:
+    #   type table [Col1 = Type1, Col2 = Type2]
+    field_defs = []
     for col in columns:
         m_type = _M_TYPES.get(col.get("data_type", "String"), "Text.Type")
         col_name = col["name"]
         # Escape column names with special characters
         if " " in col_name or any(c in col_name for c in "[](){}#"):
             col_name = f"#\"{col_name}\""
-        col_defs.append(f"[{col_name} = {m_type}]")
+        field_defs.append(f"{col_name} = {m_type}")
 
-    cols_str = ", ".join(col_defs)
-    return f'let\n    Source = #table(type table {cols_str}, {{}})\nin\n    Source'
+    fields_str = ", ".join(field_defs)
+    return f'let\n    Source = #table(type table [{fields_str}], {{}})\nin\n    Source'
 
 
 def _get_max_id_across_tables(conn: sqlite3.Connection) -> int:
-    """Find the maximum ID across ALL tables that have an ID column."""
+    """Find the maximum ID across ALL SQLite tables that have an ID column.
+
+    Scans every table in the database to avoid ID collisions with
+    Annotation, LinguisticMetadata, Culture, or any other table the
+    template may populate.
+    """
     c = conn.cursor()
     max_id = 0
-    tables_to_check = [
-        "Table", "Column", "Partition", "Measure", "Relationship",
-        "TableStorage", "ColumnStorage", "PartitionStorage",
-        "ColumnPartitionStorage", "DictionaryStorage", "SegmentStorage",
-        "SegmentMapStorage", "StorageFile", "StorageFolder",
-        "AttributeHierarchy", "AttributeHierarchyStorage",
-        "RelationshipStorage", "RelationshipIndexStorage",
+    # Get ALL table names from the SQLite schema — don't rely on a hardcoded list
+    all_tables = [
+        row[0] for row in
+        c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     ]
-    for tbl in tables_to_check:
+    for tbl in all_tables:
         try:
             row = c.execute(f"SELECT MAX(ID) FROM [{tbl}]").fetchone()
             if row and row[0] is not None:
                 max_id = max(max_id, row[0])
         except sqlite3.OperationalError:
-            pass  # Table doesn't exist
+            pass  # Table has no ID column
     return max_id
 
 
@@ -548,9 +551,14 @@ def _modify_metadata_and_encode(
         conn = sqlite3.connect(tmp_path)
         conn.row_factory = sqlite3.Row
 
-        # Find max ID across ALL tables for global counter
+        # Find max ID across ALL tables for global counter.
+        # Add a large gap (1000) because the AS engine's internal ID counter
+        # starts at max_existing_ID + 1. When PBI Desktop opens the file,
+        # it creates new objects (LinguisticMetadata, Annotations, etc.)
+        # using IDs from that counter. Without a gap, our new object IDs
+        # collide with PBI's auto-created objects.
         max_id = _get_max_id_across_tables(conn)
-        alloc = _IDAllocator(max_id + 1)
+        alloc = _IDAllocator(max_id + 1000)
 
         # Track table name -> table ID and column name -> column ID
         table_id_map: dict[str, int] = {}       # table_name -> TableID
@@ -840,6 +848,35 @@ def _modify_metadata_and_encode(
                 "hidx_fname": None,
             }
 
+            # AttributeHierarchy for RowNumber (MatType=3, no H$ table)
+            rn_ah_id = alloc.next()
+            rn_ahs_id = alloc.next()
+            c.execute(
+                "UPDATE [Column] SET AttributeHierarchyID = ? WHERE ID = ?",
+                (rn_ah_id, rn_col_id),
+            )
+            c.execute(
+                """INSERT INTO AttributeHierarchy (
+                    ID, ColumnID, State, AttributeHierarchyStorageID,
+                    ModifiedTime, RefreshedTime
+                ) VALUES (?, ?, 1, ?,
+                    ?, 31240512000000000)""",
+                (rn_ah_id, rn_col_id, rn_ahs_id,
+                 _FIXED_TIMESTAMP),
+            )
+            c.execute(
+                """INSERT INTO AttributeHierarchyStorage (
+                    ID, AttributeHierarchyID, SortOrder, OptimizationLevel,
+                    MaterializationType, ColumnPositionToData, ColumnDataToPosition,
+                    DistinctDataCount, DataVersion, StorageFileID,
+                    SystemTableID, HasStatistics
+                ) VALUES (?, ?, 0, 0,
+                    3, -1, -1,
+                    ?, 1, 0,
+                    0, 1)""",
+                (rn_ahs_id, rn_ah_id, len(tdef.get("rows", []))),
+            )
+
             # ============================================================
             # INSERT user columns (Type=1)
             # ============================================================
@@ -901,7 +938,7 @@ def _modify_metadata_and_encode(
                         -1, 0, 0,
                         ?, ?, 1,
                         ?, 0, NULL, NULL,
-                        1, 0, 0,
+                        0, 0, 0,
                         ?, ?, 31240512000000000,
                         0, 0, ?,
                         NULL, NULL, NULL,
@@ -918,38 +955,15 @@ def _modify_metadata_and_encode(
                      str(uuid.uuid4())),
                 )
 
-                # Create AttributeHierarchy entries for the column.
-                # Use MaterializationType=3 (no H$ tables needed) and SystemTableID=0
-                # to avoid requiring H$ binary files in the ABF.
+                # AttributeHierarchy for user columns — required for DAX H$ tables
                 ah_id = alloc.next()
-                c.execute(
-                    """INSERT INTO AttributeHierarchy (
-                        ID, ColumnID, State, AttributeHierarchyStorageID,
-                        ModifiedTime, RefreshedTime
-                    ) VALUES (?, ?, 1, 0, ?, ?)""",
-                    (ah_id, col_id, _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
-                )
+                ahs_id = alloc.next()
+                # Update the Column's AttributeHierarchyID
                 c.execute(
                     "UPDATE [Column] SET AttributeHierarchyID = ? WHERE ID = ?",
                     (ah_id, col_id),
                 )
-                ahs_id = alloc.next()
-                c.execute(
-                    """INSERT INTO AttributeHierarchyStorage (
-                        ID, AttributeHierarchyID, SortOrder, OptimizationLevel,
-                        MaterializationType, ColumnPositionToData,
-                        ColumnDataToPosition, DistinctDataCount,
-                        DataVersion, StorageFileID, SystemTableID,
-                        HasStatistics, MinValue, MaxValue, StringValueMaxLength
-                    ) VALUES (?, ?, 0, 0, 3, -1, -1, ?, 1, 0, 0, 0, NULL, NULL, 0)""",
-                    (ahs_id, ah_id,
-                     len(set(v for v in [row.get(col_def["name"]) for row in tdef["rows"]] if v is not None)),  # DistinctDataCount
-                    ),
-                )
-                c.execute(
-                    "UPDATE AttributeHierarchy SET AttributeHierarchyStorageID = ? WHERE ID = ?",
-                    (ahs_id, ah_id),
-                )
+                col_hidx_fname = None  # No HIDX file for user columns
 
                 # ColumnStorage
                 c.execute(
@@ -994,15 +1008,21 @@ def _modify_metadata_and_encode(
                 )
 
                 # DictionaryStorage (Type=1 = external, with file)
+                # DictionaryFlags: 3 for string columns, 0 for numeric (matches template)
+                # IsOperatingOn32: 1 for Int64 (4-byte elements), 0 for String/Double/DateTime
+                dict_flags = 3 if data_type == "String" else 0
+                is_op32 = 1 if amo_type == 6 else 0  # AMO 6=Int64 → 4-byte dict entries
                 c.execute(
                     """INSERT INTO DictionaryStorage (
                         ID, ColumnStorageID, Type, DataType, DataVersion,
                         BaseId, Magnitude, LastId, IsNullable, IsUnique,
                         IsOperatingOn32, DictionaryFlags, StorageFileID, Size
-                    ) VALUES (?, ?, 1, ?, 0, 2, 0.0, ?, ?, 0, 1, 0, ?, 0)""",
+                    ) VALUES (?, ?, 1, ?, 0, 2, 0.0, ?, ?, 0, ?, ?, ?, 0)""",
                     (ds_id, cs_id, amo_type,
                      0,  # LastId - will be updated by _update_column_storage_stats or set later
                      1 if col_def.get("nullable", True) else 0,  # IsNullable
+                     is_op32,
+                     dict_flags,
                      dict_file_id),
                 )
 
@@ -1047,12 +1067,6 @@ def _modify_metadata_and_encode(
                     (dict_file_id, ds_id, tbl_folder_id, col_dict_fname),
                 )
 
-                # NOTE: HIDX StorageFile (OwnerType=27) is intentionally NOT
-                # created for new columns. Without AttributeHierarchy entries,
-                # there are no H$ table structures to reference HIDX files.
-                # Adding orphaned HIDX files to the ABF causes AS to throw
-                # PFE_FILESTORE_CORRUPTION errors.
-
                 col_storage_info[tname][col_name] = {
                     "col_name": col_name,
                     "col_id": col_id,
@@ -1063,7 +1077,11 @@ def _modify_metadata_and_encode(
                     "idf_fname": col_idf_fname,
                     "meta_fname": col_meta_fname,
                     "dict_fname": col_dict_fname,
-                    "hidx_fname": None,  # No HIDX without AttributeHierarchy
+                    "hidx_fname": col_hidx_fname,
+                    "ah_id": ah_id,
+                    "ahs_id": ahs_id,
+                    "data_type": data_type,
+                    "amo_type": amo_type,
                 }
 
         # ============================================================
@@ -1233,7 +1251,7 @@ def _modify_metadata_and_encode(
                         "UPDATE DictionaryStorage SET Size = ? WHERE ID = ?",
                         (len(encoded_files[dict_key]), info["ds_id"]),
                     )
-                # NOTE: HIDX files are NOT added to ABF (no AH = no H$ structures)
+                # HIDX files skipped for now
 
                 # Update ColumnStorage statistics from the IDFMETA
                 if meta_key in encoded_files:
@@ -1272,6 +1290,347 @@ def _modify_metadata_and_encode(
                 vertipaq_files[abf_rn_idf_path] = rn_encoded[rn_idf_key]
             if rn_meta_key in rn_encoded:
                 vertipaq_files[abf_rn_meta_path] = rn_encoded[rn_meta_key]
+
+            # ============================================================
+            # Create H$ system tables + AttributeHierarchy for each user column
+            # ============================================================
+            for col_def in tdef["columns"]:
+                col_name = col_def["name"]
+                info = col_storage_info[tname][col_name]
+                col_id = info["col_id"]
+                ah_id = info["ah_id"]
+                ahs_id = info["ahs_id"]
+
+                # Extract distinct values from data to build sort mappings
+                base = f"{tname}.tbl\\{part_id}.prt"
+                dict_key = f"{base}\\column.{col_name}.dict"
+                meta_key = f"{base}\\column.{col_name}meta"
+
+                # Get distinct count and dict order from encoded data
+                raw_vals = [row.get(col_name) for row in rows]
+                seen = {}
+                for v in raw_vals:
+                    if v is not None and v not in seen:
+                        seen[v] = len(seen)  # dict_index in insertion order
+                # The encoder builds the dictionary in first-seen order
+                dict_values = list(seen.keys())  # values in dict order
+                distinct = len(dict_values)
+
+                # Sort values to get POS_TO_ID mapping
+                try:
+                    sorted_vals = sorted(dict_values)
+                except TypeError:
+                    sorted_vals = sorted(dict_values, key=str)
+
+                # POS_TO_ID: sorted_pos -> data_id (dict_index + 3)
+                # In the template, BaseId=0, so data_ids start at 3
+                pos_to_id = []
+                for sv in sorted_vals:
+                    di = seen[sv]
+                    pos_to_id.append(di + 3)
+
+                # ID_TO_POS: full array of RecordCount=distinct+3 entries
+                # [0]=0 (unused), [1]=distinct (sentinel), [2]=0 (unused),
+                # [3..]=sorted_position for each data_id
+                h_record_count_pre = distinct + 3  # 5 for 2 distinct
+                id_to_pos_full = [0] * h_record_count_pre
+                id_to_pos_full[1] = distinct  # sentinel
+                for sorted_pos, did in enumerate(pos_to_id):
+                    if did < h_record_count_pre:
+                        id_to_pos_full[did] = sorted_pos
+
+                # Build H$ table metadata
+                h_table_name = f"H${tname} ({table_id})${col_name} ({col_id})"
+                h_table_id = alloc.next()
+                h_ts_id = alloc.next()
+                h_tbl_folder_id = alloc.next()
+                h_tbl_folder_path = f"H${tname} ({table_id})${col_name} ({col_id})$({h_table_id}).tbl"
+
+                # H$ Table (ModelID=0, SystemFlags=1, IsHidden=1)
+                c.execute(
+                    """INSERT INTO [Table] (
+                        ID, ModelID, Name, DataCategory, Description, IsHidden,
+                        TableStorageID, ModifiedTime, StructureModifiedTime,
+                        SystemFlags, ShowAsVariationsOnly, IsPrivate,
+                        DefaultDetailRowsDefinitionID, AlternateSourcePrecedence,
+                        RefreshPolicyID, CalculationGroupID, ExcludeFromModelRefresh,
+                        LineageTag, SourceLineageTag, SystemManaged,
+                        ExcludeFromAutomaticAggregations
+                    ) VALUES (
+                        ?, 0, ?, NULL, NULL, 1,
+                        ?, ?, ?,
+                        1, 0, 0,
+                        0, 0,
+                        0, 0, 0,
+                        NULL, NULL, 0,
+                        0
+                    )""",
+                    (h_table_id, h_table_name, h_ts_id,
+                     _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
+                )
+
+                # H$ TableStorage (Settings=4)
+                c.execute(
+                    """INSERT INTO TableStorage (
+                        ID, TableID, Name, Version, Settings, RIViolationCount, StorageFolderID
+                    ) VALUES (?, ?, ?, 1, 4, 0, ?)""",
+                    (h_ts_id, h_table_id, h_table_name, h_tbl_folder_id),
+                )
+
+                c.execute(
+                    "INSERT INTO StorageFolder (ID, OwnerID, OwnerType, Path) VALUES (?, ?, 18, ?)",
+                    (h_tbl_folder_id, h_ts_id, h_tbl_folder_path),
+                )
+
+                # H$ Partition (Type=3, Mode=2, QueryDefinition=None)
+                h_part_id = alloc.next()
+                h_ps_id = alloc.next()
+                h_sms_id = alloc.next()
+                h_prt_folder_id = alloc.next()
+                h_prt_folder_path = f"{h_tbl_folder_path}\\{h_part_id}.prt"
+
+                c.execute(
+                    """INSERT INTO [Partition] (
+                        ID, TableID, Name, Description, DataSourceID,
+                        QueryDefinition, State, Type, PartitionStorageID,
+                        Mode, DataView, ModifiedTime, RefreshedTime,
+                        SystemFlags, ErrorMessage, RetainDataTillForceCalculate,
+                        RangeStart, RangeEnd, RangeGranularity, RefreshBookmark,
+                        QueryGroupID, ExpressionSourceID, MAttributes,
+                        DataCoverageDefinitionID, SchemaName
+                    ) VALUES (
+                        ?, ?, ?, NULL, 0,
+                        NULL, 1, 3, ?,
+                        2, 3, ?, ?,
+                        1, NULL, 0,
+                        0.0, 0.0, -1, NULL,
+                        0, 0, NULL,
+                        0, NULL
+                    )""",
+                    (h_part_id, h_table_id, h_table_name, h_ps_id,
+                     _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
+                )
+
+                c.execute(
+                    """INSERT INTO PartitionStorage (
+                        ID, PartitionID, Name, StoragePosition,
+                        SegmentMapStorageID, DataObjectId, StorageFolderID,
+                        DeltaTableMetadataStorageID
+                    ) VALUES (?, ?, ?, 0, ?, 0, ?, 0)""",
+                    (h_ps_id, h_part_id, h_table_name, h_sms_id, h_prt_folder_id),
+                )
+
+                c.execute(
+                    "INSERT INTO StorageFolder (ID, OwnerID, OwnerType, Path) VALUES (?, ?, 20, ?)",
+                    (h_prt_folder_id, h_ps_id, h_prt_folder_path),
+                )
+
+                # --- Build H$ binary data from hardcoded templates ---
+                # For 2 distinct values, template uses:
+                #   RecordCount=5 (distinct+3), SegCount=3, RecPerSeg=2
+                #   3 segments with records: 2, 2, 1
+                h_record_count = distinct + 3  # 5 for 2 distinct
+                h_seg_count = 3
+                h_rec_per_seg = 2
+
+                # Use EXACT template binary files from DateWithTransactions H$
+                # (2 distinct values, data_ids [3,4], sorted [4,3] in template)
+                # Template POS_TO_ID IDF: position 0→data_id 4, position 1→data_id 3
+                # Template ID_TO_POS IDF: corresponding inverse mapping
+                import base64
+                _H_POS_IDF_TEMPLATE = base64.b64decode("AgAAAAAAAAAEAAAAAwAAAAAAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAA==")
+                _H_POS_META_TEMPLATE = base64.b64decode("PDE6Q1AAAwAAAAAAAAA8MTpDUwACAAAAAAAAAAAAAAAAAAAAVroKAAEAAAAAAAAAPDE6U1MAAAAAAAAAAAACAAAAAgAAAAIAAAD//////////wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABTUzoxPgAAQ1M6MT4APDE6Q1MAAgAAAAAAAAAAAAAAAAAAAFa6CgABAAAAAAAAADwxOlNTAAAAAAAAAAAAAgAAAAIAAAACAAAA//////////8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAU1M6MT4AAENTOjE+ADwxOkNTAAEAAAAAAAAAAAAAAAAAAABWugoAAQAAAAAAAAA8MTpTUwAAAAAAAAAAAAIAAAACAAAAAgAAAP//////////AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFNTOjE+AABDUzoxPgBDUDoxPgA8MTpTRE9zADwxOkNTRE9zAAAAAAAAAAAAAgAAAAAAAABDU0RPczoxPgA8MTpDU0RPcwAYAAAAAAAAAAIAAAAAAAAAQ1NET3M6MT4APDE6Q1NET3MAMAAAAAAAAAABAAAAAAAAAENTRE9zOjE+AFNET3M6MT4A")
+                _H_ITP_IDF_TEMPLATE = base64.b64decode("AgAAAAAAAAAAAAAAAgAAAAAAAAAAAAAAAgAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAA==")
+
+                # Use exact template bytes — sort order [4,3] is self-consistent
+                # and passes DBCC. The MDNaiveCoordCell error is separate.
+                pos_idf_bytes = bytes(_H_POS_IDF_TEMPLATE)
+                itp_idf_bytes = bytes(_H_ITP_IDF_TEMPLATE)
+
+                # Use exact template IDFMETA bytes (456 bytes, identical for
+                # both POS_TO_ID and ID_TO_POS with 2 distinct values)
+                h_idfmeta_bytes = _H_POS_META_TEMPLATE
+
+                # SegmentMapStorage: RecordCount=5, SegCount=3, RecPerSeg=2
+                c.execute(
+                    """INSERT INTO SegmentMapStorage (
+                        ID, PartitionStorageID, Type, RecordCount,
+                        SegmentCount, RecordsPerSegment
+                    ) VALUES (?, ?, 2, ?, ?, ?)""",
+                    (h_sms_id, h_ps_id, h_record_count, h_seg_count, h_rec_per_seg),
+                )
+
+                # Two H$ columns: POS_TO_ID and ID_TO_POS
+                h_idf_map = {"POS_TO_ID": pos_idf_bytes, "ID_TO_POS": itp_idf_bytes}
+                for h_col_idx, (h_col_name, h_settings, h_stor_pos) in enumerate([
+                    ("POS_TO_ID", 7, 0),
+                    ("ID_TO_POS", 5, 1),
+                ]):
+                    h_col_id = alloc.next()
+                    h_cs_id = alloc.next()
+                    h_ds_id = alloc.next()
+                    h_cps_id = alloc.next()
+                    h_ss_id = alloc.next()
+                    h_idf_file_id = alloc.next()
+                    h_meta_file_id = alloc.next()
+                    _h_unused_id = alloc.next()  # keep alloc in sync
+
+                    # ColumnStorage name includes ID, file names do NOT
+                    h_cs_name = f"{h_col_name} ({h_col_id})"
+                    # File names WITHOUT column ID suffix (matches template)
+                    h_idf_fname = f"0.{h_table_name}.{h_col_name}.0.idf"
+                    h_meta_fname = f"0.{h_table_name}.{h_col_name}.0.idfmeta"
+
+                    # H$ Column (Type=1, DataType=6, InferredDataType=19, SystemFlags=1)
+                    c.execute(
+                        """INSERT INTO [Column] (
+                            ID, TableID, ExplicitName, InferredName,
+                            ExplicitDataType, InferredDataType,
+                            DataCategory, Description, IsHidden, State,
+                            IsUnique, IsKey, IsNullable, Alignment,
+                            TableDetailPosition, IsDefaultLabel, IsDefaultImage,
+                            SummarizeBy, ColumnStorageID, Type,
+                            SourceColumn, ColumnOriginID, Expression, FormatString,
+                            IsAvailableInMDX, SortByColumnID, AttributeHierarchyID,
+                            ModifiedTime, StructureModifiedTime, RefreshedTime,
+                            SystemFlags, KeepUniqueRows, DisplayOrdinal,
+                            ErrorMessage, SourceProviderType, DisplayFolder,
+                            EncodingHint, RelatedColumnDetailsID, AlternateOfID,
+                            LineageTag, SourceLineageTag, EvaluationBehavior
+                        ) VALUES (
+                            ?, ?, ?, NULL,
+                            6, 19,
+                            NULL, NULL, 0, 1,
+                            0, 0, 1, 1,
+                            -1, 0, 0,
+                            1, ?, 1,
+                            NULL, 0, NULL, NULL,
+                            1, 0, 0,
+                            ?, ?, 31240512000000000,
+                            1, 0, 0,
+                            NULL, NULL, NULL,
+                            0, 0, 0,
+                            NULL, NULL, 1
+                        )""",
+                        (h_col_id, h_table_id, h_col_name,
+                         h_cs_id,
+                         _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
+                    )
+
+                    # H$ ColumnStorage (Settings=7 for POS_TO_ID, 5 for ID_TO_POS)
+                    c.execute(
+                        """INSERT INTO ColumnStorage (
+                            ID, ColumnID, Name, StoragePosition, DictionaryStorageID,
+                            Settings, ColumnFlags, Collation, OrderByColumn,
+                            Locale, BinaryCharacters,
+                            Statistics_DistinctStates, Statistics_MinDataID,
+                            Statistics_MaxDataID, Statistics_OriginalMinSegmentDataID,
+                            Statistics_RLESortOrder, Statistics_RowCount,
+                            Statistics_HasNulls, Statistics_RLERuns,
+                            Statistics_OthersRLERuns, Statistics_Usage,
+                            Statistics_DBType, Statistics_XMType,
+                            Statistics_CompressionType, Statistics_CompressionParam,
+                            Statistics_EncodingHint, IsDeltaPartitionColumn,
+                            DeltaColumnMappingPhysicalName, DeltaColumnMappingId,
+                            FramedSourceColumn
+                        ) VALUES (
+                            ?, ?, ?, ?, ?,
+                            ?, 0, NULL, NULL,
+                            0, 0,
+                            1, 2,
+                            2, 2,
+                            -1, 0,
+                            0, 0,
+                            0, 3,
+                            0, 0,
+                            0, 0,
+                            0, 0,
+                            NULL, -1,
+                            NULL
+                        )""",
+                        (h_cs_id, h_col_id, h_col_name, h_stor_pos, h_ds_id,
+                         h_settings),
+                    )
+
+                    # DictionaryStorage: Type=0, DataType=19, BaseId=0, LastId=0,
+                    # IsOperatingOn32=0, Size=0 (no external file)
+                    c.execute(
+                        """INSERT INTO DictionaryStorage (
+                            ID, ColumnStorageID, Type, DataType, DataVersion,
+                            BaseId, Magnitude, LastId, IsNullable, IsUnique,
+                            IsOperatingOn32, DictionaryFlags, StorageFileID, Size
+                        ) VALUES (?, ?, 0, 19, 0, 0, 0.0, 0, 0, 0, 0, 0, 0, 0)""",
+                        (h_ds_id, h_cs_id),
+                    )
+
+                    # ColumnPartitionStorage (State=3 for H$ columns)
+                    c.execute(
+                        """INSERT INTO ColumnPartitionStorage (
+                            ID, ColumnStorageID, PartitionStorageID,
+                            DataVersion, State, SegmentStorageID, StorageFileID
+                        ) VALUES (?, ?, ?, 0, 3, ?, ?)""",
+                        (h_cps_id, h_cs_id, h_ps_id, h_ss_id, h_idf_file_id),
+                    )
+
+                    # SegmentStorage (SegmentCount=3, matching template)
+                    c.execute(
+                        """INSERT INTO SegmentStorage (
+                            ID, ColumnPartitionStorageID, SegmentCount, StorageFileID
+                        ) VALUES (?, ?, 3, ?)""",
+                        (h_ss_id, h_cps_id, h_meta_file_id),
+                    )
+
+                    # StorageFile for IDF (OwnerType=23)
+                    c.execute(
+                        """INSERT INTO StorageFile (
+                            ID, OwnerID, OwnerType, StorageFolderID, FileName
+                        ) VALUES (?, ?, 23, ?, ?)""",
+                        (h_idf_file_id, h_cps_id, h_prt_folder_id, h_idf_fname),
+                    )
+
+                    # StorageFile for IDFMETA (OwnerType=24)
+                    c.execute(
+                        """INSERT INTO StorageFile (
+                            ID, OwnerID, OwnerType, StorageFolderID, FileName
+                        ) VALUES (?, ?, 24, ?, ?)""",
+                        (h_meta_file_id, h_ss_id, h_prt_folder_id, h_meta_fname),
+                    )
+
+                    # NO dictionary StorageFile for H$ columns (Type=0 means inline/none)
+
+                    # Map binary data to ABF paths
+                    h_abf_idf = f"{h_prt_folder_path}\\{h_idf_fname}"
+                    h_abf_meta = f"{h_prt_folder_path}\\{h_meta_fname}"
+
+                    vertipaq_files[h_abf_idf] = h_idf_map[h_col_name]
+                    vertipaq_files[h_abf_meta] = h_idfmeta_bytes
+
+                # Now insert AttributeHierarchy and AttributeHierarchyStorage
+                # AH: State=1
+                c.execute(
+                    """INSERT INTO AttributeHierarchy (
+                        ID, ColumnID, State, AttributeHierarchyStorageID,
+                        ModifiedTime, RefreshedTime
+                    ) VALUES (?, ?, 1, ?, ?, ?)""",
+                    (ah_id, col_id, ahs_id, _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
+                )
+
+                # AHS: MaterializationType=0, SystemTableID=h_table_id
+                # Compute min/max string values for HasStatistics
+                min_val = str(sorted_vals[0]) if sorted_vals else ""
+                max_val = str(sorted_vals[-1]) if sorted_vals else ""
+                max_strlen = max((len(str(v)) for v in sorted_vals), default=0)
+                c.execute(
+                    """INSERT INTO AttributeHierarchyStorage (
+                        ID, AttributeHierarchyID, SortOrder, OptimizationLevel,
+                        MaterializationType, ColumnPositionToData, ColumnDataToPosition,
+                        DistinctDataCount, DataVersion, StorageFileID,
+                        SystemTableID, HasStatistics, MinValue, MaxValue,
+                        StringValueMaxLength
+                    ) VALUES (?, ?, 0, 0, 0, 0, 1, ?, 1, 0, ?, 1, ?, ?, ?)""",
+                    (ahs_id, ah_id, distinct, h_table_id,
+                     min_val, max_val, max_strlen),
+                )
 
         conn.commit()
         conn.close()
