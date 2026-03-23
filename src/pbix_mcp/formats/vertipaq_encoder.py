@@ -61,6 +61,7 @@ _TYPE_NAME_TO_AMO = {
     "String":   AMO_STRING,
     "Int64":    AMO_INT64,
     "Float64":  AMO_FLOAT64,
+    "Double":   AMO_FLOAT64,
     "DateTime": AMO_DATETIME,
     "Decimal":  AMO_DECIMAL,
     "Boolean":  AMO_BOOLEAN,
@@ -181,7 +182,7 @@ def _convert_value_for_dict(value, data_type: str):
         if isinstance(value, bool):
             return 1 if value else 0
         return int(bool(value))
-    elif data_type == "Float64":
+    elif data_type in ("Float64", "Double"):
         return float(value)
     elif data_type == "DateTime":
         import datetime as _dt
@@ -209,7 +210,7 @@ def _dict_type_for_data_type(data_type: str) -> int:
     """Return the VertiPaq dictionary type code for a given data type."""
     if data_type == "String":
         return DICT_TYPE_STRING
-    elif data_type in ("Float64", "DateTime"):
+    elif data_type in ("Float64", "Double", "DateTime"):
         return DICT_TYPE_REAL
     else:
         # Int64, Boolean, Decimal all stored as int64
@@ -428,7 +429,7 @@ def _encode_hidx(unique_values: list, data_type: str) -> bytes:
     for idx, val in enumerate(unique_values):
         if data_type == "String":
             val_bytes = str(val).encode("utf-16-le")
-        elif data_type in ("Float64", "DateTime"):
+        elif data_type in ("Float64", "Double", "DateTime"):
             val_bytes = struct.pack("<d", float(val))
         else:
             val_bytes = struct.pack("<q", int(val))
@@ -1536,7 +1537,7 @@ def verify_roundtrip(columns: list[dict], rows: list[dict]) -> bool:
         d = ColumnDataDictionary(KaitaiStream(BytesIO(encoded[dict_key])))
         if data_type == "String":
             assert d.dictionary_type == ColumnDataDictionary.DictionaryTypes.xm_type_string
-        elif data_type in ("Float64", "DateTime"):
+        elif data_type in ("Float64", "Double", "DateTime"):
             assert d.dictionary_type == ColumnDataDictionary.DictionaryTypes.xm_type_real
         else:
             assert d.dictionary_type == ColumnDataDictionary.DictionaryTypes.xm_type_long
