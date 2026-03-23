@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml)
 
-An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files. Exposes 60 tools covering report creation from scratch (with all 6 data types, cross-table relationships, refreshable CSV sources, and DAX measures), layout editing, visual management, DAX evaluation, RLS security, password extraction, VertiPaq data, and binary format internals.
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required for creation**. Exposes 60 tools covering report creation from scratch (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL data sources, DirectQuery live database connections, and DAX measures), layout editing, visual management, DAX evaluation, RLS security, and binary format internals.
 
 ## Quick Start
 
@@ -173,11 +173,19 @@ builder.add_table('Sales', [
 
 The initial data snapshot is embedded in the PBIX. When opened in Power BI Desktop, clicking **Refresh** re-imports from the CSV file. Edit the CSV → Refresh → data updates live.
 
-### Database Sources (SQLite / MySQL)
+### Database Sources (SQL Server / SQLite / MySQL)
 
 Connect tables to databases so data can be refreshed from the DB:
 
 ```python
+# SQL Server (built-in PBI connector — works with LocalDB, Express, full)
+builder.add_table('Orders', [
+    {'name': 'OrderID', 'data_type': 'Int64'},
+    {'name': 'Qty',     'data_type': 'Int64'},
+], rows=orders_data,
+   source_db={'type': 'sqlserver', 'server': r'(localdb)\MSSQLLocalDB',
+              'database': 'MyDB', 'table': 'Orders'})
+
 # SQLite (requires SQLite3 ODBC Driver — http://www.ch-werner.de/sqliteodbc/)
 builder.add_table('Orders', [
     {'name': 'OrderID', 'data_type': 'Int64'},
@@ -378,7 +386,15 @@ ruff check src/ tests/
 mypy src/pbix_mcp/
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for project conventions and [SUPPORT.md](SUPPORT.md) for what counts as a bug vs unsupported behavior.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for project conventions, [SUPPORT.md](SUPPORT.md) for what counts as a bug vs unsupported behavior, and [examples/](examples/) for runnable sample scripts.
+
+## Examples
+
+| Script | What it does |
+|--------|-------------|
+| [`create_from_csv.py`](examples/create_from_csv.py) | Build a report from CSV files with Refresh support |
+| [`create_directquery.py`](examples/create_directquery.py) | Live DirectQuery report connected to SQL Server |
+| [`create_all_types.py`](examples/create_all_types.py) | Demonstrate all 6 data types (String, Int64, Double, DateTime, Decimal, Boolean) |
 
 ## License
 

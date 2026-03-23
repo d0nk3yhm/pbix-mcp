@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-03-23
+
+### Added
+- **DirectQuery mode**: `mode='directquery'` creates live database connections (SQL Server verified with LocalDB)
+- **SQL Server data source**: `source_db={'type': 'sqlserver', ...}` for Import and DirectQuery
+- **SQLite data source**: `source_db={'type': 'sqlite', ...}` with ODBC driver
+- **MySQL data source**: `source_db={'type': 'mysql', ...}` (same M pattern as SQL Server)
+- **CSV refreshable sources**: `source_csv` parameter creates M expressions for Refresh in PBI Desktop
+- **Boolean data type**: full support (IsOperatingOn32=1, 0/1 values)
+- **Decimal data type**: full support (value × 10000, IsOperatingOn32=1)
+- **NoSplit<N> encoder**: reverse-engineered binary format for R$ relationship INDEX and H$ hierarchy tables
+- **R$ relationship system tables**: cross-table RELATED() and filtering work in PBI Desktop
+- **H$ attribute hierarchy tables**: NoSplit<32> POS_TO_ID/ID_TO_POS for DAX dimension support
+- **RowNumber AttributeHierarchy**: fixes MDNaiveCoordCell::InitPrototype assertion
+- **Template neutralization**: template external file references auto-neutralized on build
+- Example scripts in `examples/` directory
+
+### Fixed
+- Compression class IDs fully reverse-engineered from xmsrv.dll via Ghidra (u32_a/u32_b selectors)
+- DictionaryStorage.IsOperatingOn32=1 for Int64/Decimal/Boolean (was causing PFE_FILESTORE_CORRUPTION)
+- Double column support: added "Double" to encoder type mappings
+- DirectQuery detection: Mode=1 (not Type=6 which is PolicyRange)
+- SMS.Type=2 for H$ tables (was 3, causing DBCC_SEGMENT_CORRUPT)
+- Zero-division error when building tables with 0 distinct values
+
 ## [0.1.0] - 2026-03-20
 
 ### Added

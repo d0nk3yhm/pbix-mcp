@@ -2,7 +2,7 @@
 
 ## DAX Engine
 
-The DAX engine is a **best-effort evaluator**, not a strict Analysis Services runtime.
+The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 204 real-world measures), not a strict Analysis Services runtime.
 
 | Behavior | What happens | Impact |
 |----------|-------------|--------|
@@ -11,33 +11,47 @@ The DAX engine is a **best-effort evaluator**, not a strict Analysis Services ru
 | Date-table detection | Heuristic: looks for column named "Date" | May pick wrong table in ambiguous models |
 | SUMX with infix arithmetic | `SUMX(T, Col1 * Col2)` returns 0 | Row-level arithmetic parsing is limited |
 | Large tables | In-memory Python, no VertiPaq compression | Performance degrades at millions of rows |
+| RANKX visual row context | Returns BLANK | 1 out of 204 tested measures affected |
 
 ## File Formats
 
 | Format | Support |
 |--------|---------|
-| .pbix (Import mode) | Full read/write |
+| .pbix (Import mode) | Full read/write/create from scratch |
 | .pbit (Template) | Full read/write |
-| DirectQuery | Not supported — detected and error returned |
-| Composite models | Not supported |
+| DirectQuery (create) | ✅ Supported — SQL Server verified, MySQL/PostgreSQL same pattern |
+| DirectQuery (open existing) | Read-only for layout/measures/metadata; DAX eval unavailable (data lives in remote source) |
+| Composite models | Not tested |
 | Live connections | Not supported |
 | PBIR layout | Read-only for filter extraction; layout write requires legacy format |
 
-## VertiPaq Write
+## Data Sources (from-scratch creation)
 
-| Column Type | Support |
-|-------------|---------|
-| String | Supported |
-| Int64 | Supported |
-| Double | Supported |
-| DateTime | Supported |
-| Decimal | Supported |
-| Boolean | Supported |
+| Source | Import Mode | DirectQuery | Notes |
+|--------|------------|-------------|-------|
+| Embedded data | ✅ | N/A | Default — data in PBIX, no external source |
+| CSV files | ✅ | N/A | `source_csv` — Refresh re-imports from CSV |
+| SQLite | ✅ | N/A | `source_db` — requires SQLite3 ODBC driver |
+| SQL Server | ✅ | ✅ | `source_db` — verified with LocalDB |
+| MySQL | ✅ | Untested | `source_db` — same M pattern as SQL Server |
+| PostgreSQL | Not yet | Not yet | Needs `PostgreSQL.Database()` M expression |
+
+## Supported Data Types
+
+| Type | Status | Dictionary Format |
+|------|--------|-------------------|
+| String | ✅ Stable | External UTF-16LE with hash table |
+| Int64 | ✅ Stable | External 32-bit entries (IsOperatingOn32=1) |
+| Double | ✅ Stable | External 64-bit IEEE 754 entries |
+| DateTime | ✅ Stable | External 64-bit entries (same encoding as Double) |
+| Decimal | ✅ Stable | External 32-bit entries (value × 10000, IsOperatingOn32=1) |
+| Boolean | ✅ Stable | External 32-bit entries (0/1, IsOperatingOn32=1) |
 
 ## Builder
 
-- `[Content_Types].xml` includes Override entries for all components
-- DataMashup is included as a minimal placeholder
+- Template-based: new tables are added alongside the template's existing `financials` table
+- Template external file references are auto-neutralized on build (prevents refresh errors)
+- H$ attribute hierarchy tables use hardcoded template bytes for 2-distinct-value columns; larger cardinalities use MatType=3 (functional but no sorted dimension browsing)
 - Power BI Desktop may need a refresh to fully index data after opening a from-scratch PBIX
 
 ## Performance
