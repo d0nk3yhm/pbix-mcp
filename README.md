@@ -56,7 +56,7 @@ pbix-mcp-server --log-level debug
 | Refreshable CSV sources | **Stable** | `source_csv` parameter creates M expressions referencing external CSV files; click Refresh in PBI Desktop to re-import |
 | SQLite database sources | **Stable** | `source_db` with ODBC driver; data imported at build, Refresh re-reads from DB |
 | SQL Server / MySQL / PostgreSQL database sources | **Stable** | `source_db` Import and DirectQuery for all. MySQL DQ uses MariaDB adapter (`type: 'mariadb'`) |
-| DirectQuery mode | **Stable** | `mode='directquery'` with SQL Server — live database queries, no refresh needed |
+| DirectQuery mode | **Stable** | `mode='directquery'` with SQL Server, PostgreSQL, and MySQL (via MariaDB) — live database queries, no refresh needed |
 | VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal, Boolean column types with correct dictionary encoding |
 | H$ attribute hierarchies | **Stable** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities; MaterializationType=0 |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
@@ -90,7 +90,7 @@ pbix-mcp-server --log-level debug
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
 - **Opening existing DirectQuery files** — layout, measures, and metadata editing work; DAX evaluation and table reads return clear errors since data lives in the remote source (this is inherent to DirectQuery — the data isn't in the file)
-- **Creating DirectQuery files** — fully working with SQL Server (tested with LocalDB); requires a running database server and initial data snapshot
+- **Creating DirectQuery files** — fully working with SQL Server (LocalDB), PostgreSQL 16, and MySQL 9.6 (via MariaDB adapter); requires a running database server and initial data snapshot
 
 
 ## Tools (69)
@@ -249,7 +249,7 @@ builder.add_table('Orders', [
 
 DirectQuery creates a PBIX with `Partition.Mode=1` and a `Sql.Database()` M expression. Power BI Desktop queries the database live — INSERT/UPDATE/DELETE in the database is reflected instantly without clicking Refresh.
 
-> **Note:** DirectQuery requires a running database server. Tested with SQL Server (including LocalDB). MySQL and PostgreSQL support Import mode with verified Refresh. The `rows` parameter provides an initial data snapshot embedded in the PBIX.
+> **Note:** DirectQuery requires a running database server. Verified with SQL Server (LocalDB), PostgreSQL 16, and MySQL 9.6 (via MariaDB adapter). All three also support Import mode with Refresh. The `rows` parameter provides an initial data snapshot embedded in the PBIX.
 
 ### Via MCP Tool
 
@@ -387,7 +387,7 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (60 tools)
+  server.py              # MCP server (69 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX file builder (create from scratch)
   errors.py              # Typed exceptions with stable error codes
