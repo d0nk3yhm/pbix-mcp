@@ -62,21 +62,27 @@ class PBIXBuilder:
         columns: list[dict],
         rows: list[dict] | None = None,
         hidden: bool = False,
+        source_csv: str | None = None,
     ) -> "PBIXBuilder":
         """Add a table definition with optional row data.
 
         Args:
             name: Table name
             columns: List of {"name": str, "data_type": str} dicts.
-                     data_type: "String", "Int64", "Double", "DateTime", "Decimal"
+                     data_type: "String", "Int64", "Double", "DateTime", "Decimal", "Boolean"
             rows: Optional list of row dicts, e.g. [{"Amount": 100, "Product": "Widget"}]
             hidden: Whether the table is hidden (e.g., measure containers)
+            source_csv: Optional absolute path to a CSV file. The M expression will
+                        reference this file, so clicking "Refresh" in PBI Desktop
+                        re-imports from the CSV. The rows parameter provides the
+                        initial data snapshot embedded in the PBIX.
         """
         self._tables.append({
             "name": name,
             "columns": columns,
             "rows": rows or [],
             "hidden": hidden,
+            "source_csv": source_csv,
         })
         return self
 
@@ -426,17 +432,23 @@ class _IDAllocator:
         return val
 
 
-def _build_m_expression(table_name: str, columns: list[dict]) -> str:
+def _build_m_expression(
+    table_name: str, columns: list[dict], source_csv: str | None = None
+) -> str:
     """Build a valid M expression for a table partition.
 
     Every partition needs a QueryDefinition — even import partitions.
     Without it, the TOM model's Partition.Source is null, causing NullRef
     at RunModelSchemaValidation.
+
+    If source_csv is provided, the M expression reads from that CSV file.
+    Clicking "Refresh" in PBI Desktop will re-import from the CSV.
     """
     # Map data types to M types
     _M_TYPES = {
         "String": "Text.Type",
         "Int64": "Int64.Type",
+        "Double": "Number.Type",
         "Float64": "Number.Type",
         "DateTime": "DateTime.Type",
         "Decimal": "Number.Type",
@@ -444,16 +456,35 @@ def _build_m_expression(table_name: str, columns: list[dict]) -> str:
     }
 
     if not columns:
-        # Empty table — use minimal M expression (like Measures table)
         return 'let\n    Source = #table(type table [placeholder = text], {})\nin\n    Source'
 
-    # Build column type list — all fields go inside ONE bracket pair:
-    #   type table [Col1 = Type1, Col2 = Type2]
+    # Build column type transforms for Csv.Document
+    col_transforms = []
+    for col in columns:
+        m_type = _M_TYPES.get(col.get("data_type", "String"), "Text.Type")
+        col_name = col["name"]
+        col_transforms.append('{"' + col_name + '", ' + m_type + "}")
+
+    if source_csv:
+        # M expression that reads from a CSV file
+        # Escape backslashes in the path for M code
+        escaped_path = source_csv.replace("\\", "\\\\")
+        transforms = ", ".join(col_transforms)
+        return (
+            "let\n"
+            f'    Source = Csv.Document(File.Contents("{escaped_path}"), '
+            f'[Delimiter=",", Encoding=65001, QuoteStyle=QuoteStyle.None]),\n'
+            '    PromotedHeaders = Table.PromoteHeaders(Source, [PromoteAllScalars=true]),\n'
+            f"    TypedColumns = Table.TransformColumnTypes(PromotedHeaders, {{{transforms}}})\n"
+            "in\n"
+            "    TypedColumns"
+        )
+
+    # Default: empty typed table (data embedded in VertiPaq)
     field_defs = []
     for col in columns:
         m_type = _M_TYPES.get(col.get("data_type", "String"), "Text.Type")
         col_name = col["name"]
-        # Escape column names with special characters
         if " " in col_name or any(c in col_name for c in "[](){}#"):
             col_name = f"#\"{col_name}\""
         field_defs.append(f"{col_name} = {m_type}")
@@ -676,7 +707,7 @@ def _modify_metadata_and_encode(
                     0, NULL
                 )""",
                 (part_id, table_id, tname,
-                 _build_m_expression(tname, tdef.get("columns", [])),
+                 _build_m_expression(tname, tdef.get("columns", []), tdef.get("source_csv")),
                  ps_id,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
             )
@@ -1975,6 +2006,22 @@ def _modify_metadata_and_encode(
                 WHERE ID = ?""",
                 (r_cs_id,),
             )
+
+        # Neutralize template partition M expressions that reference external
+        # files (e.g., financials → Financial Sample.xlsx). Replace with empty
+        # table expressions so Refresh doesn't fail on missing files.
+        # Only touch partitions from the TEMPLATE (IDs below our new ID range).
+        c = conn.cursor()
+        template_partitions = c.execute(
+            "SELECT ID, QueryDefinition FROM [Partition] WHERE QueryDefinition IS NOT NULL"
+        ).fetchall()
+        for pid, qd in template_partitions:
+            if pid < (max_id + 1000) and qd and "File.Contents" in qd:
+                # This partition references an external file — neutralize it
+                c.execute(
+                    "UPDATE [Partition] SET QueryDefinition = ? WHERE ID = ?",
+                    ('let\n    Source = #table(type table [x = text], {})\nin\n    Source', pid),
+                )
 
         conn.commit()
         conn.close()
