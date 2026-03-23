@@ -52,7 +52,8 @@ pbix-mcp-server --log-level debug
 | Cross-table relationships | **Stable** | R$ system tables with NoSplit INDEX encoding; RELATED() and cross-table filtering work |
 | Refreshable CSV sources | **Stable** | `source_csv` parameter creates M expressions referencing external CSV files; click Refresh in PBI Desktop to re-import |
 | SQLite database sources | **Stable** | `source_db` with ODBC driver; data imported at build, Refresh re-reads from DB |
-| MySQL database sources | **Beta** | `source_db` generates MySQL.Database M expression; untested (requires MySQL server) |
+| MySQL database sources (Import) | **Beta** | `source_db` generates MySQL.Database M expression; untested (requires MySQL server) |
+| DirectQuery mode | **Experimental** | `mode='directquery'` creates Type=6 partitions; fails on open due to DataMashup credential encryption — see below |
 | VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal, Boolean column types with correct dictionary encoding |
 | H$ attribute hierarchies | **Stable** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities; MaterializationType=0 |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
@@ -80,6 +81,7 @@ pbix-mcp-server --log-level debug
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
 - **DirectQuery files** — open in read-only mode (layout, measures, metadata work); data operations (table reads, DAX evaluation) return clear errors since data lives in the remote source
+- **DirectQuery creation** — `mode='directquery'` generates correct metadata (Type=6 partitions, no VertiPaq data) but fails on open because Power BI's DataMashup credential encryption is machine-specific and cannot be generated from scratch. **Use Import mode with `source_db` for database connections** — data is embedded at build time, click Refresh in PBI Desktop to re-import from DB
 
 
 ## Tools (60)
