@@ -820,8 +820,13 @@ def pbix_create(
               {"name": "Product", "data_type": "String"}],
               "rows": [{"Amount": 100.0, "Product": "Widget"}]}]'
             Supported data_type values: String, Int64, Double, DateTime, Decimal, Boolean
-            Each table can optionally include "source_csv": "/path/to/data.csv" to make
-            the table refreshable from a CSV file in Power BI Desktop.
+            Optional per-table fields:
+            - "source_csv": "/path/to/data.csv" — M expression references CSV for Refresh
+            - "source_db": {"type": "sqlserver", "server": "localhost", "database": "mydb",
+              "table": "orders"} — M expression references database for Refresh/DirectQuery.
+              Supported types: "sqlserver", "mysql", "sqlite"
+            - "mode": "directquery" — live database queries (default: "import").
+              DirectQuery requires source_db and a running database server.
         measures_json: Optional JSON array of measures, e.g.
             '[{"table": "Sales", "name": "Total", "expression": "SUM(Sales[Amount])"}]'
         relationships_json: Optional JSON array of relationships, e.g.
@@ -842,6 +847,7 @@ def pbix_create(
                     hidden=tdef.get("hidden", False),
                     source_csv=tdef.get("source_csv"),
                     source_db=tdef.get("source_db"),
+                    mode=tdef.get("mode", "import"),
                 )
 
         if measures_json:
