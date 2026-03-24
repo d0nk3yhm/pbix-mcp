@@ -68,7 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Initial release as installable Python package (`pip install -e .`)
-- 60 MCP tools for full PBIX/PBIT read/write access
+- 69 MCP tools for full PBIX/PBIT read/write access
 - `pbix_create`: build PBIX files from scratch with actual row data
 - `pbix_add_visual` / `pbix_remove_visual`: visual management
 - `pbix_get_rls_roles` / `pbix_set_rls_role` / `pbix_evaluate_rls`: Row-Level Security (beta)

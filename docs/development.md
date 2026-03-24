@@ -48,7 +48,7 @@ ruff check src/ tests/
 python -m mypy src/pbix_mcp/ --ignore-missing-imports
 ```
 
-mypy has 149 errors (CI baseline — see `.github/workflows/ci.yml`). CI fails if error count exceeds 149. Tracked for gradual cleanup.
+mypy has 156 errors (CI baseline — see `.github/workflows/ci.yml`). CI fails if error count exceeds 156. Tracked for gradual cleanup.
 
 ## Adding a New DAX Function
 

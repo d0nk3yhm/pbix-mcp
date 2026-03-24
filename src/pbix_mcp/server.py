@@ -1473,8 +1473,8 @@ def pbix_add_custom_visual(alias: str, pbiviz_path: str) -> str:
         alias: The alias of the open file
         pbiviz_path: Absolute path to the .pbiviz file
     """
-    import zipfile as _zf
     import shutil
+    import zipfile as _zf
 
     try:
         info = _ensure_open(alias)
@@ -4301,7 +4301,7 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
     culture = model_row[1] if model_row and model_row[1] else "en-US"
 
     with open(os.path.join(output_dir, "model.tmdl"), "w", encoding="utf-8") as f:
-        f.write(f"model Model\n")
+        f.write("model Model\n")
         f.write(f"\tculture: {culture}\n")
 
     # ---- tables/ ----
@@ -4319,7 +4319,7 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
         if table_desc:
             lines.append(f"\tdescription: {table_desc}")
         if is_hidden:
-            lines.append(f"\tisHidden")
+            lines.append("\tisHidden")
         lines.append("")
 
         # Columns
@@ -4356,9 +4356,9 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
             if source_col:
                 lines.append(f"\t\tsourceColumn: {source_col}")
             if is_col_hidden:
-                lines.append(f"\t\tisHidden")
+                lines.append("\t\tisHidden")
             if is_key:
-                lines.append(f"\t\tisKey")
+                lines.append("\t\tisKey")
             if fmt_str:
                 lines.append(f"\t\tformatString: {fmt_str}")
             if col_desc:
@@ -4380,7 +4380,7 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
             if m_desc:
                 lines.append(f"\t\tdescription: {m_desc}")
             if m_hidden:
-                lines.append(f"\t\tisHidden")
+                lines.append("\t\tisHidden")
             if m_folder:
                 lines.append(f"\t\tdisplayFolder: {m_folder}")
             lines.append("")
@@ -4402,7 +4402,7 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
                 else:
                     lines.append(f"\tpartition '{_tmdl_escape(p_name)}' = m")
                     lines.append(f"\t\tmode: {mode_str}")
-                lines.append(f"\t\tsource =")
+                lines.append("\t\tsource =")
                 for qline in p_query.split("\n"):
                     lines.append(f"\t\t\t{qline}")
                 lines.append("")
@@ -4433,7 +4433,7 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
             lines.append(f"\tfromColumn: '{_tmdl_escape(from_tbl)}'.'{_tmdl_escape(from_col)}'")
             lines.append(f"\ttoColumn: '{_tmdl_escape(to_tbl)}'.'{_tmdl_escape(to_col)}'")
             if not is_active:
-                lines.append(f"\tisActive: false")
+                lines.append("\tisActive: false")
             cfb_map = {0: "oneDirection", 1: "bothDirections", 2: "automatic"}
             if cross_filter in cfb_map:
                 lines.append(f"\tcrossFilteringBehavior: {cfb_map[cross_filter]}")
@@ -4517,7 +4517,7 @@ def pbix_set_incremental_refresh(
         if refresh_granularity not in _GRAN_MAP:
             raise ValueError(f"refresh_granularity must be one of {list(_GRAN_MAP.keys())}")
         if mode not in _MODE_MAP:
-            raise ValueError(f"mode must be 'import' or 'hybrid'")
+            raise ValueError("mode must be 'import' or 'hybrid'")
 
         info = _ensure_open(alias)
         dm_path = os.path.join(info["work_dir"], "DataModel")
@@ -4548,8 +4548,8 @@ def pbix_set_incremental_refresh(
                         "Expression, ModifiedTime) "
                         "VALUES (?, 1, ?, 2, ?, datetime('now'))",
                         (expr_id, param_name,
-                         f'#datetime(2020, 1, 1, 0, 0, 0) meta [IsParameterQuery=true, '
-                         f'Type="DateTime", IsParameterQueryRequired=true]')
+                         '#datetime(2020, 1, 1, 0, 0, 0) meta [IsParameterQuery=true, '
+                         'Type="DateTime", IsParameterQueryRequired=true]')
                     )
 
             # Build polling expression for change detection
@@ -4643,9 +4643,10 @@ def pbix_get_incremental_refresh(alias: str) -> str:
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
 
+        import tempfile
+
         from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
         from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
-        import tempfile
 
         with open(dm_path, "rb") as f:
             dm_bytes = f.read()
@@ -4689,7 +4690,7 @@ def pbix_get_incremental_refresh(alias: str) -> str:
             lines.append(f"    Refresh: {inc_periods} {_GRAN_NAMES.get(inc_gran, '?')}(s)")
             lines.append(f"    Mode: {_MODE_NAMES.get(pmode, '?')}")
             if polling:
-                lines.append(f"    Change detection: enabled")
+                lines.append("    Change detection: enabled")
             lines.append("")
 
         return ToolResponse.ok("\n".join(lines)).to_text()

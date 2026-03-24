@@ -6,9 +6,9 @@ matching the Power BI Analysis Services internal schema.
 No template dependency — every table is created via DDL.
 """
 
-import sqlite3
-import io
 import datetime
+import io
+import sqlite3
 
 
 def _windows_filetime_now() -> int:
@@ -168,8 +168,8 @@ def create_empty_metadata_db(
     conn.commit()
 
     # Serialize to bytes using the backup API
-    import tempfile
     import os
+    import tempfile
 
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()

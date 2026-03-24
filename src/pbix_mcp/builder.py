@@ -442,8 +442,6 @@ class PBIXBuilder:
         """
         from pbix_mcp.formats.abf_rebuild import (
             _ABFStructure,
-            find_abf_file,
-            read_metadata_sqlite,
         )
         from pbix_mcp.formats.datamodel_roundtrip import (
             compress_datamodel,

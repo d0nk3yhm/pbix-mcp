@@ -2,16 +2,12 @@
 import json
 import os
 import sqlite3
-import struct
 import tempfile
 import zipfile
 
-import pytest
-
 from pbix_mcp.builder import PBIXBuilder
+from pbix_mcp.formats.abf_rebuild import _ABFStructure, read_metadata_sqlite
 from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
-from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite, _ABFStructure
-
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "test_data")
 

@@ -20,7 +20,6 @@ from pbix_mcp.formats.abf_rebuild import (
     _xml_to_utf16_bytes,
 )
 
-
 # Fixed timestamp for reproducible builds (2025-03-01 in Windows FILETIME)
 _DEFAULT_TIMESTAMP = 133_534_961_699_396_761
 
