@@ -455,16 +455,18 @@ class PBIXBuilder:
         measures = self._measures
         relationships = self._relationships
 
-        # 1. Load template ABF and extract metadata
+        from pbix_mcp.formats.metadata_schema import create_empty_metadata_db
+
+        # 1. Create clean metadata from scratch — no template data
+        sqlite_bytes = create_empty_metadata_db()
+
+        # Load template ABF for binary structure + runtime IDs
         template_path = os.path.join(
             os.path.dirname(__file__), "templates", "minimal_datamodel.bin"
         )
         with open(template_path, "rb") as f:
             template_dm = f.read()
         template_abf = decompress_datamodel(template_dm)
-        sqlite_bytes = read_metadata_sqlite(template_abf)
-
-        # Extract runtime IDs from template IDFMETA
         template_u32_a, template_max_u32_b = _extract_template_runtime_ids(template_abf)
 
         # 2. Modify metadata and encode VertiPaq files

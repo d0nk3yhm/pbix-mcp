@@ -139,9 +139,30 @@ def create_empty_metadata_db(
          culture),
     )
 
-    # Seed DBPROPERTIES (tracks max allocated ID)
+    # Seed DBPROPERTIES — these are REQUIRED by Analysis Services
+    for prop_name, prop_val in [
+        ("MAXID", 100),
+        ("SCHEMAVERSION", 106),
+        ("LASTSCHEMAVERSION", 106),
+        ("DATABASEBLOCKINGSTATE", 0),
+        ("RESTOREABFSOURCE", 0),
+        ("DATASOURCEVERSION", 2),  # Critical: enables implicit datasource resolution
+        ("LASTCOMMITTED", ts),
+        ("LASTCUBEDATACHANGE", ts),
+        ("LASTCUBESCHEMACHANGE", ts),
+        ("LASTMETADATACHANGEFORSYNCCOMMITTED", ts),
+        ("LASTPBIPUBLICXMLACOMMITTEDTIME", 0),
+    ]:
+        c.execute(
+            "INSERT INTO DBPROPERTIES (NAME, VALUE) VALUES (?, ?)",
+            (prop_name, prop_val),
+        )
+
+    # Seed Culture (required for model initialization)
     c.execute(
-        "INSERT INTO DBPROPERTIES (NAME, VALUE) VALUES ('MAXID', 100)"
+        "INSERT INTO Culture (ID, ModelID, Name, ModifiedTime, StructureModifiedTime) "
+        "VALUES (10, 1, ?, ?, ?)",
+        (culture, ts, ts),
     )
 
     conn.commit()
