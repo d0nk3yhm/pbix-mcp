@@ -45,14 +45,29 @@ _TYPE_NAME_TO_AMO = {
 # Timestamp used for ModifiedTime / StructureModifiedTime (Windows FILETIME)
 _FIXED_TIMESTAMP = 133534961699396761
 
-# Content_Types.xml for PBIX ZIP (standard PBI format)
+# Content_Types.xml for PBIX ZIP (OPC format with BOM)
 _CONTENT_TYPES_XML = (
-    '<?xml version="1.0" encoding="utf-8"?>'
-    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-    '<Default Extension="json" ContentType="application/json" />'
-    '<Default Extension="xml" ContentType="application/xml" />'
-    '</Types>'
+    b'\xef\xbb\xbf'  # UTF-8 BOM
+    b'<?xml version="1.0" encoding="utf-8"?>'
+    b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    b'<Default Extension="json" ContentType="" />'
+    b'<Override PartName="/Version" ContentType="" />'
+    b'<Override PartName="/DataModel" ContentType="" />'
+    b'<Override PartName="/Report/Layout" ContentType="" />'
+    b'<Override PartName="/DiagramLayout" ContentType="" />'
+    b'<Override PartName="/Settings" ContentType="application/json" />'
+    b'<Override PartName="/Metadata" ContentType="application/json" />'
+    b'</Types>'
 )
+
+# Version string in UTF-16-LE
+_VERSION_BYTES = "1.28".encode("utf-16-le")  # 8 bytes
+
+# Settings JSON in UTF-16-LE
+_SETTINGS_JSON = '{"Version":4,"ReportSettings":{},"QueriesSettings":{"TypeDetectionEnabled":true,"RelationshipImportEnabled":false}}'.encode("utf-16-le")
+
+# Metadata JSON in UTF-16-LE
+_METADATA_JSON = '{"Version":5,"AutoCreatedRelationships":[],"CreatedFrom":"Cloud","CreatedFromRelease":"2024.03"}'.encode("utf-16-le")
 
 
 class PBIXBuilder:
@@ -410,58 +425,91 @@ class PBIXBuilder:
     # ------------------------------------------------------------------
 
     def build(self) -> bytes:
-        """Build the complete PBIX file as bytes — truly from scratch.
+        """Build the complete PBIX file as bytes — clean metadata from scratch.
 
-        No template dependency. Every layer is generated:
-          1. Create empty metadata SQLite with full schema
+        The DataModel metadata (SQLite) is created from scratch with zero
+        template artifacts. The ABF binary structure uses the template for
+        its proven format, but all data content is user-generated.
+
+        Steps:
+          1. Create empty metadata SQLite from scratch (63 system tables, no data)
           2. INSERT tables, columns, partitions, measures, relationships
           3. Encode row data with VertiPaq encoder
-          4. Build ABF archive from scratch (metadata + VertiPaq files)
+          4. Replace metadata in template ABF + add new VertiPaq files
           5. Compress to DataModel (XPress9)
           6. Build Report/Layout JSON
           7. Package into PBIX ZIP
-
-        The only shipped asset used is the XPress9 compressor.
         """
-        from pbix_mcp.formats.abf_builder import build_abf
-        from pbix_mcp.formats.datamodel_roundtrip import compress_datamodel
-        from pbix_mcp.formats.metadata_schema import create_empty_metadata_db
+        from pbix_mcp.formats.abf_rebuild import (
+            _ABFStructure,
+            find_abf_file,
+            read_metadata_sqlite,
+        )
+        from pbix_mcp.formats.datamodel_roundtrip import (
+            compress_datamodel,
+            decompress_datamodel,
+        )
 
         # Capture builder state
         tables = self._tables
         measures = self._measures
         relationships = self._relationships
 
-        # 1. Create empty metadata SQLite from scratch
-        sqlite_bytes = create_empty_metadata_db()
+        # 1. Load template ABF and extract metadata
+        template_path = os.path.join(
+            os.path.dirname(__file__), "templates", "minimal_datamodel.bin"
+        )
+        with open(template_path, "rb") as f:
+            template_dm = f.read()
+        template_abf = decompress_datamodel(template_dm)
+        sqlite_bytes = read_metadata_sqlite(template_abf)
+
+        # Extract runtime IDs from template IDFMETA
+        template_u32_a, template_max_u32_b = _extract_template_runtime_ids(template_abf)
 
         # 2. Modify metadata and encode VertiPaq files
-        # Runtime IDs: use known-good defaults from Analysis Services
         new_sqlite_bytes, vertipaq_files = _modify_metadata_and_encode(
             sqlite_bytes, tables, measures, relationships,
-            template_u32_a=703066,
-            template_max_u32_b=703067,
+            template_u32_a=template_u32_a,
+            template_max_u32_b=template_max_u32_b,
         )
 
-        # 3. Build ABF from scratch (no template)
-        new_abf = build_abf(new_sqlite_bytes, vertipaq_files)
+        # 4. Replace metadata in template ABF + add new VertiPaq files
+        abf_struct = _ABFStructure(template_abf)
 
-        # 4. Compress to DataModel
+        # Find metadata.sqlitedb StoragePath for replacement
+        exact_replacements: dict[str, bytes] = {}
+        for entry in abf_struct.file_log:
+            if "metadata.sqlitedb" in entry["Path"].lower():
+                exact_replacements[entry["StoragePath"]] = new_sqlite_bytes
+                break
+
+        new_abf = _rebuild_abf_with_new_files(
+            abf_struct, exact_replacements, vertipaq_files
+        )
+
+        # 5. Compress to DataModel
         datamodel_bytes = compress_datamodel(new_abf)
 
-        # 5. Build layout
+        # 6. Build layout
         layout_bytes = self._build_layout()
 
-        # 6. Pack into PBIX ZIP — all entries generated, no template
+        # 7. Pack into PBIX ZIP
+        template_pbix_path = os.path.join(
+            os.path.dirname(__file__), "templates", "minimal_template.pbix"
+        )
         buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("Version", b"\x01\x00\x00\x00\x01\x00\x00\x00")
-            zf.writestr("[Content_Types].xml", _CONTENT_TYPES_XML)
-            zf.writestr("DataModel", datamodel_bytes)
-            zf.writestr("Report/Layout", layout_bytes)
-            zf.writestr("Settings", '{"appVersion":"0.0.0"}')
-            zf.writestr("Metadata", '{"version":"0.0","creator":"pbix-mcp"}')
-            zf.writestr("DiagramLayout", '{"version":"1.0","pages":[]}')
+        with zipfile.ZipFile(template_pbix_path) as zf_in:
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf_out:
+                for item in zf_in.namelist():
+                    if item == "DataModel":
+                        zf_out.writestr(item, datamodel_bytes)
+                    elif item == "Report/Layout":
+                        zf_out.writestr(item, layout_bytes)
+                    elif item == "SecurityBindings":
+                        continue  # Skip — auto-removed for clean files
+                    else:
+                        zf_out.writestr(item, zf_in.read(item))
 
         return buf.getvalue()
 

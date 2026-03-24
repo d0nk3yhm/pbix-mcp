@@ -148,15 +148,23 @@ def build_abf(
     buf.extend(vdir_bytes)
 
     # 6. Build and patch BackupLogHeader into the header page
+    # Must include ALL fields that Analysis Services expects
+    import uuid as _uuid
     total_file_count = len(file_records) + 1  # data files + BackupLog
 
     hdr_root = ET.Element("BackupLogHeader")
+    ET.SubElement(hdr_root, "BackupRestoreSyncVersion").text = "140"
+    ET.SubElement(hdr_root, "Fault").text = "false"
+    ET.SubElement(hdr_root, "faultcode").text = "0"
+    ET.SubElement(hdr_root, "ErrorCode").text = "false"
+    ET.SubElement(hdr_root, "EncryptionFlag").text = "false"
+    ET.SubElement(hdr_root, "EncryptionKey").text = "0"
+    ET.SubElement(hdr_root, "ApplyCompression").text = "false"
     ET.SubElement(hdr_root, "m_cbOffsetHeader").text = str(vdir_offset)
     ET.SubElement(hdr_root, "DataSize").text = str(vdir_size)
-    ET.SubElement(hdr_root, "m_cbOffsetData").text = str(_HEADER_PAGE_SIZE)
-    ET.SubElement(hdr_root, "ErrorCode").text = "false"
-    ET.SubElement(hdr_root, "ApplyCompression").text = "false"
     ET.SubElement(hdr_root, "Files").text = str(total_file_count)
+    ET.SubElement(hdr_root, "ObjectID").text = str(_uuid.uuid4()).upper()
+    ET.SubElement(hdr_root, "m_cbOffsetData").text = str(_HEADER_PAGE_SIZE)
 
     hdr_bytes = _xml_to_utf16_bytes(hdr_root)
     available = _HEADER_PAGE_SIZE - _SIGNATURE_LEN

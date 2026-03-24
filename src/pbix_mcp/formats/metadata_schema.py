@@ -110,21 +110,33 @@ def create_empty_metadata_db(
         c.execute(ddl)
 
     # Seed the Model row (ID=1, required by Analysis Services)
+    # ALL integer fields must be explicitly 0, not NULL — PBI Desktop validates them
     ts = _windows_filetime_now()
     c.execute(
         """INSERT INTO [Model] (
-            ID, Name, Culture, ModifiedTime, StructureModifiedTime,
-            DefaultMode, DefaultDataView, DefaultPowerBIDataSourceVersion,
-            DataAccessOptions, DataSourceDefaultMaxConnections,
-            SourceQueryCulture, DisableAutoExists,
-            MaxParallelismPerRefresh, MaxParallelismPerQuery
+            ID, Name, Description, StorageLocation, DefaultMode, DefaultDataView,
+            Culture, Collation, ModifiedTime, StructureModifiedTime,
+            DataAccessOptions, DefaultMeasureID, DefaultPowerBIDataSourceVersion,
+            ForceUniqueNames, DiscourageImplicitMeasures, DiscourageReportMeasures,
+            DataSourceVariablesOverrideBehavior, DataSourceDefaultMaxConnections,
+            SourceQueryCulture, MAttributes, DiscourageCompositeModels,
+            AutomaticAggregationOptions, DisableAutoExists,
+            MaxParallelismPerRefresh, MaxParallelismPerQuery,
+            DisableSystemDefaultExpression, DirectLakeBehavior, ValueFilterBehavior
         ) VALUES (
-            1, ?, ?, ?, ?,
-            0, 0, 2,
-            '{"legacyRedirects": true, "returnErrorValuesAsNull": true}', 10,
-            ?, -1, -1, 0
+            1, ?, NULL, NULL, 0, 0,
+            ?, NULL, ?, ?,
+            ?, 0, 2,
+            0, 0, 0,
+            0, 10,
+            ?, NULL, 0,
+            NULL, -1,
+            -1, 0,
+            0, 0, 0
         )""",
-        (model_name, culture, ts, ts, culture),
+        (model_name, culture, ts, ts,
+         '{\n  "legacyRedirects": true,\n  "returnErrorValuesAsNull": true\n}',
+         culture),
     )
 
     # Seed DBPROPERTIES (tracks max allocated ID)
