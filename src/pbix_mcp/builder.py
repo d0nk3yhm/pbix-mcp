@@ -460,37 +460,22 @@ class PBIXBuilder:
         # 1. Create clean metadata from scratch — no template data
         sqlite_bytes = create_empty_metadata_db()
 
-        # Load template ABF for binary structure + runtime IDs
-        template_path = os.path.join(
-            os.path.dirname(__file__), "templates", "minimal_datamodel.bin"
-        )
-        with open(template_path, "rb") as f:
-            template_dm = f.read()
-        template_abf = decompress_datamodel(template_dm)
-        template_u32_a, template_max_u32_b = _extract_template_runtime_ids(template_abf)
+        # Use fixed compression class IDs (from VertiPaq RE)
+        _HYBRID_RLE = 0xABA5A
+        _XM123_CLASS = 0xABA5B
 
         # 2. Modify metadata and encode VertiPaq files
         new_sqlite_bytes, vertipaq_files = _modify_metadata_and_encode(
             sqlite_bytes, tables, measures, relationships,
-            template_u32_a=template_u32_a,
-            template_max_u32_b=template_max_u32_b,
+            template_u32_a=_HYBRID_RLE,
+            template_max_u32_b=_XM123_CLASS,
         )
 
-        # 4. Replace metadata in template ABF + add new VertiPaq files
-        abf_struct = _ABFStructure(template_abf)
+        # 3. Build ABF from scratch — ZERO template dependency
+        from pbix_mcp.formats.abf_from_scratch import build_abf
+        new_abf = build_abf(new_sqlite_bytes, vertipaq_files)
 
-        # Find metadata.sqlitedb StoragePath for replacement
-        exact_replacements: dict[str, bytes] = {}
-        for entry in abf_struct.file_log:
-            if "metadata.sqlitedb" in entry["Path"].lower():
-                exact_replacements[entry["StoragePath"]] = new_sqlite_bytes
-                break
-
-        new_abf = _rebuild_abf_with_new_files(
-            abf_struct, exact_replacements, vertipaq_files
-        )
-
-        # 5. Compress to DataModel
+        # 4. Compress to DataModel
         datamodel_bytes = compress_datamodel(new_abf)
 
         # 6. Build layout
