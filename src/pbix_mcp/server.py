@@ -807,10 +807,11 @@ def pbix_create(
     measures_json: str = "",
     relationships_json: str = "",
 ) -> str:
-    """Create a new PBIX file from scratch and open it for editing.
+    """Create a new PBIX file and open it for editing.
 
     Builds a valid PBIX with XPress9-compressed DataModel, ABF archive,
-    SQLite metadata, and report layout — every layer constructed from scratch.
+    SQLite metadata, and report layout. Metadata, VertiPaq data, and layout
+    are generated from scratch; the ABF container uses a template skeleton.
 
     Args:
         file_path: Where to save the new file (e.g. "my_report.pbix")
