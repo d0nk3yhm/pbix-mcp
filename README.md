@@ -38,6 +38,15 @@ pip install -e .
 }
 ```
 
+### Codex Desktop (OpenAI)
+
+1. `pip install git+https://github.com/d0nk3yhm/pbix-mcp.git`
+2. Open Codex Desktop → Settings ⚙️ → MCP → Add Server
+3. Configure:
+   - **Name**: `powerbi-editor`
+   - **Command**: `pbix-mcp-server`
+   - **Arguments**: *(leave empty)*
+
 ### Generic MCP (stdio)
 
 ```bash
