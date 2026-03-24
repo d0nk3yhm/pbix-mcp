@@ -10,7 +10,7 @@ pbix-mcp is an MCP (Model Context Protocol) server that provides programmatic ac
 src/pbix_mcp/
   server.py              # MCP tool definitions (69 tools)
   cli.py                 # Entry point with --log-level flag
-  builder.py             # PBIX creation from scratch
+  builder.py             # PBIX creation (metadata/data/layout from scratch; ABF skeleton from template)
   errors.py              # Typed exception hierarchy
   logging_config.py      # Structured logging (normal/debug/trace)
   dax/
@@ -44,17 +44,20 @@ src/pbix_mcp/
 3. SecurityBindings are auto-removed to prevent corruption
 4. DataModel is stored uncompressed (it's already XPress9)
 
-### Creating from Scratch
+### Creating a PBIX
 
-1. `PBIXBuilder` generates clean SQLite metadata from scratch (DATASOURCEVERSION=2) — no template data in output files
+**Generated from scratch:** metadata SQLite, VertiPaq column data, report layout JSON.
+**Template skeleton:** ABF binary container system files (db.xml, CryptKey.bin, BackupLog format), PBIX OPC wrapper files. The ABF container format has not been fully reverse-engineered for from-scratch generation — the template provides the system file structure that msmdsrv requires for database restore. The template's Financial Sample VertiPaq files remain physically present but are ignored by the clean metadata (~600KB dead weight).
+
+1. `PBIXBuilder` generates clean SQLite metadata (DATASOURCEVERSION=2) — only user-specified tables, columns, and measures
 2. Key PBI annotations are written: PBI_IsFromSource (ObjectType=7), PBI_ResultType, SummarizationSetBy, PBI_QueryOrder, __PBI_TimeIntelligenceEnabled
 3. Fixed RowNumber GUID (2662979B-1795-4F74-8F37-6A1BA8059B61) ensures stable attribute hierarchy references
-4. VertiPaq encoder writes actual row data into column segments (verified with 4 tables, 8 columns, 3 relationships)
-5. H$ attribute hierarchy tables and R$ relationship index tables are generated
+4. VertiPaq encoder writes actual row data into column segments using pure bitpack (RLE disabled — slightly less space-efficient but correct). Verified with 4 tables, 8 columns, 3 relationships
+5. H$ attribute hierarchy tables and R$ relationship index tables are generated from scratch
 6. Relationships follow PBI convention: From=Many (fact table), To=One (dimension table)
-7. ABF is built using the template ABF for binary structure (BackupLog format), then XPress9-compressed into a DataModel
-8. Report/Layout JSON is generated with a default page and visuals (table, pieChart, clusteredBarChart, card, slicer all supported)
-9. Template PBIX wrapper files are used for OPC format; everything is packaged as a valid ZIP
+7. ABF is assembled by injecting generated files into the template ABF skeleton, then XPress9-compressed into a DataModel
+8. Report/Layout JSON is generated from scratch with a default page and visuals (table, pieChart, clusteredBarChart, card, slicer all supported)
+9. Template PBIX OPC wrapper files provide the ZIP structure; everything is packaged as a valid PBIX
 10. For database sources, M expressions use `Item` key (not `Name`) for MySQL/PostgreSQL table navigation
 
 ### Data Source Support

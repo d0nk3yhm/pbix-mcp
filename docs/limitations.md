@@ -17,7 +17,7 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 
 | Format | Support |
 |--------|---------|
-| .pbix (Import mode) | Full read/write/create from scratch. Open, Refresh verified for all database types |
+| .pbix (Import mode) | Full read/write/create. Metadata/data/layout from scratch; ABF container uses template skeleton. Open, Refresh verified for all database types |
 | .pbit (Template) | Full read/write |
 | DirectQuery (create) | Open, live data, Refresh all verified — PostgreSQL (native), MySQL (MariaDB ODBC 3.1), SQL Server |
 | DirectQuery (open existing) | Read-only for layout/measures/metadata; DAX eval unavailable (data lives in remote source) |
@@ -52,15 +52,23 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 
 ## Builder
 
-- From-scratch metadata is clean: DATASOURCEVERSION=2, no template data in output SQLite — only user-specified tables, columns, and measures
-- The template ABF is still used for binary structure (BackupLog format) and template PBIX wrapper files are still used (OPC format)
-- VertiPaq encoder verified working with 4 tables, 8 columns, 3 relationships
-- Supported visuals: table, pieChart, clusteredBarChart, card, slicer
+### What is generated from scratch
+- **Metadata SQLite**: clean DATASOURCEVERSION=2 — only user-specified tables, columns, and measures, no template data
+- **VertiPaq column data**: all IDF segments, dictionaries, H$ hierarchy tables, R$ relationship tables generated independently. Verified with 4 tables, 8 columns, 3 relationships
+- **Report layout JSON**: pages, visuals, filters generated from scratch. Supported visuals: table, pieChart, clusteredBarChart, card, slicer
+
+### What uses a template skeleton
+- **ABF binary container**: the ABF container format has not been fully reverse-engineered for from-scratch generation. The template skeleton provides the system file structure (db.xml, CryptKey, BackupLog format) that msmdsrv requires for database restore
+- **Template dead weight**: the template's Financial Sample VertiPaq files are still physically present in the ABF but are ignored by the clean metadata — they add ~600KB of dead weight
+- **PBIX OPC wrapper**: template files provide the ZIP/OPC structure
+
+### Other builder notes
+- **RLE encoding disabled**: pure bitpack used for IDF segments — slightly less space-efficient but correct
 - Fixed RowNumber GUID: 2662979B-1795-4F74-8F37-6A1BA8059B61
 - Relationship direction: From=Many (fact), To=One (dimension) matching PBI convention
 - Key annotations: PBI_IsFromSource (ObjectType=7), PBI_ResultType, SummarizationSetBy, PBI_QueryOrder, __PBI_TimeIntelligenceEnabled
 - M expression navigation uses `Item` key (not `Name`) for MySQL/PostgreSQL
-- Power BI Desktop may need a refresh to fully index data after opening a from-scratch PBIX
+- Power BI Desktop may need a refresh to fully index data after opening a created PBIX
 
 ## Performance
 

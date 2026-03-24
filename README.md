@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required for creation**. Exposes 69 tools covering report creation from scratch (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery live database connections, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation, RLS security, and binary format internals. From-scratch builds produce clean metadata with no template remnants (DATASOURCEVERSION=2, clean SQLite).
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required for creation**. Exposes 69 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery live database connections, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation, RLS security, and binary format internals. The metadata SQLite, VertiPaq column data, and report layout are generated from scratch (DATASOURCEVERSION=2, clean SQLite). The ABF binary container uses a template skeleton for system files (db.xml, CryptKey.bin, BackupLog format) — see Known Limitations.
 
 ## Quick Start
 
@@ -50,7 +50,7 @@ pbix-mcp-server --log-level debug
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| PBIX creation from scratch | **Stable** | Multi-table with all 6 data types, relationships, H$ hierarchies, measures — loads in PBI Desktop |
+| PBIX creation | **Stable** | Multi-table with all 6 data types, relationships, H$ hierarchies, measures — loads in PBI Desktop. Metadata/data/layout from scratch; ABF container uses template skeleton |
 | Cross-table relationships | **Stable** | R$ system tables with NoSplit INDEX encoding; RELATED() and cross-table filtering work |
 | Refreshable CSV sources | **Stable** | `source_csv` parameter creates M expressions referencing external CSV files; click Refresh in PBI Desktop to re-import |
 | SQLite database sources | **Stable** | `source_db` with ODBC driver; data imported at build, Refresh re-reads from DB |
@@ -93,7 +93,9 @@ pbix-mcp-server --log-level debug
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
 - **Opening existing DirectQuery files** — layout, measures, and metadata editing work; DAX evaluation and table reads return clear errors since data lives in the remote source (this is inherent to DirectQuery — the data isn't in the file)
 - **Creating DirectQuery files** — fully working with SQL Server (LocalDB), PostgreSQL 16, and MySQL 9.6 (via MariaDB adapter); requires a running database server and initial data snapshot
-- **Embedded VertiPaq data** — verified working with 4 tables, 8 columns, 3 relationships. The template ABF is still used for binary structure (BackupLog format) and template PBIX wrapper files are still used (OPC format)
+- **ABF container format** — has not been fully reverse-engineered for from-scratch generation. The template skeleton provides the system file structure (db.xml, CryptKey, BackupLog format) that msmdsrv requires for database restore. The template's Financial Sample VertiPaq files are still physically present in the ABF but are ignored by the clean metadata — they add ~600KB of dead weight
+- **Embedded VertiPaq data** — verified working with 4 tables, 8 columns, 3 relationships
+- **RLE encoding** — disabled in the VertiPaq encoder (pure bitpack used). Slightly less space-efficient but correct
 
 
 ## Tools (69)
@@ -128,9 +130,9 @@ pbix-mcp-server --log-level debug
 ### Diagnostics & Security (2)
 `pbix_doctor` · `pbix_get_password`
 
-## Creating Reports from Scratch
+## Creating Reports
 
-Build a complete multi-table PBIX with relationships and cross-table DAX — no Power BI Desktop needed:
+Build a complete multi-table PBIX with relationships and cross-table DAX — no Power BI Desktop needed. Metadata, VertiPaq data, and report layout are generated from scratch; the ABF binary container uses a template skeleton for system files:
 
 ```python
 from pbix_mcp.builder import PBIXBuilder
@@ -281,16 +283,16 @@ DirectQuery creates a PBIX with `Partition.Mode=1` and a `Sql.Database()` M expr
 
 ### VertiPaq Binary Format (Reverse-Engineered)
 
-The from-scratch builder implements the complete VertiPaq binary stack:
+The builder generates VertiPaq column data from scratch. The ABF container uses a template skeleton for system files while all user data is independently generated:
 
-- **IDF** — RLE + bit-packed hybrid encoding for data columns (XMHybridRLECompressionInfo)
+- **IDF** — Bit-packed encoding for data columns (RLE disabled; pure bitpack is slightly less space-efficient but correct)
 - **IDFMETA** — Segment statistics with tagged CP/CS/SS/SDOs blocks
 - **Dictionary** — Type-specific encoding (Long/Real/String) with hash tables
 - **H$ system tables** — Attribute hierarchy POS_TO_ID + ID_TO_POS using NoSplit<32> encoding
 - **R$ system tables** — Relationship join INDEX using NoSplit<N> encoding
 - **Compression class IDs** — Fully reverse-engineered from xmsrv.dll via Ghidra (u32_a/u32_b selectors)
 - **XPress9** — Byte-exact round-trip compression/decompression
-- **ABF** — Full archive manipulation with BackupLog and VirtualDirectory XML
+- **ABF** — Archive manipulation with BackupLog and VirtualDirectory XML (uses template skeleton for system files; user data generated from scratch)
 
 ## DAX Engine
 
@@ -392,7 +394,7 @@ PBIX file (ZIP)
 src/pbix_mcp/
   server.py              # MCP server (69 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
-  builder.py             # PBIX file builder (create from scratch)
+  builder.py             # PBIX file builder (metadata/data/layout from scratch; ABF skeleton from template)
   errors.py              # Typed exceptions with stable error codes
   logging_config.py      # Diagnostic logging (normal/debug/trace)
   dax/
@@ -440,13 +442,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for project conventions, [SUPPORT.md](SUP
 
 ### Incremental vs Full Rebuild
 
-The builder currently **rebuilds the entire DataModel** from scratch each time. This is the safest approach for binary format integrity — all offsets, checksums, and cross-references are recomputed from a known-good state.
+The builder currently **rebuilds the entire DataModel** each time, generating fresh metadata SQLite and VertiPaq data within the template ABF skeleton. This is the safest approach for binary format integrity — all offsets, checksums, and cross-references are recomputed from a known-good state.
 
 For **modifying existing PBIX files** (adding a measure, changing a visual), the MCP server operates differently: it opens the file, modifies the specific layer (SQLite metadata for measures, JSON for layout), and repacks — **without touching the VertiPaq binary data**. This is true incremental editing.
 
 | Operation | Approach | Why |
 |-----------|----------|-----|
-| Create from scratch | Full build | All binary layers constructed together |
+| Create new PBIX | Full build | Metadata/data/layout from scratch; ABF skeleton from template |
 | Add/modify measure | Incremental | Only SQLite metadata modified |
 | Edit visual/layout | Incremental | Only Report/Layout JSON modified |
 | Add table to existing file | Full DataModel rebuild | VertiPaq offsets change |
@@ -454,11 +456,11 @@ For **modifying existing PBIX files** (adding a measure, changing a visual), the
 
 ### No Microsoft Dependencies
 
-This project is **100% Python** with zero Microsoft DLLs or SDKs. All binary format handling is independently implemented. The `tools/` directory (gitignored) contains local development utilities that are not part of the package.
+This project is **100% Python** with zero Microsoft DLLs or SDKs. The metadata SQLite, VertiPaq column data, and report layout are independently generated. The ABF binary container uses a template skeleton for system files that have not been fully reverse-engineered (db.xml, CryptKey.bin, BackupLog format). The `tools/` directory (gitignored) contains local development utilities that are not part of the package.
 
 ## Purpose & Interoperability
 
-This project is an **independent, clean-room implementation** of the Power BI `.pbix` file specification, created for the sole purpose of **interoperability** — enabling AI agents, automation tools, and non-Windows platforms to create, read, and write Power BI files.
+This project is an **independent implementation** of the Power BI `.pbix` file specification, created for the sole purpose of **interoperability** — enabling AI agents, automation tools, and non-Windows platforms to create, read, and write Power BI files. The metadata SQLite, VertiPaq column data, and report layout are generated from scratch. The ABF binary container uses a template skeleton for system files that have not yet been fully reverse-engineered.
 
 - **No Microsoft source code** was used. All binary format knowledge was derived through independent analysis of file structures and publicly observable behavior.
 - **Interoperability rights**: In both the [EU (Directive 2009/24/EC, Article 6)](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=celex%3A32009L0024) and [US (DMCA §1201(f))](https://www.law.cornell.edu/uscode/text/17/1201), reverse engineering for interoperability purposes is a protected right that supersedes contractual restrictions.

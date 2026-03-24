@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0] - 2026-03-24
 
 ### Added
-- **From-scratch metadata generation**: DATASOURCEVERSION=2, clean SQLite metadata with no template remnants — output files contain only user-specified tables/columns/measures
+- **From-scratch metadata generation**: DATASOURCEVERSION=2, clean SQLite metadata — output files contain only user-specified tables/columns/measures. Note: the ABF binary container still uses a template skeleton for system files (db.xml, CryptKey.bin, BackupLog format); only metadata, VertiPaq data, and layout are generated from scratch
 - **Excel data source**: `source_db={'type': 'excel', ...}` for Import mode
 - **JSON/API data source**: `source_db={'type': 'json', ...}` for Import mode from REST APIs and JSON files
 - **Azure SQL data source**: `source_db={'type': 'azuresql', ...}` for Import and DirectQuery
@@ -81,7 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Smart SELECTEDVALUE/ISFILTERED fallback for parameter-driven measures
 - VertiPaq table data read/write (String, Int64, Double, DateTime, Decimal)
 - XPress9 DataModel decompress/recompress (byte-exact round-trip)
-- ABF archive build from scratch / manipulation
+- ABF archive manipulation (template skeleton used for system files; user data injected from scratch)
 - PBIXBuilder: programmatic PBIX creation with row data
 - Pydantic response models (ToolResponse, DAXEvalResponse, DAXResult)
 - Typed exception hierarchy (errors.py with 12 exception classes)
