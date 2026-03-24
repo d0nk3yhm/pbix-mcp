@@ -1,0 +1,151 @@
+"""
+Power BI metadata SQLite schema factory — create from scratch.
+
+Generates the complete metadata.sqlitedb with all 63 system tables
+matching the Power BI Analysis Services internal schema.
+No template dependency — every table is created via DDL.
+"""
+
+import sqlite3
+import io
+import datetime
+
+
+def _windows_filetime_now() -> int:
+    """Return current time as Windows FILETIME (100ns intervals since 1601-01-01)."""
+    dt = datetime.datetime.utcnow()
+    return int(dt.timestamp() * 10_000_000) + 116_444_736_000_000_000
+
+
+# Complete DDL for all 63 Power BI metadata tables.
+# Extracted from Analysis Services internal schema via template inspection.
+_SCHEMA_DDL = [
+    'CREATE TABLE [AlternateOf]( [ID] INTEGER, [ColumnID] INTEGER, [BaseColumnID] INTEGER, [BaseTableID] INTEGER, [Summarization] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [AnalyticsAIMetadata]( [ID] INTEGER, [ModelID] INTEGER, [Name] TEXT, [MeasureAnalysisDefinition] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Annotation]( [ID] INTEGER, [ObjectID] INTEGER, [ObjectType] INTEGER, [Name] TEXT, [Value] TEXT, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [AttributeHierarchy]( [ID] INTEGER, [ColumnID] INTEGER, [State] INTEGER, [AttributeHierarchyStorageID] INTEGER, [ModifiedTime] INTEGER, [RefreshedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [AttributeHierarchyStorage]( [ID] INTEGER, [AttributeHierarchyID] INTEGER, [SortOrder] INTEGER, [OptimizationLevel] INTEGER, [MaterializationType] INTEGER, [ColumnPositionToData] INTEGER, [ColumnDataToPosition] INTEGER, [DistinctDataCount] INTEGER, [DataVersion] INTEGER, [StorageFileID] INTEGER, [SystemTableID] INTEGER, [HasStatistics] INTEGER, [MinValue] TEXT, [MaxValue] TEXT, [StringValueMaxLength] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [CalculationExpression]( [ID] INTEGER, [CalculationGroupID] INTEGER, [FormatStringDefinitionID] INTEGER, [Description] TEXT, [Expression] TEXT, [ModifiedTime] INTEGER, [State] INTEGER, [ErrorMessage] TEXT, [SelectionMode] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [CalculationGroup]( [ID] INTEGER, [TableID] INTEGER, [Description] TEXT, [ModifiedTime] INTEGER, [Precedence] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [CalculationItem]( [ID] INTEGER, [CalculationGroupID] INTEGER, [FormatStringDefinitionID] INTEGER, [Name] TEXT, [Description] TEXT, [ModifiedTime] INTEGER, [State] INTEGER, [ErrorMessage] TEXT, [Expression] TEXT, [Ordinal] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Calendar]( [ID] INTEGER, [TableID] INTEGER, [Name] TEXT, [Description] TEXT, [LineageTag] TEXT, [SourceLineageTag] TEXT, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [CalendarColumnReference]( [ID] INTEGER, [TimeUnitColumnAssociationID] INTEGER, [ColumnID] INTEGER, [IsPrimaryColumn] INTEGER, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [ChangedProperty]( [ID] INTEGER, [ObjectID] INTEGER, [ObjectType] INTEGER, [Property] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Column]( [ID] INTEGER, [TableID] INTEGER, [ExplicitName] TEXT, [InferredName] TEXT, [ExplicitDataType] INTEGER, [InferredDataType] INTEGER, [DataCategory] TEXT, [Description] TEXT, [IsHidden] INTEGER, [State] INTEGER, [IsUnique] INTEGER, [IsKey] INTEGER, [IsNullable] INTEGER, [Alignment] INTEGER, [TableDetailPosition] INTEGER, [IsDefaultLabel] INTEGER, [IsDefaultImage] INTEGER, [SummarizeBy] INTEGER, [ColumnStorageID] INTEGER, [Type] INTEGER, [SourceColumn] TEXT, [ColumnOriginID] INTEGER, [Expression] TEXT, [FormatString] TEXT, [IsAvailableInMDX] INTEGER, [SortByColumnID] INTEGER, [AttributeHierarchyID] INTEGER, [ModifiedTime] INTEGER, [StructureModifiedTime] INTEGER, [RefreshedTime] INTEGER, [SystemFlags] INTEGER, [KeepUniqueRows] INTEGER, [DisplayOrdinal] INTEGER, [ErrorMessage] TEXT, [SourceProviderType] TEXT, [DisplayFolder] TEXT, [EncodingHint] INTEGER, [RelatedColumnDetailsID] INTEGER, [AlternateOfID] INTEGER, [LineageTag] TEXT, [SourceLineageTag] TEXT, [EvaluationBehavior] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [ColumnPartitionStorage]( [ID] INTEGER, [ColumnStorageID] INTEGER, [PartitionStorageID] INTEGER, [DataVersion] INTEGER, [State] INTEGER, [SegmentStorageID] INTEGER, [StorageFileID] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [ColumnPermission]( [ID] INTEGER, [TablePermissionID] INTEGER, [ColumnID] INTEGER, [ModifiedTime] INTEGER, [MetadataPermission] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [ColumnStorage]( [ID] INTEGER, [ColumnID] INTEGER, [Name] TEXT, [StoragePosition] INTEGER, [DictionaryStorageID] INTEGER, [Settings] INTEGER, [ColumnFlags] INTEGER, [Collation] TEXT, [OrderByColumn] TEXT, [Locale] INTEGER, [BinaryCharacters] INTEGER, [Statistics_DistinctStates] INTEGER, [Statistics_MinDataID] INTEGER, [Statistics_MaxDataID] INTEGER, [Statistics_OriginalMinSegmentDataID] INTEGER, [Statistics_RLESortOrder] INTEGER, [Statistics_RowCount] INTEGER, [Statistics_HasNulls] INTEGER, [Statistics_RLERuns] INTEGER, [Statistics_OthersRLERuns] INTEGER, [Statistics_Usage] INTEGER, [Statistics_DBType] INTEGER, [Statistics_XMType] INTEGER, [Statistics_CompressionType] INTEGER, [Statistics_CompressionParam] INTEGER, [Statistics_EncodingHint] INTEGER, [IsDeltaPartitionColumn] INTEGER, [DeltaColumnMappingPhysicalName] TEXT, [DeltaColumnMappingId] INTEGER, [FramedSourceColumn] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Culture]( [ID] INTEGER, [ModelID] INTEGER, [Name] TEXT, [LinguisticMetadataID] INTEGER, [ModifiedTime] INTEGER, [StructureModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [DBPROPERTIES] ([NAME] STRING, [VALUE] INTEGER, PRIMARY KEY ([NAME] ASC))',
+    'CREATE TABLE [DataCoverageDefinition]( [ID] INTEGER, [PartitionID] INTEGER, [Description] TEXT, [Expression] TEXT, [ModifiedTime] INTEGER, [State] INTEGER, [ErrorMessage] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [DataSource]( [ID] INTEGER, [ModelID] INTEGER, [Name] TEXT, [Description] TEXT, [Type] INTEGER, [ConnectionString] TEXT, [ImpersonationMode] INTEGER, [Account] TEXT, [Password] TEXT, [MaxConnections] INTEGER, [Isolation] INTEGER, [Timeout] INTEGER, [Provider] TEXT, [ModifiedTime] INTEGER, [ConnectionDetails] TEXT, [Options] TEXT, [Credential] TEXT, [ContextExpression] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [DeltaTableMetadataStorage]( [ID] INTEGER, [PartitionStorageID] INTEGER, [TableName] TEXT, [RootLocation] TEXT, [CurrentVersion] TEXT, [TableObjectID] TEXT, [DatamartObjectID] TEXT, [FramedSchemaName] TEXT, [FallbackReason] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [DetailRowsDefinition]( [ID] INTEGER, [ObjectID] INTEGER, [ObjectType] INTEGER, [Expression] TEXT, [ModifiedTime] INTEGER, [State] INTEGER, [ErrorMessage] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [DictionaryStorage]( [ID] INTEGER, [ColumnStorageID] INTEGER, [Type] INTEGER, [DataType] INTEGER, [DataVersion] INTEGER, [BaseId] INTEGER, [Magnitude] REAL, [LastId] INTEGER, [IsNullable] INTEGER, [IsUnique] INTEGER, [IsOperatingOn32] INTEGER, [DictionaryFlags] INTEGER, [StorageFileID] INTEGER, [Size] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [ExcludedArtifact]( [ID] INTEGER, [ObjectID] INTEGER, [ObjectType] INTEGER, [ArtifactType] INTEGER, [Reference] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Expression]( [ID] INTEGER, [ModelID] INTEGER, [Name] TEXT, [Description] TEXT, [Kind] INTEGER, [Expression] TEXT, [ModifiedTime] INTEGER, [QueryGroupID] INTEGER, [ParameterValuesColumnID] INTEGER, [MAttributes] TEXT, [LineageTag] TEXT, [SourceLineageTag] TEXT, [RemoteParameterName] TEXT, [ExpressionSourceID] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [ExtendedProperty]( [ID] INTEGER, [ObjectID] INTEGER, [ObjectType] INTEGER, [Name] TEXT, [Type] INTEGER, [Value] TEXT, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [FormatStringDefinition]( [ID] INTEGER, [ObjectID] INTEGER, [ObjectType] INTEGER, [Expression] TEXT, [ModifiedTime] INTEGER, [State] INTEGER, [ErrorMessage] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [GeneralSegmentMapSegmentMetadataStorage]( [ID] INTEGER, [SegmentMapStorageID] INTEGER, [RecordCount] INTEGER, [Ordinal] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [GroupByColumn]( [ID] INTEGER, [RelatedColumnDetailsID] INTEGER, [GroupingColumnID] INTEGER, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Hierarchy]( [ID] INTEGER, [TableID] INTEGER, [Name] TEXT, [Description] TEXT, [IsHidden] INTEGER, [State] INTEGER, [HierarchyStorageID] INTEGER, [ModifiedTime] INTEGER, [StructureModifiedTime] INTEGER, [RefreshedTime] INTEGER, [DisplayFolder] TEXT, [HideMembers] INTEGER, [LineageTag] TEXT, [SourceLineageTag] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [HierarchyStorage]( [ID] INTEGER, [HierarchyID] INTEGER, [Name] TEXT, [LevelDefinition] TEXT, [MaterializationType] INTEGER, [StructureType] INTEGER, [SystemTableID] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [KPI]( [ID] INTEGER, [MeasureID] INTEGER, [Description] TEXT, [TargetDescription] TEXT, [TargetExpression] TEXT, [TargetFormatString] TEXT, [StatusGraphic] TEXT, [StatusDescription] TEXT, [StatusExpression] TEXT, [TrendGraphic] TEXT, [TrendDescription] TEXT, [TrendExpression] TEXT, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Level]( [ID] INTEGER, [HierarchyID] INTEGER, [Ordinal] INTEGER, [Name] TEXT, [Description] TEXT, [ColumnID] INTEGER, [ModifiedTime] INTEGER, [LineageTag] TEXT, [SourceLineageTag] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [LinguisticMetadata]( [ID] INTEGER, [CultureID] INTEGER, [Content] TEXT, [ModifiedTime] INTEGER, [ContentType] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Measure]( [ID] INTEGER, [TableID] INTEGER, [Name] TEXT, [Description] TEXT, [DataType] INTEGER, [Expression] TEXT, [FormatString] TEXT, [IsHidden] INTEGER, [State] INTEGER, [ModifiedTime] INTEGER, [StructureModifiedTime] INTEGER, [KPIID] INTEGER, [IsSimpleMeasure] INTEGER, [ErrorMessage] TEXT, [DisplayFolder] TEXT, [DetailRowsDefinitionID] INTEGER, [DataCategory] TEXT, [FormatStringDefinitionID] INTEGER, [LineageTag] TEXT, [SourceLineageTag] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Model]( [ID] INTEGER, [Name] TEXT, [Description] TEXT, [StorageLocation] TEXT, [DefaultMode] INTEGER, [DefaultDataView] INTEGER, [Culture] TEXT, [Collation] TEXT, [ModifiedTime] INTEGER, [StructureModifiedTime] INTEGER, [DataAccessOptions] TEXT, [DefaultMeasureID] INTEGER, [DefaultPowerBIDataSourceVersion] INTEGER, [ForceUniqueNames] INTEGER, [DiscourageImplicitMeasures] INTEGER, [DiscourageReportMeasures] INTEGER, [DataSourceVariablesOverrideBehavior] INTEGER, [DataSourceDefaultMaxConnections] INTEGER, [SourceQueryCulture] TEXT, [MAttributes] TEXT, [DiscourageCompositeModels] INTEGER, [AutomaticAggregationOptions] TEXT, [DisableAutoExists] INTEGER, [MaxParallelismPerRefresh] INTEGER, [MaxParallelismPerQuery] INTEGER, [DisableSystemDefaultExpression] INTEGER, [DirectLakeBehavior] INTEGER, [ValueFilterBehavior] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [ObjectTranslation]( [ID] INTEGER, [CultureID] INTEGER, [ObjectID] INTEGER, [ObjectType] INTEGER, [Property] INTEGER, [Value] TEXT, [ModifiedTime] INTEGER, [Altered] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [ParquetFileStorage]( [ID] INTEGER, [DeltaTableMetadataStorageID] INTEGER, [Size] INTEGER, [Location] TEXT, [CreatedVersion] TEXT, [DeletedVersion] TEXT, [RowgroupCount] INTEGER, [Ordinal] INTEGER, [ETag] TEXT, [DeletionVectorFileLocation] TEXT, [DeletionVectorBitmapOffset] INTEGER, [DeletionVectorBitmapSize] INTEGER, [DeletionVectorInlineBitmap] BLOB, [DeletionVectorFileETag] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Partition]( [ID] INTEGER, [TableID] INTEGER, [Name] TEXT, [Description] TEXT, [DataSourceID] INTEGER, [QueryDefinition] TEXT, [State] INTEGER, [Type] INTEGER, [PartitionStorageID] INTEGER, [Mode] INTEGER, [DataView] INTEGER, [ModifiedTime] INTEGER, [RefreshedTime] INTEGER, [SystemFlags] INTEGER, [ErrorMessage] TEXT, [RetainDataTillForceCalculate] INTEGER, [RangeStart] REAL, [RangeEnd] REAL, [RangeGranularity] INTEGER, [RefreshBookmark] TEXT, [QueryGroupID] INTEGER, [ExpressionSourceID] INTEGER, [MAttributes] TEXT, [DataCoverageDefinitionID] INTEGER, [SchemaName] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [PartitionStorage]( [ID] INTEGER, [PartitionID] INTEGER, [Name] TEXT, [StoragePosition] INTEGER, [SegmentMapStorageID] INTEGER, [DataObjectId] INTEGER, [StorageFolderID] INTEGER, [DeltaTableMetadataStorageID] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Perspective]( [ID] INTEGER, [ModelID] INTEGER, [Name] TEXT, [Description] TEXT, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [PerspectiveColumn]( [ID] INTEGER, [PerspectiveTableID] INTEGER, [ColumnID] INTEGER, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [PerspectiveHierarchy]( [ID] INTEGER, [PerspectiveTableID] INTEGER, [HierarchyID] INTEGER, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [PerspectiveMeasure]( [ID] INTEGER, [PerspectiveTableID] INTEGER, [MeasureID] INTEGER, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [PerspectiveSet]( [ID] INTEGER, [PerspectiveTableID] INTEGER, [SetID] INTEGER, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [PerspectiveTable]( [ID] INTEGER, [PerspectiveID] INTEGER, [TableID] INTEGER, [IncludeAll] INTEGER, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [QueryGroup]( [ID] INTEGER, [ModelID] INTEGER, [Folder] TEXT, [Description] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [RefreshPolicy]( [ID] INTEGER, [TableID] INTEGER, [PolicyType] INTEGER, [RollingWindowGranularity] INTEGER, [RollingWindowPeriods] INTEGER, [IncrementalGranularity] INTEGER, [IncrementalPeriods] INTEGER, [IncrementalPeriodsOffset] INTEGER, [PollingExpression] TEXT, [SourceExpression] TEXT, [Mode] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [RelatedColumnDetails]( [ID] INTEGER, [ColumnID] INTEGER, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Relationship]( [ID] INTEGER, [ModelID] INTEGER, [Name] TEXT, [IsActive] INTEGER, [Type] INTEGER, [CrossFilteringBehavior] INTEGER, [JoinOnDateBehavior] INTEGER, [RelyOnReferentialIntegrity] INTEGER, [FromTableID] INTEGER, [FromColumnID] INTEGER, [FromCardinality] INTEGER, [ToTableID] INTEGER, [ToColumnID] INTEGER, [ToCardinality] INTEGER, [State] INTEGER, [RelationshipStorageID] INTEGER, [RelationshipStorage2ID] INTEGER, [ModifiedTime] INTEGER, [RefreshedTime] INTEGER, [SecurityFilteringBehavior] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [RelationshipIndexStorage]( [ID] INTEGER, [RelationshipStorageID] INTEGER, [IndexType] INTEGER, [Flags] INTEGER, [RecordCount] INTEGER, [SecondaryRecordCount] INTEGER, [StorageFolderID] INTEGER, [StorageFileID] INTEGER, [SystemTableID] INTEGER, [SecondarySystemTableID] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [RelationshipStorage]( [ID] INTEGER, [RelationshipID] INTEGER, [Name] TEXT, [DefinitionType] INTEGER, [Cardinality] INTEGER, [Flags] INTEGER, [RelationshipIndexStorageID] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Role]( [ID] INTEGER, [ModelID] INTEGER, [Name] TEXT, [Description] TEXT, [ModelPermission] INTEGER, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [RoleMembership]( [ID] INTEGER, [RoleID] INTEGER, [MemberName] TEXT, [MemberID] TEXT, [IdentityProvider] TEXT, [MemberType] INTEGER, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [SegmentMapStorage]( [ID] INTEGER, [PartitionStorageID] INTEGER, [Type] INTEGER, [RecordCount] INTEGER, [SegmentCount] INTEGER, [RecordsPerSegment] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [SegmentStorage]( [ID] INTEGER, [ColumnPartitionStorageID] INTEGER, [SegmentCount] INTEGER, [StorageFileID] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Set]( [ID] INTEGER, [TableID] INTEGER, [Name] TEXT, [Description] TEXT, [Expression] TEXT, [IsDynamic] INTEGER, [IsHidden] INTEGER, [State] INTEGER, [ModifiedTime] INTEGER, [StructureModifiedTime] INTEGER, [ErrorMessage] TEXT, [DisplayFolder] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [StorageFile]( [ID] INTEGER, [OwnerID] INTEGER, [OwnerType] INTEGER, [StorageFolderID] INTEGER, [FileName] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [StorageFolder]( [ID] INTEGER, [OwnerID] INTEGER, [OwnerType] INTEGER, [Path] TEXT, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Table]( [ID] INTEGER, [ModelID] INTEGER, [Name] TEXT, [DataCategory] TEXT, [Description] TEXT, [IsHidden] INTEGER, [TableStorageID] INTEGER, [ModifiedTime] INTEGER, [StructureModifiedTime] INTEGER, [SystemFlags] INTEGER, [ShowAsVariationsOnly] INTEGER, [IsPrivate] INTEGER, [DefaultDetailRowsDefinitionID] INTEGER, [AlternateSourcePrecedence] INTEGER, [RefreshPolicyID] INTEGER, [CalculationGroupID] INTEGER, [ExcludeFromModelRefresh] INTEGER, [LineageTag] TEXT, [SourceLineageTag] TEXT, [SystemManaged] INTEGER, [ExcludeFromAutomaticAggregations] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [TablePermission]( [ID] INTEGER, [RoleID] INTEGER, [TableID] INTEGER, [FilterExpression] TEXT, [ModifiedTime] INTEGER, [State] INTEGER, [ErrorMessage] TEXT, [MetadataPermission] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [TableStorage]( [ID] INTEGER, [TableID] INTEGER, [Name] TEXT, [Version] INTEGER, [Settings] INTEGER, [RIViolationCount] INTEGER, [StorageFolderID] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [TimeUnitColumnAssociation]( [ID] INTEGER, [CalendarID] INTEGER, [TimeUnit] INTEGER, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
+    'CREATE TABLE [Variation]( [ID] INTEGER, [ColumnID] INTEGER, [Name] TEXT, [Description] TEXT, [RelationshipID] INTEGER, [DefaultHierarchyID] INTEGER, [DefaultColumnID] INTEGER, [IsDefault] INTEGER, PRIMARY KEY("ID" ASC) )',
+]
+
+
+def create_empty_metadata_db(
+    culture: str = "en-US",
+    model_name: str = "Model",
+) -> bytes:
+    """Create a complete Power BI metadata SQLite database from scratch.
+
+    Returns the raw bytes of the SQLite database file, ready to be
+    embedded in an ABF archive.
+
+    Args:
+        culture: Model culture/locale (default "en-US")
+        model_name: Model display name (default "Model")
+    """
+    buf = io.BytesIO()
+
+    # SQLite requires a file path — use :memory: then serialize
+    conn = sqlite3.connect(":memory:")
+    c = conn.cursor()
+
+    # Create all 63 system tables
+    for ddl in _SCHEMA_DDL:
+        c.execute(ddl)
+
+    # Seed the Model row (ID=1, required by Analysis Services)
+    ts = _windows_filetime_now()
+    c.execute(
+        """INSERT INTO [Model] (
+            ID, Name, Culture, ModifiedTime, StructureModifiedTime,
+            DefaultMode, DefaultDataView, DefaultPowerBIDataSourceVersion,
+            DataAccessOptions, DataSourceDefaultMaxConnections,
+            SourceQueryCulture, DisableAutoExists,
+            MaxParallelismPerRefresh, MaxParallelismPerQuery
+        ) VALUES (
+            1, ?, ?, ?, ?,
+            0, 0, 2,
+            '{"legacyRedirects": true, "returnErrorValuesAsNull": true}', 10,
+            ?, -1, -1, 0
+        )""",
+        (model_name, culture, ts, ts, culture),
+    )
+
+    # Seed DBPROPERTIES (tracks max allocated ID)
+    c.execute(
+        "INSERT INTO DBPROPERTIES (NAME, VALUE) VALUES ('MAXID', 100)"
+    )
+
+    conn.commit()
+
+    # Serialize to bytes using the backup API
+    import tempfile
+    import os
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    try:
+        backup_conn = sqlite3.connect(tmp.name)
+        conn.backup(backup_conn)
+        backup_conn.close()
+        conn.close()
+        with open(tmp.name, "rb") as f:
+            return f.read()
+    finally:
+        os.unlink(tmp.name)
