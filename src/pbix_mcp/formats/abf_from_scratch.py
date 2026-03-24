@@ -97,7 +97,7 @@ def build_abf(
         '<Ordinal>0</Ordinal>'
         '<PersistLocation>0</PersistLocation>'
         '<System>false</System>'
-        '<DataFileList>0.CryptKey.bin</DataFileList>'
+        '<DataFileList/>'
         '<Description/>'
         f'<ddl800:DbUniqueId>{db_unique_id}</ddl800:DbUniqueId>'
         '<AggregationPrefix/>'
