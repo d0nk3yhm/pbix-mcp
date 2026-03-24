@@ -1440,8 +1440,8 @@ def _modify_metadata_and_encode(
                     ?, ?, 1
                 )""",
                 (rel_id, rel_name,
-                 from_tid, from_col_id,
                  to_tid, to_col_id,
+                 from_tid, from_col_id,
                  rs_id,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
             )
@@ -1945,36 +1945,40 @@ def _modify_metadata_and_encode(
             if "_rel_id" not in rdef:
                 continue
 
-            from_tname = rdef["from_table"]
-            to_tname = rdef["to_table"]
+            # PBI convention: From = Many (fact), To = One (dimension)
+            # User API: from_table = One/dimension, to_table = Many/fact
+            # So we swap: PBI.From = user's to_table, PBI.To = user's from_table
+            one_tname = rdef["from_table"]   # dimension/lookup
+            many_tname = rdef["to_table"]    # fact
 
             rel_id = rdef["_rel_id"]
             rel_name = rdef["_rel_name"]
             rs_id = rdef["_rs_id"]
             ris_id = rdef["_ris_id"]
-            from_tid = table_id_map[from_tname]
-            to_tid = table_id_map[to_tname]
-            from_col_name = rdef["from_column"]
-            to_col_name = rdef["to_column"]
+            from_tid = table_id_map[many_tname]   # PBI From = Many
+            to_tid = table_id_map[one_tname]      # PBI To = One
+            many_col_name = rdef["to_column"]
+            one_col_name = rdef["from_column"]
 
-            # Find the "from" table definition to get row data
-            from_tdef = next(t for t in tables if t["name"] == from_tname)
-            to_tdef = next(t for t in tables if t["name"] == to_tname)
-            from_rows = from_tdef["rows"]
-            to_rows = to_tdef["rows"]
+            # R$ table indexes the Many (fact) side
+            from_tname = many_tname
+            many_tdef = next(t for t in tables if t["name"] == many_tname)
+            one_tdef = next(t for t in tables if t["name"] == one_tname)
+            from_rows = many_tdef["rows"]
+            to_rows = one_tdef["rows"]
             from_row_count = len(from_rows)
 
-            # Compute the INDEX column: for each row in "from" table,
-            # find the row index in "to" table where the key matches
+            # Compute the INDEX column: for each row in Many table,
+            # find the row index in One table where the key matches
             to_key_index: dict[object, int] = {}
             for idx, row in enumerate(to_rows):
-                key_val = row.get(to_col_name)
+                key_val = row.get(one_col_name)
                 if key_val is not None and key_val not in to_key_index:
                     to_key_index[key_val] = idx
 
             index_values: list[int] = []
             for row in from_rows:
-                fk_val = row.get(from_col_name)
+                fk_val = row.get(many_col_name)
                 matched_idx = to_key_index.get(fk_val, 0)  # default 0 if no match
                 index_values.append(matched_idx)
 
