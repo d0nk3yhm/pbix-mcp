@@ -471,9 +471,26 @@ class PBIXBuilder:
             template_max_u32_b=_XM123_CLASS,
         )
 
-        # 3. Build ABF from scratch — ZERO template dependency
-        from pbix_mcp.formats.abf_from_scratch import build_abf
-        new_abf = build_abf(new_sqlite_bytes, vertipaq_files)
+        # 3. Build ABF: template structure + our metadata + our VP files
+        # The template VP data stays (neutralized by our clean metadata)
+        # Our new VP files are added alongside
+        template_path = os.path.join(
+            os.path.dirname(__file__), "templates", "minimal_datamodel.bin"
+        )
+        with open(template_path, "rb") as f:
+            template_dm = f.read()
+        template_abf = decompress_datamodel(template_dm)
+        abf_struct = _ABFStructure(template_abf)
+
+        exact_replacements: dict[str, bytes] = {}
+        for entry in abf_struct.file_log:
+            if "metadata.sqlitedb" in entry["Path"].lower():
+                exact_replacements[entry["StoragePath"]] = new_sqlite_bytes
+                break
+
+        new_abf = _rebuild_abf_with_new_files(
+            abf_struct, exact_replacements, vertipaq_files
+        )
 
         # 4. Compress to DataModel
         datamodel_bytes = compress_datamodel(new_abf)
@@ -2503,6 +2520,185 @@ def _update_column_storage_stats(
             "UPDATE ColumnStorage SET Statistics_RowCount = ? WHERE ID = ?",
             (row_count, cs_id),
         )
+
+
+def _rebuild_abf_clean(
+    abf_struct,
+    replacements: dict[str, bytes],
+    new_files: dict[str, bytes],
+) -> bytes:
+    """Rebuild ABF using template skeleton but with ALL template VP data stripped.
+
+    Keeps: system files from Class=100002 (db.xml, CryptKey, etc.)
+    Strips: ALL files from Class=100069 (template VertiPaq data)
+    Injects: our metadata.sqlitedb (via replacements) + our VertiPaq files (new_files)
+
+    This eliminates template data contamination while keeping the proven
+    ABF structure that PBI's restore engine accepts.
+    """
+    import xml.etree.ElementTree as ET
+    from copy import deepcopy
+
+    from pbix_mcp.formats.abf_rebuild import (
+        _HEADER_PAGE_SIZE,
+        _SIGNATURE_LEN,
+        STREAM_STORAGE_SIGNATURE,
+        _xml_to_utf16_bytes,
+    )
+
+    # Identify template VP StoragePaths to strip (Class=100069)
+    template_vp_sps = set()
+    for fg in abf_struct.backup_log_root.findall("FileGroups/FileGroup"):
+        if fg.findtext("Class", "") == "100069":
+            for bf in fg.findall("FileList/BackupFile"):
+                sp = bf.findtext("StoragePath", "")
+                if sp:
+                    template_vp_sps.add(sp)
+
+    buf = bytearray()
+    buf.extend(STREAM_STORAGE_SIGNATURE)
+    header_page_start = len(buf)
+    buf.extend(b"\x00" * (_HEADER_PAGE_SIZE - _SIGNATURE_LEN))
+
+    # ---- Write data files ----
+    new_offsets: dict[str, int] = {}
+    new_sizes: dict[str, int] = {}
+    kept_entries = []
+
+    for ve in abf_struct.data_entries:
+        if ve.path in template_vp_sps:
+            continue  # STRIP template VertiPaq data
+        if ve.path in replacements:
+            data = replacements[ve.path]
+        else:
+            data = abf_struct.read_file_data(ve.path)
+        new_offsets[ve.path] = len(buf)
+        new_sizes[ve.path] = len(data)
+        buf.extend(data)
+        kept_entries.append(ve)
+
+    # ---- Write new VertiPaq files ----
+    import secrets
+    new_file_records = []
+    timestamp = 134002835794032078
+    for fpath, content in new_files.items():
+        offset = len(buf)
+        size = len(content)
+        sp = secrets.token_hex(10).upper()
+        new_file_records.append((fpath, sp, offset, size))
+        buf.extend(content)
+
+    # ---- Build BackupLog ----
+    blog_root = deepcopy(abf_struct.backup_log_root)
+
+    # Update sizes for replaced files
+    for fg in blog_root.findall("FileGroups/FileGroup"):
+        for bf in fg.findall("FileList/BackupFile"):
+            sp = bf.findtext("StoragePath")
+            if sp in new_sizes:
+                size_elem = bf.find("Size")
+                if size_elem is not None:
+                    size_elem.text = str(new_sizes[sp])
+
+    # Strip ALL template VP entries from Class=100069 FileGroup
+    for fg in blog_root.findall("FileGroups/FileGroup"):
+        if fg.findtext("Class", "") == "100069":
+            file_list = fg.find("FileList")
+            if file_list is not None:
+                for bf in list(file_list.findall("BackupFile")):
+                    file_list.remove(bf)
+            else:
+                file_list = ET.SubElement(fg, "FileList")
+
+            persist_path = fg.findtext("PersistLocationPath", "")
+
+            # Add metadata.sqlitedb
+            for entry in abf_struct.file_log:
+                if "metadata.sqlitedb" in entry.get("Path", "").lower():
+                    bf = ET.SubElement(file_list, "BackupFile")
+                    full_path = persist_path + "\\" + entry["Path"].split("\\")[-1] if persist_path else entry["Path"]
+                    # Use the original full path from the template
+                    for orig_bf in abf_struct.backup_log_root.findall(".//BackupFile"):
+                        if orig_bf.findtext("StoragePath") == entry["StoragePath"]:
+                            full_path = orig_bf.findtext("Path", full_path)
+                            break
+                    ET.SubElement(bf, "Path").text = full_path
+                    ET.SubElement(bf, "StoragePath").text = entry["StoragePath"]
+                    ET.SubElement(bf, "LastWriteTime").text = str(timestamp)
+                    ET.SubElement(bf, "Size").text = str(new_sizes.get(entry["StoragePath"], entry["Size"]))
+                    break
+
+            # Add our new VertiPaq files
+            for fpath, sp, offset, size in new_file_records:
+                bf = ET.SubElement(file_list, "BackupFile")
+                ET.SubElement(bf, "Path").text = f"{persist_path}\\{fpath}"
+                ET.SubElement(bf, "StoragePath").text = sp
+                ET.SubElement(bf, "LastWriteTime").text = str(timestamp)
+                ET.SubElement(bf, "Size").text = str(size)
+
+    blog_bytes = _xml_to_utf16_bytes(blog_root)
+    if abf_struct.error_code:
+        blog_bytes = blog_bytes + b"\x00\x00\x00\x00"
+    blog_offset = len(buf)
+    blog_size = len(blog_bytes)
+    buf.extend(blog_bytes)
+
+    # ---- Build VirtualDirectory ----
+    vdir_root = ET.Element("VirtualDirectory")
+
+    # Kept entries (system files + metadata replacement)
+    for ve in kept_entries:
+        bf = ET.SubElement(vdir_root, "BackupFile")
+        ET.SubElement(bf, "Path").text = ve.path
+        ET.SubElement(bf, "Size").text = str(new_sizes.get(ve.path, ve.size))
+        ET.SubElement(bf, "m_cbOffsetHeader").text = str(new_offsets.get(ve.path, ve.m_cbOffsetHeader))
+        ET.SubElement(bf, "Delete").text = "true" if ve.delete else "false"
+        ET.SubElement(bf, "CreatedTimestamp").text = str(ve.created_timestamp)
+        ET.SubElement(bf, "Access").text = str(ve.access)
+        ET.SubElement(bf, "LastWriteTime").text = str(ve.last_write_time)
+
+    # New VertiPaq files
+    for fpath, sp, offset, size in new_file_records:
+        bf = ET.SubElement(vdir_root, "BackupFile")
+        ET.SubElement(bf, "Path").text = sp
+        ET.SubElement(bf, "Size").text = str(size)
+        ET.SubElement(bf, "m_cbOffsetHeader").text = str(offset)
+        ET.SubElement(bf, "Delete").text = "false"
+        ET.SubElement(bf, "CreatedTimestamp").text = str(timestamp)
+        ET.SubElement(bf, "Access").text = str(timestamp)
+        ET.SubElement(bf, "LastWriteTime").text = str(timestamp)
+
+    # BackupLog entry (last)
+    blog_ve = abf_struct.backup_log_entry
+    bf = ET.SubElement(vdir_root, "BackupFile")
+    ET.SubElement(bf, "Path").text = blog_ve.path
+    ET.SubElement(bf, "Size").text = str(blog_size)
+    ET.SubElement(bf, "m_cbOffsetHeader").text = str(blog_offset)
+    ET.SubElement(bf, "Delete").text = "true" if blog_ve.delete else "false"
+    ET.SubElement(bf, "CreatedTimestamp").text = str(blog_ve.created_timestamp)
+    ET.SubElement(bf, "Access").text = str(blog_ve.access)
+    ET.SubElement(bf, "LastWriteTime").text = str(blog_ve.last_write_time)
+
+    vdir_bytes = _xml_to_utf16_bytes(vdir_root)
+    vdir_offset = len(buf)
+    vdir_size = len(vdir_bytes)
+    buf.extend(vdir_bytes)
+
+    # ---- Patch header ----
+    hdr = deepcopy(abf_struct.header_root)
+    hdr.find("m_cbOffsetHeader").text = str(vdir_offset)
+    hdr.find("DataSize").text = str(vdir_size)
+    total_entries = len(kept_entries) + len(new_file_records) + 1
+    hdr.find("Files").text = str(total_entries)
+
+    hdr_bytes = _xml_to_utf16_bytes(hdr)
+    available = _HEADER_PAGE_SIZE - _SIGNATURE_LEN
+    if len(hdr_bytes) > available:
+        raise ValueError(f"Header {len(hdr_bytes)} bytes exceeds {available}")
+    hdr_padded = hdr_bytes + b"\x00" * (available - len(hdr_bytes))
+    buf[header_page_start: header_page_start + available] = hdr_padded
+
+    return bytes(buf)
 
 
 def _rebuild_abf_with_new_files(

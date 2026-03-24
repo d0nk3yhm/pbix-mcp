@@ -556,17 +556,18 @@ def _encode_idf(indices: list[int], bit_width: int) -> bytes:
             best_run_idx = ri
 
     primary_entries = []
-    bitpacked_values = []
+    bitpacked_values = []  # current batch for primary entry counting
+    all_bitpacked_values = []  # ALL values for sub-segment encoding
 
-    if best_run_len >= 3 and len(runs) > 1:
+    if False and best_run_len >= 3 and len(runs) > 1:  # DISABLED: RLE has encoding bugs
         # Use 1 RLE entry for the longest run, bitpack everything else
-        # Collect values before the best run
         for ri, (val, count) in enumerate(runs):
             if ri == best_run_idx:
                 # Flush any pending bit-packed values first
                 if bitpacked_values:
                     primary_entries.append((0xFFFFFFFF, len(bitpacked_values)))
-                    bitpacked_values = []  # CRITICAL: reset after flush
+                    all_bitpacked_values.extend(bitpacked_values)
+                    bitpacked_values = []
                 # RLE entry for the longest run
                 primary_entries.append((runs[best_run_idx][0], runs[best_run_idx][1]))
             else:
@@ -576,23 +577,23 @@ def _encode_idf(indices: list[int], bit_width: int) -> bytes:
         # Flush remaining bit-packed values
         if bitpacked_values:
             primary_entries.append((0xFFFFFFFF, len(bitpacked_values)))
+            all_bitpacked_values.extend(bitpacked_values)
     elif len(runs) == 1 and runs[0][1] == len(indices) and runs[0][0] != 0:
         # All values are the same AND value != 0 → single RLE entry
-        # NOTE: dv=0 is the end-of-entries sentinel, so value 0 MUST be bit-packed
         primary_entries.append((runs[0][0], runs[0][1]))
     else:
         # No good RLE candidate → bitpack everything
         primary_entries.append((0xFFFFFFFF, len(indices)))
-        bitpacked_values = list(indices)
+        all_bitpacked_values = list(indices)
 
     # Safety check: must never exceed 16 primary entries
     if len(primary_entries) > 16:
         # Fallback: bitpack everything
         primary_entries = [(0xFFFFFFFF, len(indices))]
-        bitpacked_values = list(indices)
+        all_bitpacked_values = list(indices)
 
     # Encode the sub_segment (bit-packed uint64 array)
-    sub_segment_u64s = _bitpack_values(bitpacked_values, bit_width)
+    sub_segment_u64s = _bitpack_values(all_bitpacked_values, bit_width)
 
     # Build the binary IDF
     buf = bytearray()
