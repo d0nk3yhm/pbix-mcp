@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required for creation**. Exposes 69 tools covering report creation from scratch (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL data sources, DirectQuery live database connections, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation, RLS security, and binary format internals.
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required for creation**. Exposes 69 tools covering report creation from scratch (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery live database connections, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation, RLS security, and binary format internals. From-scratch builds produce clean metadata with no template remnants (DATASOURCEVERSION=2, clean SQLite).
 
 ## Quick Start
 
@@ -54,8 +54,11 @@ pbix-mcp-server --log-level debug
 | Cross-table relationships | **Stable** | R$ system tables with NoSplit INDEX encoding; RELATED() and cross-table filtering work |
 | Refreshable CSV sources | **Stable** | `source_csv` parameter creates M expressions referencing external CSV files; click Refresh in PBI Desktop to re-import |
 | SQLite database sources | **Stable** | `source_db` with ODBC driver; data imported at build, Refresh re-reads from DB |
-| SQL Server / MySQL / PostgreSQL database sources | **Stable** | `source_db` Import and DirectQuery for all. MySQL DQ uses MariaDB adapter (`type: 'mariadb'`) |
-| DirectQuery mode | **Stable** | `mode='directquery'` with SQL Server, PostgreSQL, and MySQL (via MariaDB) — live database queries, no refresh needed |
+| SQL Server / MySQL / PostgreSQL database sources | **Stable** | `source_db` Import and DirectQuery for all. MySQL DQ requires MariaDB ODBC 3.1 (`type: 'mariadb'`) |
+| Excel data sources | **Stable** | `source_db` with `type: 'excel'` — Import mode |
+| JSON/API data sources | **Stable** | `source_db` with `type: 'json'` — Import mode from REST APIs and JSON files |
+| Azure SQL data sources | **Stable** | `source_db` with `type: 'azuresql'` — Import and DirectQuery |
+| DirectQuery mode | **Stable** | `mode='directquery'` with SQL Server, PostgreSQL, and MySQL (via MariaDB ODBC 3.1) — live database queries, no refresh needed |
 | VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal, Boolean column types with correct dictionary encoding |
 | H$ attribute hierarchies | **Stable** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities; MaterializationType=0 |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
@@ -90,7 +93,7 @@ pbix-mcp-server --log-level debug
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
 - **Opening existing DirectQuery files** — layout, measures, and metadata editing work; DAX evaluation and table reads return clear errors since data lives in the remote source (this is inherent to DirectQuery — the data isn't in the file)
 - **Creating DirectQuery files** — fully working with SQL Server (LocalDB), PostgreSQL 16, and MySQL 9.6 (via MariaDB adapter); requires a running database server and initial data snapshot
-- **Embedded VertiPaq data** — tables with 3+ user tables or 4+ columns may have Int64 data corruption in the embedded snapshot. Use database-backed sources (Import with Refresh, or DirectQuery) for reliable data
+- **Embedded VertiPaq data** — verified working with 4 tables, 8 columns, 3 relationships. The template ABF is still used for binary structure (BackupLog format) and template PBIX wrapper files are still used (OPC format)
 
 
 ## Tools (69)
@@ -185,7 +188,7 @@ builder.add_table('Sales', [
 
 The initial data snapshot is embedded in the PBIX. When opened in Power BI Desktop, clicking **Refresh** re-imports from the CSV file. Edit the CSV → Refresh → data updates live.
 
-### Database Sources (SQL Server / SQLite / MySQL / PostgreSQL)
+### Database Sources (SQL Server / SQLite / MySQL / PostgreSQL / Excel / JSON / Azure SQL)
 
 Connect tables to databases so data can be refreshed from the DB:
 
@@ -360,7 +363,7 @@ PBIX_TEST_SAMPLES=test_corpus pytest tests/test_cross_report.py -v
 | `test_beta_features.py` | 10 | `unit` | No |
 | `test_cross_report.py` | 19 | `slow`, `integration` | Yes (4 public PBIX dashboards) |
 
-**From a fresh clone: 190 tests collected, ~8 skip gracefully, 19 integration tests skip.** The skipped tests require the public test corpus. Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus`.
+**From a fresh clone: 200 tests collected, 173 passed, 27 skipped, 0 failures.** The skipped tests require the public test corpus or private PBIX files. Download the corpus with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus`.
 
 ## Architecture
 
@@ -429,8 +432,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for project conventions, [SUPPORT.md](SUP
 
 ## Roadmap
 
-- **TMDL (Tabular Model Definition Language)** — import/export models as human-readable TMDL files for Git-friendly version control and CI/CD pipelines
-- **PostgreSQL DirectQuery** — verify and test DirectQuery with PostgreSQL
+- **TMDL import** — import models from TMDL files (export already implemented)
 - **Composite models** — mixed Import + DirectQuery tables in the same report
 - **PBIR layout write** — write reports in the new PBIR format alongside legacy
 

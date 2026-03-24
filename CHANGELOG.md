@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-03-24
+
+### Added
+- **From-scratch metadata generation**: DATASOURCEVERSION=2, clean SQLite metadata with no template remnants — output files contain only user-specified tables/columns/measures
+- **Excel data source**: `source_db={'type': 'excel', ...}` for Import mode
+- **JSON/API data source**: `source_db={'type': 'json', ...}` for Import mode from REST APIs and JSON files
+- **Azure SQL data source**: `source_db={'type': 'azuresql', ...}` for Import and DirectQuery
+- **Key PBI annotations**: PBI_IsFromSource (ObjectType=7), PBI_ResultType, SummarizationSetBy, PBI_QueryOrder, __PBI_TimeIntelligenceEnabled — matching PBI Desktop output
+- **Fixed RowNumber GUID**: 2662979B-1795-4F74-8F37-6A1BA8059B61 for stable attribute hierarchy references
+- **Relationship direction convention**: From=Many (fact), To=One (dimension) matching PBI Desktop convention
+- **M expression Item key navigation**: MySQL/PostgreSQL use `Item` key (not `Name`) for table navigation in M expressions
+
+### Fixed
+- VertiPaq encoder verified working with 4 tables, 8 columns, 3 relationships
+- All 5 visual types verified: table, pieChart, clusteredBarChart, card, slicer
+- DirectQuery Refresh verified for PostgreSQL (native), MySQL (via MariaDB ODBC 3.1), SQL Server
+- Import mode Refresh verified for all database types
+- Test suite: 173 passed, 27 skipped, 0 failures
+
 ## [0.3.0] - 2026-03-23
 
 ### Added

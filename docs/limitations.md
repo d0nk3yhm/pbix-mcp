@@ -17,9 +17,9 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 
 | Format | Support |
 |--------|---------|
-| .pbix (Import mode) | Full read/write/create from scratch |
+| .pbix (Import mode) | Full read/write/create from scratch. Open, Refresh verified for all database types |
 | .pbit (Template) | Full read/write |
-| DirectQuery (create) | ✅ Supported — SQL Server verified, MySQL/PostgreSQL same pattern |
+| DirectQuery (create) | Open, live data, Refresh all verified — PostgreSQL (native), MySQL (MariaDB ODBC 3.1), SQL Server |
 | DirectQuery (open existing) | Read-only for layout/measures/metadata; DAX eval unavailable (data lives in remote source) |
 | Composite models | Not tested |
 | Live connections | Not supported |
@@ -29,12 +29,15 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 
 | Source | Import Mode | DirectQuery | Notes |
 |--------|------------|-------------|-------|
-| Embedded data | ✅ | N/A | Default — data in PBIX, no external source |
-| CSV files | ✅ | N/A | `source_csv` — Refresh re-imports from CSV |
-| SQLite | ✅ | N/A | `source_db` — requires SQLite3 ODBC driver |
-| SQL Server | ✅ | ✅ | `source_db` — verified with LocalDB |
-| MySQL | ✅ | ✅ (via MariaDB) | `source_db` type `mariadb` — verified with MySQL 9.6 via MariaDB ODBC 3.1 connector |
-| PostgreSQL | ✅ | ✅ | `source_db` — verified with PostgreSQL 16. Import and DirectQuery both working |
+| Embedded data | Open ✅, Refresh N/A | N/A | Default — data in PBIX, no external source |
+| CSV files | Open ✅, Refresh ✅ | N/A | `source_csv` — Refresh re-imports from CSV |
+| SQLite | Open ✅, Refresh ✅ | N/A | `source_db` — requires SQLite3 ODBC driver |
+| SQL Server | Open ✅, Refresh ✅ | Open ✅, Live ✅, Refresh ✅ | `source_db` — verified with LocalDB |
+| MySQL | Open ✅, Refresh ✅ | Open ✅, Live ✅, Refresh ✅ | DirectQuery requires MariaDB ODBC 3.1 driver (`type: 'mariadb'`) |
+| PostgreSQL | Open ✅, Refresh ✅ | Open ✅, Live ✅, Refresh ✅ | `source_db` — verified with PostgreSQL 16 (native DirectQuery) |
+| Excel | Open ✅, Refresh ✅ | N/A | `source_db` with `type: 'excel'` |
+| JSON/API | Open ✅, Refresh ✅ | N/A | `source_db` with `type: 'json'` |
+| Azure SQL | Open ✅, Refresh ✅ | Open ✅, Live ✅, Refresh ✅ | `source_db` with `type: 'azuresql'` |
 
 ## Supported Data Types
 
@@ -49,9 +52,14 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 
 ## Builder
 
-- Template-based: new tables are added alongside the template's existing `financials` table
-- Template external file references are auto-neutralized on build (prevents refresh errors)
-- H$ attribute hierarchy tables use hardcoded template bytes for 2-distinct-value columns; larger cardinalities use MatType=3 (functional but no sorted dimension browsing)
+- From-scratch metadata is clean: DATASOURCEVERSION=2, no template data in output SQLite — only user-specified tables, columns, and measures
+- The template ABF is still used for binary structure (BackupLog format) and template PBIX wrapper files are still used (OPC format)
+- VertiPaq encoder verified working with 4 tables, 8 columns, 3 relationships
+- Supported visuals: table, pieChart, clusteredBarChart, card, slicer
+- Fixed RowNumber GUID: 2662979B-1795-4F74-8F37-6A1BA8059B61
+- Relationship direction: From=Many (fact), To=One (dimension) matching PBI convention
+- Key annotations: PBI_IsFromSource (ObjectType=7), PBI_ResultType, SummarizationSetBy, PBI_QueryOrder, __PBI_TimeIntelligenceEnabled
+- M expression navigation uses `Item` key (not `Name`) for MySQL/PostgreSQL
 - Power BI Desktop may need a refresh to fully index data after opening a from-scratch PBIX
 
 ## Performance

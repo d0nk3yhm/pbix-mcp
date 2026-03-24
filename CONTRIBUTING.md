@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast unit tests only (~163 pass from fresh clone, ~8 skip without test corpus)
+# Fast unit tests only (173 pass, 27 skip without test corpus/private files)
 pytest -m "not slow"
 
 # Download public test corpus, then run integration tests
@@ -31,7 +31,7 @@ pytest --cov=src/pbix_mcp --cov-report=term-missing -m "not slow"
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (60 tools)
+  server.py              # MCP server (69 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX file builder (create from scratch with row data)
   errors.py              # Typed exceptions with stable error codes (12 classes)
@@ -42,7 +42,7 @@ src/pbix_mcp/
   formats/
     abf_rebuild.py       # ABF archive format (read, modify, build from scratch)
     datamodel_roundtrip.py  # XPress9 compress/decompress
-    vertipaq_encoder.py  # VertiPaq column encoding (5 data types)
+    vertipaq_encoder.py  # VertiPaq column encoding (6 data types)
   models/
     requests.py          # Tool input models (FilterContext, DimensionRef)
     responses.py         # Tool output models (ToolResponse, DAXEvalResponse)

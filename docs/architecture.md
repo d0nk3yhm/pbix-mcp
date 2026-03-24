@@ -46,11 +46,30 @@ src/pbix_mcp/
 
 ### Creating from Scratch
 
-1. `PBIXBuilder` generates ABF metadata (SQLite) with tables/measures
-2. VertiPaq encoder writes actual row data into column segments
-3. ABF is XPress9-compressed into a DataModel
-4. Report/Layout JSON is generated with a default page
-5. Everything is packaged as a valid ZIP
+1. `PBIXBuilder` generates clean SQLite metadata from scratch (DATASOURCEVERSION=2) — no template data in output files
+2. Key PBI annotations are written: PBI_IsFromSource (ObjectType=7), PBI_ResultType, SummarizationSetBy, PBI_QueryOrder, __PBI_TimeIntelligenceEnabled
+3. Fixed RowNumber GUID (2662979B-1795-4F74-8F37-6A1BA8059B61) ensures stable attribute hierarchy references
+4. VertiPaq encoder writes actual row data into column segments (verified with 4 tables, 8 columns, 3 relationships)
+5. H$ attribute hierarchy tables and R$ relationship index tables are generated
+6. Relationships follow PBI convention: From=Many (fact table), To=One (dimension table)
+7. ABF is built using the template ABF for binary structure (BackupLog format), then XPress9-compressed into a DataModel
+8. Report/Layout JSON is generated with a default page and visuals (table, pieChart, clusteredBarChart, card, slicer all supported)
+9. Template PBIX wrapper files are used for OPC format; everything is packaged as a valid ZIP
+10. For database sources, M expressions use `Item` key (not `Name`) for MySQL/PostgreSQL table navigation
+
+### Data Source Support
+
+| Source | Import Mode | DirectQuery | Refresh Verified |
+|--------|------------|-------------|------------------|
+| Embedded data | Yes | N/A | N/A |
+| CSV files | Yes | N/A | Yes |
+| SQLite | Yes | N/A | Yes |
+| SQL Server | Yes | Yes | Yes |
+| MySQL | Yes | Yes (MariaDB ODBC 3.1) | Yes |
+| PostgreSQL | Yes | Yes (native) | Yes |
+| Excel | Yes | N/A | Yes |
+| JSON/API | Yes | N/A | Yes |
+| Azure SQL | Yes | Yes | Yes |
 
 ## Error Handling
 
