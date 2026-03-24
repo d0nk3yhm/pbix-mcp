@@ -90,7 +90,9 @@ pbix-mcp-server --log-level debug
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
 - **Opening existing DirectQuery files** — layout, measures, and metadata editing work; DAX evaluation and table reads return clear errors since data lives in the remote source (this is inherent to DirectQuery — the data isn't in the file)
-- **Creating DirectQuery files** — fully working with SQL Server (LocalDB), PostgreSQL 16, and MySQL 9.6 (via MariaDB adapter); requires a running database server and initial data snapshot
+- **Creating DirectQuery files** — fully working with SQL Server (LocalDB), PostgreSQL 16, and MySQL 9.6 (via MariaDB adapter); requires a running database server and initial data snapshot. Do not click Refresh in DirectQuery mode — data is already live; Refresh triggers a schema sync that conflicts with template metadata
+- **Embedded VertiPaq data** — tables with 3+ user tables or 4+ columns may have Int64 data corruption in the embedded snapshot. Use database-backed sources (Import with Refresh, or DirectQuery) for reliable data
+- **Template remnants** — the builder uses a minimal template for binary format structure; `financials`, `DateAutoTemplate`, and `Date` tables are neutralized but their M queries remain in the DataMashup
 
 
 ## Tools (69)
