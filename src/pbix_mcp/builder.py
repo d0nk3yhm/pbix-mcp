@@ -1568,6 +1568,16 @@ def _modify_metadata_and_encode(
                 (ris_id, rs_id),
             )
 
+            # Mark relationship as "from source" so PBI Desktop recognizes
+            # it during Refresh and doesn't try to re-import it (which
+            # causes TMCCollectionObject::Add errors)
+            ann_id = alloc.next()
+            c.execute(
+                "INSERT INTO Annotation (ID, ObjectID, ObjectType, Name, Value, "
+                "ModifiedTime) VALUES (?, ?, 11, 'PBI_IsFromSource', 'FS', ?)",
+                (ann_id, rel_id, _FIXED_TIMESTAMP),
+            )  # ObjectType 11 = Relationship in TOM
+
             # Store relationship info for R$ table creation later
             rdef["_rel_id"] = rel_id
             rdef["_rel_name"] = rel_name
