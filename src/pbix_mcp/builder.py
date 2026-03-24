@@ -1083,11 +1083,19 @@ def _modify_metadata_and_encode(
 
             col_storage_info[tname] = {}
 
+            # PBI_ResultType annotation for user tables (ObjectType=3 = Table)
+            rt_ann_id = alloc.next()
+            c.execute(
+                "INSERT INTO Annotation (ID, ObjectID, ObjectType, Name, Value, "
+                "ModifiedTime) VALUES (?, ?, 3, 'PBI_ResultType', 'Table', ?)",
+                (rt_ann_id, table_id, _FIXED_TIMESTAMP),
+            )  # ObjectType 3 = Table in TOM
+
             # ============================================================
             # INSERT RowNumber column (system column, Type=3)
             # ============================================================
             rn_col_id = alloc.next()
-            rn_name = f"RowNumber-{str(uuid.uuid4()).upper()}"
+            rn_name = "RowNumber-2662979B-1795-4F74-8F37-6A1BA8059B61"
             column_id_map[tname]["__rownumber__"] = rn_col_id
 
             # ColumnStorage for RowNumber
@@ -1335,8 +1343,16 @@ def _modify_metadata_and_encode(
                      col_name,  # SourceColumn
                      _FIXED_TIMESTAMP, _FIXED_TIMESTAMP,
                      col_idx,  # DisplayOrdinal
-                     str(uuid.uuid4())),
+                     str(uuid.uuid4())),  # LineageTag only; SourceLineageTag = NULL
                 )
+
+                # SummarizationSetBy annotation for user data columns
+                summ_ann_id = alloc.next()
+                c.execute(
+                    "INSERT INTO Annotation (ID, ObjectID, ObjectType, Name, Value, "
+                    "ModifiedTime) VALUES (?, ?, 4, 'SummarizationSetBy', 'Automatic', ?)",
+                    (summ_ann_id, col_id, _FIXED_TIMESTAMP),
+                )  # ObjectType 4 = Column in TOM
 
                 # AttributeHierarchy for user columns — required for DAX H$ tables
                 ah_id = alloc.next()
@@ -1576,15 +1592,35 @@ def _modify_metadata_and_encode(
             ann_id = alloc.next()
             c.execute(
                 "INSERT INTO Annotation (ID, ObjectID, ObjectType, Name, Value, "
-                "ModifiedTime) VALUES (?, ?, 11, 'PBI_IsFromSource', 'FS', ?)",
+                "ModifiedTime) VALUES (?, ?, 7, 'PBI_IsFromSource', 'FS', ?)",
                 (ann_id, rel_id, _FIXED_TIMESTAMP),
-            )  # ObjectType 11 = Relationship in TOM
+            )  # ObjectType 7 = Relationship in TOM
 
             # Store relationship info for R$ table creation later
             rdef["_rel_id"] = rel_id
             rdef["_rel_name"] = rel_name
             rdef["_rs_id"] = rs_id
             rdef["_ris_id"] = ris_id
+
+        # ============================================================
+        # Model-level annotations (ObjectType=1, ObjectID=1)
+        # ============================================================
+        # PBI_QueryOrder: JSON list of user table names in declaration order
+        query_order_value = json.dumps([tdef["name"] for tdef in tables])
+        qo_ann_id = alloc.next()
+        c.execute(
+            "INSERT INTO Annotation (ID, ObjectID, ObjectType, Name, Value, "
+            "ModifiedTime) VALUES (?, 1, 1, 'PBI_QueryOrder', ?, ?)",
+            (qo_ann_id, query_order_value, _FIXED_TIMESTAMP),
+        )  # ObjectType 1 = Model in TOM
+
+        # __PBI_TimeIntelligenceEnabled: always '1' for standard models
+        ti_ann_id = alloc.next()
+        c.execute(
+            "INSERT INTO Annotation (ID, ObjectID, ObjectType, Name, Value, "
+            "ModifiedTime) VALUES (?, 1, 1, '__PBI_TimeIntelligenceEnabled', '1', ?)",
+            (ti_ann_id, _FIXED_TIMESTAMP),
+        )  # ObjectType 1 = Model in TOM
 
         conn.commit()
 
