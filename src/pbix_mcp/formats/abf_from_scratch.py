@@ -113,7 +113,7 @@ def build_abf(
         '<DataSourceImpersonationInfo>'
         '<ImpersonationMode>Default</ImpersonationMode>'
         '<Account/>'
-        '<Password/>'
+        '<Password>CAAAAAAAAAAC9sjaeulJCtv8o19QEIQu \n</Password>'
         '</DataSourceImpersonationInfo>'
         '<DataVersion>0</DataVersion>'
         '</Database></ObjectDefinition></Load>'
@@ -297,7 +297,7 @@ def build_abf(
     # ADDITIONAL_LOG(1) + PARTITIONS(1) + dbxml(1) + cryptkey(1) + metadata(1) + VP files + BackupLog(1)
     total_files = 5 + len(vp_records) + 1
 
-    hdr = ET.Element("BackupLogHeader")
+    hdr = ET.Element("BackupLog")
     ET.SubElement(hdr, "BackupRestoreSyncVersion").text = "140"
     ET.SubElement(hdr, "Fault").text = "false"
     ET.SubElement(hdr, "faultcode").text = "0"
