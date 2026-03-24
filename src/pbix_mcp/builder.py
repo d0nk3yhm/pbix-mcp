@@ -154,6 +154,94 @@ class PBIXBuilder:
         return self
 
     # ------------------------------------------------------------------
+    # DataMashup rebuilding — clean M queries only
+    # ------------------------------------------------------------------
+
+    def _rebuild_datamashup(self) -> bytes | None:
+        """Rebuild the DataMashup binary with only user table M queries.
+
+        Strips all template remnants (financials, # Measures, DateAutoTemplate)
+        and writes clean Section1.m containing only the user's table queries.
+        """
+        template_pbix_path = os.path.join(
+            os.path.dirname(__file__), "templates", "minimal_template.pbix"
+        )
+
+        # Read the template DataMashup
+        with zipfile.ZipFile(template_pbix_path) as zf:
+            if "DataMashup" not in zf.namelist():
+                return None
+            data = zf.read("DataMashup")
+
+        # Find inner ZIP
+        pk_offset = data.find(b"PK\x03\x04")
+        if pk_offset == -1:
+            return None
+
+        eocd_sig = b"PK\x05\x06"
+        eocd_pos = data.rfind(eocd_sig)
+        if eocd_pos == -1:
+            return None
+
+        eocd_comment_len = struct.unpack_from("<H", data, eocd_pos + 20)[0]
+        zip_end = eocd_pos + 22 + eocd_comment_len
+        old_zip_data = data[pk_offset:zip_end]
+
+        # Build clean M code with only user tables
+        m_lines = ["section Section1;"]
+        for tdef in self._tables:
+            tname = tdef["name"]
+            source_db = tdef.get("source_db")
+            source_csv = tdef.get("source_csv")
+            is_dq = tdef.get("mode") == "directquery"
+
+            if source_db or source_csv:
+                # Build M expression for this table
+                m_expr = _build_m_expression(
+                    tname, tdef.get("columns", []),
+                    source_csv, source_db,
+                    is_directquery=is_dq,
+                )
+                # Escape table name if needed
+                m_name = tname
+                if " " in tname or any(c in tname for c in "[](){}#"):
+                    m_name = f'#"{tname}"'
+                m_lines.append(f"shared {m_name} = {m_expr};")
+
+        new_m_code = "\n".join(m_lines) + "\n"
+
+        # Rebuild inner ZIP with new Section1.m
+        new_zip_buf = io.BytesIO()
+        try:
+            with zipfile.ZipFile(io.BytesIO(old_zip_data), "r") as old_zf:
+                with zipfile.ZipFile(new_zip_buf, "w", zipfile.ZIP_DEFLATED) as new_zf:
+                    for item in old_zf.namelist():
+                        if item.endswith("Section1.m"):
+                            new_zf.writestr(item, new_m_code.encode("utf-8"))
+                        else:
+                            new_zf.writestr(item, old_zf.read(item))
+        except zipfile.BadZipFile:
+            return None
+
+        new_zip_bytes = new_zip_buf.getvalue()
+
+        # Splice: prefix + new_zip + suffix
+        prefix = data[:pk_offset]
+        suffix = data[zip_end:]
+        new_data = prefix + new_zip_bytes + suffix
+
+        # Update size field if present
+        if pk_offset >= 4:
+            old_size = struct.unpack_from("<I", prefix, pk_offset - 4)[0]
+            old_zip_len = zip_end - pk_offset
+            if old_size == old_zip_len:
+                new_data = bytearray(new_data)
+                struct.pack_into("<I", new_data, pk_offset - 4, len(new_zip_bytes))
+                new_data = bytes(new_data)
+
+        return bytes(new_data)
+
+    # ------------------------------------------------------------------
     # Layout building (preserved from original)
     # ------------------------------------------------------------------
 
@@ -408,7 +496,10 @@ class PBIXBuilder:
         # 6. Build layout
         layout_bytes = self._build_layout()
 
-        # 7. Pack into ZIP
+        # 7. Build clean DataMashup with only user table M queries
+        datamashup_bytes = self._rebuild_datamashup()
+
+        # 8. Pack into ZIP
         template_pbix_path = os.path.join(
             os.path.dirname(__file__), "templates", "minimal_template.pbix"
         )
@@ -420,6 +511,8 @@ class PBIXBuilder:
                         zf_out.writestr(item, datamodel_bytes)
                     elif item == "Report/Layout":
                         zf_out.writestr(item, layout_bytes)
+                    elif item == "DataMashup" and datamashup_bytes:
+                        zf_out.writestr(item, datamashup_bytes)
                     else:
                         zf_out.writestr(item, zf_in.read(item))
 
@@ -2260,41 +2353,45 @@ def _modify_metadata_and_encode(
                 (r_cs_id,),
             )
 
-        # Neutralize template partition M expressions that reference external
-        # files (e.g., financials → Financial Sample.xlsx) or template-specific
-        # tables (e.g., DateAutoTemplate → references 'financials'[Date]).
-        # Replace with empty table expressions so Refresh doesn't fail.
-        # Only touch partitions from the TEMPLATE (IDs below our new ID range).
-        _empty_m = 'let\n    Source = #table(type table [x = text], {})\nin\n    Source'
-        user_table_names = {t["name"] for t in tables}
+        # NEUTRALIZE template tables — keep them (ABF binary references their IDs)
+        # but make them completely inert so they don't interfere with Refresh.
+        user_table_ids = set(table_id_map.values())
         c = conn.cursor()
-        template_partitions = c.execute(
-            "SELECT p.ID, p.QueryDefinition, t.Name FROM [Partition] p "
+        _empty_m = 'let\n    Source = #table(type table [x = text], {})\nin\n    Source'
+
+        # 1. Neutralize ALL non-user partition M expressions
+        c.execute(
+            "SELECT p.ID, t.ID as TableID FROM [Partition] p "
             "JOIN [Table] t ON p.TableID = t.ID "
             "WHERE p.QueryDefinition IS NOT NULL"
-        ).fetchall()
-        for pid, qd, tname in template_partitions:
-            if tname in user_table_names:
-                continue  # Don't touch user-created tables
-            if pid < (max_id + 1000) and qd:
-                if "File.Contents" in qd:
-                    # References an external file — neutralize
-                    c.execute(
-                        "UPDATE [Partition] SET QueryDefinition = ? WHERE ID = ?",
-                        (_empty_m, pid),
-                    )
-                elif tname == "DateAutoTemplate" and "financials" in qd:
-                    # Template date table references template data — neutralize
-                    c.execute(
-                        "UPDATE [Partition] SET QueryDefinition = ? WHERE ID = ?",
-                        (_empty_m, pid),
-                    )
-                elif tname == "Date" and qd.strip() == "DateAutoTemplate":
-                    # Date table references DateAutoTemplate — neutralize
-                    c.execute(
-                        "UPDATE [Partition] SET QueryDefinition = ? WHERE ID = ?",
-                        (_empty_m, pid),
-                    )
+        )
+        for pid, tid in c.fetchall():
+            if tid not in user_table_ids:
+                c.execute(
+                    "UPDATE [Partition] SET QueryDefinition = ? WHERE ID = ?",
+                    (_empty_m, pid),
+                )
+
+        # 2. Delete ALL template relationships (prevents schema sync conflicts)
+        c.execute(
+            "SELECT ID FROM [Relationship] WHERE "
+            "FromTableID NOT IN ({ids}) OR ToTableID NOT IN ({ids})".format(
+                ids=",".join(str(i) for i in user_table_ids)
+            )
+        )
+        template_rel_ids = [r[0] for r in c.fetchall()]
+        if template_rel_ids:
+            ph = ",".join("?" * len(template_rel_ids))
+            c.execute(f"DELETE FROM [Relationship] WHERE ID IN ({ph})", template_rel_ids)
+
+        # 3. Hide all template tables
+        c.execute("SELECT ID FROM [Table]")
+        for (tid,) in c.fetchall():
+            if tid not in user_table_ids:
+                c.execute(
+                    "UPDATE [Table] SET IsHidden = 1, IsPrivate = 1 WHERE ID = ?",
+                    (tid,),
+                )
 
         conn.commit()
         conn.close()

@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast tests (~140 pass from fresh clone, ~8 skip without private files)
+# Fast tests (~190 collected, ~8 skip without private files)
 pytest -m "not slow"
 
 # With coverage
@@ -48,7 +48,7 @@ ruff check src/ tests/
 python -m mypy src/pbix_mcp/ --ignore-missing-imports
 ```
 
-mypy has ~239 errors as of v0.1.0. These are tracked for gradual cleanup.
+mypy has ~149 errors (CI baseline). Tracked for gradual cleanup.
 
 ## Adding a New DAX Function
 

@@ -36,7 +36,8 @@
 - DAX engine is best-effort, not a strict runtime — unsupported functions return `None` with status `"unsupported"`, circular references raise `DAXEvaluationError`
 - PBIR format is read-only for filter extraction (no layout write)
 - Performance — tables >100K rows trigger a warning; the engine operates on in-memory Python data
-- Import mode only — DirectQuery files are detected on open and rejected with a clear error
+- **Creating DirectQuery files** — fully working with SQL Server, PostgreSQL 16, and MySQL 9.6 (via MariaDB adapter)
+- **Opening existing DirectQuery files** — layout, measures, and metadata editing work; DAX evaluation and table reads return clear errors since data lives in the remote source
 - 1 out of 204 tested measures returns BLANK (requires per-employee RANKX visual row context)
 
 ## Bug Reports

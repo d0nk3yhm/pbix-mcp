@@ -72,8 +72,8 @@ DAX evaluation returns extended results:
 - `pbix_close` — Release temp dir (force flag for dirty state)
 - `pbix_list_open` — Show all open file sessions
 
-### Report Layout & Visuals (18)
-Visual CRUD, page management, filters, positions, bookmarks, settings.
+### Report Layout & Visuals (20)
+Visual CRUD, page management, filters, positions, bookmarks (add/remove), settings.
 
 ### DAX Engine (4)
 Measure evaluation, per-dimension evaluation, calculated columns, cache management.
@@ -81,17 +81,21 @@ Measure evaluation, per-dimension evaluation, calculated columns, cache manageme
 ### DataModel Read (8)
 Schema, measures, relationships, Power Query, columns, table data.
 
-### DataModel Write (13)
-Metadata SQL, measure CRUD, column modification, decompress/recompress, ABF file ops.
+### DataModel Write (16)
+Metadata SQL, measure CRUD, column modification, field parameters, calculation groups,
+TMDL export, decompress/recompress, ABF file ops.
 
-### Resources & Theme (5)
-Static resources, theme read/write, linguistic schema.
+### Resources, Themes & Custom Visuals (7)
+Static resources, theme read/write, linguistic schema, custom visual import/remove.
 
 ### DataMashup (2)
 M code read/write.
 
 ### Row-Level Security (3)
 RLS role CRUD, filter expression evaluation against data.
+
+### Incremental Refresh (2)
+Set/get incremental refresh policies with archive/refresh windows and change detection.
 
 ### Diagnostics & Security (2)
 8-point health check, password extraction.

@@ -1,8 +1,7 @@
 # pbix-mcp
 
 [![CI](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/pbix-mcp)](https://pypi.org/project/pbix-mcp/)
-[![Python](https://img.shields.io/pypi/pyversions/pbix-mcp)](https://pypi.org/project/pbix-mcp/)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required for creation**. Exposes 69 tools covering report creation from scratch (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL data sources, DirectQuery live database connections, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation, RLS security, and binary format internals.
@@ -90,9 +89,8 @@ pbix-mcp-server --log-level debug
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
 - **Opening existing DirectQuery files** — layout, measures, and metadata editing work; DAX evaluation and table reads return clear errors since data lives in the remote source (this is inherent to DirectQuery — the data isn't in the file)
-- **Creating DirectQuery files** — fully working with SQL Server (LocalDB), PostgreSQL 16, and MySQL 9.6 (via MariaDB adapter); requires a running database server and initial data snapshot. Do not click Refresh in DirectQuery mode — data is already live; Refresh triggers a schema sync that conflicts with template metadata
+- **Creating DirectQuery files** — fully working with SQL Server (LocalDB), PostgreSQL 16, and MySQL 9.6 (via MariaDB adapter); requires a running database server and initial data snapshot
 - **Embedded VertiPaq data** — tables with 3+ user tables or 4+ columns may have Int64 data corruption in the embedded snapshot. Use database-backed sources (Import with Refresh, or DirectQuery) for reliable data
-- **Template remnants** — the builder uses a minimal template for binary format structure; `financials`, `DateAutoTemplate`, and `Date` tables are neutralized but their M queries remain in the DataMashup
 
 
 ## Tools (69)
@@ -362,7 +360,7 @@ PBIX_TEST_SAMPLES=test_corpus pytest tests/test_cross_report.py -v
 | `test_beta_features.py` | 10 | `unit` | No |
 | `test_cross_report.py` | 19 | `slow`, `integration` | Yes (4 public PBIX dashboards) |
 
-**From a fresh clone: ~163 tests pass, ~8 skip gracefully, 19 integration tests skip.** The skipped tests require the public test corpus. Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus`.
+**From a fresh clone: 190 tests collected, ~8 skip gracefully, 19 integration tests skip.** The skipped tests require the public test corpus. Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus`.
 
 ## Architecture
 
