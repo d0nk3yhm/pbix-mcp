@@ -510,6 +510,16 @@ class PBIXBuilder:
                         zf_out.writestr(item, layout_bytes)
                     elif item == "SecurityBindings":
                         continue  # Skip — auto-removed for clean files
+                    elif item == "Settings":
+                        # Patch Settings to disable auto-relationship detection
+                        # which causes TMCCollectionObject::Add errors on Refresh
+                        settings_raw = zf_in.read(item)
+                        settings_text = settings_raw.decode("utf-16-le")
+                        settings_text = settings_text.replace(
+                            '"RelationshipImportEnabled":true',
+                            '"RelationshipImportEnabled":false',
+                        )
+                        zf_out.writestr(item, settings_text.encode("utf-16-le"))
                     else:
                         zf_out.writestr(item, zf_in.read(item))
 
