@@ -1032,7 +1032,9 @@ def _modify_metadata_and_encode(
 
             # Insert Partition row
             # Mode=0 for Import, Mode=1 for DirectQuery
+            # Type=4 for both (Calculated partition — Type=2 requires Mode=0)
             partition_mode = 1 if is_directquery else 0
+            partition_type = 4  # Always Type=4
             c.execute(
                 """INSERT INTO [Partition] (
                     ID, TableID, Name, Description, DataSourceID,
@@ -1044,7 +1046,7 @@ def _modify_metadata_and_encode(
                     DataCoverageDefinitionID, SchemaName
                 ) VALUES (
                     ?, ?, ?, NULL, 0,
-                    ?, 1, 4, ?,
+                    ?, 1, ?, ?,
                     ?, 3, ?, ?,
                     0, NULL, 0,
                     0.0, 0.0, -1, NULL,
@@ -1055,7 +1057,7 @@ def _modify_metadata_and_encode(
                  _build_m_expression(tname, tdef.get("columns", []),
                                      tdef.get("source_csv"), tdef.get("source_db"),
                                      is_directquery=is_directquery),
-                 ps_id,
+                 partition_type, ps_id,
                  partition_mode,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
             )
