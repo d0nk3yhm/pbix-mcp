@@ -566,6 +566,7 @@ def _encode_idf(indices: list[int], bit_width: int) -> bytes:
                 # Flush any pending bit-packed values first
                 if bitpacked_values:
                     primary_entries.append((0xFFFFFFFF, len(bitpacked_values)))
+                    bitpacked_values = []  # CRITICAL: reset after flush
                 # RLE entry for the longest run
                 primary_entries.append((runs[best_run_idx][0], runs[best_run_idx][1]))
             else:

@@ -2562,6 +2562,7 @@ def _rebuild_abf_with_new_files(
     # ---- 2. Existing data files ----
     new_offsets: dict[str, int] = {}
     new_sizes: dict[str, int] = {}
+    kept_entries = []
 
     for ve in abf_struct.data_entries:
         if ve.path in replacements:
@@ -2572,6 +2573,7 @@ def _rebuild_abf_with_new_files(
         new_offsets[ve.path] = len(buf)
         new_sizes[ve.path] = len(data)
         buf.extend(data)
+        kept_entries.append(ve)
 
     # ---- 2b. NEW files (VertiPaq data) ----
     # These don't exist in the original ABF. We add them as new VDir entries.
@@ -2588,7 +2590,7 @@ def _rebuild_abf_with_new_files(
     # ---- 3. BackupLog ----
     blog_root = deepcopy(abf_struct.backup_log_root)
 
-    # Update sizes in BackupLog for replaced files
+    # Update sizes in BackupLog for ALL modified files (replacements + nullified)
     for fg in blog_root.findall("FileGroups/FileGroup"):
         for bf in fg.findall("FileList/BackupFile"):
             sp = bf.findtext("StoragePath")
@@ -2597,15 +2599,22 @@ def _rebuild_abf_with_new_files(
                 if size_elem is not None:
                     size_elem.text = str(new_sizes[sp])
 
-    # Add new files to the BackupLog FileGroup
+    # Add new VertiPaq files to the data FileGroup (Class=100069)
     file_groups = blog_root.findall("FileGroups/FileGroup")
-    db_fg = file_groups[-1] if file_groups else None
-    if db_fg is not None:
-        file_list = db_fg.find("FileList")
-        if file_list is None:
-            file_list = ET.SubElement(db_fg, "FileList")
+    data_fg = None
+    for fg in file_groups:
+        if fg.findtext("Class", "") == "100069":
+            data_fg = fg
+            break
+    if data_fg is None:
+        data_fg = file_groups[-1] if file_groups else None
 
-        persist_path = db_fg.findtext("PersistLocationPath", "")
+    if data_fg is not None:
+        file_list = data_fg.find("FileList")
+        if file_list is None:
+            file_list = ET.SubElement(data_fg, "FileList")
+
+        persist_path = data_fg.findtext("PersistLocationPath", "")
         timestamp = 134002835794032078
 
         for fpath, storage_path, offset, size in new_file_records:
@@ -2628,8 +2637,8 @@ def _rebuild_abf_with_new_files(
 
     timestamp = 134002835794032078
 
-    # Existing entries (use their original StoragePaths)
-    for ve in abf_struct.data_entries:
+    # All kept entries (system + nullified template data)
+    for ve in kept_entries:
         bf_elem = ET.SubElement(vdir_root_new, "BackupFile")
         ET.SubElement(bf_elem, "Path").text = ve.path
         ET.SubElement(bf_elem, "Size").text = str(new_sizes.get(ve.path, ve.size))
@@ -2670,7 +2679,7 @@ def _rebuild_abf_with_new_files(
     hdr = deepcopy(abf_struct.header_root)
     hdr.find("m_cbOffsetHeader").text = str(vdir_offset)
     hdr.find("DataSize").text = str(vdir_size)
-    total_entries = len(abf_struct.data_entries) + len(new_file_records) + 1
+    total_entries = len(kept_entries) + len(new_file_records) + 1  # +1 for BackupLog
     hdr.find("Files").text = str(total_entries)
 
     hdr_bytes = _xml_to_utf16_bytes(hdr)
