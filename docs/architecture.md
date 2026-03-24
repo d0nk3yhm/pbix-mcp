@@ -52,7 +52,7 @@ src/pbix_mcp/
 1. `PBIXBuilder` generates clean SQLite metadata (DATASOURCEVERSION=2) — only user-specified tables, columns, and measures
 2. Key PBI annotations are written: PBI_IsFromSource (ObjectType=7), PBI_ResultType, SummarizationSetBy, PBI_QueryOrder, __PBI_TimeIntelligenceEnabled
 3. Fixed RowNumber GUID (2662979B-1795-4F74-8F37-6A1BA8059B61) ensures stable attribute hierarchy references
-4. VertiPaq encoder writes actual row data into column segments using pure bitpack (RLE disabled — slightly less space-efficient but correct). Verified with 4 tables, 8 columns, 3 relationships
+4. VertiPaq encoder writes actual row data into column segments using pure bitpack (RLE disabled — slightly less space-efficient but correct). Verified with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase)
 5. H$ attribute hierarchy tables and R$ relationship index tables are generated from scratch
 6. Relationships follow PBI convention: From=Many (fact table), To=One (dimension table)
 7. ABF is assembled by injecting generated files into the template ABF skeleton, then XPress9-compressed into a DataModel

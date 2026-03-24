@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **M expression Item key navigation**: MySQL/PostgreSQL use `Item` key (not `Name`) for table navigation in M expressions
 
 ### Fixed
-- VertiPaq encoder verified working with 4 tables, 8 columns, 3 relationships
+- VertiPaq encoder verified working with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase)
 - All 5 visual types verified: table, pieChart, clusteredBarChart, card, slicer
 - DirectQuery Refresh verified for PostgreSQL (native), MySQL (via MariaDB ODBC 3.1), SQL Server
 - Import mode Refresh verified for all database types

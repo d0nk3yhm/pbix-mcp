@@ -54,7 +54,7 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 
 ### What is generated from scratch
 - **Metadata SQLite**: clean DATASOURCEVERSION=2 — only user-specified tables, columns, and measures, no template data
-- **VertiPaq column data**: all IDF segments, dictionaries, H$ hierarchy tables, R$ relationship tables generated independently. Verified with 4 tables, 8 columns, 3 relationships
+- **VertiPaq column data**: all IDF segments, dictionaries, H$ hierarchy tables, R$ relationship tables generated independently. Verified with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase)
 - **Report layout JSON**: pages, visuals, filters generated from scratch. Supported visuals: table, pieChart, clusteredBarChart, card, slicer
 
 ### What uses a template skeleton
