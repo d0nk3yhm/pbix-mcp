@@ -1397,6 +1397,11 @@ def _modify_metadata_and_encode(
                 )
                 col_hidx_fname = None  # No HIDX file for user columns
 
+                _col_distinct = len(set(
+                    r.get(col_name) for r in tdef.get("rows", [])
+                    if r.get(col_name) is not None
+                ))
+
                 # ColumnStorage
                 c.execute(
                     """INSERT INTO ColumnStorage (
@@ -1417,11 +1422,11 @@ def _modify_metadata_and_encode(
                         ?, ?, ?, ?, ?,
                         1, 8, NULL, NULL,
                         1033, 0,
+                        ?, ?,
+                        ?, 0,
+                        -1, ?,
                         0, 0,
-                        0, 0,
-                        -1, 0,
-                        0, 0,
-                        0, ?,
+                        1, ?,
                         ?, ?,
                         0, 0,
                         0, 0,
@@ -1429,6 +1434,10 @@ def _modify_metadata_and_encode(
                         NULL
                     )""",
                     (cs_id, col_id, cs_name, col_idx + 1, ds_id,
+                     _col_distinct,  # Statistics_DistinctStates
+                     3,  # Statistics_MinDataID (DATA_ID_OFFSET)
+                     3 + max(_col_distinct - 1, 0),  # Statistics_MaxDataID
+                     len(tdef.get("rows", [])),  # Statistics_RowCount
                      3,  # Statistics_Usage (always 3 for data columns)
                      # Statistics_DBType: maps AMO data type to OLE DB type
                      {2: 130, 6: 20, 8: 5, 9: 7, 10: 14, 11: 11}.get(
@@ -1555,13 +1564,36 @@ def _modify_metadata_and_encode(
         # INSERT Relationships
         # ============================================================
         for rdef in relationships:
-            from_tid = table_id_map.get(rdef["from_table"])
-            to_tid = table_id_map.get(rdef["to_table"])
-            from_col_id = column_id_map.get(rdef["from_table"], {}).get(rdef["from_column"])
-            to_col_id = column_id_map.get(rdef["to_table"], {}).get(rdef["to_column"])
+            # Ensure PBI TOM convention: FromTable = Many (fact), ToTable = One (dimension)
+            # The "from" table in TOM is the Many side (has FK, more rows).
+            # Users may pass either order; auto-detect by checking which column
+            # has unique values (PK → One side) vs duplicates (FK → Many side).
+            ft, fc = rdef["from_table"], rdef["from_column"]
+            tt, tc = rdef["to_table"], rdef["to_column"]
+            # Check if from_table's column has all unique values (= PK = One side)
+            from_tdef = next((t for t in tables if t["name"] == ft), None)
+            to_tdef = next((t for t in tables if t["name"] == tt), None)
+            if from_tdef and to_tdef:
+                from_vals = [r.get(fc) for r in from_tdef.get("rows", [])]
+                to_vals = [r.get(tc) for r in to_tdef.get("rows", [])]
+                from_is_unique = len(set(from_vals)) == len(from_vals)
+                to_is_unique = len(set(to_vals)) == len(to_vals)
+                # If from has unique values and to doesn't (or has more rows), swap
+                if from_is_unique and (not to_is_unique or len(to_vals) > len(from_vals)):
+                    ft, fc, tt, tc = tt, tc, ft, fc
+            from_tid = table_id_map.get(ft)
+            to_tid = table_id_map.get(tt)
+            from_col_id = column_id_map.get(ft, {}).get(fc)
+            to_col_id = column_id_map.get(tt, {}).get(tc)
 
             if not all([from_tid, to_tid, from_col_id, to_col_id]):
                 continue  # Skip if any reference is missing
+
+            # Store resolved Many/One for R$ section
+            rdef["_many_table"] = ft
+            rdef["_many_column"] = fc
+            rdef["_one_table"] = tt
+            rdef["_one_column"] = tc
 
             rel_id = alloc.next()
             rel_name = str(uuid.uuid4())
@@ -1779,24 +1811,22 @@ def _modify_metadata_and_encode(
                 meta_key = f"{base}\\column.{col_name}meta"
 
                 # Get distinct count and dict order from encoded data
-                # CRITICAL: must use the SAME sort order as the encoder
-                # (_encode_column uses sorted(set(...), key=...) for dictionary)
+                # CRITICAL: must use INSERTION ORDER (first-seen) matching the encoder
                 raw_vals = [row.get(col_name) for row in rows]
-                non_null_unique = set(v for v in raw_vals if v is not None)
-                # Match encoder's sort key exactly (vertipaq_encoder.py line 943)
-                dict_values = sorted(
-                    non_null_unique,
-                    key=lambda x: (str(type(x)), x) if not isinstance(x, (int, float)) else x,
-                )
-                # Build value → sorted dict index map (matching encoder)
-                seen = {v: i for i, v in enumerate(dict_values)}
+                seen: dict[object, int] = {}
+                dict_values: list = []  # insertion order
+                for v in raw_vals:
+                    if v is not None and v not in seen:
+                        seen[v] = len(dict_values)
+                        dict_values.append(v)
                 distinct = len(dict_values)
 
-                # Sort values to get POS_TO_ID mapping
-                try:
-                    sorted_vals = sorted(dict_values, key=str)
-                except TypeError:
-                    sorted_vals = sorted(dict_values, key=str)
+                # Sort values for H$ POS_TO_ID mapping
+                # Use same sort key as encoder's unique_sorted
+                sorted_vals = sorted(
+                    dict_values,
+                    key=lambda x: (str(type(x)), x) if not isinstance(x, (int, float)) else x,
+                )
 
                 # POS_TO_ID: sorted_pos -> data_id (dict_index + 3)
                 # BaseId=0, so data_ids start at 3
@@ -2130,10 +2160,9 @@ def _modify_metadata_and_encode(
             if "_rel_id" not in rdef:
                 continue
 
-            # User API: from_table = Many/fact, to_table = One/dimension
-            # PBI convention: FromTableID = Many, ToTableID = One
-            many_tname = rdef["from_table"]   # fact (e.g. Orders)
-            one_tname = rdef["to_table"]      # dimension/lookup (e.g. Products)
+            # Use resolved Many/One from relationship INSERT phase
+            many_tname = rdef["_many_table"]
+            one_tname = rdef["_one_table"]
 
             rel_id = rdef["_rel_id"]
             rel_name = rdef["_rel_name"]
@@ -2141,8 +2170,8 @@ def _modify_metadata_and_encode(
             ris_id = rdef["_ris_id"]
             from_tid = table_id_map[many_tname]   # PBI From = Many
             to_tid = table_id_map[one_tname]      # PBI To = One
-            many_col_name = rdef["from_column"]
-            one_col_name = rdef["to_column"]
+            many_col_name = rdef["_many_column"]
+            one_col_name = rdef["_one_column"]
 
             # R$ table indexes the Many (fact) side
             from_tname = many_tname
