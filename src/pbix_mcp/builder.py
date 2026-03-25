@@ -1779,13 +1779,17 @@ def _modify_metadata_and_encode(
                 meta_key = f"{base}\\column.{col_name}meta"
 
                 # Get distinct count and dict order from encoded data
+                # CRITICAL: must use the SAME sort order as the encoder
+                # (_encode_column uses sorted(set(...), key=...) for dictionary)
                 raw_vals = [row.get(col_name) for row in rows]
-                seen: dict[object, int] = {}
-                for v in raw_vals:
-                    if v is not None and v not in seen:
-                        seen[v] = len(seen)  # dict_index in insertion order
-                # The encoder builds the dictionary in first-seen order
-                dict_values = list(seen.keys())  # values in dict order
+                non_null_unique = set(v for v in raw_vals if v is not None)
+                # Match encoder's sort key exactly (vertipaq_encoder.py line 943)
+                dict_values = sorted(
+                    non_null_unique,
+                    key=lambda x: (str(type(x)), x) if not isinstance(x, (int, float)) else x,
+                )
+                # Build value → sorted dict index map (matching encoder)
+                seen = {v: i for i, v in enumerate(dict_values)}
                 distinct = len(dict_values)
 
                 # Sort values to get POS_TO_ID mapping
