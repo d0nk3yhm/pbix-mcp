@@ -17,7 +17,7 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 
 | Format | Support |
 |--------|---------|
-| .pbix (Import mode) | Full read/write/create. Metadata/data/layout from scratch; ABF container uses template skeleton. Open, Refresh verified for all database types |
+| .pbix (Import mode) | Full read/write/create. Entire PBIX generated from scratch — no templates. Open, Refresh verified for all database types |
 | .pbit (Template) | Full read/write |
 | DirectQuery (create) | Open, live data, Refresh all verified — PostgreSQL (native), MySQL (MariaDB ODBC 3.1), SQL Server |
 | DirectQuery (open existing) | Read-only for layout/measures/metadata; DAX eval unavailable (data lives in remote source) |
@@ -53,14 +53,16 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 ## Builder
 
 ### What is generated from scratch
-- **Metadata SQLite**: clean DATASOURCEVERSION=2 — only user-specified tables, columns, and measures, no template data
-- **VertiPaq column data**: all IDF segments, dictionaries, H$ hierarchy tables, R$ relationship tables generated independently. Verified with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase)
-- **Report layout JSON**: pages, visuals, filters generated from scratch. Supported visuals: table, pieChart, clusteredBarChart, card, slicer
+Every layer of the PBIX is generated from scratch — no templates or skeletons:
 
-### What uses a template skeleton
-- **ABF binary container**: the ABF container format has not been fully documented for from-scratch generation. The template skeleton provides the system file structure (db.xml, CryptKey, BackupLog format) that the VertiPaq engine requires for database restore
-- **Template dead weight**: the template's Financial Sample VertiPaq files are still physically present in the ABF but are ignored by the clean metadata — they add ~600KB of dead weight
-- **PBIX OPC wrapper**: template files provide the ZIP/OPC structure
+- **PBIX ZIP shell**: Version, Content_Types, DiagramLayout, Settings, Metadata — all generated constants
+- **ABF binary container**: signature, BackupLogHeader, VirtualDirectory, BackupLog — `build_abf_clean()`
+- **XMLA Load document (db.xml)**: 28 xmlns namespaces, CompatibilityLevel=1550 — `generate_db_xml()`
+- **CryptKey.bin**: 144-byte RSA key BLOB constant (Microsoft crypto format; GUID-independent)
+- **Metadata SQLite**: clean DATASOURCEVERSION=2, 63 system tables — only user-specified tables, columns, and measures
+- **VertiPaq column data**: all IDF segments, dictionaries, H$ hierarchy tables, R$ relationship tables. Verified with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 13 visuals (Northwind showcase)
+- **Report layout JSON**: pages, visuals, filters generated from scratch. Supported visuals: table, pieChart, clusteredBarChart, clusteredColumnChart, card, slicer
+- **XPress9 compression**: custom compress/decompress with reversed chunk framing and headers
 
 ### Other builder notes
 - **RLE encoding disabled**: pure bitpack used for IDF segments — slightly less space-efficient but correct

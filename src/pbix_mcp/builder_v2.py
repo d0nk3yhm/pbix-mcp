@@ -1,218 +1,23 @@
-"""Template-free ABF builder — Step-by-step template elimination.
+"""ABF and PBIX generation — every byte from scratch.
 
-This module provides functions to progressively eliminate template
-dependency from the ABF binary container. Each step is independently
-testable and builds on the previous one.
-
-Current step: Step 2 — Generate own db.xml + strip template VP
+Generates the complete PBIX binary stack from code:
+  - ABF binary container (signature, header, VDir, BackupLog, db.xml, CryptKey)
+  - PBIX ZIP shell (Version, Content_Types, DiagramLayout, Settings, Metadata)
 """
 
 from __future__ import annotations
 
+import json
 import secrets
 import xml.etree.ElementTree as ET
 from typing import Dict
 
 from pbix_mcp.formats.abf_rebuild import (
     STREAM_STORAGE_SIGNATURE,
-    _ABFStructure,
     _HEADER_PAGE_SIZE,
     _SIGNATURE_LEN,
     _xml_to_utf16_bytes,
 )
-
-
-def _rebuild_abf_without_template_vp(
-    template_abf: bytes,
-    metadata_replacement: bytes,
-    new_files: Dict[str, bytes],
-) -> bytes:
-    """Rebuild ABF from template but STRIP all template VertiPaq files.
-
-    Keeps: ADDITIONAL_LOG, PARTITIONS, db.xml, CryptKey.bin, metadata.sqlitedb
-    Strips: ALL 280 template VertiPaq data files (IDF, IDFMETA, dict, hidx)
-    Adds: Our new VertiPaq files from new_files dict
-
-    Args:
-        template_abf: Decompressed template ABF bytes
-        metadata_replacement: Our clean metadata.sqlitedb bytes
-        new_files: Dict mapping ABF paths to VertiPaq file bytes
-                   Keys like "Regions (1010).tbl\\1013.prt\\0.Regions (1010).RegionID (1027).0.idf"
-
-    Returns:
-        Complete ABF bytes ready for XPress9 compression
-    """
-    s = _ABFStructure(template_abf)
-    now = _windows_filetime_now()
-
-    # ── Identify which template files to KEEP vs STRIP ──────────────
-    # Class=100002 files (db.xml, CryptKey) → KEEP
-    # Class=100069 files → STRIP ALL except metadata.sqlitedb
-    # Standalone VDir entries (ADDITIONAL_LOG, PARTITIONS) → KEEP
-
-    keep_storage_paths = set()  # StoragePaths to keep from template
-
-    # Keep Class=100002 (system files)
-    for fg in s.backup_log_root.findall("FileGroups/FileGroup"):
-        if fg.findtext("Class", "") == "100002":
-            for bf in fg.findall("FileList/BackupFile"):
-                keep_storage_paths.add(bf.findtext("StoragePath", ""))
-
-    # Find metadata.sqlitedb StoragePath in Class=100069 → KEEP
-    metadata_sp = None
-    for fg in s.backup_log_root.findall("FileGroups/FileGroup"):
-        if fg.findtext("Class", "") == "100069":
-            for bf in fg.findall("FileList/BackupFile"):
-                path = bf.findtext("Path", "")
-                sp = bf.findtext("StoragePath", "")
-                if "metadata.sqlitedb" in path:
-                    metadata_sp = sp
-                    keep_storage_paths.add(sp)
-
-    # Standalone VDir entries (ADDITIONAL_LOG, PARTITIONS) are always kept
-    # They're identified by not being in any FileGroup
-
-    # ── Collect file data: kept template files + our new files ──────
-    file_entries = []  # List of (vdir_path, data_bytes, is_backuplog_file, fg_class, blog_path)
-
-    # 1. Standalone VDir entries (ADDITIONAL_LOG, PARTITIONS)
-    blog_sps = set()
-    for fg in s.backup_log_root.findall("FileGroups/FileGroup"):
-        for bf in fg.findall("FileList/BackupFile"):
-            blog_sps.add(bf.findtext("StoragePath", ""))
-
-    for ve in s.data_entries:
-        if ve.path not in blog_sps:
-            # Standalone entry — keep as-is
-            data = template_abf[ve.m_cbOffsetHeader:ve.m_cbOffsetHeader + ve.size]
-            file_entries.append((ve.path, data, False, None, None))
-
-    # 2. Class=100002 files (db.xml, CryptKey) — keep from template
-    for fg in s.backup_log_root.findall("FileGroups/FileGroup"):
-        if fg.findtext("Class", "") == "100002":
-            for bf in fg.findall("FileList/BackupFile"):
-                sp = bf.findtext("StoragePath", "")
-                path = bf.findtext("Path", "")
-                # Read original data from template
-                ve = next((v for v in s.data_entries if v.path == sp), None)
-                if ve:
-                    data = template_abf[ve.m_cbOffsetHeader:ve.m_cbOffsetHeader + ve.size]
-                    file_entries.append((sp, data, True, "100002", path))
-
-    # 3. metadata.sqlitedb — our replacement
-    if metadata_sp:
-        # Find the original BackupLog path for metadata
-        for fg in s.backup_log_root.findall("FileGroups/FileGroup"):
-            if fg.findtext("Class", "") == "100069":
-                for bf in fg.findall("FileList/BackupFile"):
-                    if bf.findtext("StoragePath", "") == metadata_sp:
-                        blog_path = bf.findtext("Path", "")
-                        file_entries.append((metadata_sp, metadata_replacement, True, "100069", blog_path))
-                        break
-
-    # 4. Our new VertiPaq files — assign random StoragePaths
-    persist_root = ""
-    for fg in s.backup_log_root.findall("FileGroups/FileGroup"):
-        if fg.findtext("Class", "") == "100069":
-            plp = fg.findtext("PersistLocationPath", "")
-            if plp:
-                persist_root = plp.rstrip("\\") + "\\"
-            break
-
-    new_file_mappings = []  # (sp, blog_path, data)
-    for rel_path, data in sorted(new_files.items()):
-        sp = secrets.token_hex(10).upper()
-        blog_path = persist_root + rel_path
-        file_entries.append((sp, data, True, "100069", blog_path))
-        new_file_mappings.append((sp, blog_path, len(data)))
-
-    # ── Build the binary layout ─────────────────────────────────────
-    buf = bytearray(STREAM_STORAGE_SIGNATURE)
-    buf.extend(b"\x00" * (_HEADER_PAGE_SIZE - _SIGNATURE_LEN))  # Header placeholder
-
-    # Write file data sequentially
-    vdir_entries = []  # (path, offset, size)
-    for vdir_path, data, _, _, _ in file_entries:
-        offset = len(buf)
-        buf.extend(data)
-        vdir_entries.append((vdir_path, offset, len(data)))
-
-    # ── Build BackupLog XML ─────────────────────────────────────────
-    # Clone template BackupLog but strip Class=100069 VP entries
-    new_blog = ET.Element(s.backup_log_root.tag)
-    for child in s.backup_log_root:
-        if child.tag == "FileGroups":
-            new_fgs = ET.SubElement(new_blog, "FileGroups")
-            for fg in child.findall("FileGroup"):
-                cls = fg.findtext("Class", "")
-                if cls == "100002":
-                    # Keep Class=100002 as-is
-                    new_fgs.append(fg)
-                elif cls == "100069":
-                    # Rebuild Class=100069 with only our files
-                    new_fg = ET.SubElement(new_fgs, "FileGroup")
-                    for fg_child in fg:
-                        if fg_child.tag == "FileList":
-                            new_fl = ET.SubElement(new_fg, "FileList")
-                            # Keep metadata.sqlitedb
-                            for bf in fg_child.findall("BackupFile"):
-                                if "metadata.sqlitedb" in bf.findtext("Path", ""):
-                                    # Update size
-                                    bf.find("Size").text = str(len(metadata_replacement))
-                                    bf.find("LastWriteTime").text = str(now)
-                                    new_fl.append(bf)
-                            # Add our new VP files
-                            for sp, blog_path, size in new_file_mappings:
-                                new_bf = ET.SubElement(new_fl, "BackupFile")
-                                ET.SubElement(new_bf, "Path").text = blog_path
-                                ET.SubElement(new_bf, "StoragePath").text = sp
-                                ET.SubElement(new_bf, "LastWriteTime").text = str(now)
-                                ET.SubElement(new_bf, "Size").text = str(size)
-                        else:
-                            new_fg.append(fg_child)
-        else:
-            new_blog.append(child)
-
-    blog_bytes = _xml_to_utf16_bytes(new_blog)
-    blog_offset = len(buf)
-    buf.extend(blog_bytes)
-    vdir_entries.append(("LOG", blog_offset, len(blog_bytes)))
-
-    # ── Build VirtualDirectory XML ──────────────────────────────────
-    vdir_root = ET.Element("VirtualDirectory")
-    for vdir_path, offset, size in vdir_entries:
-        bf = ET.SubElement(vdir_root, "BackupFile")
-        ET.SubElement(bf, "Path").text = vdir_path
-        ET.SubElement(bf, "Size").text = str(size)
-        ET.SubElement(bf, "m_cbOffsetHeader").text = str(offset)
-        ET.SubElement(bf, "Delete").text = "false"
-        ET.SubElement(bf, "CreatedTimestamp").text = str(now)
-        ET.SubElement(bf, "Access").text = str(now)
-        ET.SubElement(bf, "LastWriteTime").text = str(now)
-
-    vdir_bytes = _xml_to_utf16_bytes(vdir_root)
-    vdir_offset = len(buf)
-    buf.extend(vdir_bytes)
-
-    # ── Patch BackupLogHeader ───────────────────────────────────────
-    header_root = ET.Element("BackupLog")
-    for child in s.header_root:
-        new_child = ET.SubElement(header_root, child.tag)
-        if child.tag == "m_cbOffsetHeader":
-            new_child.text = str(vdir_offset)
-        elif child.tag == "DataSize":
-            new_child.text = str(len(vdir_bytes))
-        elif child.tag == "Files":
-            new_child.text = str(len(vdir_entries))
-        else:
-            new_child.text = child.text
-
-    header_bytes = _xml_to_utf16_bytes(header_root)
-    if len(header_bytes) > _HEADER_PAGE_SIZE - _SIGNATURE_LEN:
-        raise ValueError(f"Header XML too large: {len(header_bytes)} bytes")
-    buf[_SIGNATURE_LEN:_SIGNATURE_LEN + len(header_bytes)] = header_bytes
-
-    return bytes(buf)
 
 
 def _windows_filetime_now() -> int:
@@ -335,7 +140,7 @@ def generate_db_xml(db_id: str, object_id: str, db_unique_id: str) -> bytes:
     return xml.encode("utf-8")
 
 
-# ── Steps 4-6: Complete template-free ABF builder ───────────────────
+# ── ABF builder ─────────────────────────────────────────────────────
 
 # System file constants
 _ADDITIONAL_LOG = '<Property><ProductName>Default</ProductName></Property>'.encode("utf-16")
@@ -347,7 +152,7 @@ def build_abf_clean(
     vertipaq_files: Dict[str, bytes],
     db_id: str | None = None,
 ) -> bytes:
-    """Build a complete ABF archive from scratch — ZERO template dependency.
+    """Build a complete ABF archive from scratch.
 
     Only uses the CRYPTKEY_BYTES constant (144 bytes, crypto format requirement).
     Everything else is generated: db.xml, BackupLog, VDir, Header.
@@ -387,7 +192,9 @@ def build_abf_clean(
         vp_mappings.append((_sp(), rel_path, vertipaq_files[rel_path]))
 
     # ── Persist path (synthetic — PBI doesn't validate the actual path) ──
-    persist_path = f"\\\\?\\C:\\Sandboxes\\{db_id}.0.db"
+    # ServerRoot must be the PARENT directory; PersistLocationPath is the .0.db child
+    server_root = "\\\\?\\C:\\Sandboxes"
+    persist_path = f"{server_root}\\{db_id}.0.db"
 
     # ── Lay out file data sequentially ──────────────────────────────
     buf = bytearray(STREAM_STORAGE_SIGNATURE)
@@ -426,10 +233,11 @@ def build_abf_clean(
         buf.extend(data)
         vdir_entries.append((sp, offset, len(data)))
 
-    # ── Build BackupLog XML ─────────────────────────────────────────
-    blog_xml = _build_backup_log(
+    # ── Build BackupLog XML (using ET for consistent encoding) ──────
+    blog_root = _build_backup_log_et(
         db_id=db_id,
         object_id=object_id,
+        server_root=server_root,
         persist_path=persist_path,
         db_xml_sp=db_xml_sp,
         db_xml_size=len(db_xml_bytes),
@@ -440,49 +248,43 @@ def build_abf_clean(
         vp_mappings=vp_mappings,
         now=now,
     )
-    blog_bytes = blog_xml.encode("utf-16")
+    blog_bytes = _xml_to_utf16_bytes(blog_root)
     blog_offset = len(buf)
     buf.extend(blog_bytes)
     vdir_entries.append(("LOG", blog_offset, len(blog_bytes)))
 
-    # ── Build VirtualDirectory XML ──────────────────────────────────
-    vdir_parts = ['<VirtualDirectory>']
+    # ── Build VirtualDirectory XML (using ET) ────────────────────────
+    vdir_root = ET.Element("VirtualDirectory")
     for path, off, size in vdir_entries:
-        vdir_parts.append(
-            f'<BackupFile>'
-            f'<Path>{path}</Path>'
-            f'<Size>{size}</Size>'
-            f'<m_cbOffsetHeader>{off}</m_cbOffsetHeader>'
-            f'<Delete>false</Delete>'
-            f'<CreatedTimestamp>{now}</CreatedTimestamp>'
-            f'<Access>{now}</Access>'
-            f'<LastWriteTime>{now}</LastWriteTime>'
-            f'</BackupFile>'
-        )
-    vdir_parts.append('</VirtualDirectory>')
-    vdir_xml = ''.join(vdir_parts)
-    vdir_bytes = vdir_xml.encode("utf-16")
+        bf = ET.SubElement(vdir_root, "BackupFile")
+        ET.SubElement(bf, "Path").text = path
+        ET.SubElement(bf, "Size").text = str(size)
+        ET.SubElement(bf, "m_cbOffsetHeader").text = str(off)
+        ET.SubElement(bf, "Delete").text = "false"
+        ET.SubElement(bf, "CreatedTimestamp").text = str(now)
+        ET.SubElement(bf, "Access").text = str(now)
+        ET.SubElement(bf, "LastWriteTime").text = str(now)
+
+    vdir_bytes = _xml_to_utf16_bytes(vdir_root)
     vdir_offset = len(buf)
     buf.extend(vdir_bytes)
 
-    # ── Build BackupLogHeader ───────────────────────────────────────
-    header_xml = (
-        f'<BackupLog>'
-        f'<BackupRestoreSyncVersion>140</BackupRestoreSyncVersion>'
-        f'<Fault>false</Fault>'
-        f'<faultcode>0</faultcode>'
-        f'<ErrorCode>false</ErrorCode>'
-        f'<EncryptionFlag>false</EncryptionFlag>'
-        f'<EncryptionKey>0</EncryptionKey>'
-        f'<ApplyCompression>false</ApplyCompression>'
-        f'<m_cbOffsetHeader>{vdir_offset}</m_cbOffsetHeader>'
-        f'<DataSize>{len(vdir_bytes)}</DataSize>'
-        f'<Files>{len(vdir_entries)}</Files>'
-        f'<ObjectID>{object_id}</ObjectID>'
-        f'<m_cbOffsetData>{_HEADER_PAGE_SIZE}</m_cbOffsetData>'
-        f'</BackupLog>'
-    )
-    header_bytes = header_xml.encode("utf-16")
+    # ── Build BackupLogHeader (using ET) ─────────────────────────────
+    header_root = ET.Element("BackupLog")
+    ET.SubElement(header_root, "BackupRestoreSyncVersion").text = "140"
+    ET.SubElement(header_root, "Fault").text = "false"
+    ET.SubElement(header_root, "faultcode").text = "0"
+    ET.SubElement(header_root, "ErrorCode").text = "false"
+    ET.SubElement(header_root, "EncryptionFlag").text = "false"
+    ET.SubElement(header_root, "EncryptionKey").text = "0"
+    ET.SubElement(header_root, "ApplyCompression").text = "false"
+    ET.SubElement(header_root, "m_cbOffsetHeader").text = str(vdir_offset)
+    ET.SubElement(header_root, "DataSize").text = str(len(vdir_bytes))
+    ET.SubElement(header_root, "Files").text = str(len(vdir_entries))
+    ET.SubElement(header_root, "ObjectID").text = object_id
+    ET.SubElement(header_root, "m_cbOffsetData").text = str(_HEADER_PAGE_SIZE)
+
+    header_bytes = _xml_to_utf16_bytes(header_root)
     if len(header_bytes) > _HEADER_PAGE_SIZE - _SIGNATURE_LEN:
         raise ValueError(f"Header XML too large: {len(header_bytes)} bytes")
     buf[_SIGNATURE_LEN:_SIGNATURE_LEN + len(header_bytes)] = header_bytes
@@ -490,9 +292,10 @@ def build_abf_clean(
     return bytes(buf)
 
 
-def _build_backup_log(
+def _build_backup_log_et(
     db_id: str,
     object_id: str,
+    server_root: str,
     persist_path: str,
     db_xml_sp: str,
     db_xml_size: int,
@@ -502,92 +305,172 @@ def _build_backup_log(
     metadata_size: int,
     vp_mappings: list,
     now: int,
-) -> str:
-    """Build the BackupLog XML string (NOT the header — the full log)."""
-    parts = [
-        '<BackupLog>',
-        '<BackupRestoreSyncVersion>11.53</BackupRestoreSyncVersion>',
-        f'<ServerRoot>{persist_path}</ServerRoot>',
-        '<SvrEncryptPwdFlag>true</SvrEncryptPwdFlag>',
-        '<ServerEnableBinaryXML>false</ServerEnableBinaryXML>',
-        '<ServerEnableCompression>false</ServerEnableCompression>',
-        '<CompressionFlag>false</CompressionFlag>',
-        '<EncryptionFlag>false</EncryptionFlag>',
-        f'<ObjectName>{db_id}</ObjectName>',
-        f'<ObjectId>{db_id}</ObjectId>',
-        '<Write>ReadWrite</Write>',
-        '<OlapInfo>false</OlapInfo>',
-        '<IsTabular>true</IsTabular>',
-        '<Collations />',
-        '<Languages><Language>1033</Language></Languages>',
-        '<FileGroups>',
-    ]
+) -> ET.Element:
+    """Build the BackupLog XML as an ET.Element tree (NOT the header — the full log)."""
+    root = ET.Element("BackupLog")
+
+    ET.SubElement(root, "BackupRestoreSyncVersion").text = "11.53"
+    ET.SubElement(root, "ServerRoot").text = server_root
+    ET.SubElement(root, "SvrEncryptPwdFlag").text = "true"
+    ET.SubElement(root, "ServerEnableBinaryXML").text = "false"
+    ET.SubElement(root, "ServerEnableCompression").text = "false"
+    ET.SubElement(root, "CompressionFlag").text = "false"
+    ET.SubElement(root, "EncryptionFlag").text = "false"
+    ET.SubElement(root, "ObjectName").text = db_id
+    ET.SubElement(root, "ObjectId").text = db_id
+    ET.SubElement(root, "Write").text = "ReadWrite"
+    ET.SubElement(root, "OlapInfo").text = "false"
+    ET.SubElement(root, "IsTabular").text = "true"
+    ET.SubElement(root, "Collations")
+    langs = ET.SubElement(root, "Languages")
+    ET.SubElement(langs, "Language").text = "1033"
+
+    file_groups = ET.SubElement(root, "FileGroups")
 
     # FileGroup 0: Class=100002 (database metadata)
-    db_xml_path = f'{persist_path}\\{db_id}.0.db.xml'
-    cryptkey_path = f'{persist_path}\\0.CryptKey.bin'
-    parts.extend([
-        '<FileGroup>',
-        '<Class>100002</Class>',
-        f'<ID>{db_id}</ID>',
-        f'<Name>{db_id}</Name>',
-        '<ObjectVersion>0</ObjectVersion>',
-        '<PersistLocation>0</PersistLocation>',
-        f'<PersistLocationPath>{persist_path}</PersistLocationPath>',
-        '<StorageLocationPath />',
-        f'<ObjectID>{object_id}</ObjectID>',
-        '<FileList>',
-        f'<BackupFile><Path>{db_xml_path}</Path>'
-        f'<StoragePath>{db_xml_sp}</StoragePath>'
-        f'<LastWriteTime>{now}</LastWriteTime>'
-        f'<Size>{db_xml_size}</Size></BackupFile>',
-        f'<BackupFile><Path>{cryptkey_path}</Path>'
-        f'<StoragePath>{cryptkey_sp}</StoragePath>'
-        f'<LastWriteTime>{now}</LastWriteTime>'
-        f'<Size>{cryptkey_size}</Size></BackupFile>',
-        '</FileList>',
-        '</FileGroup>',
-    ])
+    fg0 = ET.SubElement(file_groups, "FileGroup")
+    ET.SubElement(fg0, "Class").text = "100002"
+    ET.SubElement(fg0, "ID").text = db_id
+    ET.SubElement(fg0, "Name").text = db_id
+    ET.SubElement(fg0, "ObjectVersion").text = "0"
+    ET.SubElement(fg0, "PersistLocation").text = "0"
+    ET.SubElement(fg0, "PersistLocationPath").text = persist_path
+    ET.SubElement(fg0, "StorageLocationPath")
+    ET.SubElement(fg0, "ObjectID").text = object_id
+    fl0 = ET.SubElement(fg0, "FileList")
+
+    # db.xml entry — file sits at ServerRoot level (sibling of .0.db dir)
+    bf_dbxml = ET.SubElement(fl0, "BackupFile")
+    ET.SubElement(bf_dbxml, "Path").text = f"{server_root}\\{db_id}.0.db.xml"
+    ET.SubElement(bf_dbxml, "StoragePath").text = db_xml_sp
+    ET.SubElement(bf_dbxml, "LastWriteTime").text = str(now)
+    ET.SubElement(bf_dbxml, "Size").text = str(db_xml_size)
+
+    # CryptKey entry
+    bf_ck = ET.SubElement(fl0, "BackupFile")
+    ET.SubElement(bf_ck, "Path").text = f"{persist_path}\\0.CryptKey.bin"
+    ET.SubElement(bf_ck, "StoragePath").text = cryptkey_sp
+    ET.SubElement(bf_ck, "LastWriteTime").text = str(now)
+    ET.SubElement(bf_ck, "Size").text = str(cryptkey_size)
 
     # FileGroup 1: Class=100069 (VertiPaq data)
-    vp_persist = persist_path
-    parts.extend([
-        '<FileGroup>',
-        '<Class>100069</Class>',
-        f'<ID>{db_id}</ID>',
-        f'<Name>{db_id}</Name>',
-        '<ObjectVersion>-1</ObjectVersion>',
-        '<PersistLocation>-1</PersistLocation>',
-        f'<PersistLocationPath>{vp_persist}</PersistLocationPath>',
-        '<StorageLocationPath />',
-        '<ObjectID>00000000-0000-0000-0000-000000000000</ObjectID>',
-        '<FileList>',
-    ])
+    fg1 = ET.SubElement(file_groups, "FileGroup")
+    ET.SubElement(fg1, "Class").text = "100069"
+    ET.SubElement(fg1, "ID").text = db_id
+    ET.SubElement(fg1, "Name").text = db_id
+    ET.SubElement(fg1, "ObjectVersion").text = "-1"
+    ET.SubElement(fg1, "PersistLocation").text = "-1"
+    ET.SubElement(fg1, "PersistLocationPath").text = persist_path
+    ET.SubElement(fg1, "StorageLocationPath")
+    ET.SubElement(fg1, "ObjectID").text = "00000000-0000-0000-0000-000000000000"
+    fl1 = ET.SubElement(fg1, "FileList")
 
     # metadata.sqlitedb
-    meta_path = f'{vp_persist}\\metadata.sqlitedb'
-    parts.append(
-        f'<BackupFile><Path>{meta_path}</Path>'
-        f'<StoragePath>{metadata_sp}</StoragePath>'
-        f'<LastWriteTime>{now}</LastWriteTime>'
-        f'<Size>{metadata_size}</Size></BackupFile>'
-    )
+    bf_meta = ET.SubElement(fl1, "BackupFile")
+    ET.SubElement(bf_meta, "Path").text = f"{persist_path}\\metadata.sqlitedb"
+    ET.SubElement(bf_meta, "StoragePath").text = metadata_sp
+    ET.SubElement(bf_meta, "LastWriteTime").text = str(now)
+    ET.SubElement(bf_meta, "Size").text = str(metadata_size)
 
     # VertiPaq files
     for sp, rel_path, data in vp_mappings:
-        full_path = vp_persist + '\\' + rel_path
-        parts.append(
-            f'<BackupFile><Path>{full_path}</Path>'
-            f'<StoragePath>{sp}</StoragePath>'
-            f'<LastWriteTime>{now}</LastWriteTime>'
-            f'<Size>{len(data)}</Size></BackupFile>'
-        )
+        bf_vp = ET.SubElement(fl1, "BackupFile")
+        ET.SubElement(bf_vp, "Path").text = f"{persist_path}\\{rel_path}"
+        ET.SubElement(bf_vp, "StoragePath").text = sp
+        ET.SubElement(bf_vp, "LastWriteTime").text = str(now)
+        ET.SubElement(bf_vp, "Size").text = str(len(data))
 
-    parts.extend([
-        '</FileList>',
-        '</FileGroup>',
-        '</FileGroups>',
-        '</BackupLog>',
-    ])
+    return root
 
-    return ''.join(parts)
+
+# ── PBIX ZIP shell constants ──────────────────────────────────────────
+
+# Version: "1.28" in UTF-16-LE (8 bytes)
+_PBIX_VERSION = "1.28".encode("utf-16-le")
+
+# [Content_Types].xml — standard OOXML content types for PBIX
+_CONTENT_TYPES_XML = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    '<Default Extension="json" ContentType="" />'
+    '<Override PartName="/Version" ContentType="" />'
+    '<Override PartName="/DiagramLayout" ContentType="" />'
+    '<Override PartName="/Report/Layout" ContentType="" />'
+    '<Override PartName="/Settings" ContentType="application/json" />'
+    '<Override PartName="/Metadata" ContentType="application/json" />'
+    '<Override PartName="/DataModel" ContentType="" />'
+    '</Types>'
+).encode("utf-8")
+
+# DiagramLayout — empty diagram
+_DIAGRAM_LAYOUT = json.dumps({
+    "version": "1.1.0",
+    "diagrams": [{
+        "ordinal": 0,
+        "scrollPosition": {"x": 0, "y": 0},
+        "nodes": [],
+        "name": "All tables",
+        "zoomValue": 100,
+        "pinKeyFieldsToTop": False,
+        "showExtraHeaderInfo": False,
+        "hideKeyFieldsWhenCollapsed": False,
+        "tablesLocked": False,
+    }],
+    "selectedDiagram": "All tables",
+    "defaultDiagram": "All tables",
+}, separators=(",", ":")).encode("utf-16-le")
+
+# Settings — auto-relationship detection disabled to prevent TMCCollectionObject errors
+_SETTINGS = json.dumps({
+    "Version": 4,
+    "ReportSettings": {},
+    "QueriesSettings": {
+        "TypeDetectionEnabled": True,
+        "RelationshipImportEnabled": False,
+        "Version": "2.126.29.0",
+    },
+}, separators=(",", ":")).encode("utf-16-le")
+
+# Metadata — file-level metadata
+_METADATA = json.dumps({
+    "Version": 5,
+    "AutoCreatedRelationships": [],
+    "CreatedFrom": "Cloud",
+    "CreatedFromRelease": "2024.03",
+}, separators=(",", ":")).encode("utf-16-le")
+
+
+def build_pbix_clean(
+    datamodel_bytes: bytes,
+    layout_bytes: bytes,
+    theme_json: str | None = None,
+) -> bytes:
+    """Build a complete PBIX ZIP from scratch.
+
+    Args:
+        datamodel_bytes: XPress9-compressed DataModel bytes
+        layout_bytes: Report/Layout JSON bytes
+        theme_json: Optional theme JSON string. If provided, included as BaseThemes.
+
+    Returns:
+        Complete PBIX file bytes (ZIP format)
+    """
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("Version", _PBIX_VERSION)
+        zf.writestr("[Content_Types].xml", _CONTENT_TYPES_XML)
+        zf.writestr("DiagramLayout", _DIAGRAM_LAYOUT)
+        zf.writestr("Settings", _SETTINGS)
+        zf.writestr("Metadata", _METADATA)
+        zf.writestr("Report/Layout", layout_bytes)
+        zf.writestr("DataModel", datamodel_bytes)
+        if theme_json is not None:
+            zf.writestr(
+                "Report/StaticResources/SharedResources/BaseThemes/CY24SU11.json",
+                theme_json.encode("utf-8"),
+            )
+
+    return buf.getvalue()

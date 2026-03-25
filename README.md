@@ -4,7 +4,9 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. Exposes 69 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery live database connections, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation, RLS security, and binary format internals. The metadata SQLite, VertiPaq column data, and report layout are generated from scratch (DATASOURCEVERSION=2, clean SQLite). The ABF binary container uses a template skeleton for system files (db.xml, CryptKey.bin, BackupLog format) — see Known Limitations.
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python: PBIX ZIP shell, ABF binary container, XMLA database document, VertiPaq columnar storage (IDF/IDFMETA/dictionary/HIDX/H$/R$), metadata SQLite (63 system tables), XPress9 compression, and report layout — all generated from scratch with zero templates or skeletons.
+
+Exposes 69 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
 
 ## Quick Start
 
@@ -49,7 +51,7 @@ Add to your MCP config file:
 ### Codex Desktop (OpenAI)
 
 1. `pip install git+https://github.com/d0nk3yhm/pbix-mcp.git`
-2. Open Codex Desktop → Settings ⚙️ → MCP → Add Server
+2. Open Codex Desktop → Settings → MCP → Add Server
 3. Configure:
    - **Name**: `powerbi-editor`
    - **Command**: `pbix-mcp-server`
@@ -63,11 +65,30 @@ pbix-mcp-server
 pbix-mcp-server --log-level debug
 ```
 
+## Format Reversal Status
+
+Every layer of the PBIX binary format has been independently reversed and reimplemented. No templates, skeletons, or Microsoft binaries are used.
+
+| Layer | Status | Implementation |
+|-------|--------|----------------|
+| PBIX ZIP shell | **Reversed** | Version, Content_Types, DiagramLayout, Settings, Metadata — generated constants |
+| Report/Layout JSON | **Reversed** | Pages, visuals, data bindings, filters — `_build_layout()` |
+| ABF binary container | **Reversed** | 72-byte signature, BackupLogHeader, VirtualDirectory, BackupLog — `build_abf_clean()` |
+| XMLA Load document (db.xml) | **Reversed** | 28 xmlns namespaces, CompatibilityLevel=1550, TabularMetadata — `generate_db_xml()` |
+| CryptKey.bin | **Constant** | 144-byte RSA key BLOB (Microsoft crypto format; GUID-independent constant) |
+| Metadata SQLite | **Reversed** | 63 system tables created from scratch — `create_empty_metadata_db()` |
+| VertiPaq column storage | **Reversed** | IDF (bit-packed), IDFMETA (segment stats), dictionary (Long/Real/String), HIDX (hash index) |
+| H$ attribute hierarchies | **Reversed** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities |
+| R$ relationship indexes | **Reversed** | NoSplit<N> INDEX encoding with foreign key mapping |
+| XPress9 compression | **Reversed** | Custom compress/decompress with reversed chunk framing, headers, and multi-thread format; core algorithm via [xpress9-python](https://github.com/Hugoberry/xpress9-python) (MIT) |
+
+The only non-generated artifact is the 144-byte CryptKey constant. This is a Microsoft RSA key BLOB that requires `rskeymgmt` infrastructure to generate. The key is GUID-independent — any valid key works with any database ID. Random bytes produce `PFE_INVALID_CRYPT_KEY`.
+
 ## Stability
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| PBIX creation | **Stable** | Multi-table with all 6 data types, relationships, H$ hierarchies, measures — loads in PBI Desktop. Metadata/data/layout from scratch; ABF container uses template skeleton |
+| PBIX creation | **Stable** | Multi-table with all 6 data types, relationships, H$ hierarchies, measures — generated entirely from scratch |
 | Cross-table relationships | **Stable** | R$ system tables with NoSplit INDEX encoding; RELATED() and cross-table filtering work |
 | Refreshable CSV sources | **Stable** | `source_csv` parameter creates M expressions referencing external CSV files; click Refresh in PBI Desktop to re-import |
 | SQLite database sources | **Stable** | `source_db` with ODBC driver; data imported at build, Refresh re-reads from DB |
@@ -110,8 +131,8 @@ pbix-mcp-server --log-level debug
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
 - **Opening existing DirectQuery files** — layout, measures, and metadata editing work; DAX evaluation and table reads return clear errors since data lives in the remote source (this is inherent to DirectQuery — the data isn't in the file)
 - **Creating DirectQuery files** — fully working with SQL Server (LocalDB), PostgreSQL 16, and MySQL 9.6 (via MariaDB adapter); requires a running database server and initial data snapshot
-- **ABF container format** — has not been fully documented for from-scratch generation. The template skeleton provides the system file structure (db.xml, CryptKey, BackupLog format) that the VertiPaq engine requires for database restore. The template's Financial Sample VertiPaq files are still physically present in the ABF but are ignored by the clean metadata — they add ~600KB of dead weight
-- **Embedded VertiPaq data** — verified working with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase)
+- **CryptKey.bin** — the 144-byte RSA key BLOB cannot be generated without Microsoft's crypto infrastructure (`rskeymgmt`). A known-valid GUID-independent constant is used.
+- **Embedded VertiPaq data** — verified working with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 13 visuals (Northwind showcase)
 - **RLE encoding** — disabled in the VertiPaq encoder (pure bitpack used). Slightly less space-efficient but correct
 
 
@@ -149,7 +170,7 @@ pbix-mcp-server --log-level debug
 
 ## Creating Reports
 
-Build a complete multi-table PBIX with relationships and cross-table DAX — no Power BI Desktop needed. Metadata, VertiPaq data, and report layout are generated from scratch; the ABF binary container uses a template skeleton for system files:
+Build a complete multi-table PBIX with relationships and cross-table DAX — no Power BI Desktop needed. Every byte is generated from scratch:
 
 ```python
 from pbix_mcp.builder import PBIXBuilder
@@ -179,7 +200,7 @@ builder.add_table('Sales', [
     {'OrderID': 1003, 'ProductID': 3, 'Qty': 20, 'Region': 'East'},
 ])
 
-# Cross-table relationship
+# Cross-table relationship (from=many, to=one)
 builder.add_relationship('Sales', 'ProductID', 'Products', 'ProductID')
 
 # Measures (including cross-table RELATED)
@@ -291,16 +312,16 @@ DirectQuery creates a PBIX with `Partition.Mode=1` and a `Sql.Database()` M expr
 
 | Type | Status | Dictionary Format |
 |------|--------|-------------------|
-| `String` | ✅ Stable | External UTF-16LE with hash table |
-| `Int64` | ✅ Stable | External 32-bit entries (IsOperatingOn32=1) |
-| `Double` | ✅ Stable | External 64-bit IEEE 754 entries |
-| `DateTime` | ✅ Stable | External 64-bit entries (same encoding as Double) |
-| `Decimal` | ✅ Stable | External 32-bit entries (value × 10000, IsOperatingOn32=1) |
-| `Boolean` | ✅ Stable | External 32-bit entries (0/1, IsOperatingOn32=1) |
+| `String` | Stable | External UTF-16LE with hash table |
+| `Int64` | Stable | External 32-bit entries (IsOperatingOn32=1) |
+| `Double` | Stable | External 64-bit IEEE 754 entries |
+| `DateTime` | Stable | External 64-bit entries (same encoding as Double) |
+| `Decimal` | Stable | External 32-bit entries (value x 10000, IsOperatingOn32=1) |
+| `Boolean` | Stable | External 32-bit entries (0/1, IsOperatingOn32=1) |
 
 ### VertiPaq Binary Format
 
-The builder generates VertiPaq column data from scratch. The ABF container uses a template skeleton for system files while all user data is independently generated:
+Every component of the VertiPaq columnar storage engine is generated from scratch:
 
 - **IDF** — Bit-packed encoding for data columns (RLE disabled; pure bitpack is slightly less space-efficient but correct)
 - **IDFMETA** — Segment statistics with tagged CP/CS/SS/SDOs blocks
@@ -308,8 +329,8 @@ The builder generates VertiPaq column data from scratch. The ABF container uses 
 - **H$ system tables** — Attribute hierarchy POS_TO_ID + ID_TO_POS using NoSplit<32> encoding
 - **R$ system tables** — Relationship join INDEX using NoSplit<N> encoding
 - **Compression class IDs** — Determined through binary format analysis (u32_a/u32_b selectors)
-- **XPress9** — Byte-exact round-trip compression/decompression
-- **ABF** — Archive manipulation with BackupLog and VirtualDirectory XML (uses template skeleton for system files; user data generated from scratch)
+- **XPress9** — Custom implementation of Power BI's DataModel compression format: reversed chunk framing, header signatures, single-thread and multi-thread container formats. The core XPress9 algorithm uses [xpress9-python](https://github.com/Hugoberry/xpress9-python) as a primitive; the full read/write/modify pipeline is original work
+- **ABF** — Full archive generation: STREAM_STORAGE_SIGNATURE, BackupLogHeader, VirtualDirectory, BackupLog XML, data file layout
 
 ## DAX Engine
 
@@ -346,12 +367,12 @@ The 1 BLANK measure requires per-employee RANKX visual row context that doesn't 
 
 | Measure | Power BI | DAX Engine | Match |
 |---------|----------|------------|-------|
-| Sales (Year=2015) | $470,532 | $470,533 | ✅ |
-| Profit Margin | 13.1% | 13.1% | ✅ |
-| Sales LY | $484,247 | $484,247 | ✅ |
-| Sales Change | -2.8% | -2.8% | ✅ |
-| California Sales | $88,444 | $88,444 | ✅ |
-| Technology Sales | $162,781 | $162,781 | ✅ |
+| Sales (Year=2015) | $470,532 | $470,533 | Yes |
+| Profit Margin | 13.1% | 13.1% | Yes |
+| Sales LY | $484,247 | $484,247 | Yes |
+| Sales Change | -2.8% | -2.8% | Yes |
+| California Sales | $88,444 | $88,444 | Yes |
+| Technology Sales | $162,781 | $162,781 | Yes |
 
 ## Safety
 
@@ -387,22 +408,27 @@ PBIX_TEST_SAMPLES=test_corpus pytest tests/test_cross_report.py -v
 ## Architecture
 
 ```
-PBIX file (ZIP)
-├── Report/Layout          ← JSON: pages, visuals, filters
-├── Report/LinguisticSchema ← XML: Q&A config
-├── Report/StaticResources/ ← Themes, images, custom visuals
-├── DataMashup             ← Binary + inner ZIP: M code
-├── DataModel              ← XPress9 compressed → ABF archive
-│   ├── metadata.sqlitedb  ← SQLite: tables, columns, measures, relationships
-│   ├── *.tbl\*.prt\*.idf  ← VertiPaq: column data (RLE + bit-packed)
-│   ├── *.idfmeta          ← Segment statistics
-│   ├── *.dict             ← Dictionary encoding
-│   ├── *.hidx             ← Hash index
-│   ├── H$*.tbl\...        ← Attribute hierarchy tables (NoSplit<32>)
-│   └── R$*.tbl\...        ← Relationship index tables (NoSplit<N>)
-├── Settings               ← JSON
-├── Metadata               ← JSON
-└── [Content_Types].xml    ← Package manifest
+PBIX file (ZIP) — generated from scratch
+├── Version                ← "1.28" UTF-16-LE (8 bytes)
+├── [Content_Types].xml    ← OOXML package manifest
+├── DiagramLayout          ← JSON: model diagram state
+├── Settings               ← JSON: report settings
+├── Metadata               ← JSON: file metadata
+├── Report/Layout          ← JSON: pages, visuals, filters, data bindings
+└── DataModel              ← XPress9 compressed → ABF archive
+    ├── BackupLogHeader    ← XML: VDir offset, data offset, file count
+    ├── ADDITIONAL_LOG     ← UTF-16: product name
+    ├── PARTITIONS         ← UTF-16: partition marker
+    ├── db.xml             ← XMLA Load document (28 namespaces)
+    ├── CryptKey.bin       ← 144-byte RSA key BLOB (constant)
+    ├── metadata.sqlitedb  ← SQLite: 63 system tables (Table, Column, Measure, Relationship, ...)
+    ├── *.tbl\*.prt\*.idf  ← VertiPaq: bit-packed column data
+    ├── *.idfmeta          ← Segment statistics (CP/CS/SS/SDOs)
+    ├── *.dictionary       ← Dictionary encoding (Long/Real/String + hash)
+    ├── H$*.tbl\...        ← Attribute hierarchy tables (NoSplit<32>)
+    ├── R$*.tbl\...        ← Relationship index tables (NoSplit<N>)
+    ├── BackupLog          ← XML: FileGroups, file paths, storage mappings
+    └── VirtualDirectory   ← XML: file offsets and sizes
 ```
 
 ### Package Layout
@@ -411,15 +437,17 @@ PBIX file (ZIP)
 src/pbix_mcp/
   server.py              # MCP server (69 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
-  builder.py             # PBIX file builder (metadata/data/layout from scratch; ABF skeleton from template)
+  builder.py             # PBIX builder (metadata, VertiPaq, layout, relationships)
+  builder_v2.py          # Template-free ABF + ZIP generation
   errors.py              # Typed exceptions with stable error codes
   logging_config.py      # Diagnostic logging (normal/debug/trace)
   dax/
     engine.py            # DAX evaluator (156 functions, best-effort)
     calc_tables.py       # Calculated table support
   formats/
-    abf_rebuild.py       # ABF archive format
+    abf_rebuild.py       # ABF archive reader and rebuilder
     datamodel_roundtrip.py  # XPress9 compress/decompress
+    metadata_schema.py   # SQLite metadata schema (63 tables from scratch)
     vertipaq_encoder.py  # VertiPaq column encoding + NoSplit<N> encoder
   models/
     responses.py         # Pydantic response models
@@ -459,13 +487,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for project conventions, [SUPPORT.md](SUP
 
 ### Incremental vs Full Rebuild
 
-The builder currently **rebuilds the entire DataModel** each time, generating fresh metadata SQLite and VertiPaq data within the template ABF skeleton. This is the safest approach for binary format integrity — all offsets, checksums, and cross-references are recomputed from a known-good state.
+The builder **generates the entire DataModel from scratch** each time — metadata SQLite, VertiPaq column data, ABF container, and XPress9 compression. All offsets, checksums, and cross-references are computed from first principles.
 
 For **modifying existing PBIX files** (adding a measure, changing a visual), the MCP server operates differently: it opens the file, modifies the specific layer (SQLite metadata for measures, JSON for layout), and repacks — **without touching the VertiPaq binary data**. This is true incremental editing.
 
 | Operation | Approach | Why |
 |-----------|----------|-----|
-| Create new PBIX | Full build | Metadata/data/layout from scratch; ABF skeleton from template |
+| Create new PBIX | Full build from scratch | Every byte generated from code |
 | Add/modify measure | Incremental | Only SQLite metadata modified |
 | Edit visual/layout | Incremental | Only Report/Layout JSON modified |
 | Add table to existing file | Full DataModel rebuild | VertiPaq offsets change |
@@ -473,14 +501,14 @@ For **modifying existing PBIX files** (adding a measure, changing a visual), the
 
 ### No Microsoft Dependencies
 
-This project is **100% Python** with zero Microsoft DLLs or SDKs. The metadata SQLite, VertiPaq column data, and report layout are independently generated. The ABF binary container uses a template skeleton for system files that have not been fully documented (db.xml, CryptKey.bin, BackupLog format). The `tools/` directory (gitignored) contains local development utilities that are not part of the package.
+This project is **100% Python** with zero Microsoft DLLs or SDKs. Every layer of the PBIX format — from the ZIP shell to the VertiPaq column encoding — is independently reversed and implemented. The XPress9 compression uses [xpress9-python](https://github.com/Hugoberry/xpress9-python) (MIT) as a low-level primitive; the Power BI DataModel container format (chunk framing, headers, multi-thread support, full read/write/modify round-trip) is original work in `datamodel_roundtrip.py`.
 
 ## Purpose & Interoperability
 
-This project is an **independent implementation** of the Power BI `.pbix` file specification, created for the sole purpose of **interoperability** — enabling AI agents, automation tools, and non-Windows platforms to create, read, and write Power BI files. The metadata SQLite, VertiPaq column data, and report layout are generated from scratch. The ABF binary container uses a template skeleton for system files that are not yet fully documented.
+This project is an **independent reimplementation** of the Power BI `.pbix` file format, created for the sole purpose of **interoperability** — enabling AI agents, automation tools, and non-Windows platforms to create, read, and write Power BI files. Every layer of the binary format has been independently reversed and reimplemented from scratch.
 
 - **No Microsoft source code** was used. All binary format knowledge was derived through independent analysis of file structures and publicly observable behavior.
-- **Interoperability rights**: In both the [EU (Directive 2009/24/EC, Article 6)](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=celex%3A32009L0024) and [US (DMCA §1201(f))](https://www.law.cornell.edu/uscode/text/17/1201), reverse engineering for interoperability purposes is a protected right that supersedes contractual restrictions.
+- **Interoperability rights**: In both the [EU (Directive 2009/24/EC, Article 6)](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=celex%3A32009L0024) and [US (DMCA 1201(f))](https://www.law.cornell.edu/uscode/text/17/1201), reverse engineering for interoperability purposes is a protected right that supersedes contractual restrictions.
 - **Functional specification**: The binary format documentation in [`docs/vertipaq-spec.md`](docs/vertipaq-spec.md) describes functional information (data layouts, compression formats, metadata schemas) necessary for cross-platform compatibility.
 
 This project is not affiliated with, endorsed by, or associated with Microsoft Corporation. "Power BI" and "PBIX" are trademarks of Microsoft.

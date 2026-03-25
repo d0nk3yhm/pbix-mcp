@@ -178,95 +178,7 @@ class PBIXBuilder:
         return self
 
     # ------------------------------------------------------------------
-    # DataMashup rebuilding — clean M queries only
-    # ------------------------------------------------------------------
-
-    def _rebuild_datamashup(self) -> bytes | None:
-        """Rebuild the DataMashup binary with only user table M queries.
-
-        Strips all template remnants (financials, # Measures, DateAutoTemplate)
-        and writes clean Section1.m containing only the user's table queries.
-        """
-        template_pbix_path = os.path.join(
-            os.path.dirname(__file__), "templates", "minimal_template.pbix"
-        )
-
-        # Read the template DataMashup
-        with zipfile.ZipFile(template_pbix_path) as zf:
-            if "DataMashup" not in zf.namelist():
-                return None
-            data = zf.read("DataMashup")
-
-        # Find inner ZIP
-        pk_offset = data.find(b"PK\x03\x04")
-        if pk_offset == -1:
-            return None
-
-        eocd_sig = b"PK\x05\x06"
-        eocd_pos = data.rfind(eocd_sig)
-        if eocd_pos == -1:
-            return None
-
-        eocd_comment_len = struct.unpack_from("<H", data, eocd_pos + 20)[0]
-        zip_end = eocd_pos + 22 + eocd_comment_len
-        old_zip_data = data[pk_offset:zip_end]
-
-        # Build clean M code with only user tables
-        m_lines = ["section Section1;"]
-        for tdef in self._tables:
-            tname = tdef["name"]
-            source_db = tdef.get("source_db")
-            source_csv = tdef.get("source_csv")
-            is_dq = tdef.get("mode") == "directquery"
-
-            if source_db or source_csv:
-                # Build M expression for this table
-                m_expr = _build_m_expression(
-                    tname, tdef.get("columns", []),
-                    source_csv, source_db,
-                    is_directquery=is_dq,
-                )
-                # Escape table name if needed
-                m_name = tname
-                if " " in tname or any(c in tname for c in "[](){}#"):
-                    m_name = f'#"{tname}"'
-                m_lines.append(f"shared {m_name} = {m_expr};")
-
-        new_m_code = "\n".join(m_lines) + "\n"
-
-        # Rebuild inner ZIP with new Section1.m
-        new_zip_buf = io.BytesIO()
-        try:
-            with zipfile.ZipFile(io.BytesIO(old_zip_data), "r") as old_zf:
-                with zipfile.ZipFile(new_zip_buf, "w", zipfile.ZIP_DEFLATED) as new_zf:
-                    for item in old_zf.namelist():
-                        if item.endswith("Section1.m"):
-                            new_zf.writestr(item, new_m_code.encode("utf-8"))
-                        else:
-                            new_zf.writestr(item, old_zf.read(item))
-        except zipfile.BadZipFile:
-            return None
-
-        new_zip_bytes = new_zip_buf.getvalue()
-
-        # Splice: prefix + new_zip + suffix
-        prefix = data[:pk_offset]
-        suffix = data[zip_end:]
-        new_data = prefix + new_zip_bytes + suffix
-
-        # Update size field if present
-        if pk_offset >= 4:
-            old_size = struct.unpack_from("<I", prefix, pk_offset - 4)[0]
-            old_zip_len = zip_end - pk_offset
-            if old_size == old_zip_len:
-                new_data = bytearray(new_data)
-                struct.pack_into("<I", new_data, pk_offset - 4, len(new_zip_bytes))
-                new_data = bytes(new_data)
-
-        return bytes(new_data)
-
-    # ------------------------------------------------------------------
-    # Layout building (preserved from original)
+    # Layout building
     # ------------------------------------------------------------------
 
     def _build_layout(self) -> bytes:
@@ -425,105 +337,47 @@ class PBIXBuilder:
     # ------------------------------------------------------------------
 
     def build(self) -> bytes:
-        """Build the complete PBIX file as bytes — clean metadata from scratch.
-
-        The DataModel metadata (SQLite) is created from scratch with zero
-        template artifacts. The ABF binary structure uses the template for
-        its proven format, but all data content is user-generated.
+        """Build the complete PBIX file as bytes — every byte generated from scratch.
 
         Steps:
-          1. Create empty metadata SQLite from scratch (63 system tables, no data)
+          1. Create empty metadata SQLite (63 system tables)
           2. INSERT tables, columns, partitions, measures, relationships
           3. Encode row data with VertiPaq encoder
-          4. Replace metadata in template ABF + add new VertiPaq files
+          4. Build ABF binary container
           5. Compress to DataModel (XPress9)
           6. Build Report/Layout JSON
           7. Package into PBIX ZIP
         """
-        from pbix_mcp.formats.abf_rebuild import (
-            _ABFStructure,
-        )
-        from pbix_mcp.formats.datamodel_roundtrip import (
-            compress_datamodel,
-            decompress_datamodel,
-        )
+        from pbix_mcp.formats.datamodel_roundtrip import compress_datamodel
+        from pbix_mcp.formats.metadata_schema import create_empty_metadata_db
+        from pbix_mcp.builder_v2 import build_abf_clean, build_pbix_clean
 
-        # Capture builder state
         tables = self._tables
         measures = self._measures
         relationships = self._relationships
 
-        from pbix_mcp.formats.metadata_schema import create_empty_metadata_db
-
-        # 1. Create clean metadata from scratch — no template data
+        # 1. Create clean metadata from scratch
         sqlite_bytes = create_empty_metadata_db()
 
-        # Use fixed compression class IDs (from VertiPaq RE)
-        _HYBRID_RLE = 0xABA5A
-        _XM123_CLASS = 0xABA5B
-
-        # 2. Modify metadata and encode VertiPaq files
+        # 2. Populate metadata and encode VertiPaq files
+        # Compression class IDs determined through binary format analysis
         new_sqlite_bytes, vertipaq_files = _modify_metadata_and_encode(
             sqlite_bytes, tables, measures, relationships,
-            template_u32_a=_HYBRID_RLE,
-            template_max_u32_b=_XM123_CLASS,
+            compression_class_a=0xABA5A,
+            compression_class_b=0xABA5B,
         )
 
-        # 3. Build ABF: template structure + our metadata + our VP files
-        # The template VP data stays (neutralized by our clean metadata)
-        # Our new VP files are added alongside
-        template_path = os.path.join(
-            os.path.dirname(__file__), "templates", "minimal_datamodel.bin"
-        )
-        with open(template_path, "rb") as f:
-            template_dm = f.read()
-        template_abf = decompress_datamodel(template_dm)
-        abf_struct = _ABFStructure(template_abf)
+        # 3-4. Build ABF binary container from scratch
+        new_abf = build_abf_clean(new_sqlite_bytes, vertipaq_files)
 
-        exact_replacements: dict[str, bytes] = {}
-        for entry in abf_struct.file_log:
-            if "metadata.sqlitedb" in entry["Path"].lower():
-                exact_replacements[entry["StoragePath"]] = new_sqlite_bytes
-                break
-
-        new_abf = _rebuild_abf_with_new_files(
-            abf_struct, exact_replacements, vertipaq_files
-        )
-
-        # 4. Compress to DataModel
+        # 5. Compress to DataModel
         datamodel_bytes = compress_datamodel(new_abf)
 
         # 6. Build layout
         layout_bytes = self._build_layout()
 
-        # 7. Pack into PBIX ZIP
-        template_pbix_path = os.path.join(
-            os.path.dirname(__file__), "templates", "minimal_template.pbix"
-        )
-        buf = io.BytesIO()
-        with zipfile.ZipFile(template_pbix_path) as zf_in:
-            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf_out:
-                for item in zf_in.namelist():
-                    if item == "DataModel":
-                        zf_out.writestr(item, datamodel_bytes)
-                    elif item == "Report/Layout":
-                        zf_out.writestr(item, layout_bytes)
-                    elif item == "SecurityBindings":
-                        continue  # Skip — auto-removed for clean files
-                    elif item == "Settings":
-                        # Patch Settings to disable auto-relationship detection
-                        # which causes TMCCollectionObject::Add errors on Refresh
-                        settings_raw = zf_in.read(item)
-                        settings_text = settings_raw.decode("utf-16-le")
-                        settings_text = settings_text.replace(
-                            '"RelationshipImportEnabled":true',
-                            '"RelationshipImportEnabled":false',
-                        )
-                        zf_out.writestr(item, settings_text.encode("utf-16-le"))
-                    else:
-                        zf_out.writestr(item, zf_in.read(item))
-
-        return buf.getvalue()
+        # 7. Package into PBIX ZIP
+        return build_pbix_clean(datamodel_bytes, layout_bytes)
 
     def validate(self, data: bytes | None = None) -> list[str]:
         """Validate a built PBIX for structural integrity.
@@ -835,7 +689,7 @@ def _get_max_id_across_tables(conn: sqlite3.Connection) -> int:
 
     Scans every table in the database to avoid ID collisions with
     Annotation, LinguisticMetadata, Culture, or any other table the
-    template may populate.
+    the schema initializer may populate.
     """
     c = conn.cursor()
     max_id = 0
@@ -854,51 +708,15 @@ def _get_max_id_across_tables(conn: sqlite3.Connection) -> int:
     return max_id
 
 
-def _extract_template_runtime_ids(template_abf: bytes) -> tuple[int, int]:
-    """Extract AS runtime IDs (u32_a, max u32_b) from template IDFMETA files.
-
-    These values are embedded in every IDFMETA at fixed offsets:
-      offset 36: u32_a (4 bytes, same for all columns)
-      offset 40: u32_b (4 bytes, varies per column)
-
-    Returns (u32_a, max_u32_b) to use as a base for generating new column IDs.
-    """
-    from pbix_mcp.formats.abf_rebuild import list_abf_files, read_abf_file
-
-    file_log = list_abf_files(template_abf)
-    idfmeta_files = [f for f in file_log
-                     if f.get("FileName", "").endswith(".0.idfmeta")
-                     and f.get("Size", 0) == 264
-                     and "H$" not in f.get("FileName", "")]
-
-    u32_a = 703066  # default from known template
-    max_u32_b = 703067  # default
-
-    for mf in idfmeta_files:
-        try:
-            data = read_abf_file(template_abf, mf)
-            if len(data) >= 44:
-                a = struct.unpack_from("<I", data, 36)[0]
-                b = struct.unpack_from("<I", data, 40)[0]
-                if a > 0:
-                    u32_a = a
-                if b > max_u32_b:
-                    max_u32_b = b
-        except Exception:
-            continue
-
-    return u32_a, max_u32_b
-
-
 def _modify_metadata_and_encode(
     sqlite_bytes: bytes,
     tables: list[dict],
     measures: list[dict],
     relationships: list[dict],
-    template_u32_a: int = 703066,
-    template_max_u32_b: int = 703067,
+    compression_class_a: int = 0xABA5A,
+    compression_class_b: int = 0xABA5B,
 ) -> tuple[bytes, dict[str, bytes]]:
-    """Modify the template metadata SQLite and encode VertiPaq data.
+    """Populate metadata SQLite with tables/measures/relationships and encode VertiPaq data.
 
     Returns:
         (new_sqlite_bytes, vertipaq_files) where vertipaq_files maps
@@ -1181,7 +999,7 @@ def _modify_metadata_and_encode(
                     NULL
                 )""",
                 (rn_cs_id, rn_col_id, rn_cs_name, rn_ds_id,
-                 max(row_count, 1),  # distinct states (at least 1, matching template)
+                 max(row_count, 1),  # distinct states (at least 1, matching VertiPaq format)
                  2 if row_count == 0 else 3,  # min data id (2 for empty, 3 otherwise)
                  2 if row_count == 0 else (row_count + 2),  # max data id
                  row_count),  # row count
@@ -1407,7 +1225,7 @@ def _modify_metadata_and_encode(
                 )
 
                 # DictionaryStorage (Type=1 = external, with file)
-                # DictionaryFlags: 3 for string columns, 0 for numeric (matches template)
+                # DictionaryFlags: 3 for string columns, 0 for numeric
                 # IsOperatingOn32: 1 for Int64 (4-byte elements), 0 for String/Double/DateTime
                 dict_flags = 3 if data_type == "String" else 0
                 # IsOperatingOn32: 1 for integer types (4-byte dict entries), 0 for string/float
@@ -1558,8 +1376,8 @@ def _modify_metadata_and_encode(
                     ?, ?, 1
                 )""",
                 (rel_id, rel_name,
-                 to_tid, to_col_id,
                  from_tid, from_col_id,
+                 to_tid, to_col_id,
                  rs_id,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
             )
@@ -1762,7 +1580,7 @@ def _modify_metadata_and_encode(
                     sorted_vals = sorted(dict_values, key=str)
 
                 # POS_TO_ID: sorted_pos -> data_id (dict_index + 3)
-                # In the template, BaseId=0, so data_ids start at 3
+                # BaseId=0, so data_ids start at 3
                 pos_to_id = []
                 for sv in sorted_vals:
                     di = seen[sv]
@@ -1944,7 +1762,7 @@ def _modify_metadata_and_encode(
 
                     # ColumnStorage name includes ID, file names do NOT
                     h_cs_name = f"{h_col_name} ({h_col_id})"
-                    # File names WITHOUT column ID suffix (matches template)
+                    # File names WITHOUT column ID suffix
                     h_idf_fname = f"0.{h_table_name}.{h_col_name}.0.idf"
                     h_meta_fname = f"0.{h_table_name}.{h_col_name}.0.idfmeta"
 
@@ -2093,11 +1911,10 @@ def _modify_metadata_and_encode(
             if "_rel_id" not in rdef:
                 continue
 
-            # PBI convention: From = Many (fact), To = One (dimension)
-            # User API: from_table = One/dimension, to_table = Many/fact
-            # So we swap: PBI.From = user's to_table, PBI.To = user's from_table
-            one_tname = rdef["from_table"]   # dimension/lookup
-            many_tname = rdef["to_table"]    # fact
+            # User API: from_table = Many/fact, to_table = One/dimension
+            # PBI convention: FromTableID = Many, ToTableID = One
+            many_tname = rdef["from_table"]   # fact (e.g. Orders)
+            one_tname = rdef["to_table"]      # dimension/lookup (e.g. Products)
 
             rel_id = rdef["_rel_id"]
             rel_name = rdef["_rel_name"]
@@ -2105,8 +1922,8 @@ def _modify_metadata_and_encode(
             ris_id = rdef["_ris_id"]
             from_tid = table_id_map[many_tname]   # PBI From = Many
             to_tid = table_id_map[one_tname]      # PBI To = One
-            many_col_name = rdef["to_column"]
-            one_col_name = rdef["from_column"]
+            many_col_name = rdef["from_column"]
+            one_col_name = rdef["to_column"]
 
             # R$ table indexes the Many (fact) side
             from_tname = many_tname
@@ -2316,7 +2133,7 @@ def _modify_metadata_and_encode(
             )
 
             # R$ DictionaryStorage (Type=0, DataType=19 — no dictionary, raw values)
-            # Must match template exactly: no external dictionary file
+            # No external dictionary file for R$ INDEX columns
             r_dict_file_id = alloc.next()  # consumed but unused
             r_dict_fname = None  # no dictionary file for R$ INDEX
             c.execute(
@@ -2394,7 +2211,7 @@ def _modify_metadata_and_encode(
             vertipaq_files[r_abf_meta_path] = r_idfmeta_bytes
             # No dictionary file for R$ INDEX (Type=0)
 
-            # Override ColumnStorage stats to match template (Type=0 pattern)
+            # Override ColumnStorage stats (Type=0 pattern)
             c.execute(
                 """UPDATE ColumnStorage SET
                     Statistics_DistinctStates = 1,
@@ -2408,13 +2225,13 @@ def _modify_metadata_and_encode(
                 (r_cs_id,),
             )
 
-        # NEUTRALIZE template tables — keep them (ABF binary references their IDs)
-        # but make them completely inert so they don't interfere with Refresh.
+        # Clean up any pre-existing system tables — make them inert
+        # so they don't interfere with Refresh.
         user_table_ids = set(table_id_map.values())
         c = conn.cursor()
         _empty_m = 'let\n    Source = #table(type table [x = text], {})\nin\n    Source'
 
-        # 1. Neutralize ALL non-user partition M expressions
+        # 1. Neutralize non-user partition M expressions
         c.execute(
             "SELECT p.ID, t.ID as TableID FROM [Partition] p "
             "JOIN [Table] t ON p.TableID = t.ID "
@@ -2427,19 +2244,19 @@ def _modify_metadata_and_encode(
                     (_empty_m, pid),
                 )
 
-        # 2. Delete ALL template relationships (prevents schema sync conflicts)
+        # 2. Delete non-user relationships (prevents schema sync conflicts)
         c.execute(
             "SELECT ID FROM [Relationship] WHERE "
             "FromTableID NOT IN ({ids}) OR ToTableID NOT IN ({ids})".format(
                 ids=",".join(str(i) for i in user_table_ids)
             )
         )
-        template_rel_ids = [r[0] for r in c.fetchall()]
-        if template_rel_ids:
-            ph = ",".join("?" * len(template_rel_ids))
-            c.execute(f"DELETE FROM [Relationship] WHERE ID IN ({ph})", template_rel_ids)
+        stale_rel_ids = [r[0] for r in c.fetchall()]
+        if stale_rel_ids:
+            ph = ",".join("?" * len(stale_rel_ids))
+            c.execute(f"DELETE FROM [Relationship] WHERE ID IN ({ph})", stale_rel_ids)
 
-        # 3. Hide all template tables
+        # 3. Hide non-user tables
         c.execute("SELECT ID FROM [Table]")
         for (tid,) in c.fetchall():
             if tid not in user_table_ids:
@@ -2518,357 +2335,3 @@ def _update_column_storage_stats(
             "UPDATE ColumnStorage SET Statistics_RowCount = ? WHERE ID = ?",
             (row_count, cs_id),
         )
-
-
-def _rebuild_abf_clean(
-    abf_struct,
-    replacements: dict[str, bytes],
-    new_files: dict[str, bytes],
-) -> bytes:
-    """Rebuild ABF using template skeleton but with ALL template VP data stripped.
-
-    Keeps: system files from Class=100002 (db.xml, CryptKey, etc.)
-    Strips: ALL files from Class=100069 (template VertiPaq data)
-    Injects: our metadata.sqlitedb (via replacements) + our VertiPaq files (new_files)
-
-    This eliminates template data contamination while keeping the proven
-    ABF structure that PBI's restore engine accepts.
-    """
-    import xml.etree.ElementTree as ET
-    from copy import deepcopy
-
-    from pbix_mcp.formats.abf_rebuild import (
-        _HEADER_PAGE_SIZE,
-        _SIGNATURE_LEN,
-        STREAM_STORAGE_SIGNATURE,
-        _xml_to_utf16_bytes,
-    )
-
-    # Identify template VP StoragePaths to strip (Class=100069)
-    template_vp_sps = set()
-    for fg in abf_struct.backup_log_root.findall("FileGroups/FileGroup"):
-        if fg.findtext("Class", "") == "100069":
-            for bf in fg.findall("FileList/BackupFile"):
-                sp = bf.findtext("StoragePath", "")
-                if sp:
-                    template_vp_sps.add(sp)
-
-    buf = bytearray()
-    buf.extend(STREAM_STORAGE_SIGNATURE)
-    header_page_start = len(buf)
-    buf.extend(b"\x00" * (_HEADER_PAGE_SIZE - _SIGNATURE_LEN))
-
-    # ---- Write data files ----
-    new_offsets: dict[str, int] = {}
-    new_sizes: dict[str, int] = {}
-    kept_entries = []
-
-    for ve in abf_struct.data_entries:
-        if ve.path in template_vp_sps:
-            continue  # STRIP template VertiPaq data
-        if ve.path in replacements:
-            data = replacements[ve.path]
-        else:
-            data = abf_struct.read_file_data(ve.path)
-        new_offsets[ve.path] = len(buf)
-        new_sizes[ve.path] = len(data)
-        buf.extend(data)
-        kept_entries.append(ve)
-
-    # ---- Write new VertiPaq files ----
-    import secrets
-    new_file_records = []
-    timestamp = 134002835794032078
-    for fpath, content in new_files.items():
-        offset = len(buf)
-        size = len(content)
-        sp = secrets.token_hex(10).upper()
-        new_file_records.append((fpath, sp, offset, size))
-        buf.extend(content)
-
-    # ---- Build BackupLog ----
-    blog_root = deepcopy(abf_struct.backup_log_root)
-
-    # Update sizes for replaced files
-    for fg in blog_root.findall("FileGroups/FileGroup"):
-        for bf in fg.findall("FileList/BackupFile"):
-            sp = bf.findtext("StoragePath")
-            if sp in new_sizes:
-                size_elem = bf.find("Size")
-                if size_elem is not None:
-                    size_elem.text = str(new_sizes[sp])
-
-    # Strip ALL template VP entries from Class=100069 FileGroup
-    for fg in blog_root.findall("FileGroups/FileGroup"):
-        if fg.findtext("Class", "") == "100069":
-            file_list = fg.find("FileList")
-            if file_list is not None:
-                for bf in list(file_list.findall("BackupFile")):
-                    file_list.remove(bf)
-            else:
-                file_list = ET.SubElement(fg, "FileList")
-
-            persist_path = fg.findtext("PersistLocationPath", "")
-
-            # Add metadata.sqlitedb
-            for entry in abf_struct.file_log:
-                if "metadata.sqlitedb" in entry.get("Path", "").lower():
-                    bf = ET.SubElement(file_list, "BackupFile")
-                    full_path = persist_path + "\\" + entry["Path"].split("\\")[-1] if persist_path else entry["Path"]
-                    # Use the original full path from the template
-                    for orig_bf in abf_struct.backup_log_root.findall(".//BackupFile"):
-                        if orig_bf.findtext("StoragePath") == entry["StoragePath"]:
-                            full_path = orig_bf.findtext("Path", full_path)
-                            break
-                    ET.SubElement(bf, "Path").text = full_path
-                    ET.SubElement(bf, "StoragePath").text = entry["StoragePath"]
-                    ET.SubElement(bf, "LastWriteTime").text = str(timestamp)
-                    ET.SubElement(bf, "Size").text = str(new_sizes.get(entry["StoragePath"], entry["Size"]))
-                    break
-
-            # Add our new VertiPaq files
-            for fpath, sp, offset, size in new_file_records:
-                bf = ET.SubElement(file_list, "BackupFile")
-                ET.SubElement(bf, "Path").text = f"{persist_path}\\{fpath}"
-                ET.SubElement(bf, "StoragePath").text = sp
-                ET.SubElement(bf, "LastWriteTime").text = str(timestamp)
-                ET.SubElement(bf, "Size").text = str(size)
-
-    blog_bytes = _xml_to_utf16_bytes(blog_root)
-    if abf_struct.error_code:
-        blog_bytes = blog_bytes + b"\x00\x00\x00\x00"
-    blog_offset = len(buf)
-    blog_size = len(blog_bytes)
-    buf.extend(blog_bytes)
-
-    # ---- Build VirtualDirectory ----
-    vdir_root = ET.Element("VirtualDirectory")
-
-    # Kept entries (system files + metadata replacement)
-    for ve in kept_entries:
-        bf = ET.SubElement(vdir_root, "BackupFile")
-        ET.SubElement(bf, "Path").text = ve.path
-        ET.SubElement(bf, "Size").text = str(new_sizes.get(ve.path, ve.size))
-        ET.SubElement(bf, "m_cbOffsetHeader").text = str(new_offsets.get(ve.path, ve.m_cbOffsetHeader))
-        ET.SubElement(bf, "Delete").text = "true" if ve.delete else "false"
-        ET.SubElement(bf, "CreatedTimestamp").text = str(ve.created_timestamp)
-        ET.SubElement(bf, "Access").text = str(ve.access)
-        ET.SubElement(bf, "LastWriteTime").text = str(ve.last_write_time)
-
-    # New VertiPaq files
-    for fpath, sp, offset, size in new_file_records:
-        bf = ET.SubElement(vdir_root, "BackupFile")
-        ET.SubElement(bf, "Path").text = sp
-        ET.SubElement(bf, "Size").text = str(size)
-        ET.SubElement(bf, "m_cbOffsetHeader").text = str(offset)
-        ET.SubElement(bf, "Delete").text = "false"
-        ET.SubElement(bf, "CreatedTimestamp").text = str(timestamp)
-        ET.SubElement(bf, "Access").text = str(timestamp)
-        ET.SubElement(bf, "LastWriteTime").text = str(timestamp)
-
-    # BackupLog entry (last)
-    blog_ve = abf_struct.backup_log_entry
-    bf = ET.SubElement(vdir_root, "BackupFile")
-    ET.SubElement(bf, "Path").text = blog_ve.path
-    ET.SubElement(bf, "Size").text = str(blog_size)
-    ET.SubElement(bf, "m_cbOffsetHeader").text = str(blog_offset)
-    ET.SubElement(bf, "Delete").text = "true" if blog_ve.delete else "false"
-    ET.SubElement(bf, "CreatedTimestamp").text = str(blog_ve.created_timestamp)
-    ET.SubElement(bf, "Access").text = str(blog_ve.access)
-    ET.SubElement(bf, "LastWriteTime").text = str(blog_ve.last_write_time)
-
-    vdir_bytes = _xml_to_utf16_bytes(vdir_root)
-    vdir_offset = len(buf)
-    vdir_size = len(vdir_bytes)
-    buf.extend(vdir_bytes)
-
-    # ---- Patch header ----
-    hdr = deepcopy(abf_struct.header_root)
-    hdr.find("m_cbOffsetHeader").text = str(vdir_offset)
-    hdr.find("DataSize").text = str(vdir_size)
-    total_entries = len(kept_entries) + len(new_file_records) + 1
-    hdr.find("Files").text = str(total_entries)
-
-    hdr_bytes = _xml_to_utf16_bytes(hdr)
-    available = _HEADER_PAGE_SIZE - _SIGNATURE_LEN
-    if len(hdr_bytes) > available:
-        raise ValueError(f"Header {len(hdr_bytes)} bytes exceeds {available}")
-    hdr_padded = hdr_bytes + b"\x00" * (available - len(hdr_bytes))
-    buf[header_page_start: header_page_start + available] = hdr_padded
-
-    return bytes(buf)
-
-
-def _rebuild_abf_with_new_files(
-    abf_struct,
-    replacements: dict[str, bytes],
-    new_files: dict[str, bytes],
-) -> bytes:
-    """Rebuild the ABF with existing file replacements AND new files added.
-
-    This extends the standard _rebuild_abf to also inject brand-new files
-    that don't exist in the original ABF.
-
-    Parameters
-    ----------
-    abf_struct : _ABFStructure
-        Parsed structure of the original ABF.
-    replacements : dict[str, bytes]
-        Exact StoragePath -> new content for existing files.
-    new_files : dict[str, bytes]
-        New ABF-internal paths -> content for files to add.
-        Keys are paths like "Sales (100).tbl\\50.prt\\0.Sales (100).Amount (101).0.idf"
-    """
-    import xml.etree.ElementTree as ET
-    from copy import deepcopy
-
-    from pbix_mcp.formats.abf_rebuild import (
-        _HEADER_PAGE_SIZE,
-        _SIGNATURE_LEN,
-        STREAM_STORAGE_SIGNATURE,
-        _xml_to_utf16_bytes,
-    )
-
-    buf = bytearray()
-
-    # ---- 1. Signature (72 bytes) ----
-    buf.extend(STREAM_STORAGE_SIGNATURE)
-
-    # ---- placeholder for header page ----
-    header_page_start = len(buf)
-    buf.extend(b"\x00" * (_HEADER_PAGE_SIZE - _SIGNATURE_LEN))
-
-    # ---- 2. Existing data files ----
-    new_offsets: dict[str, int] = {}
-    new_sizes: dict[str, int] = {}
-    kept_entries = []
-
-    for ve in abf_struct.data_entries:
-        if ve.path in replacements:
-            data = replacements[ve.path]
-        else:
-            data = abf_struct.read_file_data(ve.path)
-
-        new_offsets[ve.path] = len(buf)
-        new_sizes[ve.path] = len(data)
-        buf.extend(data)
-        kept_entries.append(ve)
-
-    # ---- 2b. NEW files (VertiPaq data) ----
-    # These don't exist in the original ABF. We add them as new VDir entries.
-    # Generate random hex StoragePaths matching template format (20-char uppercase hex)
-    import secrets
-    new_file_records: list[tuple[str, str, int, int]] = []  # (fpath, storage_path, offset, size)
-    for fpath, content in new_files.items():
-        offset = len(buf)
-        size = len(content)
-        storage_path = secrets.token_hex(10).upper()
-        new_file_records.append((fpath, storage_path, offset, size))
-        buf.extend(content)
-
-    # ---- 3. BackupLog ----
-    blog_root = deepcopy(abf_struct.backup_log_root)
-
-    # Update sizes in BackupLog for ALL modified files (replacements + nullified)
-    for fg in blog_root.findall("FileGroups/FileGroup"):
-        for bf in fg.findall("FileList/BackupFile"):
-            sp = bf.findtext("StoragePath")
-            if sp in new_sizes:
-                size_elem = bf.find("Size")
-                if size_elem is not None:
-                    size_elem.text = str(new_sizes[sp])
-
-    # Add new VertiPaq files to the data FileGroup (Class=100069)
-    file_groups = blog_root.findall("FileGroups/FileGroup")
-    data_fg = None
-    for fg in file_groups:
-        if fg.findtext("Class", "") == "100069":
-            data_fg = fg
-            break
-    if data_fg is None:
-        data_fg = file_groups[-1] if file_groups else None
-
-    if data_fg is not None:
-        file_list = data_fg.find("FileList")
-        if file_list is None:
-            file_list = ET.SubElement(data_fg, "FileList")
-
-        persist_path = data_fg.findtext("PersistLocationPath", "")
-        timestamp = 134002835794032078
-
-        for fpath, storage_path, offset, size in new_file_records:
-            bf = ET.SubElement(file_list, "BackupFile")
-            ET.SubElement(bf, "Path").text = f"{persist_path}\\{fpath}"
-            ET.SubElement(bf, "StoragePath").text = storage_path
-            ET.SubElement(bf, "LastWriteTime").text = str(timestamp)
-            ET.SubElement(bf, "Size").text = str(size)
-
-    blog_bytes = _xml_to_utf16_bytes(blog_root)
-    if abf_struct.error_code:
-        blog_bytes = blog_bytes + b"\x00\x00\x00\x00"
-
-    blog_offset = len(buf)
-    blog_size = len(blog_bytes)
-    buf.extend(blog_bytes)
-
-    # ---- 4. VirtualDirectory ----
-    vdir_root_new = ET.Element("VirtualDirectory")
-
-    timestamp = 134002835794032078
-
-    # All kept entries (system + nullified template data)
-    for ve in kept_entries:
-        bf_elem = ET.SubElement(vdir_root_new, "BackupFile")
-        ET.SubElement(bf_elem, "Path").text = ve.path
-        ET.SubElement(bf_elem, "Size").text = str(new_sizes.get(ve.path, ve.size))
-        ET.SubElement(bf_elem, "m_cbOffsetHeader").text = str(new_offsets.get(ve.path, ve.m_cbOffsetHeader))
-        ET.SubElement(bf_elem, "Delete").text = "true" if ve.delete else "false"
-        ET.SubElement(bf_elem, "CreatedTimestamp").text = str(ve.created_timestamp)
-        ET.SubElement(bf_elem, "Access").text = str(ve.access)
-        ET.SubElement(bf_elem, "LastWriteTime").text = str(ve.last_write_time)
-
-    # New VertiPaq file entries — use the SAME random hex StoragePaths as BackupLog
-    for fpath, storage_path, offset, size in new_file_records:
-        bf_elem = ET.SubElement(vdir_root_new, "BackupFile")
-        ET.SubElement(bf_elem, "Path").text = storage_path  # Random hex, NOT fpath!
-        ET.SubElement(bf_elem, "Size").text = str(size)
-        ET.SubElement(bf_elem, "m_cbOffsetHeader").text = str(offset)
-        ET.SubElement(bf_elem, "Delete").text = "false"
-        ET.SubElement(bf_elem, "CreatedTimestamp").text = str(timestamp)
-        ET.SubElement(bf_elem, "Access").text = str(timestamp)
-        ET.SubElement(bf_elem, "LastWriteTime").text = str(timestamp)
-
-    # BackupLog entry (last)
-    blog_ve = abf_struct.backup_log_entry
-    bf_elem = ET.SubElement(vdir_root_new, "BackupFile")
-    ET.SubElement(bf_elem, "Path").text = blog_ve.path
-    ET.SubElement(bf_elem, "Size").text = str(blog_size)
-    ET.SubElement(bf_elem, "m_cbOffsetHeader").text = str(blog_offset)
-    ET.SubElement(bf_elem, "Delete").text = "true" if blog_ve.delete else "false"
-    ET.SubElement(bf_elem, "CreatedTimestamp").text = str(blog_ve.created_timestamp)
-    ET.SubElement(bf_elem, "Access").text = str(blog_ve.access)
-    ET.SubElement(bf_elem, "LastWriteTime").text = str(blog_ve.last_write_time)
-
-    vdir_bytes = _xml_to_utf16_bytes(vdir_root_new)
-    vdir_offset = len(buf)
-    vdir_size = len(vdir_bytes)
-    buf.extend(vdir_bytes)
-
-    # ---- 5. Patch header ----
-    hdr = deepcopy(abf_struct.header_root)
-    hdr.find("m_cbOffsetHeader").text = str(vdir_offset)
-    hdr.find("DataSize").text = str(vdir_size)
-    total_entries = len(kept_entries) + len(new_file_records) + 1  # +1 for BackupLog
-    hdr.find("Files").text = str(total_entries)
-
-    hdr_bytes = _xml_to_utf16_bytes(hdr)
-    available = _HEADER_PAGE_SIZE - _SIGNATURE_LEN
-    if len(hdr_bytes) > available:
-        raise ValueError(
-            f"BackupLogHeader XML is {len(hdr_bytes)} bytes, "
-            f"exceeds the {available}-byte page limit."
-        )
-    hdr_padded = hdr_bytes + b"\x00" * (available - len(hdr_bytes))
-    buf[header_page_start: header_page_start + available] = hdr_padded
-
-    return bytes(buf)

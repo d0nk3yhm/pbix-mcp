@@ -809,9 +809,9 @@ def pbix_create(
 ) -> str:
     """Create a new PBIX file and open it for editing.
 
-    Builds a valid PBIX with XPress9-compressed DataModel, ABF archive,
-    SQLite metadata, and report layout. Metadata, VertiPaq data, and layout
-    are generated from scratch; the ABF container uses a template skeleton.
+    Builds a valid PBIX entirely from scratch — no templates or skeletons.
+    Every layer is generated from code: PBIX ZIP shell, ABF binary container,
+    db.xml, metadata SQLite, VertiPaq column data, and report layout.
 
     Args:
         file_path: Where to save the new file (e.g. "my_report.pbix")
