@@ -2149,17 +2149,28 @@ def _modify_metadata_and_encode(
             from_row_count = len(from_rows)
 
             # Compute the INDEX column: for each row in Many table,
-            # find the row index in One table where the key matches
+            # R$ INDEX: one entry per FROM row, sorted by FK value.
+            # PBI indexes R$ by H$-sorted-position of the FK value.
+            # So we sort FROM rows by FK and store the matching TO row index.
+
+            # Map TO table key values to row indices
             to_key_index: dict[object, int] = {}
             for idx, row in enumerate(to_rows):
                 key_val = row.get(one_col_name)
                 if key_val is not None and key_val not in to_key_index:
                     to_key_index[key_val] = idx
 
+            # Sort FROM rows by FK value
+            sorted_from = sorted(from_rows, key=lambda r: (
+                r.get(many_col_name) if isinstance(r.get(many_col_name), (int, float))
+                else str(r.get(many_col_name, ''))
+            ))
+
+            # Build R$ INDEX in sorted-FK order
             index_values: list[int] = []
-            for row in from_rows:
+            for row in sorted_from:
                 fk_val = row.get(many_col_name)
-                matched_idx = to_key_index.get(fk_val, 0)  # default 0 if no match
+                matched_idx = to_key_index.get(fk_val, 0)
                 index_values.append(matched_idx)
 
             # R$ table naming: table name does NOT include .tbl suffix

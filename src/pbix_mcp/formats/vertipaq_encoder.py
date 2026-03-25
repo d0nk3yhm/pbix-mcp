@@ -726,8 +726,8 @@ def _encode_idfmeta(
     #   0xABA36 + N = XMRENoSplitCompressionInfo<N> where N is the aligned bit width
     #   0xABA5B = XM123CompressionInfo (for RowNumber)
     buf += _u4(u32_b)
-    # bookmark_bits: 24 for RowNumber, 12 for data columns
-    buf += _u8(24 if is_row_number else 12)
+    # bookmark_bits: 24 for RowNumber, row_count for data columns (PBI ground truth)
+    buf += _u8(24 if is_row_number else row_count)
 
     # storage_alloc_size: always 32
     buf += _u8(32)
@@ -981,14 +981,13 @@ def _encode_column(
         max_data_id = _DATA_ID_OFFSET + max(len(unique_sorted) - 1, 0)
 
     # Bit width for encoding indices
-    # CRITICAL: bit width must match what the engine computes from max_data_id.
-    # The engine uses max_data_id (from IDFMETA) to determine how many bits
-    # each value occupies in the IDF sub-segment. We must encode with the
-    # SAME bit width, which is ceil(log2(max_data_id + 1)).
-    if max_data_id <= 1:
+    # PBI computes bw from distinct_count (verified by IDFMETA ground truth comparison).
+    # IDF stores 0-based dict indices; max stored value = len(unique_sorted) - 1.
+    _distinct = len(unique_sorted)
+    if _distinct <= 2:
         bit_width_raw = 1
     else:
-        bit_width_raw = math.ceil(math.log2(max_data_id + 1))
+        bit_width_raw = math.ceil(math.log2(_distinct))
     bit_width = _align_bit_width(max(1, bit_width_raw))
 
     # --- Encode IDF ---
@@ -1148,17 +1147,11 @@ def encode_table_data(
             # The encoder computes bit_width internally, but we need it here for u32_b
             non_null = [v for v in values if v is not None]
             unique_count = len(set(non_null))
-            _DATA_ID_OFFSET = 3
-            if len(values) == 0:
-                max_did = 2
-            elif nullable and any(v is None for v in values):
-                max_did = _DATA_ID_OFFSET + unique_count
-            else:
-                max_did = _DATA_ID_OFFSET + max(unique_count - 1, 0)
-            if max_did <= 1:
+            # bw from distinct_count (matching PBI ground truth IDFMETA)
+            if unique_count <= 2:
                 bw = 1
             else:
-                bw = math.ceil(math.log2(max_did + 1))
+                bw = math.ceil(math.log2(unique_count))
             bw = _align_bit_width(max(1, bw))
             col_u32_a = _HYBRID_RLE_FAMILY
             col_u32_b = _NOSPLIT_BASE + bw
