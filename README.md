@@ -14,29 +14,37 @@ cd pbix-mcp
 pip install -e .
 ```
 
-### Claude Desktop
+### Claude Desktop / Claude Code
+
+Add to your MCP config file:
+
+| Platform | Config file |
+|----------|------------|
+| Claude Desktop (macOS) | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Claude Desktop (Windows) | `%APPDATA%\Claude\claude_desktop_config.json` |
+| Claude Code | `~/.claude/settings.json` (Linux/macOS) or `%USERPROFILE%\.claude\settings.json` (Windows) |
 
 ```json
 {
   "mcpServers": {
-    "powerbi": {
+    "powerbi-editor": {
       "command": "pbix-mcp-server"
     }
   }
 }
 ```
 
-### Claude Code
-
-```json
-{
-  "mcpServers": {
-    "powerbi": {
-      "command": "pbix-mcp-server"
-    }
-  }
-}
-```
+> **Windows note:** If `pbix-mcp-server` is not on PATH, use the full Python path:
+> ```json
+> {
+>   "mcpServers": {
+>     "powerbi-editor": {
+>       "command": "python",
+>       "args": ["-m", "pbix_mcp.cli"]
+>     }
+>   }
+> }
+> ```
 
 ### Codex Desktop (OpenAI)
 
