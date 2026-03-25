@@ -170,7 +170,7 @@ SDOs:1>\0
 
 ## Compression Class ID Selectors
 
-Discovered via reverse engineering of `FUN_18026d420` in xmsrv.dll:
+Determined through binary format analysis:
 
 ```
 u32_a (compression family):

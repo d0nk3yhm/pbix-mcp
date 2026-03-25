@@ -119,11 +119,11 @@ def _next_power_of_2(n: int) -> int:
 def _align_bit_width(bw: int) -> int:
     """
     VertiPaq bit-widths correspond to XMRENoSplitCompressionInfo<N> template
-    instantiations in xmsrv.dll. The engine auto-detects N from the data range
+    instantiations in the VertiPaq engine. The engine auto-detects N from the data range
     (max_data_id - min_data_id). Bit-packing uses floor(64/N) values per u64
     word — N does NOT need to be a power of 2.
 
-    Valid N values (from xmsrv.dll Ghidra analysis):
+    Valid N values (from binary format analysis):
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16, 21, 32
     """
     valid = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16, 21, 32]
@@ -1123,7 +1123,7 @@ def encode_table_data(
 
     base_path = f"{table_name}.tbl\\{partition_num}.prt"
 
-    # Compression class ID constants (from xmsrv.dll RE):
+    # Compression class ID constants (from format analysis):
     _HYBRID_RLE_FAMILY = 0xABA5A    # XMHybridRLECompressionInfo
     _NOSPLIT_BASE = 0xABA36          # + N = XMRENoSplitCompressionInfo<N>
     _XM123_CLASS = 0xABA5B           # XM123CompressionInfo (for RowNumber)

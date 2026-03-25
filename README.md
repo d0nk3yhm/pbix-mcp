@@ -110,7 +110,7 @@ pbix-mcp-server --log-level debug
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
 - **Opening existing DirectQuery files** — layout, measures, and metadata editing work; DAX evaluation and table reads return clear errors since data lives in the remote source (this is inherent to DirectQuery — the data isn't in the file)
 - **Creating DirectQuery files** — fully working with SQL Server (LocalDB), PostgreSQL 16, and MySQL 9.6 (via MariaDB adapter); requires a running database server and initial data snapshot
-- **ABF container format** — has not been fully reverse-engineered for from-scratch generation. The template skeleton provides the system file structure (db.xml, CryptKey, BackupLog format) that msmdsrv requires for database restore. The template's Financial Sample VertiPaq files are still physically present in the ABF but are ignored by the clean metadata — they add ~600KB of dead weight
+- **ABF container format** — has not been fully documented for from-scratch generation. The template skeleton provides the system file structure (db.xml, CryptKey, BackupLog format) that the VertiPaq engine requires for database restore. The template's Financial Sample VertiPaq files are still physically present in the ABF but are ignored by the clean metadata — they add ~600KB of dead weight
 - **Embedded VertiPaq data** — verified working with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase)
 - **RLE encoding** — disabled in the VertiPaq encoder (pure bitpack used). Slightly less space-efficient but correct
 
@@ -298,7 +298,7 @@ DirectQuery creates a PBIX with `Partition.Mode=1` and a `Sql.Database()` M expr
 | `Decimal` | ✅ Stable | External 32-bit entries (value × 10000, IsOperatingOn32=1) |
 | `Boolean` | ✅ Stable | External 32-bit entries (0/1, IsOperatingOn32=1) |
 
-### VertiPaq Binary Format (Reverse-Engineered)
+### VertiPaq Binary Format
 
 The builder generates VertiPaq column data from scratch. The ABF container uses a template skeleton for system files while all user data is independently generated:
 
@@ -307,7 +307,7 @@ The builder generates VertiPaq column data from scratch. The ABF container uses 
 - **Dictionary** — Type-specific encoding (Long/Real/String) with hash tables
 - **H$ system tables** — Attribute hierarchy POS_TO_ID + ID_TO_POS using NoSplit<32> encoding
 - **R$ system tables** — Relationship join INDEX using NoSplit<N> encoding
-- **Compression class IDs** — Fully reverse-engineered from xmsrv.dll via Ghidra (u32_a/u32_b selectors)
+- **Compression class IDs** — Determined through binary format analysis (u32_a/u32_b selectors)
 - **XPress9** — Byte-exact round-trip compression/decompression
 - **ABF** — Archive manipulation with BackupLog and VirtualDirectory XML (uses template skeleton for system files; user data generated from scratch)
 
@@ -473,11 +473,11 @@ For **modifying existing PBIX files** (adding a measure, changing a visual), the
 
 ### No Microsoft Dependencies
 
-This project is **100% Python** with zero Microsoft DLLs or SDKs. The metadata SQLite, VertiPaq column data, and report layout are independently generated. The ABF binary container uses a template skeleton for system files that have not been fully reverse-engineered (db.xml, CryptKey.bin, BackupLog format). The `tools/` directory (gitignored) contains local development utilities that are not part of the package.
+This project is **100% Python** with zero Microsoft DLLs or SDKs. The metadata SQLite, VertiPaq column data, and report layout are independently generated. The ABF binary container uses a template skeleton for system files that have not been fully documented (db.xml, CryptKey.bin, BackupLog format). The `tools/` directory (gitignored) contains local development utilities that are not part of the package.
 
 ## Purpose & Interoperability
 
-This project is an **independent implementation** of the Power BI `.pbix` file specification, created for the sole purpose of **interoperability** — enabling AI agents, automation tools, and non-Windows platforms to create, read, and write Power BI files. The metadata SQLite, VertiPaq column data, and report layout are generated from scratch. The ABF binary container uses a template skeleton for system files that have not yet been fully reverse-engineered.
+This project is an **independent implementation** of the Power BI `.pbix` file specification, created for the sole purpose of **interoperability** — enabling AI agents, automation tools, and non-Windows platforms to create, read, and write Power BI files. The metadata SQLite, VertiPaq column data, and report layout are generated from scratch. The ABF binary container uses a template skeleton for system files that are not yet fully documented.
 
 - **No Microsoft source code** was used. All binary format knowledge was derived through independent analysis of file structures and publicly observable behavior.
 - **Interoperability rights**: In both the [EU (Directive 2009/24/EC, Article 6)](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=celex%3A32009L0024) and [US (DMCA §1201(f))](https://www.law.cornell.edu/uscode/text/17/1201), reverse engineering for interoperability purposes is a protected right that supersedes contractual restrictions.

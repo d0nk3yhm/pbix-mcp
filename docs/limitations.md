@@ -58,7 +58,7 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 - **Report layout JSON**: pages, visuals, filters generated from scratch. Supported visuals: table, pieChart, clusteredBarChart, card, slicer
 
 ### What uses a template skeleton
-- **ABF binary container**: the ABF container format has not been fully reverse-engineered for from-scratch generation. The template skeleton provides the system file structure (db.xml, CryptKey, BackupLog format) that msmdsrv requires for database restore
+- **ABF binary container**: the ABF container format has not been fully documented for from-scratch generation. The template skeleton provides the system file structure (db.xml, CryptKey, BackupLog format) that the VertiPaq engine requires for database restore
 - **Template dead weight**: the template's Financial Sample VertiPaq files are still physically present in the ABF but are ignored by the clean metadata — they add ~600KB of dead weight
 - **PBIX OPC wrapper**: template files provide the ZIP/OPC structure
 

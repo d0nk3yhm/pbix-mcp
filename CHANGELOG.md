@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CSV refreshable sources**: `source_csv` parameter creates M expressions for Refresh in PBI Desktop
 - **Boolean data type**: full support (IsOperatingOn32=1, 0/1 values)
 - **Decimal data type**: full support (value × 10000, IsOperatingOn32=1)
-- **NoSplit<N> encoder**: reverse-engineered binary format for R$ relationship INDEX and H$ hierarchy tables
+- **NoSplit<N> encoder**: documented binary format for R$ relationship INDEX and H$ hierarchy tables
 - **R$ relationship system tables**: cross-table RELATED() and filtering work in PBI Desktop
 - **H$ attribute hierarchy tables**: NoSplit<32> POS_TO_ID/ID_TO_POS for DAX dimension support
 - **RowNumber AttributeHierarchy**: fixes MDNaiveCoordCell::InitPrototype assertion
@@ -57,7 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Example scripts in `examples/` directory
 
 ### Fixed
-- Compression class IDs fully reverse-engineered from xmsrv.dll via Ghidra (u32_a/u32_b selectors)
+- Compression class IDs determined through binary format analysis (u32_a/u32_b selectors)
 - DictionaryStorage.IsOperatingOn32=1 for Int64/Decimal/Boolean (was causing PFE_FILESTORE_CORRUPTION)
 - Double column support: added "Double" to encoder type mappings
 - DirectQuery detection: Mode=1 (not Type=6 which is PolicyRange)

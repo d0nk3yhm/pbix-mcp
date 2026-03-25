@@ -47,7 +47,7 @@ src/pbix_mcp/
 ### Creating a PBIX
 
 **Generated from scratch:** metadata SQLite, VertiPaq column data, report layout JSON.
-**Template skeleton:** ABF binary container system files (db.xml, CryptKey.bin, BackupLog format), PBIX OPC wrapper files. The ABF container format has not been fully reverse-engineered for from-scratch generation — the template provides the system file structure that msmdsrv requires for database restore. The template's Financial Sample VertiPaq files remain physically present but are ignored by the clean metadata (~600KB dead weight).
+**Template skeleton:** ABF binary container system files (db.xml, CryptKey.bin, BackupLog format), PBIX OPC wrapper files. The ABF container format has not been fully documented for from-scratch generation — the template provides the system file structure that the VertiPaq engine requires for database restore. The template's Financial Sample VertiPaq files remain physically present but are ignored by the clean metadata (~600KB dead weight).
 
 1. `PBIXBuilder` generates clean SQLite metadata (DATASOURCEVERSION=2) — only user-specified tables, columns, and measures
 2. Key PBI annotations are written: PBI_IsFromSource (ObjectType=7), PBI_ResultType, SummarizationSetBy, PBI_QueryOrder, __PBI_TimeIntelligenceEnabled

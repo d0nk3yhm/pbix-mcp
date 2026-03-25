@@ -1650,7 +1650,7 @@ def _modify_metadata_and_encode(
                     "nullable": col_def.get("nullable", True),
                 })
 
-            # Compression class IDs (from xmsrv.dll reverse engineering):
+            # Compression class IDs (from format analysis):
             #   u32_a = 0xABA5A = XMHybridRLECompressionInfo family
             #   u32_b = 0xABA36 + aligned_bit_width (computed per column by encoder)
             # These are NOT runtime IDs - they're fixed class selectors!

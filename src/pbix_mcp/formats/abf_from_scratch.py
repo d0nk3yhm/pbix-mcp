@@ -64,7 +64,7 @@ def build_abf(
     dbxml_sp = secrets.token_hex(10).upper()
     crypt_sp = secrets.token_hex(10).upper()
 
-    # db.xml — XMLA Load document (full format required by msmdsrv)
+    # db.xml — XMLA Load document (full format required by the VertiPaq engine)
     obj_id = str(uuid.uuid4()).upper()
     db_unique_id = str(uuid.uuid4()).upper()
     db_xml_content = (
