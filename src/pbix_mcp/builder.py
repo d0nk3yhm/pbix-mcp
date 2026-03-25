@@ -1811,22 +1811,18 @@ def _modify_metadata_and_encode(
                 meta_key = f"{base}\\column.{col_name}meta"
 
                 # Get distinct count and dict order from encoded data
-                # CRITICAL: must use INSERTION ORDER (first-seen) matching the encoder
+                # CRITICAL: must use SORTED ORDER matching the encoder
                 raw_vals = [row.get(col_name) for row in rows]
-                seen: dict[object, int] = {}
-                dict_values: list = []  # insertion order
-                for v in raw_vals:
-                    if v is not None and v not in seen:
-                        seen[v] = len(dict_values)
-                        dict_values.append(v)
-                distinct = len(dict_values)
-
-                # Sort values for H$ POS_TO_ID mapping
-                # Use same sort key as encoder's unique_sorted
-                sorted_vals = sorted(
-                    dict_values,
+                non_null_unique = set(v for v in raw_vals if v is not None)
+                dict_values = sorted(
+                    non_null_unique,
                     key=lambda x: (str(type(x)), x) if not isinstance(x, (int, float)) else x,
                 )
+                seen = {v: i for i, v in enumerate(dict_values)}
+                distinct = len(dict_values)
+
+                # sorted_vals = dict_values (already sorted)
+                sorted_vals = dict_values
 
                 # POS_TO_ID: sorted_pos -> data_id (dict_index + 3)
                 # BaseId=0, so data_ids start at 3

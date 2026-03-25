@@ -938,22 +938,14 @@ def _encode_column(
     for v in values:
         converted.append(_convert_value_for_dict(v, data_type))
 
-    # Build unique values in INSERTION ORDER (matching PBI ground truth).
+    # Build unique values list in SORTED ORDER.
     non_null_values = [v for v in converted if v is not None]
-    _seen_keys: set = set()
-    unique_insertion: list = []
-    for v in non_null_values:
-        k = _val_key(v)
-        if k not in _seen_keys:
-            _seen_keys.add(k)
-            unique_insertion.append(v)
-    # Sorted version needed for H$ and IDFMETA stats
-    unique_sorted = sorted(unique_insertion, key=lambda x: (str(type(x)), x) if not isinstance(x, (int, float)) else x)
+    unique_sorted = sorted(set(non_null_values), key=lambda x: (str(type(x)), x) if not isinstance(x, (int, float)) else x)
 
-    # Map value -> insertion-order dictionary index
+    # Map value -> sorted dictionary index
     null_offset = 1 if has_nulls else 0
     value_to_idx = {}
-    for i, uv in enumerate(unique_insertion):
+    for i, uv in enumerate(unique_sorted):
         value_to_idx[_val_key(uv)] = i + null_offset
 
     # Build index array
@@ -1061,11 +1053,11 @@ def _encode_column(
         u32_b=u32_b,
     )
 
-    # --- Encode Dictionary (insertion order — matching PBI ground truth) ---
-    dict_bytes = _encode_dictionary(unique_insertion, data_type)
+    # --- Encode Dictionary (sorted order) ---
+    dict_bytes = _encode_dictionary(unique_sorted, data_type)
 
-    # --- Encode HIDX (insertion order — hash must match dict) ---
-    hidx_bytes = _encode_hidx(unique_insertion, data_type)
+    # --- Encode HIDX (sorted order — hash must match dict) ---
+    hidx_bytes = _encode_hidx(unique_sorted, data_type)
 
     return {
         "idf": idf_bytes,
