@@ -333,6 +333,207 @@ class PBIXBuilder:
         }
 
     # ------------------------------------------------------------------
+    # Pre-build validation
+    # ------------------------------------------------------------------
+
+    def _pre_build_checks(self) -> list[str]:
+        """Validate tables, measures, relationships, and visuals before building.
+
+        Returns a list of issues. Empty list = all checks passed.
+        Raises ValueError for critical issues that would produce a corrupt file.
+        """
+        issues: list[str] = []
+        table_names = {t["name"] for t in self._tables}
+        # Map table→columns for lookup
+        table_columns: dict[str, set[str]] = {}
+        table_col_types: dict[str, dict[str, str]] = {}
+        for t in self._tables:
+            cols = {c["name"] for c in t["columns"]}
+            col_types = {c["name"]: c.get("data_type", "String") for c in t["columns"]}
+            table_columns[t["name"]] = cols
+            table_col_types[t["name"]] = col_types
+
+        # Collect measure names per table
+        table_measures: dict[str, set[str]] = {t: set() for t in table_names}
+        for m in self._measures:
+            if m["table"] in table_measures:
+                table_measures[m["table"]].add(m["name"])
+
+        # --- Table checks ---
+        if not self._tables:
+            issues.append("CRITICAL: No tables defined — file will be empty")
+
+        for t in self._tables:
+            if not t["columns"]:
+                issues.append(f"CRITICAL: Table '{t['name']}' has no columns")
+            if not t["rows"]:
+                issues.append(f"WARNING: Table '{t['name']}' has no rows (empty table)")
+            # Check row data matches column definitions
+            col_names = {c["name"] for c in t["columns"]}
+            for i, row in enumerate(t.get("rows", [])):
+                extra = set(row.keys()) - col_names
+                if extra:
+                    issues.append(
+                        f"WARNING: Table '{t['name']}' row {i} has extra "
+                        f"fields not in columns: {extra}"
+                    )
+
+        # --- Measure checks ---
+        for m in self._measures:
+            if m["table"] not in table_names:
+                issues.append(
+                    f"CRITICAL: Measure '{m['name']}' references "
+                    f"non-existent table '{m['table']}'"
+                )
+            expr = m.get("expression", "")
+            # Check RELATED() calls have a relationship path
+            if "RELATED(" in expr.upper():
+                # Extract RELATED(Table[Column]) references
+                import re
+                related_refs = re.findall(
+                    r"RELATED\s*\(\s*(\w+)\s*\[", expr, re.IGNORECASE
+                )
+                for ref_table in related_refs:
+                    if ref_table not in table_names:
+                        issues.append(
+                            f"CRITICAL: Measure '{m['name']}' uses "
+                            f"RELATED({ref_table}[...]) but table "
+                            f"'{ref_table}' does not exist"
+                        )
+                    # Check there's a relationship path to that table
+                    rel_targets = set()
+                    for r in self._relationships:
+                        if r["from_table"] == m["table"]:
+                            rel_targets.add(r["to_table"])
+                        if r["to_table"] == m["table"]:
+                            rel_targets.add(r["from_table"])
+                    # Also check indirect (2-hop) via other relationships
+                    indirect = set()
+                    for rt in rel_targets:
+                        for r in self._relationships:
+                            if r["from_table"] == rt:
+                                indirect.add(r["to_table"])
+                            if r["to_table"] == rt:
+                                indirect.add(r["from_table"])
+                    all_reachable = rel_targets | indirect
+                    if ref_table not in all_reachable and ref_table != m["table"]:
+                        issues.append(
+                            f"CRITICAL: Measure '{m['name']}' uses "
+                            f"RELATED({ref_table}[...]) but no relationship "
+                            f"path exists from '{m['table']}' to '{ref_table}'"
+                        )
+
+        # --- Relationship checks ---
+        for r in self._relationships:
+            ft, fc = r["from_table"], r["from_column"]
+            tt, tc = r["to_table"], r["to_column"]
+            # Tables exist?
+            if ft not in table_names:
+                issues.append(
+                    f"CRITICAL: Relationship from_table '{ft}' does not exist"
+                )
+            elif fc not in table_columns.get(ft, set()):
+                issues.append(
+                    f"CRITICAL: Relationship from_column '{ft}.{fc}' "
+                    f"does not exist"
+                )
+            if tt not in table_names:
+                issues.append(
+                    f"CRITICAL: Relationship to_table '{tt}' does not exist"
+                )
+            elif tc not in table_columns.get(tt, set()):
+                issues.append(
+                    f"CRITICAL: Relationship to_column '{tt}.{tc}' "
+                    f"does not exist"
+                )
+            # Data type compatibility
+            if ft in table_col_types and tt in table_col_types:
+                ft_type = table_col_types[ft].get(fc)
+                tt_type = table_col_types[tt].get(tc)
+                if ft_type and tt_type and ft_type != tt_type:
+                    issues.append(
+                        f"WARNING: Relationship {ft}.{fc} ({ft_type}) → "
+                        f"{tt}.{tc} ({tt_type}) — data type mismatch"
+                    )
+            # Check FK values exist in dimension table
+            if ft in table_names and tt in table_names:
+                fk_vals = {row.get(fc) for row in self._get_table_rows(ft)}
+                pk_vals = {row.get(tc) for row in self._get_table_rows(tt)}
+                orphans = fk_vals - pk_vals - {None}
+                if orphans:
+                    issues.append(
+                        f"WARNING: Relationship {ft}.{fc} → {tt}.{tc} has "
+                        f"orphan FK values not in dimension: {orphans}"
+                    )
+
+        # --- Visual checks ---
+        for page in self._pages:
+            for v in page.get("visuals", []):
+                cfg = v.get("config", {})
+                sv = cfg.get("singleVisual", {})
+                pq = sv.get("prototypeQuery", {})
+                # Check referenced entities exist
+                for src in pq.get("From", []):
+                    entity = src.get("Entity", "")
+                    if entity and entity not in table_names:
+                        issues.append(
+                            f"CRITICAL: Visual on '{page['name']}' references "
+                            f"non-existent table '{entity}'"
+                        )
+                # Check referenced columns/measures exist
+                for sel in pq.get("Select", []):
+                    if "Column" in sel:
+                        col_ref = sel["Column"]
+                        prop = col_ref.get("Property", "")
+                        src_ref = col_ref.get("Expression", {}).get(
+                            "SourceRef", {}
+                        ).get("Source", "")
+                        # Resolve source alias to entity
+                        entity = self._resolve_source_alias(
+                            src_ref, pq.get("From", [])
+                        )
+                        if entity and entity in table_columns:
+                            if prop not in table_columns[entity]:
+                                issues.append(
+                                    f"WARNING: Visual on '{page['name']}' "
+                                    f"references non-existent column "
+                                    f"'{entity}.{prop}'"
+                                )
+                    elif "Measure" in sel:
+                        meas_ref = sel["Measure"]
+                        prop = meas_ref.get("Property", "")
+                        src_ref = meas_ref.get("Expression", {}).get(
+                            "SourceRef", {}
+                        ).get("Source", "")
+                        entity = self._resolve_source_alias(
+                            src_ref, pq.get("From", [])
+                        )
+                        if entity and entity in table_measures:
+                            if prop not in table_measures[entity]:
+                                issues.append(
+                                    f"WARNING: Visual on '{page['name']}' "
+                                    f"references non-existent measure "
+                                    f"'{entity}.{prop}'"
+                                )
+
+        return issues
+
+    def _get_table_rows(self, table_name: str) -> list[dict]:
+        """Get rows for a table by name."""
+        for t in self._tables:
+            if t["name"] == table_name:
+                return t.get("rows", [])
+        return []
+
+    @staticmethod
+    def _resolve_source_alias(alias: str, from_list: list[dict]) -> str:
+        """Resolve a query source alias (e.g., 'o') to entity name (e.g., 'Orders')."""
+        for src in from_list:
+            if src.get("Name") == alias:
+                return src.get("Entity", "")
+        return ""
+
+    # ------------------------------------------------------------------
     # Core build logic
     # ------------------------------------------------------------------
 
@@ -340,6 +541,7 @@ class PBIXBuilder:
         """Build the complete PBIX file as bytes — every byte generated from scratch.
 
         Steps:
+          0. Pre-build validation (tables, measures, relationships, visuals)
           1. Create empty metadata SQLite (63 system tables)
           2. INSERT tables, columns, partitions, measures, relationships
           3. Encode row data with VertiPaq encoder
@@ -351,6 +553,19 @@ class PBIXBuilder:
         from pbix_mcp.formats.datamodel_roundtrip import compress_datamodel
         from pbix_mcp.formats.metadata_schema import create_empty_metadata_db
         from pbix_mcp.builder_v2 import build_abf_clean, build_pbix_clean
+
+        # 0. Pre-build validation
+        issues = self._pre_build_checks()
+        critical = [i for i in issues if i.startswith("CRITICAL:")]
+        if critical:
+            raise ValueError(
+                f"Pre-build validation failed with {len(critical)} critical "
+                f"issue(s):\n" + "\n".join(critical)
+            )
+        if issues:
+            import warnings
+            for issue in issues:
+                warnings.warn(f"PBIX pre-build: {issue}", stacklevel=2)
 
         tables = self._tables
         measures = self._measures
