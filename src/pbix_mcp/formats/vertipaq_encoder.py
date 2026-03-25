@@ -749,8 +749,8 @@ def _encode_idfmeta(
     buf += _u4(min_data_id)
     # max_data_id: offset by +3 from actual max stored index
     buf += _u4(max_data_id)
-    # original_min_segment_data_id: matches min_data_id (PBI ground truth)
-    buf += _u4(min_data_id)
+    # original_min_segment_data_id: GT v2 shows 2 (= BaseId), not min_data_id
+    buf += _u4(2)
     # r_l_e_sort_order: -1 = unsorted
     buf += _s8(-1)
     # row_count (in SS)
@@ -938,11 +938,23 @@ def _encode_column(
     for v in values:
         converted.append(_convert_value_for_dict(v, data_type))
 
-    # Build unique values list in SORTED ORDER.
+    # Build unique values list.
+    # GT v2 comparison: String columns use INSERTION order, numeric use SORTED.
     non_null_values = [v for v in converted if v is not None]
-    unique_sorted = sorted(set(non_null_values), key=lambda x: (str(type(x)), x) if not isinstance(x, (int, float)) else x)
+    if data_type == "String":
+        # Insertion order for strings (matching PBI ground truth)
+        _seen_keys: set = set()
+        unique_sorted: list = []
+        for v in non_null_values:
+            k = _val_key(v)
+            if k not in _seen_keys:
+                _seen_keys.add(k)
+                unique_sorted.append(v)
+    else:
+        # Sorted order for numeric types
+        unique_sorted = sorted(set(non_null_values), key=lambda x: (str(type(x)), x) if not isinstance(x, (int, float)) else x)
 
-    # Map value -> sorted dictionary index
+    # Map value -> dictionary index
     null_offset = 1 if has_nulls else 0
     value_to_idx = {}
     for i, uv in enumerate(unique_sorted):
@@ -1056,7 +1068,7 @@ def _encode_column(
     # --- Encode Dictionary (sorted order) ---
     dict_bytes = _encode_dictionary(unique_sorted, data_type)
 
-    # --- Encode HIDX (sorted order — hash must match dict) ---
+    # --- Encode HIDX (sorted order) ---
     hidx_bytes = _encode_hidx(unique_sorted, data_type)
 
     return {

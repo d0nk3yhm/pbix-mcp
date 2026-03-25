@@ -1811,18 +1811,30 @@ def _modify_metadata_and_encode(
                 meta_key = f"{base}\\column.{col_name}meta"
 
                 # Get distinct count and dict order from encoded data
-                # CRITICAL: must use SORTED ORDER matching the encoder
+                # CRITICAL: String=insertion order, Numeric=sorted (matching GT v2)
                 raw_vals = [row.get(col_name) for row in rows]
-                non_null_unique = set(v for v in raw_vals if v is not None)
-                dict_values = sorted(
-                    non_null_unique,
+                if data_type == "String":
+                    # Insertion order for strings
+                    seen_order: dict[object, int] = {}
+                    dict_values: list = []
+                    for v in raw_vals:
+                        if v is not None and v not in seen_order:
+                            seen_order[v] = len(dict_values)
+                            dict_values.append(v)
+                    seen = seen_order
+                else:
+                    # Sorted order for numerics
+                    non_null_unique = set(v for v in raw_vals if v is not None)
+                    dict_values = sorted(
+                        non_null_unique,
+                        key=lambda x: (str(type(x)), x) if not isinstance(x, (int, float)) else x,
+                    )
+                    seen = {v: i for i, v in enumerate(dict_values)}
+                distinct = len(dict_values)
+                sorted_vals = sorted(
+                    dict_values,
                     key=lambda x: (str(type(x)), x) if not isinstance(x, (int, float)) else x,
                 )
-                seen = {v: i for i, v in enumerate(dict_values)}
-                distinct = len(dict_values)
-
-                # sorted_vals = dict_values (already sorted)
-                sorted_vals = dict_values
 
                 # POS_TO_ID: sorted_pos -> data_id (dict_index + 3)
                 # BaseId=0, so data_ids start at 3
@@ -2196,10 +2208,12 @@ def _modify_metadata_and_encode(
                 set(v for v in fk_values if v is not None),
                 key=lambda x: x if isinstance(x, (int, float)) else str(x),
             )
-            from_row_count = len(fk_distinct_sorted)  # R$ has distinct entries
+            # R$ RecordCount = distinct + 3 (matching PBI ground truth v2)
+            _R_OFFSET = 3
+            from_row_count = len(fk_distinct_sorted) + _R_OFFSET
 
-            # Build R$ INDEX: one entry per distinct FK (sorted)
-            index_values: list[int] = []
+            # Build R$ INDEX: 3 padding entries + one per distinct FK (sorted)
+            index_values: list[int] = [0] * _R_OFFSET  # positions 0,1,2 = padding
             for fk_val in fk_distinct_sorted:
                 matched_idx = to_key_index.get(fk_val, 0)
                 index_values.append(matched_idx)
