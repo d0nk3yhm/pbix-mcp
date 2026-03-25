@@ -4125,11 +4125,13 @@ def pbix_get_password(alias: str) -> str:
 
 @mcp.tool()
 def pbix_doctor(alias: str) -> str:
-    """Run diagnostic checks on an open PBIX/PBIT file.
+    """Run comprehensive diagnostics on an open PBIX/PBIT file.
 
-    Checks ZIP validity, layout parseability, DataModel recognition,
-    ABF readability, SQLite metadata, table/measure counts, and
-    known unsupported features.
+    Performs a full health check across every layer of the file:
+    ZIP structure, report layout, DataModel compression, ABF archive,
+    SQLite metadata, data source connections, storage modes,
+    VertiPaq column data, relationships, measures, calculated tables,
+    RLS roles, and slicer filters.
 
     Args:
         alias: The alias of the open file
@@ -4223,26 +4225,219 @@ def pbix_doctor(alias: str) -> str:
             os.unlink(tmp.name)
     _check("Metadata SQLite", check_sqlite)
 
-    # 6. PBIXRay table access
+    # 6. Data sources & storage modes
+    def check_data_sources():
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        import sqlite3
+        import tempfile
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        with open(dm_path, "rb") as f:
+            dm = f.read()
+        abf = decompress_datamodel(dm)
+        db_bytes = read_metadata_sqlite(abf)
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(db_bytes)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            c = conn.cursor()
+            mode_names = {0: "Import", 1: "DirectQuery", 2: "Dual"}
+            results = []
+            c.execute("""SELECT t.Name, p.Mode, SUBSTR(p.QueryDefinition, 1, 60)
+                         FROM Partition p JOIN [Table] t ON p.TableID = t.ID
+                         WHERE t.Name NOT LIKE 'H$%' AND t.Name NOT LIKE 'R$%'
+                         AND p.QueryDefinition IS NOT NULL
+                         ORDER BY t.Name""")
+            modes = set()
+            sources = set()
+            for row in c.fetchall():
+                tname, mode, qd = row
+                mode_str = mode_names.get(mode, f"Unknown({mode})")
+                modes.add(mode_str)
+                # Detect source type from M expression
+                if qd:
+                    if "PostgreSQL.Database" in qd:
+                        sources.add("PostgreSQL")
+                    elif "MySQL.Database" in qd:
+                        sources.add("MySQL")
+                    elif "Sql.Database" in qd:
+                        sources.add("SQL Server")
+                    elif "Odbc.DataSource" in qd:
+                        sources.add("ODBC")
+                    elif "Excel.Workbook" in qd:
+                        sources.add("Excel")
+                    elif "Web.Contents" in qd:
+                        sources.add("Web/JSON")
+                    elif "#table(" in qd:
+                        sources.add("Embedded (Import)")
+                    else:
+                        sources.add("Other M expression")
+                results.append(f"    {tname}: {mode_str}")
+            conn.close()
+            summary = f"Modes: {', '.join(sorted(modes))} | Sources: {', '.join(sorted(sources))}"
+            return summary + "\n" + "\n".join(results)
+        finally:
+            os.unlink(tmp.name)
+    _check("Data sources & storage modes", check_data_sources)
+
+    # 7. Per-table column breakdown
+    def check_columns():
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        import sqlite3
+        import tempfile
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        with open(dm_path, "rb") as f:
+            dm = f.read()
+        abf = decompress_datamodel(dm)
+        db_bytes = read_metadata_sqlite(abf)
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(db_bytes)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            c = conn.cursor()
+            type_names = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime", 10: "Decimal", 11: "Boolean"}
+            c.execute("""SELECT t.Name, COUNT(*) as cols,
+                         GROUP_CONCAT(DISTINCT CASE col.ExplicitDataType
+                             WHEN 2 THEN 'String' WHEN 6 THEN 'Int64' WHEN 8 THEN 'Double'
+                             WHEN 9 THEN 'DateTime' WHEN 10 THEN 'Decimal' WHEN 11 THEN 'Boolean'
+                             ELSE 'Type' || col.ExplicitDataType END)
+                         FROM [Column] col JOIN [Table] t ON col.TableID = t.ID
+                         WHERE t.Name NOT LIKE 'H$%' AND t.Name NOT LIKE 'R$%'
+                         AND col.Type = 1
+                         GROUP BY t.Name ORDER BY t.Name""")
+            lines = []
+            total_cols = 0
+            for row in c.fetchall():
+                tname, ncols, types = row
+                total_cols += ncols
+                lines.append(f"    {tname}: {ncols} columns ({types})")
+            conn.close()
+            return f"{total_cols} total data columns\n" + "\n".join(lines)
+        finally:
+            os.unlink(tmp.name)
+    _check("Column breakdown", check_columns)
+
+    # 8. VertiPaq table data (row counts)
     def check_tables():
         from pbixray import PBIXRay
         model = PBIXRay(info["path"])
         schema = model.schema
         if schema is None or schema.empty:
-            return "No tables readable"
+            return "No VertiPaq data (DirectQuery or empty)"
         names = [t for t in schema["TableName"].unique() if not t.startswith("H$") and not t.startswith("R$")]
+        lines = []
         total_rows = 0
-        for t in names:
+        for t in sorted(names):
             try:
                 df = model.get_table(t)
                 if df is not None:
                     total_rows += len(df)
+                    lines.append(f"    {t}: {len(df):,} rows")
             except Exception:
-                pass
-        return f"{len(names)} tables, {total_rows:,} total rows"
-    _check("VertiPaq tables (PBIXRay)", check_tables)
+                lines.append(f"    {t}: (read error)")
+        return f"{len(names)} tables, {total_rows:,} total rows\n" + "\n".join(lines)
+    _check("VertiPaq data (row counts)", check_tables)
 
-    # 7. Calculated tables
+    # 9. Relationships
+    def check_relationships():
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        import sqlite3
+        import tempfile
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        with open(dm_path, "rb") as f:
+            dm = f.read()
+        abf = decompress_datamodel(dm)
+        db_bytes = read_metadata_sqlite(abf)
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(db_bytes)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            c = conn.cursor()
+            c.execute("""SELECT ft.Name, fc.ExplicitName, tt.Name, tc.ExplicitName, r.IsActive
+                         FROM Relationship r
+                         JOIN [Table] ft ON r.FromTableID = ft.ID
+                         JOIN [Column] fc ON r.FromColumnID = fc.ID
+                         JOIN [Table] tt ON r.ToTableID = tt.ID
+                         JOIN [Column] tc ON r.ToColumnID = tc.ID""")
+            lines = []
+            for row in c.fetchall():
+                active = "active" if row[4] else "inactive"
+                lines.append(f"    {row[0]}.{row[1]} → {row[2]}.{row[3]} ({active})")
+            conn.close()
+            if not lines:
+                return "None"
+            return f"{len(lines)} relationships\n" + "\n".join(lines)
+        finally:
+            os.unlink(tmp.name)
+    _check("Relationships", check_relationships)
+
+    # 10. Measures
+    def check_measures():
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        import sqlite3
+        import tempfile
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        with open(dm_path, "rb") as f:
+            dm = f.read()
+        abf = decompress_datamodel(dm)
+        db_bytes = read_metadata_sqlite(abf)
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(db_bytes)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            c = conn.cursor()
+            c.execute("""SELECT t.Name, m.Name, m.Expression
+                         FROM Measure m JOIN [Table] t ON m.TableID = t.ID""")
+            lines = []
+            for row in c.fetchall():
+                expr = row[2][:40] + "..." if len(row[2]) > 40 else row[2]
+                lines.append(f"    [{row[0]}] {row[1]} = {expr}")
+            conn.close()
+            if not lines:
+                return "None"
+            return f"{len(lines)} measures\n" + "\n".join(lines)
+        finally:
+            os.unlink(tmp.name)
+    _check("DAX measures", check_measures)
+
+    # 11. RLS roles
+    def check_rls():
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        import sqlite3
+        import tempfile
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        with open(dm_path, "rb") as f:
+            dm = f.read()
+        abf = decompress_datamodel(dm)
+        db_bytes = read_metadata_sqlite(abf)
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(db_bytes)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM Role WHERE ModelID=1")
+            count = c.fetchone()[0]
+            conn.close()
+            return f"{count} roles" if count else "None"
+        finally:
+            os.unlink(tmp.name)
+    _check("Row-Level Security (RLS)", check_rls)
+
+    # 12. Calculated tables
     def check_calc():
         from pbixray import PBIXRay
 
@@ -4252,17 +4447,16 @@ def pbix_doctor(alias: str) -> str:
         if model.schema is not None:
             base_tables = set(t for t in model.schema["TableName"].unique()
                              if not t.startswith("H$") and not t.startswith("R$"))
-        # Load with empty tables to see what calc_tables adds
         tables = load_calculated_tables(info["path"], {}, [])
         calc_names = [t for t in tables if t not in base_tables]
-        return f"{len(calc_names)} calculated tables loaded" if calc_names else "None found"
+        return f"{len(calc_names)} calculated tables" if calc_names else "None"
     _check("Calculated tables", check_calc)
 
-    # 8. Default slicer filters
+    # 13. Default slicer filters
     def check_filters():
         filters = _get_all_default_filters(info["work_dir"])
         if filters:
-            return f"{len(filters)} default slicer filters detected"
+            return f"{len(filters)} default slicer filters"
         return "None"
     _check("Default slicer filters", check_filters)
 
