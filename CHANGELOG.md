@@ -87,7 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Typed exception hierarchy (errors.py with 12 exception classes)
 - Diagnostic logging (normal/debug/trace via PBIX_MCP_LOG_LEVEL or --log-level)
 - CI pipeline for Python 3.10-3.13 (ruff, mypy, pytest, coverage)
-- ~163 passing tests from fresh clone, ~8 skip without private files
+- ~173 passing tests from fresh clone, ~8 skip without private files
 - 19 cross-report integration tests (require private PBIX corpus)
 - Public PBIX fixtures (basic_layout, basic_measures)
 - SUPPORT.md, CONTRIBUTING.md, issue templates
