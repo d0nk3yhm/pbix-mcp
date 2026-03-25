@@ -100,7 +100,7 @@ pbix-mcp-server --log-level debug
 | TMDL Export | **Beta** | Export data model as Git-friendly TMDL text files via `pbix_export_tmdl` |
 | Custom Visuals | **Beta** | Import .pbiviz packages via `pbix_add_custom_visual`, place with `pbix_add_visual` |
 | Incremental Refresh | **Beta** | Configure date-based partition policies via `pbix_set_incremental_refresh` |
-| Diagnostic tool (`pbix_doctor`) | **Beta** | 8-point health check |
+| Diagnostic tool (`pbix_doctor`) | **Stable** | 13-point comprehensive diagnostic — data sources, storage modes, columns, relationships, measures, RLS, VertiPaq row counts |
 
 ## Known Limitations
 
