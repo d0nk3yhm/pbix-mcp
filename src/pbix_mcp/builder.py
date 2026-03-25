@@ -2177,10 +2177,11 @@ def _modify_metadata_and_encode(
             to_rows = one_tdef["rows"]
             from_row_count = len(from_rows)
 
-            # Compute the INDEX column: for each row in Many table,
-            # R$ INDEX: one entry per FROM row, sorted by FK value.
-            # PBI indexes R$ by H$-sorted-position of the FK value.
-            # So we sort FROM rows by FK and store the matching TO row index.
+            # Compute the INDEX column.
+            # From Ghidra RE of XMRelationshipIndexSparseDIDs::InitSparseRelIndex:
+            # R$ INDEX has ONE entry per DISTINCT FK value (not per row).
+            # PBI uses H$ sorted_pos to index: R$[sorted_pos] → PK row.
+            # So for each distinct FK value (sorted), store the matching PK row.
 
             # Map TO table key values to row indices
             to_key_index: dict[object, int] = {}
@@ -2189,16 +2190,17 @@ def _modify_metadata_and_encode(
                 if key_val is not None and key_val not in to_key_index:
                     to_key_index[key_val] = idx
 
-            # Sort FROM rows by FK value
-            sorted_from = sorted(from_rows, key=lambda r: (
-                r.get(many_col_name) if isinstance(r.get(many_col_name), (int, float))
-                else str(r.get(many_col_name, ''))
-            ))
+            # Get DISTINCT FK values, sorted (matching H$ sorted positions)
+            fk_values = [r.get(many_col_name) for r in from_rows]
+            fk_distinct_sorted = sorted(
+                set(v for v in fk_values if v is not None),
+                key=lambda x: x if isinstance(x, (int, float)) else str(x),
+            )
+            from_row_count = len(fk_distinct_sorted)  # R$ has distinct entries
 
-            # Build R$ INDEX in sorted-FK order
+            # Build R$ INDEX: one entry per distinct FK (sorted)
             index_values: list[int] = []
-            for row in sorted_from:
-                fk_val = row.get(many_col_name)
+            for fk_val in fk_distinct_sorted:
                 matched_idx = to_key_index.get(fk_val, 0)
                 index_values.append(matched_idx)
 
