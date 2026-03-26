@@ -108,6 +108,30 @@ Sub Segment:
   N × u64: bit-packed values at specified bit_width
 ```
 
+#### Bit Width Computation
+
+**Critical**: bit_width must be computed from the number of distinct values, NOT from `max_data_id + 1`:
+
+```
+distinct = number of unique non-null values in the column
+if distinct <= 2:
+    bit_width_raw = 1
+else:
+    bit_width_raw = ceil(log2(distinct))
+bit_width = align_to_valid_N(max(1, bit_width_raw))
+```
+
+The IDFMETA u32_b field must use the same aligned bit_width. A mismatch between the IDF encoding bit width and IDFMETA u32_b causes `QuerySystemError` crashes in PBI Desktop.
+
+#### Dictionary Order
+
+The dictionary determines the mapping between values and data_ids:
+
+- **String columns**: insertion order (order values first appear in the row data)
+- **Numeric columns** (Int64, Double, DateTime, Decimal, Boolean): sorted ascending
+
+The first dictionary entry gets data_id = DATA_ID_OFFSET (3). All dependent structures (H$ POS_TO_ID, IDF data_ids) must use the same ordering.
+
 ### XMRENoSplitCompressionInfo<N> (u32_a = 0xABA36 + N)
 
 Used for H$ and R$ system table columns. Raw N-bit values:
@@ -168,6 +192,26 @@ CP:1>\0  (6 bytes) — close
 SDOs:1>\0
 ```
 
+### IDFMETA for Data Columns
+
+For standard data columns (XMHybridRLE):
+- `u32_b` = `0xABA36 + aligned_bit_width` — MUST match the IDF encoding bit width
+- `distinct_states` = number of distinct values in the column
+- `min_data_id` = DATA_ID_OFFSET (3) for non-empty columns
+- `max_data_id` = DATA_ID_OFFSET + distinct - 1
+- `original_min_segment_data_id` = 2 (PBI Desktop convention)
+- `row_count` = total number of rows
+
+### IDFMETA for System Columns (H$, R$)
+
+For NoSplit-encoded system columns:
+- `one` = 0 (system flag)
+- `distinct_states` = 0
+- `min_data_id` = 2
+- `max_data_id` = 2
+- `original_min_segment_data_id` = 2
+- `row_count` = 0
+
 ## Compression Class ID Selectors
 
 Determined through binary format analysis:
@@ -195,6 +239,8 @@ u32: entry_count
 u32[]: values (4 bytes each if IsOperatingOn32=1, 8 bytes if =0)
 ```
 
+Values are sorted ascending for numeric types.
+
 ### Float Dictionary (dict_type = 1, REAL)
 
 ```
@@ -202,6 +248,8 @@ u32: dict_type (1)
 u32: entry_count
 f64[]: values (8 bytes each, IEEE 754)
 ```
+
+Values are sorted ascending.
 
 ### String Dictionary (dict_type = 2, STRING)
 
@@ -221,6 +269,8 @@ HashInfo:
   u32[]: chain_next (-1 = end of chain)
 ```
 
+String dictionary entries use **insertion order** (order values first appear in the source data), not sorted order. This is critical for correct H$ hierarchy alignment.
+
 ## H$ System Tables (Attribute Hierarchies)
 
 Each user column with MaterializationType=0 has an H$ system table:
@@ -231,7 +281,10 @@ Columns: POS_TO_ID (sorted position → data_id)
           ID_TO_POS (data_id → sorted position)
 Encoding: NoSplit<32> (u32_a = 0xABA56)
 SMS: RecordCount = distinct + 3, SegmentCount = ceil(RecordCount/RecPerSeg)
+ColumnStorage: distinct=1, min=2, max=2, orig_min=2, rows=0
 ```
+
+**Critical**: POS_TO_ID and ID_TO_POS must be computed using the same dictionary ordering as the VertiPaq encoder. For String columns (insertion order), the "sorted position" refers to the lexicographic sort of the insertion-ordered dictionary. For numeric columns (already sorted), POS_TO_ID is an identity mapping offset by DATA_ID_OFFSET.
 
 ## R$ System Tables (Relationships)
 
@@ -256,6 +309,19 @@ The R$ INDEX is addressed by the FK column's data_id. Since data columns use
 DATA_ID_OFFSET=3, position 3 corresponds to the first dictionary entry. The
 stored value is the 1-based row index into the TO table (matching RowNumber
 values, which start at 1).
+
+### R$ Verification
+
+Verified through binary comparison against PBI Desktop ground truth:
+
+| Property | Generated | Ground Truth | Match |
+|----------|-----------|-------------|-------|
+| RecordCount (6 distinct FK) | 9 | 9 | ✅ |
+| RecordCount (3 distinct FK) | 6 | 6 | ✅ |
+| Padding positions 0-2 | [0, 0, 0] | [0, 0, 0] | ✅ |
+| Data positions 3+ | 1-based indices | 1-based indices | ✅ |
+| ColumnStorage stats | D=1,min=2,max=2 | D=1,min=2,max=2 | ✅ |
+| DictionaryStorage | Type=0,DT=19,Base=0 | Type=0,DT=19,Base=0 | ✅ |
 
 ## XPress9 Compression
 

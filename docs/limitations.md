@@ -60,17 +60,24 @@ Every layer of the PBIX is generated from scratch — no templates or skeletons:
 - **XMLA Load document (db.xml)**: 28 xmlns namespaces, CompatibilityLevel=1550 — `generate_db_xml()`
 - **CryptKey.bin**: 144-byte RSA key BLOB constant (Microsoft crypto format; GUID-independent)
 - **Metadata SQLite**: clean DATASOURCEVERSION=2, 63 system tables — only user-specified tables, columns, and measures
-- **VertiPaq column data**: all IDF segments, dictionaries, H$ hierarchy tables, R$ relationship tables. Verified with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 13 visuals (Northwind showcase)
+- **VertiPaq column data**: all IDF segments, dictionaries, H$ hierarchy tables, R$ relationship tables. Verified with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase). Cross-table lookups verified byte-exact against PBI Desktop ground truth.
 - **Report layout JSON**: pages, visuals, filters generated from scratch. Supported visuals: table, pieChart, clusteredBarChart, clusteredColumnChart, card, slicer
 - **XPress9 compression**: custom compress/decompress with reversed chunk framing and headers
 
-### Other builder notes
+### VertiPaq encoding details
+- **IDF bit_width**: computed from `ceil(log2(distinct_count))`, aligned to valid NoSplit widths {1,2,3,4,5,6,7,8,9,10,12,16,21,32}
+- **IDFMETA u32_b**: must match IDF bit_width exactly — mismatch causes `QuerySystemError`
+- **Dictionary order**: String columns use insertion order; numeric columns use sorted order
+- **R$ INDEX**: +3 DATA_ID_OFFSET padding at positions 0-2; values are 1-based row indices into TO table
+- **R$ RecordCount**: distinct FK values + 3 (not total FK rows)
+- **H$ POS_TO_ID**: must use same sort order as encoder's dictionary
 - **RLE encoding disabled**: pure bitpack used for IDF segments — slightly less space-efficient but correct
+
+### Other builder notes
 - Fixed RowNumber GUID: 2662979B-1795-4F74-8F37-6A1BA8059B61
-- Relationship direction: From=Many (fact), To=One (dimension) matching PBI convention
+- Relationship direction: auto-detects Many/One sides; From=Many (fact), To=One (dimension)
 - Key annotations: PBI_IsFromSource (ObjectType=7), PBI_ResultType, SummarizationSetBy, PBI_QueryOrder, __PBI_TimeIntelligenceEnabled
 - M expression navigation uses `Item` key (not `Name`) for MySQL/PostgreSQL
-- Power BI Desktop may need a refresh to fully index data after opening a created PBIX
 
 ## Performance
 

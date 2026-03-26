@@ -4,9 +4,11 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python: PBIX ZIP shell, ABF binary container, XMLA database document, VertiPaq columnar storage (IDF/IDFMETA/dictionary/HIDX/H$/R$), metadata SQLite (63 system tables), XPress9 compression, and report layout — all generated from scratch with zero templates or skeletons.
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python: PBIX ZIP shell, ABF binary container, XMLA database document, VertiPaq columnar storage (IDF/IDFMETA/dictionary/HIDX/H$/R$), metadata SQLite (63 system tables), XPress9 compression, and report layout — all generated from scratch with zero templates or skeletons. Cross-table relationship lookups verified byte-exact against PBI Desktop ground truth.
 
 Exposes 69 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
+
+See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ## Quick Start
 
