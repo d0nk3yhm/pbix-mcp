@@ -2208,15 +2208,17 @@ def _modify_metadata_and_encode(
                 set(v for v in fk_values if v is not None),
                 key=lambda x: x if isinstance(x, (int, float)) else str(x),
             )
-            # R$ RecordCount = distinct + 3 (matching PBI ground truth v2)
-            _R_OFFSET = 3
-            from_row_count = len(fk_distinct_sorted) + _R_OFFSET
+            # R$ RecordCount = distinct + DATA_ID_OFFSET (3 padding slots).
+            # Ground truth analysis: R$ is indexed by data_id (position 3 =
+            # first dict entry). Values are 1-based row indices into TO table.
+            DATA_ID_OFFSET = 3
+            from_row_count = len(fk_distinct_sorted) + DATA_ID_OFFSET
 
-            # Build R$ INDEX: 3 padding entries + one per distinct FK (sorted)
-            index_values: list[int] = [0] * _R_OFFSET  # positions 0,1,2 = padding
+            # Build R$ INDEX: 3 padding zeros + 1-based TO row per distinct FK
+            index_values: list[int] = [0] * DATA_ID_OFFSET
             for fk_val in fk_distinct_sorted:
                 matched_idx = to_key_index.get(fk_val, 0)
-                index_values.append(matched_idx)
+                index_values.append(matched_idx + 1)  # 1-based row index
 
             # R$ table naming: table name does NOT include .tbl suffix
             rel_name_spaced = rel_name.replace("-", " ")
