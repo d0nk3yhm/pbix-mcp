@@ -550,9 +550,9 @@ class PBIXBuilder:
           6. Build Report/Layout JSON
           7. Package into PBIX ZIP
         """
+        from pbix_mcp.builder_v2 import build_abf_clean, build_pbix_clean
         from pbix_mcp.formats.datamodel_roundtrip import compress_datamodel
         from pbix_mcp.formats.metadata_schema import create_empty_metadata_db
-        from pbix_mcp.builder_v2 import build_abf_clean, build_pbix_clean
 
         # 0. Pre-build validation
         issues = self._pre_build_checks()

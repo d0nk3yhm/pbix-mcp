@@ -13,9 +13,9 @@ import xml.etree.ElementTree as ET
 from typing import Dict
 
 from pbix_mcp.formats.abf_rebuild import (
-    STREAM_STORAGE_SIGNATURE,
     _HEADER_PAGE_SIZE,
     _SIGNATURE_LEN,
+    STREAM_STORAGE_SIGNATURE,
     _xml_to_utf16_bytes,
 )
 
