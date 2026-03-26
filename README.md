@@ -79,7 +79,7 @@ Every layer of the PBIX binary format has been independently reversed and reimpl
 | Metadata SQLite | **Reversed** | 63 system tables created from scratch — `create_empty_metadata_db()` |
 | VertiPaq column storage | **Reversed** | IDF (bit-packed), IDFMETA (segment stats), dictionary (Long/Real/String), HIDX (hash index) |
 | H$ attribute hierarchies | **Reversed** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities |
-| R$ relationship indexes | **Reversed** | NoSplit<N> INDEX encoding with foreign key mapping |
+| R$ relationship indexes | **Reversed** | NoSplit<N> INDEX encoding with +3 DATA_ID_OFFSET padding and 1-based row indices (verified byte-exact against PBI Desktop ground truth) |
 | XPress9 compression | **Reversed** | Custom compress/decompress with reversed chunk framing, headers, and multi-thread format; core algorithm via [xpress9-python](https://github.com/Hugoberry/xpress9-python) (MIT) |
 
 The only non-generated artifact is the 144-byte CryptKey constant. This is a Microsoft RSA key BLOB that requires `rskeymgmt` infrastructure to generate. The key is GUID-independent — any valid key works with any database ID. Random bytes produce `PFE_INVALID_CRYPT_KEY`.
@@ -89,7 +89,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Feature | Status | Notes |
 |---------|--------|-------|
 | PBIX creation | **Stable** | Multi-table with all 6 data types, relationships, H$ hierarchies, measures — generated entirely from scratch |
-| Cross-table relationships | **Stable** | R$ system tables with NoSplit INDEX encoding; RELATED() and cross-table filtering work |
+| Cross-table relationships | **Stable** | R$ system tables with NoSplit INDEX encoding (+3 padding, 1-based row indices); cross-table visuals, RELATED(), and cross-table filtering verified byte-exact against PBI Desktop ground truth |
 | Refreshable CSV sources | **Stable** | `source_csv` parameter creates M expressions referencing external CSV files; click Refresh in PBI Desktop to re-import |
 | SQLite database sources | **Stable** | `source_db` with ODBC driver; data imported at build, Refresh re-reads from DB |
 | SQL Server / MySQL / PostgreSQL database sources | **Stable** | `source_db` Import and DirectQuery for all. MySQL DQ requires MariaDB ODBC 3.1 (`type: 'mariadb'`) |
@@ -132,7 +132,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 - **Opening existing DirectQuery files** — layout, measures, and metadata editing work; DAX evaluation and table reads return clear errors since data lives in the remote source (this is inherent to DirectQuery — the data isn't in the file)
 - **Creating DirectQuery files** — fully working with SQL Server (LocalDB), PostgreSQL 16, and MySQL 9.6 (via MariaDB adapter); requires a running database server and initial data snapshot
 - **CryptKey.bin** — the 144-byte RSA key BLOB cannot be generated without Microsoft's crypto infrastructure (`rskeymgmt`). A known-valid GUID-independent constant is used.
-- **Embedded VertiPaq data** — verified working with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 13 visuals (Northwind showcase)
+- **Embedded VertiPaq data** — verified working with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase). Cross-table relationship lookups verified byte-exact against PBI Desktop ground truth
 - **RLE encoding** — disabled in the VertiPaq encoder (pure bitpack used). Slightly less space-efficient but correct
 
 
@@ -327,7 +327,7 @@ Every component of the VertiPaq columnar storage engine is generated from scratc
 - **IDFMETA** — Segment statistics with tagged CP/CS/SS/SDOs blocks
 - **Dictionary** — Type-specific encoding (Long/Real/String) with hash tables
 - **H$ system tables** — Attribute hierarchy POS_TO_ID + ID_TO_POS using NoSplit<32> encoding
-- **R$ system tables** — Relationship join INDEX using NoSplit<N> encoding
+- **R$ system tables** — Relationship join INDEX using NoSplit<N> encoding; +3 DATA_ID_OFFSET padding, 1-based row indices into TO table (derived from PBI Desktop ground truth binary comparison)
 - **Compression class IDs** — Determined through binary format analysis (u32_a/u32_b selectors)
 - **XPress9** — Custom implementation of Power BI's DataModel compression format: reversed chunk framing, header signatures, single-thread and multi-thread container formats. The core XPress9 algorithm uses [xpress9-python](https://github.com/Hugoberry/xpress9-python) as a primitive; the full read/write/modify pipeline is original work
 - **ABF** — Full archive generation: STREAM_STORAGE_SIGNATURE, BackupLogHeader, VirtualDirectory, BackupLog XML, data file layout
