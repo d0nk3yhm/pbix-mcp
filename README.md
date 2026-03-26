@@ -1,6 +1,8 @@
 # pbix-mcp
 
 [![CI](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/pbix-mcp)](https://pypi.org/project/pbix-mcp/)
+[![Downloads](https://img.shields.io/pypi/dm/pbix-mcp)](https://pypi.org/project/pbix-mcp/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
