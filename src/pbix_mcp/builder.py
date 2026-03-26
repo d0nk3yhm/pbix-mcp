@@ -2190,7 +2190,6 @@ def _modify_metadata_and_encode(
             from_row_count = len(from_rows)
 
             # Compute the INDEX column.
-            # From Ghidra RE of XMRelationshipIndexSparseDIDs::InitSparseRelIndex:
             # R$ INDEX has ONE entry per DISTINCT FK value (not per row).
             # PBI uses H$ sorted_pos to index: R$[sorted_pos] → PK row.
             # So for each distinct FK value (sorted), store the matching PK row.
