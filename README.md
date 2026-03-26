@@ -12,6 +12,17 @@ Exposes 69 tools covering report creation (all 6 data types, cross-table relatio
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
+## Try It
+
+Generate a complete 3-page Northwind Analytics Dashboard in under a second:
+
+```bash
+pip install pbix-mcp
+python examples/create_showcase.py
+```
+
+Creates a PBIX with 6 tables, 5 relationships (including chained cross-table lookups), 4 DAX measures, 3 pages, and 14 visuals. Open `showcase_northwind.pbix` in Power BI Desktop — everything works: slicers, cross-filtering, drill-through.
+
 ## Quick Start
 
 ```bash
@@ -475,6 +486,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for project conventions, [SUPPORT.md](SUP
 
 | Script | What it does |
 |--------|-------------|
+| [`create_showcase.py`](examples/create_showcase.py) | **Full showcase** — 6 tables, 5 relationships, 4 measures, 3 pages, 14 visuals |
 | [`create_from_csv.py`](examples/create_from_csv.py) | Build a report from CSV files with Refresh support |
 | [`create_from_sqlite.py`](examples/create_from_sqlite.py) | Build a report connected to SQLite database |
 | [`create_directquery.py`](examples/create_directquery.py) | Live DirectQuery report connected to SQL Server |
