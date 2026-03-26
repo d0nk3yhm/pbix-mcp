@@ -239,11 +239,23 @@ Each relationship has an R$ system table:
 
 ```
 Table name: R$<from_table> (<tid>)$<guid> (<rid>)
-Columns: INDEX (from-table row → to-table row mapping)
-Encoding: NoSplit<N> where N = bits_needed(max_to_row_index)
-Data: 0-based row indices (no dictionary offset)
+Columns: INDEX (from-table FK data_id → to-table row mapping)
+Encoding: NoSplit<N> where N = bits_needed(max_row_value)
+RecordCount: distinct_FK_values + DATA_ID_OFFSET (3)
+Layout:
+  positions 0-2: padding zeros (DATA_ID_OFFSET)
+  position 3+i:  1-based row index into TO table for FK dict entry i
+Values: 1-based row indices (RowNumber-style, NOT 0-based)
 IDFMETA: one=0, min_data_id=0
+SMS: RecordCount = distinct + 3, SegmentCount = 1
+ColumnStorage: distinct=1, min=2, max=2, orig_min=2, rows=0
+DictionaryStorage: Type=0, DataType=19, BaseId=0 (no external dictionary)
 ```
+
+The R$ INDEX is addressed by the FK column's data_id. Since data columns use
+DATA_ID_OFFSET=3, position 3 corresponds to the first dictionary entry. The
+stored value is the 1-based row index into the TO table (matching RowNumber
+values, which start at 1).
 
 ## XPress9 Compression
 

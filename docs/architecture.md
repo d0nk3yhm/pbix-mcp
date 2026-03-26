@@ -53,13 +53,14 @@ src/pbix_mcp/
 2. Key PBI annotations are written: PBI_IsFromSource (ObjectType=7), PBI_ResultType, SummarizationSetBy, PBI_QueryOrder, __PBI_TimeIntelligenceEnabled
 3. Fixed RowNumber GUID (2662979B-1795-4F74-8F37-6A1BA8059B61) ensures stable attribute hierarchy references
 4. VertiPaq encoder writes actual row data into column segments using pure bitpack (RLE disabled — slightly less space-efficient but correct). Verified with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase)
-5. H$ attribute hierarchy tables and R$ relationship index tables are generated from scratch
-6. Relationships follow PBI convention: From=Many (fact table), To=One (dimension table)
-7. ABF binary container is built from scratch — signature, header, VDir, BackupLog, db.xml, CryptKey, all data files laid out sequentially
-8. ABF is XPress9-compressed into a DataModel
-9. Report/Layout JSON is generated from scratch with a default page and visuals (table, pieChart, clusteredBarChart, card, slicer all supported)
-10. PBIX ZIP shell is generated from scratch (Version, Content_Types, DiagramLayout, Settings, Metadata); packaged as a valid PBIX
-10. For database sources, M expressions use `Item` key (not `Name`) for MySQL/PostgreSQL table navigation
+5. H$ attribute hierarchy tables are generated with sorted POS_TO_ID/ID_TO_POS using NoSplit<32>
+6. R$ relationship index tables use +3 DATA_ID_OFFSET padding and 1-based row indices (verified byte-exact against PBI Desktop ground truth)
+7. Relationships auto-detect Many/One sides; From=Many (fact table), To=One (dimension table)
+8. ABF binary container is built from scratch — signature, header, VDir, BackupLog, db.xml, CryptKey, all data files laid out sequentially
+9. ABF is XPress9-compressed into a DataModel
+10. Report/Layout JSON is generated from scratch with a default page and visuals (table, pieChart, clusteredBarChart, card, slicer all supported)
+11. PBIX ZIP shell is generated from scratch (Version, Content_Types, DiagramLayout, Settings, Metadata); packaged as a valid PBIX
+12. For database sources, M expressions use `Item` key (not `Name`) for MySQL/PostgreSQL table navigation
 
 ### Data Source Support
 
