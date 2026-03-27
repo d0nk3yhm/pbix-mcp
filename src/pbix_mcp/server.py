@@ -4687,21 +4687,26 @@ def pbix_set_incremental_refresh(
                 raise ValueError(f"Table '{table_name}' not found")
             table_id = trow[0]
 
-            # Ensure RangeStart and RangeEnd expressions exist
-            for param_name in ("RangeStart", "RangeEnd"):
-                c.execute("SELECT ID FROM Expression WHERE Name = ?", (param_name,))
-                if not c.fetchone():
-                    c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM Expression")
-                    expr_id = c.fetchone()[0]
-                    # Kind=1 = M expression (parameters are M expressions with meta annotations)
-                    c.execute(
-                        "INSERT INTO Expression (ID, ModelID, Name, Kind, "
-                        "Expression, ModifiedTime) "
-                        "VALUES (?, 1, ?, 1, ?, datetime('now'))",
-                        (expr_id, param_name,
-                         '#datetime(2020, 1, 1, 0, 0, 0) meta [IsParameterQuery=true, '
-                         'Type="DateTime", IsParameterQueryRequired=true]')
-                    )
+            # Only insert RangeStart/RangeEnd expressions if the file has a DataMashup.
+            # Without a DataMashup, Expression rows cause PBI to reject the file with
+            # PFE_TM_ENUM_VALUES_VALIDATION_FAILED because the expressions have no
+            # corresponding M query section to resolve against.
+            has_mashup = os.path.exists(os.path.join(info["work_dir"], "DataMashup"))
+            if has_mashup:
+                for param_name in ("RangeStart", "RangeEnd"):
+                    c.execute("SELECT ID FROM Expression WHERE Name = ?", (param_name,))
+                    if not c.fetchone():
+                        c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM Expression")
+                        expr_id = c.fetchone()[0]
+                        # Kind=1 = M expression (parameters are M expressions with meta annotations)
+                        c.execute(
+                            "INSERT INTO Expression (ID, ModelID, Name, Kind, "
+                            "Expression, ModifiedTime) "
+                            "VALUES (?, 1, ?, 1, ?, datetime('now'))",
+                            (expr_id, param_name,
+                             '#datetime(2020, 1, 1, 0, 0, 0) meta [IsParameterQuery=true, '
+                             'Type="DateTime", IsParameterQueryRequired=true]')
+                        )
 
             # Build polling expression for change detection
             polling_expr = ""
