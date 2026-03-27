@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python — no templates, no skeletons, no Microsoft binaries. Cross-table relationship lookups verified byte-exact against PBI Desktop ground truth.
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python — no templates, no skeletons, no Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026.
 
 Exposes 69 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
 
@@ -91,7 +91,7 @@ Every layer of the PBIX binary format has been independently reversed and reimpl
 | ABF binary container | **Reversed** | 72-byte signature, BackupLogHeader, VirtualDirectory, BackupLog — `build_abf_clean()` |
 | XMLA Load document (db.xml) | **Reversed** | 28 xmlns namespaces, CompatibilityLevel=1550, TabularMetadata — `generate_db_xml()` |
 | CryptKey.bin | **Constant** | 144-byte RSA key BLOB (Microsoft crypto format; GUID-independent constant) |
-| Metadata SQLite | **Reversed** | 63 system tables — `create_empty_metadata_db()` |
+| Metadata SQLite | **Reversed** | 68 system tables matching PBI March 2026 schema — `create_empty_metadata_db()` |
 | VertiPaq column storage | **Reversed** | IDF (bit-packed), IDFMETA (segment stats), dictionary (Long/Real/String), HIDX (hash index) |
 | H$ attribute hierarchies | **Reversed** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities |
 | R$ relationship indexes | **Reversed** | NoSplit<N> INDEX encoding with +3 DATA_ID_OFFSET padding and 1-based row indices (verified byte-exact against PBI Desktop ground truth) |
@@ -103,7 +103,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| PBIX creation | **Stable** | Multi-table with all 6 data types, relationships, H$ hierarchies, and measures |
+| PBIX creation | **Stable** | Multi-table with all 6 data types, relationships, H$ hierarchies, and measures. Generated files support full PBI Desktop editing (add measures, columns, visuals) |
 | Cross-table relationships | **Stable** | R$ system tables with NoSplit INDEX encoding (+3 padding, 1-based row indices); cross-table visuals, RELATED(), and cross-table filtering verified byte-exact against PBI Desktop ground truth |
 | Refreshable CSV sources | **Stable** | `source_csv` parameter creates M expressions referencing external CSV files; click Refresh in PBI Desktop to re-import |
 | SQLite database sources | **Stable** | `source_db` with ODBC driver; data imported at build, Refresh re-reads from DB |
@@ -436,7 +436,7 @@ PBIX file (ZIP)
     ├── PARTITIONS         ← UTF-16: partition marker
     ├── db.xml             ← XMLA Load document (28 namespaces)
     ├── CryptKey.bin       ← 144-byte RSA key BLOB (constant)
-    ├── metadata.sqlitedb  ← SQLite: 63 system tables (Table, Column, Measure, Relationship, ...)
+    ├── metadata.sqlitedb  ← SQLite: 68 system tables (Table, Column, Measure, Relationship, ...)
     ├── *.tbl\*.prt\*.idf  ← VertiPaq: bit-packed column data
     ├── *.idfmeta          ← Segment statistics (CP/CS/SS/SDOs)
     ├── *.dictionary       ← Dictionary encoding (Long/Real/String + hash)
