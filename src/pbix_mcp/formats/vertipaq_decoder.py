@@ -519,6 +519,10 @@ def read_table_from_abf(
         for entry in file_log:
             path = entry["Path"]
 
+            # Skip H$ (hierarchy) and R$ (relationship) system table files
+            if path.startswith("H$") or path.startswith("R$"):
+                continue
+
             # Check if this file belongs to the right table
             # Real PBIX: "TableName (TableID).tbl"
             # Our encoder: "TableName.tbl"
