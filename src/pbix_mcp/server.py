@@ -4693,11 +4693,11 @@ def pbix_set_incremental_refresh(
                 if not c.fetchone():
                     c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM Expression")
                     expr_id = c.fetchone()[0]
-                    # Kind=2 = M parameter
+                    # Kind=1 = M expression (parameters are M expressions with meta annotations)
                     c.execute(
                         "INSERT INTO Expression (ID, ModelID, Name, Kind, "
                         "Expression, ModifiedTime) "
-                        "VALUES (?, 1, ?, 2, ?, datetime('now'))",
+                        "VALUES (?, 1, ?, 1, ?, datetime('now'))",
                         (expr_id, param_name,
                          '#datetime(2020, 1, 1, 0, 0, 0) meta [IsParameterQuery=true, '
                          'Type="DateTime", IsParameterQueryRequired=true]')
