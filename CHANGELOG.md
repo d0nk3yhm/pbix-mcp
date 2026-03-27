@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.6] - 2026-03-28
+
+### Fixed
+- CI: ruff lint errors (unsorted imports, unused imports in vertipaq_decoder.py)
+- CI: mypy baseline updated 158 → 175 for new vertipaq_decoder/model_reader files
+
 ## [0.5.5] - 2026-03-28
 
 ### Changed
