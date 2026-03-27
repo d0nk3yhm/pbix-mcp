@@ -115,13 +115,13 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal, Boolean column types with correct dictionary encoding |
 | H$ attribute hierarchies | **Stable** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities; MaterializationType=0 |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
-| Visual add/remove | **Stable** | Cards, charts, shapes/buttons, images, textboxes, slicers |
+| Visual add/remove | **Stable** | Cards, charts, shapes/buttons, images, textboxes, slicers — with full data bindings (projections + prototypeQuery) |
 | Visual property editing | **Stable** | Dot-path and full JSON |
 | DAX measure CRUD | **Stable** | Add, modify, remove via metadata SQL |
 | DAX evaluation (156 functions) | **Stable** | Best-effort evaluator; see accuracy notes below |
 | Metadata SQL read/write | **Stable** | Full SQLite access to tables, columns, relationships |
 | Default slicer filter extraction | **Stable** | Legacy Layout JSON and PBIR format |
-| Table data read (PBIXRay) | **Stable** | All materialized VertiPaq tables |
+| Table data read | **Stable** | Native VertiPaq decoder — all materialized tables (no external dependencies) |
 | Calculated table evaluation | **Stable** | DATATABLE, GENERATESERIES, CALENDAR, field parameters |
 | XPress9 decompress/recompress | **Stable** | Byte-exact round-trip verified |
 | ABF archive manipulation | **Stable** | List, extract, replace internal files |
@@ -463,6 +463,8 @@ src/pbix_mcp/
     abf_rebuild.py       # ABF archive reader and rebuilder
     datamodel_roundtrip.py  # XPress9 compress/decompress
     metadata_schema.py   # SQLite metadata schema (63 tables)
+    model_reader.py      # Native VertiPaq table data reader (replaces PBIXRay)
+    vertipaq_decoder.py  # VertiPaq IDF/dictionary/HIDX decoder
     vertipaq_encoder.py  # VertiPaq column encoding + NoSplit<N> encoder
   models/
     responses.py         # Pydantic response models
