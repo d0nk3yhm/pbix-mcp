@@ -1163,7 +1163,7 @@ def _modify_metadata_and_encode(
                     SystemFlags, KeepUniqueRows, DisplayOrdinal,
                     ErrorMessage, SourceProviderType, DisplayFolder,
                     EncodingHint, RelatedColumnDetailsID, AlternateOfID,
-                    LineageTag, SourceLineageTag, EvaluationBehavior
+                    LineageTag, SourceLineageTag, ExpressionContext, StringIndexingBehavior
                 ) VALUES (
                     ?, ?, ?, NULL,
                     6, 19,
@@ -1177,7 +1177,7 @@ def _modify_metadata_and_encode(
                     0, 0, 0,
                     NULL, NULL, NULL,
                     0, 0, 0,
-                    NULL, NULL, 1
+                    NULL, NULL, 1, 1
                 )""",
                 (rn_col_id, table_id, rn_name,
                  rn_cs_id, _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
@@ -1353,7 +1353,7 @@ def _modify_metadata_and_encode(
                         SystemFlags, KeepUniqueRows, DisplayOrdinal,
                         ErrorMessage, SourceProviderType, DisplayFolder,
                         EncodingHint, RelatedColumnDetailsID, AlternateOfID,
-                        LineageTag, SourceLineageTag, EvaluationBehavior
+                        LineageTag, SourceLineageTag, ExpressionContext, StringIndexingBehavior
                     ) VALUES (
                         ?, ?, ?, NULL,
                         ?, ?,
@@ -1367,7 +1367,7 @@ def _modify_metadata_and_encode(
                         0, 0, ?,
                         NULL, NULL, NULL,
                         0, 0, 0,
-                        ?, NULL, 1
+                        ?, NULL, 1, 1
                     )""",
                     (col_id, table_id, col_name,
                      amo_type, amo_type,
@@ -2038,7 +2038,7 @@ def _modify_metadata_and_encode(
                             SystemFlags, KeepUniqueRows, DisplayOrdinal,
                             ErrorMessage, SourceProviderType, DisplayFolder,
                             EncodingHint, RelatedColumnDetailsID, AlternateOfID,
-                            LineageTag, SourceLineageTag, EvaluationBehavior
+                            LineageTag, SourceLineageTag, ExpressionContext, StringIndexingBehavior
                         ) VALUES (
                             ?, ?, ?, NULL,
                             6, 19,
@@ -2052,7 +2052,7 @@ def _modify_metadata_and_encode(
                             1, 0, 0,
                             NULL, NULL, NULL,
                             0, 0, 0,
-                            NULL, NULL, 1
+                            NULL, NULL, 1, 1
                         )""",
                         (h_col_id, h_table_id, h_col_name,
                          h_cs_id,
@@ -2349,7 +2349,7 @@ def _modify_metadata_and_encode(
                     SystemFlags, KeepUniqueRows, DisplayOrdinal,
                     ErrorMessage, SourceProviderType, DisplayFolder,
                     EncodingHint, RelatedColumnDetailsID, AlternateOfID,
-                    LineageTag, SourceLineageTag, EvaluationBehavior
+                    LineageTag, SourceLineageTag, ExpressionContext, StringIndexingBehavior
                 ) VALUES (
                     ?, ?, 'INDEX', NULL,
                     6, 19,
@@ -2363,7 +2363,7 @@ def _modify_metadata_and_encode(
                     1, 0, 0,
                     NULL, NULL, NULL,
                     0, 0, 0,
-                    NULL, NULL, 1
+                    NULL, NULL, 1, 1
                 )""",
                 (r_col_id, r_table_id,
                  r_cs_id,
@@ -2536,6 +2536,16 @@ def _modify_metadata_and_encode(
                     "UPDATE [Table] SET IsHidden = 1, IsPrivate = 1 WHERE ID = ?",
                     (tid,),
                 )
+
+        # Update MAXID to the actual highest ID in the database.
+        # PBI Desktop uses MAXID as its ID counter — new objects get MAXID+1.
+        # If MAXID is lower than existing IDs, the assertion
+        # m_vecItems[last] < in_idItem in TMCCollectionObject::Add fails.
+        final_max_id = _get_max_id_across_tables(conn)
+        conn.execute(
+            "UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'",
+            (str(final_max_id),),
+        )
 
         conn.commit()
         conn.close()
