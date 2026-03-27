@@ -22,24 +22,22 @@ read_table_from_abf(abf_bytes, table_name, metadata_db_bytes) -> dict
 from __future__ import annotations
 
 import math
+import os
 import sqlite3
 import struct
 import tempfile
-import os
-from typing import Optional
 
 from pbix_mcp.formats.vertipaq_encoder import (
-    DICT_TYPE_LONG,
+    AMO_BOOLEAN,
+    AMO_DATETIME,
+    AMO_DECIMAL,
+    AMO_FLOAT64,
+    AMO_INT64,
+    AMO_STRING,
     DICT_TYPE_REAL,
     DICT_TYPE_STRING,
     STRING_STORE_BEGIN,
     STRING_STORE_END,
-    AMO_STRING,
-    AMO_INT64,
-    AMO_FLOAT64,
-    AMO_DATETIME,
-    AMO_DECIMAL,
-    AMO_BOOLEAN,
     _align_bit_width,
 )
 
