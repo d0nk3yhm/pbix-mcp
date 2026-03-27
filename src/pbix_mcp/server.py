@@ -4453,6 +4453,105 @@ def pbix_doctor(alias: str) -> str:
             return "None"
         _check("Default slicer filters", check_filters)
 
+        # 14. Tables without VertiPaq storage (metadata exists, ABF files missing)
+        def check_tables_have_storage():
+            _init_datamodel()
+            c = db_conn.cursor()
+            c.execute("""SELECT t.ID, t.Name FROM [Table] t
+                         WHERE t.Name NOT LIKE 'H$%' AND t.Name NOT LIKE 'R$%'
+                         AND t.ModelID = 1""")
+            abf_paths = [f["path"] for f in abf_files] if abf_files else []
+            abf_str = "\n".join(abf_paths)
+            missing = []
+            for row in c.fetchall():
+                tid, tname = row
+                # Check if any ABF file references this table's ID
+                # Table data files use pattern: TableName (ID).tbl\...
+                marker = f"{tname} ({tid}).tbl"
+                if marker not in abf_str:
+                    missing.append(tname)
+            if missing:
+                raise ValueError(
+                    f"{len(missing)} table(s) in metadata have NO VertiPaq storage — "
+                    f"PBI will crash (TMCacheManager): {', '.join(missing)}"
+                )
+            return "All metadata tables have VertiPaq storage"
+        _check("Table/storage consistency", check_tables_have_storage)
+
+        # 15. Orphaned foreign key references
+        def check_orphaned_refs():
+            _init_datamodel()
+            c = db_conn.cursor()
+            issues = []
+            # Table.RefreshPolicyID → RefreshPolicy.ID
+            c.execute("""SELECT t.Name, t.RefreshPolicyID FROM [Table] t
+                         WHERE t.RefreshPolicyID IS NOT NULL AND t.RefreshPolicyID != 0
+                         AND t.RefreshPolicyID NOT IN (SELECT ID FROM RefreshPolicy)""")
+            for row in c.fetchall():
+                issues.append(f"Table '{row[0]}' → missing RefreshPolicy ID {row[1]}")
+            # Table.CalculationGroupID → CalculationGroup.ID
+            c.execute("""SELECT t.Name, t.CalculationGroupID FROM [Table] t
+                         WHERE t.CalculationGroupID IS NOT NULL AND t.CalculationGroupID != 0
+                         AND t.CalculationGroupID NOT IN (SELECT ID FROM CalculationGroup)""")
+            for row in c.fetchall():
+                issues.append(f"Table '{row[0]}' → missing CalculationGroup ID {row[1]}")
+            # CalculationGroup.TableID → Table.ID
+            c.execute("""SELECT cg.ID, cg.TableID FROM CalculationGroup cg
+                         WHERE cg.TableID NOT IN (SELECT ID FROM [Table])""")
+            for row in c.fetchall():
+                issues.append(f"CalculationGroup {row[0]} → missing Table ID {row[1]}")
+            if issues:
+                raise ValueError(
+                    f"{len(issues)} orphaned reference(s) — PBI will reject file:\n    "
+                    + "\n    ".join(issues)
+                )
+            return "No orphaned references"
+        _check("Metadata referential integrity", check_orphaned_refs)
+
+        # 16. Expression rows without DataMashup
+        def check_expressions():
+            _init_datamodel()
+            c = db_conn.cursor()
+            c.execute("SELECT COUNT(*) FROM Expression")
+            expr_count = c.fetchone()[0]
+            if expr_count > 0:
+                mashup_path = os.path.join(info["work_dir"], "DataMashup")
+                if not os.path.exists(mashup_path):
+                    raise ValueError(
+                        f"{expr_count} Expression row(s) in metadata but no DataMashup — "
+                        f"PBI will reject with PFE_TM_ENUM_VALUES_VALIDATION_FAILED"
+                    )
+            return f"{expr_count} expressions (DataMashup present)" if expr_count else "None"
+        _check("Expression/DataMashup consistency", check_expressions)
+
+        # 17. MAXID consistency
+        def check_maxid():
+            _init_datamodel()
+            c = db_conn.cursor()
+            c.execute("SELECT Value FROM DBPROPERTIES WHERE Name = 'MAXID'")
+            row = c.fetchone()
+            if not row:
+                raise ValueError("MAXID not found in DBPROPERTIES")
+            maxid = int(row[0])
+            # Find actual max ID across all object tables
+            actual_max = 0
+            for tbl in ("Table", "Column", "Measure", "Partition", "Relationship",
+                        "Role", "CalculationGroup", "CalculationItem"):
+                try:
+                    c.execute(f"SELECT MAX(ID) FROM [{tbl}]")
+                    r = c.fetchone()
+                    if r and r[0]:
+                        actual_max = max(actual_max, r[0])
+                except Exception:
+                    pass
+            if maxid < actual_max:
+                raise ValueError(
+                    f"MAXID={maxid} but highest object ID is {actual_max} — "
+                    f"PBI will crash with TMCCollectionObject::Add assertion"
+                )
+            return f"MAXID={maxid} (highest ID={actual_max})"
+        _check("MAXID consistency", check_maxid)
+
     finally:
         # Clean up shared resources
         if db_conn:
