@@ -1607,14 +1607,16 @@ def verify_roundtrip(columns: list[dict], rows: list[dict]) -> bool:
     """
     Verify that encoding and then decoding produces the original data.
 
-    This is a self-test function that encodes data and then uses the Kaitai
-    parsers to decode it, checking for consistency.
+    This is a self-test function that encodes data and then uses our native
+    VertiPaq decoder to verify the encoded output.
 
     Returns True if the roundtrip succeeds.
     """
-    from io import BytesIO
-
-    from kaitaistruct import KaitaiStream
+    from pbix_mcp.formats.vertipaq_decoder import (
+        decode_dictionary,
+        decode_idf,
+        decode_idfmeta,
+    )
 
     encoded = encode_table_data("Test", 0, columns, rows)
 
@@ -1627,25 +1629,25 @@ def verify_roundtrip(columns: list[dict], rows: list[dict]) -> bool:
         dict_key = f"Test.tbl\\0.prt\\column.{col_name}.dict"
 
         # Parse IDFMETA
-        from pbixray.column_data.idfmeta import IdfmetaParser
-        meta = IdfmetaParser(KaitaiStream(BytesIO(encoded[meta_key])))
-        assert meta.blocks.cp.cs.ss.row_count == len(rows), \
-            f"Row count mismatch for {col_name}"
-
-        # Parse IDF
-        from pbixray.column_data.idf import ColumnDataIdf
-        idf = ColumnDataIdf(KaitaiStream(BytesIO(encoded[idf_key])))
-        assert len(idf.segments) >= 1, f"No segments in IDF for {col_name}"
+        meta_info = decode_idfmeta(encoded[meta_key])
+        assert meta_info["row_count"] == len(rows), \
+            f"Row count mismatch for {col_name}: {meta_info['row_count']} != {len(rows)}"
 
         # Parse Dictionary
-        from pbixray.column_data.dictionary import ColumnDataDictionary
-        d = ColumnDataDictionary(KaitaiStream(BytesIO(encoded[dict_key])))
+        dict_type, dict_values = decode_dictionary(encoded[dict_key])
         if data_type == "String":
-            assert d.dictionary_type == ColumnDataDictionary.DictionaryTypes.xm_type_string
+            assert dict_type == DICT_TYPE_STRING, f"Expected string dict for {col_name}"
         elif data_type in ("Float64", "Double", "DateTime"):
-            assert d.dictionary_type == ColumnDataDictionary.DictionaryTypes.xm_type_real
+            assert dict_type == DICT_TYPE_REAL, f"Expected real dict for {col_name}"
         else:
-            assert d.dictionary_type == ColumnDataDictionary.DictionaryTypes.xm_type_long
+            assert dict_type == DICT_TYPE_LONG, f"Expected long dict for {col_name}"
+
+        # Parse IDF and verify index count
+        bit_width = meta_info["bit_width"]
+        if bit_width > 0:
+            indices = decode_idf(encoded[idf_key], bit_width, len(rows))
+            assert len(indices) == len(rows), \
+                f"Index count mismatch for {col_name}: {len(indices)} != {len(rows)}"
 
         print(f"  Column '{col_name}' ({data_type}): OK")
 
@@ -1678,6 +1680,6 @@ if __name__ == "__main__":
     try:
         verify_roundtrip(test_columns, test_rows)
     except ImportError:
-        print("  (pbixray not available for verification, skipping)")
+        print("  (vertipaq_decoder not available for verification, skipping)")
     except Exception as e:
         print(f"  Verification error: {e}")

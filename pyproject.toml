@@ -27,7 +27,6 @@ classifiers = [
 
 dependencies = [
     "mcp>=1.0.0",
-    "pbixray>=0.5.0",
     "xpress9",
     "pandas",
     "pydantic>=2.0",

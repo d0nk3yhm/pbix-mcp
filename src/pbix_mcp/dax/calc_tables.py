@@ -4,8 +4,8 @@ Calculated Table Evaluator
 Reads ABF metadata to find calculated tables (DATATABLE, GENERATESERIES, CALENDAR, etc.)
 and evaluates their DAX expressions to produce table data.
 
-This fills the gap where PBIXRay can't read calculated tables because they're
-not materialized in VertiPaq — they exist only as DAX expressions in the metadata.
+This handles calculated tables that are not materialized in VertiPaq column stores
+— they exist only as DAX expressions in the metadata.
 """
 
 import os
@@ -28,7 +28,7 @@ def load_calculated_tables(
 
     Args:
         pbix_path: Path to the .pbix file
-        existing_tables: Already-loaded tables from PBIXRay {name: {columns, rows}}
+        existing_tables: Already-loaded tables {name: {columns, rows}}
         relationships: Model relationships list
 
     Returns:

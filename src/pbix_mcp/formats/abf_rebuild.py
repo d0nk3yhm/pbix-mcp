@@ -2,7 +2,7 @@
 ABF (Analysis Backup Format) reader and rebuilder for PBIX DataModel editing.
 
 The ABF is the decompressed binary blob inside a PBIX ``DataModel`` entry.
-Its structure (discovered via pbixray) is:
+Its structure is:
 
   [0..72)          STREAM_STORAGE_SIGNATURE  (fixed 72 bytes)
   [72..4096)       BackupLogHeader XML       (UTF-16-LE, zero-padded to one 4096-byte page)
@@ -107,7 +107,7 @@ def list_abf_files(abf_bytes: bytes) -> list[dict]:
       - SizeFromLog       : byte size recorded in the BackupLog
       - m_cbOffsetHeader  : absolute byte offset of the file data inside the ABF
 
-    This mirrors the ``file_log`` produced by ``pbixray.abf.parser.AbfParser``.
+    Each dict describes one embedded file in the ABF archive.
     """
     header_root = _parse_header_xml(abf_bytes)
 
@@ -591,7 +591,7 @@ class ABFArchive:
     Attributes
     ----------
     file_log : list[dict]
-        Parsed file log (same format as ``pbixray`` produces).
+        Parsed file log from :func:`list_abf_files`.
     """
 
     def __init__(self, abf_bytes: bytes):
