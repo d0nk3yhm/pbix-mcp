@@ -2555,6 +2555,18 @@ def pbix_datamodel_add_field_parameter(
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
 
+        # Field parameters create a new table in metadata, but adding a table
+        # requires VertiPaq data files in the ABF (H$ hierarchies, partition data).
+        # Without them, PBI crashes with TMCacheManager::CreateEmptyCollectionsForAllParents.
+        # This tool currently only modifies metadata — it needs a full DataModel rebuild
+        # to generate VertiPaq storage for the new table.  Block until that's implemented.
+        return ToolResponse.error(
+            "Field parameters require creating a new table with VertiPaq storage. "
+            "This tool currently only modifies metadata — use pbix_create with the "
+            "field parameter table defined upfront, or add field parameters in PBI Desktop.",
+            "NOT_IMPLEMENTED"
+        ).to_text()
+
         # Build DAX expression for display purposes
         rows_dax = []
         for i, f in enumerate(fields):
@@ -2681,6 +2693,17 @@ def pbix_datamodel_add_calculation_group(
         dm_path = os.path.join(info["work_dir"], "DataModel")
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
+
+        # Calculation groups create a new table in metadata, but adding a table
+        # requires VertiPaq data files in the ABF (H$ hierarchies, partition data).
+        # Without them, PBI crashes with TMCacheManager::CreateEmptyCollectionsForAllParents.
+        # This tool currently only modifies metadata — it needs a full DataModel rebuild.
+        return ToolResponse.error(
+            "Calculation groups require creating a new table with VertiPaq storage. "
+            "This tool currently only modifies metadata — use pbix_create with the "
+            "calculation group defined upfront, or add calculation groups in PBI Desktop.",
+            "NOT_IMPLEMENTED"
+        ).to_text()
 
         def _do_add(conn: sqlite3.Connection):
             c = conn.cursor()
