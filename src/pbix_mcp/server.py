@@ -2198,6 +2198,26 @@ def _modify_metadata_sqlite(
     #   3. Rebuilds ABF with the modified sqlite file
     def _sqlite_modifier(conn: sqlite3.Connection):
         modifier_fn(conn)
+        # After any modification, update MAXID to the actual highest ID.
+        # PBI Desktop uses MAXID as its ID counter — new objects get MAXID+1.
+        max_id = 0
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall():
+            try:
+                val = conn.execute(
+                    f"SELECT MAX(ID) FROM [{row[0]}]"
+                ).fetchone()[0]
+                if val is not None and val > max_id:
+                    max_id = val
+            except Exception:
+                pass
+        if max_id > 0:
+            conn.execute(
+                "UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'",
+                (str(max_id),),
+            )
+            conn.commit()
 
     new_abf = rebuild_abf_with_modified_sqlite(abf, _sqlite_modifier)
 
@@ -2401,15 +2421,42 @@ def pbix_datamodel_add_measure(
             if c.fetchone():
                 raise ValueError(f"Measure '{measure_name}' already exists")
 
-            # Get next ID
-            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM Measure")
-            new_id = c.fetchone()[0]
+            # Get next ID (must be globally unique — use max across ALL tables)
+            max_id = 0
+            for row in c.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall():
+                try:
+                    val = c.execute(
+                        f"SELECT MAX(ID) FROM [{row[0]}]"
+                    ).fetchone()[0]
+                    if val is not None and val > max_id:
+                        max_id = val
+                except Exception:
+                    pass
+            new_id = max_id + 1
+
+            # Use Windows FILETIME timestamp (matching builder format)
+            import datetime
+            now = datetime.datetime.utcnow()
+            epoch = datetime.datetime(1601, 1, 1)
+            filetime = int((now - epoch).total_seconds() * 10_000_000)
+
+            # Generate a LineageTag UUID
+            import uuid
+            lineage_tag = str(uuid.uuid4())
 
             c.execute(
-                "INSERT INTO Measure (ID, TableID, Name, Expression, FormatString, "
-                "Description, IsHidden, ModifiedTime) "
-                "VALUES (?, ?, ?, ?, ?, ?, 0, datetime('now'))",
-                (new_id, table_id, measure_name, expression, format_string, description)
+                """INSERT INTO Measure (ID, TableID, Name, Description, DataType,
+                    Expression, FormatString, IsHidden, State, ModifiedTime,
+                    StructureModifiedTime, KPIID, IsSimpleMeasure, ErrorMessage,
+                    DisplayFolder, DetailRowsDefinitionID, DataCategory,
+                    FormatStringDefinitionID, LineageTag, SourceLineageTag)
+                VALUES (?, ?, ?, ?, 6, ?, ?, 0, 1, ?, ?, 0, 0, NULL,
+                    NULL, 0, NULL, 0, ?, NULL)""",
+                (new_id, table_id, measure_name, description or None,
+                 expression, format_string or None,
+                 filetime, filetime, lineage_tag)
             )
             conn.commit()
 
