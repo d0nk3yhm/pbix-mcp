@@ -4285,25 +4285,28 @@ def pbix_doctor(alias: str) -> str:
             return f"{total_cols} total data columns\n" + "\n".join(lines)
         _check("Column breakdown", check_columns)
 
-        # 8. VertiPaq table data (row counts)
+        # 8. VertiPaq table data (row counts from ColumnStorage metadata)
         def check_tables():
-            from pbixray import PBIXRay
-            model = PBIXRay(info["path"])
-            schema = model.schema
-            if schema is None or schema.empty:
-                return "No VertiPaq data (DirectQuery or empty)"
-            names = [t for t in schema["TableName"].unique() if not t.startswith("H$") and not t.startswith("R$")]
+            _init_datamodel()
+            c = db_conn.cursor()
+            c.execute("""SELECT t.Name,
+                         MAX(cs.Statistics_RowCount) as row_count
+                         FROM [Table] t
+                         JOIN [Column] col ON col.TableID = t.ID
+                         LEFT JOIN ColumnStorage cs ON cs.ColumnID = col.ID
+                         WHERE t.Name NOT LIKE 'H$%' AND t.Name NOT LIKE 'R$%'
+                         AND col.Type = 1
+                         GROUP BY t.Name ORDER BY t.Name""")
             lines = []
             total_rows = 0
-            for t in sorted(names):
-                try:
-                    df = model.get_table(t)
-                    if df is not None:
-                        total_rows += len(df)
-                        lines.append(f"    {t}: {len(df):,} rows")
-                except Exception:
-                    lines.append(f"    {t}: (read error)")
-            return f"{len(names)} tables, {total_rows:,} total rows\n" + "\n".join(lines)
+            table_count = 0
+            for row in c.fetchall():
+                tname, rcount = row
+                rcount = rcount or 0
+                total_rows += rcount
+                table_count += 1
+                lines.append(f"    {tname}: {rcount:,} rows")
+            return f"{table_count} tables, {total_rows:,} total rows\n" + "\n".join(lines)
         _check("VertiPaq data (row counts)", check_tables)
 
         # 9. Relationships
@@ -4349,19 +4352,18 @@ def pbix_doctor(alias: str) -> str:
             return f"{count} roles" if count else "None"
         _check("Row-Level Security (RLS)", check_rls)
 
-        # 12. Calculated tables
+        # 12. Calculated tables (detected via partition type or expression)
         def check_calc():
-            from pbixray import PBIXRay
-
-            from pbix_mcp.dax.calc_tables import load_calculated_tables
-            model = PBIXRay(info["path"])
-            base_tables = set()
-            if model.schema is not None:
-                base_tables = set(t for t in model.schema["TableName"].unique()
-                                 if not t.startswith("H$") and not t.startswith("R$"))
-            tables = load_calculated_tables(info["path"], {}, [])
-            calc_names = [t for t in tables if t not in base_tables]
-            return f"{len(calc_names)} calculated tables" if calc_names else "None"
+            _init_datamodel()
+            c = db_conn.cursor()
+            c.execute("""SELECT t.Name FROM [Table] t
+                         JOIN Partition p ON p.TableID = t.ID
+                         WHERE t.Name NOT LIKE 'H$%' AND t.Name NOT LIKE 'R$%'
+                         AND (p.Type = 4 OR (p.QueryDefinition IS NOT NULL
+                              AND p.QueryDefinition NOT LIKE '%#table(%'))
+                         AND p.QueryDefinition LIKE '%=%'""")
+            calc = [r[0] for r in c.fetchall()]
+            return f"{len(calc)} calculated tables" if calc else "None"
         _check("Calculated tables", check_calc)
 
         # 13. Default slicer filters
