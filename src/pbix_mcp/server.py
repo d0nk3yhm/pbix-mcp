@@ -2555,29 +2555,39 @@ def pbix_datamodel_add_field_parameter(
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
 
-        # Build DAX expression: { ("Display", NAMEOF('Table'[Column]), 0), ... }
-        rows = []
+        # Build DAX expression for display purposes
+        rows_dax = []
         for i, f in enumerate(fields):
             ref = f["ref"]
             display = f["display"].replace('"', '""')
-            # Ensure ref is in 'Table'[Column] format
             if "'" not in ref and "[" in ref:
-                # Convert Sales[Revenue] → 'Sales'[Revenue]
                 tbl = ref.split("[")[0]
                 col = ref.split("[")[1].rstrip("]")
                 ref = f"'{tbl}'[{col}]"
-            rows.append(f'    ("{display}", NAMEOF({ref}), {i})')
-        dax_expr = "{\n" + ",\n".join(rows) + "\n}"
+            rows_dax.append(f'    ("{display}", NAMEOF({ref}), {i})')
+        dax_expr = "{\n" + ",\n".join(rows_dax) + "\n}"
+
+        # Build M expression — field parameters need a valid M #table() so the
+        # M engine can parse the partition on file load.  The DAX NAMEOF/tuple
+        # syntax cannot go into QueryDefinition (the M engine rejects it).
+        m_cols = (
+            f'type table [{parameter_name} = text, '
+            f'{parameter_name} Fields = text, '
+            f'{parameter_name} Order = number]'
+        )
+        m_rows = []
+        for i, f in enumerate(fields):
+            display_m = f["display"].replace('"', '""')
+            ref_m = f["ref"].replace('"', '""')
+            m_rows.append(f'{{"{display_m}", "{ref_m}", {i}}}')
+        m_expr = f"let\n    Source = #table({m_cols}, {{{', '.join(m_rows)}}})\nin\n    Source"
 
         def _do_add(conn: sqlite3.Connection):
             c = conn.cursor()
 
-            # Get next table ID
             c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM [Table]")
             table_id = c.fetchone()[0]
 
-            # Insert calculated table (Type is not stored; calculated tables use
-            # partition type 4 = "Calculated")
             c.execute(
                 "INSERT INTO [Table] (ID, ModelID, Name, IsHidden, "
                 "ModifiedTime, StructureModifiedTime, SystemFlags, "
@@ -2587,27 +2597,21 @@ def pbix_datamodel_add_field_parameter(
                 (table_id, parameter_name)
             )
 
-            # Get next column ID
             c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM [Column]")
             col_base_id = c.fetchone()[0]
 
-            # Column 1: Parameter (display name) — String
             c.execute(
                 "INSERT INTO [Column] (ID, TableID, ExplicitName, ExplicitDataType, "
                 "Type, IsHidden, IsAvailableInMDX, ModifiedTime, StructureModifiedTime) "
                 "VALUES (?, ?, ?, 2, 2, 0, 1, datetime('now'), datetime('now'))",
                 (col_base_id, table_id, parameter_name)
             )
-
-            # Column 2: Parameter Fields (NAMEOF result) — String
             c.execute(
                 "INSERT INTO [Column] (ID, TableID, ExplicitName, ExplicitDataType, "
                 "Type, IsHidden, IsAvailableInMDX, ModifiedTime, StructureModifiedTime) "
                 "VALUES (?, ?, ?, 2, 2, 1, 0, datetime('now'), datetime('now'))",
                 (col_base_id + 1, table_id, f"{parameter_name} Fields")
             )
-
-            # Column 3: Parameter Order — Int64
             c.execute(
                 "INSERT INTO [Column] (ID, TableID, ExplicitName, ExplicitDataType, "
                 "Type, IsHidden, IsAvailableInMDX, ModifiedTime, StructureModifiedTime) "
@@ -2615,17 +2619,16 @@ def pbix_datamodel_add_field_parameter(
                 (col_base_id + 2, table_id, f"{parameter_name} Order")
             )
 
-            # Get next partition ID
             c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM [Partition]")
             part_id = c.fetchone()[0]
 
-            # Insert calculated partition (Type=4 for calculated table)
+            # Use M expression (not DAX) — the M engine parses QueryDefinition on load
             c.execute(
                 "INSERT INTO [Partition] (ID, TableID, Name, "
                 "Type, Mode, State, ModifiedTime, RefreshedTime, "
                 "QueryDefinition) "
-                "VALUES (?, ?, ?, 4, 0, 1, datetime('now'), datetime('now'), ?)",
-                (part_id, table_id, parameter_name, dax_expr)
+                "VALUES (?, ?, ?, 2, 0, 1, datetime('now'), datetime('now'), ?)",
+                (part_id, table_id, parameter_name, m_expr)
             )
 
             conn.commit()
@@ -2742,6 +2745,23 @@ def pbix_datamodel_add_calculation_group(
                     (item_base_id + i, cg_id, item["name"], item["expression"], i)
                 )
 
+            # Partition: calc groups need a valid M partition so file opens
+            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM [Partition]")
+            part_id = c.fetchone()[0]
+            m_expr = (
+                "let\n"
+                "    Source = #table(type table [Name = text, Ordinal = number], {})\n"
+                "in\n"
+                "    Source"
+            )
+            c.execute(
+                "INSERT INTO [Partition] (ID, TableID, Name, "
+                "Type, Mode, State, ModifiedTime, RefreshedTime, "
+                "QueryDefinition) "
+                "VALUES (?, ?, ?, 2, 0, 1, datetime('now'), datetime('now'), ?)",
+                (part_id, table_id, group_name, m_expr)
+            )
+
             conn.commit()
 
         dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_add)
@@ -2757,7 +2777,7 @@ def pbix_datamodel_add_calculation_group(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
 @mcp.tool()
@@ -4674,6 +4694,18 @@ def pbix_set_incremental_refresh(
         dm_path = os.path.join(info["work_dir"], "DataModel")
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
+
+        # Incremental refresh requires a DataMashup with M expressions that
+        # filter on RangeStart/RangeEnd.  Without it, PBI rejects the file.
+        mashup_path = os.path.join(info["work_dir"], "DataMashup")
+        if not os.path.exists(mashup_path):
+            return ToolResponse.error(
+                "Incremental refresh requires a DataMashup section with M expressions "
+                "that filter on RangeStart/RangeEnd parameters. This file has no "
+                "DataMashup (it uses embedded data). Use source_csv or source_db when "
+                "creating tables to enable incremental refresh.",
+                "INVALID_OPERATION"
+            ).to_text()
 
         policy_info = {}
 
