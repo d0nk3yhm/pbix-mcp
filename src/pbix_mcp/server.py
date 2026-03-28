@@ -1915,6 +1915,299 @@ def pbix_get_model_power_query(alias: str) -> str:
 
 
 @mcp.tool()
+def pbix_list_data_sources(alias: str) -> str:
+    """List all data sources with connection details for each table.
+
+    Parses M expressions from Partition.QueryDefinition to extract
+    connection type, server, database, table, mode, and file paths.
+
+    Args:
+        alias: The alias of the open file
+    """
+    try:
+        info = _ensure_open(alias)
+        from pbix_mcp.formats.model_reader import ModelReader
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
+        pq = model.power_query
+
+        import re
+        mode_names = {0: "Import", 1: "DirectQuery"}
+        lines = []
+        for entry in pq:
+            tname = entry.get("TableName", "")
+            expr = entry.get("Expression", "")
+            if not expr:
+                continue
+
+            # Parse connection type and parameters from M expression
+            source_type = "Embedded"
+            details = {}
+
+            if "Sql.Database(" in expr:
+                source_type = "SQL Server"
+                m = re.search(r'Sql\.Database\("([^"]*)",\s*"([^"]*)"', expr)
+                if m:
+                    details["server"] = m.group(1)
+                    details["database"] = m.group(2)
+                m2 = re.search(r'Schema="([^"]*)".*?Item="([^"]*)"', expr)
+                if m2:
+                    details["schema"] = m2.group(1)
+                    details["table"] = m2.group(2)
+            elif "PostgreSQL.Database(" in expr:
+                source_type = "PostgreSQL"
+                m = re.search(r'PostgreSQL\.Database\("([^"]*)",\s*"([^"]*)"', expr)
+                if m:
+                    details["server"] = m.group(1)
+                    details["database"] = m.group(2)
+                m2 = re.search(r'Schema="([^"]*)".*?Item="([^"]*)"', expr)
+                if m2:
+                    details["schema"] = m2.group(1)
+                    details["table"] = m2.group(2)
+            elif "MySQL.Database(" in expr:
+                source_type = "MySQL"
+                m = re.search(r'MySQL\.Database\("([^"]*)",\s*"([^"]*)"', expr)
+                if m:
+                    details["server"] = m.group(1)
+                    details["database"] = m.group(2)
+                m2 = re.search(r'Schema="([^"]*)".*?Item="([^"]*)"', expr)
+                if m2:
+                    details["schema"] = m2.group(1)
+                    details["table"] = m2.group(2)
+            elif "MariaDB.Contents(" in expr:
+                source_type = "MariaDB"
+                m = re.search(r'MariaDB\.Contents\("([^"]*)",\s*"([^"]*)"', expr)
+                if m:
+                    details["server"] = m.group(1)
+                    details["database"] = m.group(2)
+            elif "Odbc.DataSource(" in expr and "SQLite" in expr:
+                source_type = "SQLite"
+                m = re.search(r'Database=([^;"\}]+)', expr)
+                if m:
+                    details["path"] = m.group(1)
+            elif "Csv.Document(" in expr:
+                source_type = "CSV"
+                m = re.search(r'File\.Contents\("([^"]*)"', expr)
+                if m:
+                    details["path"] = m.group(1)
+            elif "Excel.Workbook(" in expr:
+                source_type = "Excel"
+                m = re.search(r'File\.Contents\("([^"]*)"', expr)
+                if m:
+                    details["path"] = m.group(1)
+                m2 = re.search(r'Item="([^"]*)"', expr)
+                if m2:
+                    details["sheet"] = m2.group(1)
+            elif "Json.Document(" in expr or "Web.Contents(" in expr:
+                source_type = "JSON/Web"
+                m = re.search(r'Web\.Contents\("([^"]*)"', expr)
+                if m:
+                    details["url"] = m.group(1)
+            elif "#table(" in expr:
+                source_type = "Embedded"
+
+            # Get mode from metadata
+            mode_str = "Import"
+            try:
+                mode_rows = model._query_metadata(
+                    "SELECT p.Mode FROM Partition p JOIN [Table] t ON p.TableID = t.ID "
+                    "WHERE t.Name = ? AND t.ModelID = 1 "
+                    "AND t.Name NOT LIKE 'H$%' AND t.Name NOT LIKE 'R$%'",
+                    (tname,)
+                )
+                if mode_rows:
+                    mode_str = mode_names.get(mode_rows[0].get("Mode", 0), "Import")
+            except Exception:
+                pass
+
+            detail_str = ", ".join(f"{k}={v}" for k, v in details.items())
+            lines.append(f"  {tname}: {source_type} ({mode_str}){' — ' + detail_str if detail_str else ''}")
+
+        if not lines:
+            return ToolResponse.ok("No data sources found.").to_text()
+        return ToolResponse.ok(f"Data sources ({len(lines)} tables):\n\n" + "\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_update_data_source(
+    alias: str, table_name: str, new_source_json: str
+) -> str:
+    """Update a table's data source connection without full DataModel rebuild.
+
+    Changes the M expression (Partition.QueryDefinition) and optionally the
+    mode (Import/DirectQuery). This is a lightweight metadata-only operation
+    that does NOT regenerate VertiPaq data.
+
+    Args:
+        alias: The alias of the open file
+        table_name: Table to update
+        new_source_json: JSON with new connection parameters. Examples:
+            '{"server": "new-server.example.com", "database": "prod_db"}'
+            '{"type": "postgresql", "server": "pg.local", "port": 5432, "database": "analytics", "table": "orders"}'
+            '{"type": "csv", "path": "C:/data/sales.csv"}'
+            '{"mode": "directquery"}'
+            Supported types: sqlserver, postgresql, mysql, mariadb, sqlite, csv, excel, json, azuresql
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
+
+        new_source = json.loads(new_source_json)
+        from pbix_mcp.builder import _build_m_expression
+
+        def _do_update(conn: sqlite3.Connection):
+            conn.row_factory = sqlite3.Row
+
+            # Find the partition for this table
+            row = conn.execute(
+                "SELECT p.ID, p.QueryDefinition, p.Mode, t.ID as TableID "
+                "FROM Partition p JOIN [Table] t ON p.TableID = t.ID "
+                "WHERE t.Name = ? AND t.ModelID = 1 "
+                "AND t.Name NOT LIKE 'H$%' AND t.Name NOT LIKE 'R$%'",
+                (table_name,)
+            ).fetchone()
+            if not row:
+                raise ValueError(f"Table '{table_name}' not found")
+
+            part_id = row["ID"]
+            current_mode = row["Mode"] or 0
+
+            # Read column definitions for M expression generation
+            cols = [{"name": c["ExplicitName"],
+                     "data_type": {2: "String", 6: "Int64", 8: "Double",
+                                   9: "DateTime", 10: "Decimal", 11: "Boolean"
+                                   }.get(c["ExplicitDataType"], "String")}
+                    for c in conn.execute(
+                        "SELECT ExplicitName, ExplicitDataType FROM [Column] "
+                        "WHERE TableID = ? AND Type = 1 ORDER BY ID",
+                        (row["TableID"],)
+                    )]
+
+            # Determine new mode
+            new_mode = current_mode
+            if "mode" in new_source:
+                new_mode = 1 if new_source["mode"] == "directquery" else 0
+
+            # Build source_db dict for M expression generator
+            source_db = None
+            source_csv = None
+            is_dq = new_mode == 1
+
+            src_type = new_source.get("type", "").lower()
+            if src_type in ("sqlserver", "azuresql", "azure"):
+                source_db = {
+                    "type": src_type if src_type != "azure" else "azuresql",
+                    "server": new_source.get("server", "localhost"),
+                    "database": new_source.get("database", ""),
+                    "table": new_source.get("table", table_name),
+                    "schema": new_source.get("schema", "dbo"),
+                }
+            elif src_type == "postgresql":
+                source_db = {
+                    "type": "postgresql",
+                    "server": new_source.get("server", "localhost"),
+                    "port": new_source.get("port", 5432),
+                    "database": new_source.get("database", ""),
+                    "table": new_source.get("table", table_name),
+                    "schema": new_source.get("schema", "public"),
+                }
+            elif src_type == "mysql":
+                source_db = {
+                    "type": "mysql",
+                    "server": new_source.get("server", "localhost"),
+                    "port": new_source.get("port", 3306),
+                    "database": new_source.get("database", ""),
+                    "table": new_source.get("table", table_name),
+                }
+            elif src_type == "mariadb":
+                source_db = {
+                    "type": "mariadb",
+                    "server": new_source.get("server", "localhost"),
+                    "port": new_source.get("port", 3306),
+                    "database": new_source.get("database", ""),
+                    "table": new_source.get("table", table_name),
+                }
+            elif src_type == "sqlite":
+                source_db = {
+                    "type": "sqlite",
+                    "path": new_source.get("path", ""),
+                    "table": new_source.get("table", table_name),
+                }
+            elif src_type == "csv":
+                source_csv = new_source.get("path", "")
+            elif src_type == "excel":
+                source_db = {
+                    "type": "excel",
+                    "path": new_source.get("path", ""),
+                    "sheet": new_source.get("sheet", "Sheet1"),
+                }
+            elif src_type in ("json", "web", "api"):
+                source_db = {
+                    "type": "json",
+                    "url": new_source.get("url", ""),
+                }
+            elif not src_type and ("server" in new_source or "database" in new_source):
+                # Partial update — rewrite with same type, infer from current M expression
+                current_qd = row["QueryDefinition"] or ""
+                if "Sql.Database(" in current_qd:
+                    source_db = {"type": "sqlserver"}
+                elif "PostgreSQL.Database(" in current_qd:
+                    source_db = {"type": "postgresql", "port": 5432, "schema": "public"}
+                elif "MySQL.Database(" in current_qd:
+                    source_db = {"type": "mysql", "port": 3306}
+                else:
+                    source_db = {"type": "sqlserver"}
+                # Merge new params
+                for k, v in new_source.items():
+                    if k != "mode":
+                        source_db[k] = v
+                if "table" not in source_db:
+                    source_db["table"] = table_name
+
+            if source_db or source_csv:
+                new_m = _build_m_expression(
+                    table_name, cols,
+                    source_csv=source_csv,
+                    source_db=source_db,
+                    is_directquery=is_dq,
+                )
+                conn.execute(
+                    "UPDATE Partition SET QueryDefinition = ?, Mode = ? WHERE ID = ?",
+                    (new_m, new_mode, part_id),
+                )
+            elif "mode" in new_source:
+                # Mode-only change
+                conn.execute(
+                    "UPDATE Partition SET Mode = ? WHERE ID = ?",
+                    (new_mode, part_id),
+                )
+            else:
+                raise ValueError("No recognized connection parameters in new_source_json")
+
+            conn.commit()
+
+        old_size, new_size = _modify_metadata_only(dm_path, _do_update)
+        info["modified"] = True
+
+        src_type = new_source.get("type", "connection")
+        return ToolResponse.ok(
+            f"Data source updated for '{table_name}': {src_type}\n"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes (lightweight, no rebuild)"
+        ).to_text()
+    except json.JSONDecodeError as e:
+        return ToolResponse.error(f"Invalid JSON: {e}", "INVALID_INPUT").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
 def pbix_get_model_columns(alias: str) -> str:
     """Get all DAX calculated columns from the model.
 
@@ -2309,6 +2602,40 @@ def pbix_list_tables(alias: str) -> str:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), DataModelCompressionError.code).to_text()
+
+
+# ---- Section 7b: Lightweight metadata-only modification ----
+
+def _modify_metadata_only(
+    dm_path: str, modifier_fn: Callable[[sqlite3.Connection], None]
+) -> tuple[int, int]:
+    """Lightweight metadata modification — no full DataModel rebuild.
+
+    Only modifies metadata.sqlitedb inside the ABF. Does NOT regenerate
+    VertiPaq binary data, H$ hierarchies, or R$ relationship indexes.
+
+    Safe for: Partition.QueryDefinition, Partition.Mode changes.
+    NOT safe for: adding/removing tables, columns, or relationships.
+
+    Returns (old_dm_size, new_dm_size).
+    """
+    from pbix_mcp.formats.abf_rebuild import rebuild_abf_with_modified_sqlite
+    from pbix_mcp.formats.datamodel_roundtrip import (
+        compress_datamodel,
+        decompress_datamodel,
+    )
+
+    with open(dm_path, "rb") as f:
+        dm_bytes = f.read()
+
+    abf = decompress_datamodel(dm_bytes)
+    new_abf = rebuild_abf_with_modified_sqlite(abf, modifier_fn)
+    new_dm = compress_datamodel(new_abf)
+
+    with open(dm_path, "wb") as f:
+        f.write(new_dm)
+
+    return len(dm_bytes), len(new_dm)
 
 
 # ---- Section 8: DataModel WRITE tools (via XPress9 round-trip) ----

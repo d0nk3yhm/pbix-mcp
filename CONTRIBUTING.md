@@ -31,7 +31,7 @@ pytest --cov=src/pbix_mcp --cov-report=term-missing -m "not slow"
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (72 tools)
+  server.py              # MCP server (74 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX file builder (create from scratch with row data)
   errors.py              # Typed exceptions with stable error codes (12 classes)
