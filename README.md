@@ -327,6 +327,61 @@ DirectQuery creates a PBIX with `Partition.Mode=1` and a `Sql.Database()` M expr
 }
 ```
 
+### Switching Data Sources (No Rebuild)
+
+Change connection strings on existing PBIX files without regenerating the DataModel — lightweight metadata-only update:
+
+```python
+from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel, compress_datamodel
+from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite, rebuild_abf_with_modified_sqlite
+from pbix_mcp.builder import _build_m_expression
+import zipfile, io
+
+# Open existing PBIX
+with open('report.pbix', 'rb') as f:
+    original = f.read()
+
+z = zipfile.ZipFile(io.BytesIO(original))
+abf = decompress_datamodel(z.read('DataModel'))
+
+# Switch Sales table from SQL Server to PostgreSQL DirectQuery
+def switch_source(conn):
+    conn.row_factory = __import__('sqlite3').Row
+    row = conn.execute(
+        "SELECT p.ID, t.ID as tid FROM Partition p "
+        "JOIN [Table] t ON p.TableID = t.ID WHERE t.Name = 'Sales'"
+    ).fetchone()
+    cols = [{'name': c['ExplicitName'],
+             'data_type': {6:'Int64', 8:'Double', 2:'String'}[c['ExplicitDataType']]}
+            for c in conn.execute(
+                'SELECT ExplicitName, ExplicitDataType FROM [Column] '
+                'WHERE TableID = ? AND Type = 1', (row['tid'],))]
+    new_m = _build_m_expression('Sales', cols, source_db={
+        'type': 'postgresql', 'server': 'pg.example.com', 'port': 5432,
+        'database': 'analytics', 'table': 'sales', 'schema': 'public',
+    }, is_directquery=True)
+    conn.execute('UPDATE Partition SET QueryDefinition=?, Mode=1 WHERE ID=?',
+                 (new_m, row['ID']))
+    conn.commit()
+
+new_abf = rebuild_abf_with_modified_sqlite(abf, switch_source)
+new_dm = compress_datamodel(new_abf)
+
+# Write back — only DataModel changes, rest of PBIX untouched
+buf = io.BytesIO()
+with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z_out:
+    with zipfile.ZipFile(io.BytesIO(original)) as z_in:
+        for item in z_in.infolist():
+            if item.filename == 'DataModel':
+                z_out.writestr(item.filename, new_dm, compress_type=zipfile.ZIP_STORED)
+            else:
+                z_out.writestr(item, z_in.read(item.filename))
+with open('report.pbix', 'wb') as f:
+    f.write(buf.getvalue())
+```
+
+Supports all source types: `sqlserver`, `postgresql`, `mysql`, `mariadb`, `sqlite`, `csv`, `excel`, `json`, `azuresql`. Set `is_directquery=True` and `Mode=1` for DirectQuery, or `is_directquery=False` and `Mode=0` for Import.
+
 ### Supported Data Types
 
 | Type | Status | Dictionary Format |
