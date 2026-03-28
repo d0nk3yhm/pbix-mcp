@@ -111,6 +111,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Excel data sources | **Stable** | `source_db` with `type: 'excel'` — Import mode |
 | JSON/API data sources | **Stable** | `source_db` with `type: 'json'` — Import mode from REST APIs and JSON files |
 | Azure SQL data sources | **Stable** | `source_db` with `type: 'azuresql'` — Import and DirectQuery |
+| Data source switching | **Stable** | `pbix_update_data_source` — lightweight connection string change without full DataModel rebuild. Switch between SQL Server, PostgreSQL, MySQL, CSV, Excel, JSON, SQLite, Azure SQL. Switch Import/DirectQuery mode. Verified with live MSSQL→PostgreSQL→CSV roundtrip |
 | DirectQuery mode | **Stable** | `mode='directquery'` with SQL Server, PostgreSQL, and MySQL (via MariaDB ODBC 3.1) — live database queries, no refresh needed |
 | VertiPaq table data write | **Stable** | Create and roundtrip (set_table_data, update_table_rows) via full builder rebuild |
 | Roundtrip DataModel modify | **Stable** | Add/remove tables, relationships, measures on existing files — all modifications go through full builder rebuild pipeline |
@@ -151,7 +152,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 - **Embedded VertiPaq data** — verified working with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase). Cross-table relationship lookups verified byte-exact against PBI Desktop ground truth
 - **RLE encoding** — disabled in the VertiPaq encoder (pure bitpack used). Slightly less space-efficient but correct
 - **RLS write (set_rls_role)** — triggers full DataModel rebuild but builder doesn't generate Role/TablePermission rows, so RLS roles are silently dropped. Read and evaluate work correctly.
-- **All DataModel modifications trigger full rebuild** — add_measure, modify_measure, set_rls_role, modify_column, set_table_data, update_table_rows, add/remove relationship/table all rebuild the entire DataModel via the builder pipeline. This ensures consistency but is slower for large models.
+- **Most DataModel modifications trigger full rebuild** — add_measure, modify_measure, set_rls_role, modify_column, set_table_data, update_table_rows, add/remove relationship/table all rebuild the entire DataModel via the builder pipeline. Exception: `pbix_update_data_source` uses a lightweight metadata-only path (no rebuild).
 
 
 ## Tools (74)
