@@ -1961,17 +1961,24 @@ def pbix_get_table_data(alias: str, table_name: str, max_rows: int = 50) -> str:
         return ToolResponse.error(str(e), DataModelCompressionError.code).to_text()
 
 
-def _rebuild_datamodel_with_new_rows(
+def _rebuild_datamodel(
     info: dict,
-    target_table: str,
-    new_columns: list[dict],
-    new_rows: list[dict],
+    table_updates: dict[str, dict] | None = None,
+    extra_tables: list[dict] | None = None,
+    extra_measures: list[dict] | None = None,
+    extra_relationships: list[dict] | None = None,
 ) -> tuple[int, int]:
-    """Rebuild the entire DataModel using the builder, substituting one table's rows.
+    """Rebuild the entire DataModel using the builder pipeline.
 
-    Reads existing table definitions, measures, relationships, and row data from
-    the current DataModel. Replaces the target table's data with new_rows. Uses
-    the builder's full pipeline to generate a completely fresh DataModel.
+    Reads all existing tables, measures, relationships, and row data.
+    Applies updates/additions, then regenerates the DataModel from scratch.
+
+    Args:
+        info: Open file info dict from _ensure_open()
+        table_updates: {table_name: {"columns": [...], "rows": [...]}} to replace
+        extra_tables: New tables to add: [{"name", "columns", "rows"}, ...]
+        extra_measures: New measures: [{"table", "name", "expression", "format_string"}, ...]
+        extra_relationships: New rels: [{"from_table", "from_column", "to_table", "to_column"}, ...]
 
     Returns (old_dm_size, new_dm_size).
     """
@@ -1979,6 +1986,11 @@ def _rebuild_datamodel_with_new_rows(
     from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
     from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
     from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
+
+    table_updates = table_updates or {}
+    extra_tables = extra_tables or []
+    extra_measures = extra_measures or []
+    extra_relationships = extra_relationships or []
 
     dm_path = os.path.join(info["work_dir"], "DataModel")
     with open(dm_path, "rb") as f:
@@ -1998,7 +2010,7 @@ def _rebuild_datamodel_with_new_rows(
         _AMO_TO_TYPE = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime",
                         10: "Decimal", 11: "Boolean"}
 
-        # Get all user tables
+        # Get all existing user tables
         tables = []
         for trow in conn.execute(
             "SELECT ID, Name FROM [Table] WHERE ModelID = 1 "
@@ -2014,7 +2026,7 @@ def _rebuild_datamodel_with_new_rows(
                 cols.append({"name": crow["ExplicitName"], "data_type": dt})
             tables.append({"name": tname, "columns": cols})
 
-        # Get measures
+        # Get existing measures
         measures = []
         for mrow in conn.execute(
             "SELECT t.Name as tbl, m.Name, m.Expression, m.FormatString "
@@ -2026,7 +2038,7 @@ def _rebuild_datamodel_with_new_rows(
                 "format_string": mrow["FormatString"] or "",
             })
 
-        # Get relationships
+        # Get existing relationships
         rels = []
         for rrow in conn.execute(
             "SELECT ft.Name as ft, fc.ExplicitName as fc, "
@@ -2048,26 +2060,42 @@ def _rebuild_datamodel_with_new_rows(
 
     # Build new DataModel via builder
     builder = PBIXBuilder()
+
+    # Add existing tables (with optional row updates)
     for tinfo in tables:
         tname = tinfo["name"]
-        if tname == target_table:
-            builder.add_table(tname, new_columns, rows=new_rows)
+        if tname in table_updates:
+            upd = table_updates[tname]
+            builder.add_table(tname, upd["columns"], rows=upd["rows"])
         else:
             # Read existing row data from VertiPaq
             try:
                 td = read_table_from_abf(abf, tname, meta_bytes)
-                existing_rows = []
-                for row_vals in td.get("rows", []):
-                    existing_rows.append(dict(zip(td["columns"], row_vals)))
+                existing_rows = [
+                    dict(zip(td["columns"], row_vals))
+                    for row_vals in td.get("rows", [])
+                ]
                 builder.add_table(tname, tinfo["columns"], rows=existing_rows)
             except Exception:
-                # If we can't read data, add table with no rows
                 builder.add_table(tname, tinfo["columns"], rows=[])
 
+    # Add new tables
+    for et in extra_tables:
+        builder.add_table(et["name"], et["columns"], rows=et.get("rows", []))
+
+    # Add all measures (existing + new)
     for m in measures:
         builder.add_measure(m["table"], m["name"], m["expression"], m["format_string"])
+    for m in extra_measures:
+        builder.add_measure(m["table"], m["name"], m["expression"],
+                            m.get("format_string", ""))
 
+    # Add all relationships (existing + new)
     for r in rels:
+        builder.add_relationship(
+            r["from_table"], r["from_column"], r["to_table"], r["to_column"]
+        )
+    for r in extra_relationships:
         builder.add_relationship(
             r["from_table"], r["from_column"], r["to_table"], r["to_column"]
         )
@@ -2123,12 +2151,41 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
 
-        old_size, new_size = _rebuild_datamodel_with_new_rows(
-            info, table_name, columns, rows
-        )
+        # Check if table exists — update existing or add new
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        with open(dm_path, "rb") as f:
+            dm_check = f.read()
+        abf_check = decompress_datamodel(dm_check)
+        meta_check = read_metadata_sqlite(abf_check)
+        tmp_check = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp_check.write(meta_check)
+        tmp_check.close()
+        try:
+            conn_check = sqlite3.connect(tmp_check.name)
+            exists = conn_check.execute(
+                "SELECT 1 FROM [Table] WHERE Name = ? AND ModelID = 1", (table_name,)
+            ).fetchone()
+            conn_check.close()
+        finally:
+            os.unlink(tmp_check.name)
+
+        if exists:
+            old_size, new_size = _rebuild_datamodel(
+                info,
+                table_updates={table_name: {"columns": columns, "rows": rows}},
+            )
+            action = "updated"
+        else:
+            old_size, new_size = _rebuild_datamodel(
+                info,
+                extra_tables=[{"name": table_name, "columns": columns, "rows": rows}],
+            )
+            action = "created"
+
         info["modified"] = True
         return ToolResponse.ok(
-            f"Table '{table_name}' data written: {len(rows)} rows, {len(columns)} columns\n"
+            f"Table '{table_name}' {action}: {len(rows)} rows, {len(columns)} columns\n"
             f"  DataModel: {old_size:,} → {new_size:,} bytes"
         ).to_text()
     except json.JSONDecodeError as e:
@@ -2200,8 +2257,9 @@ def pbix_update_table_rows(alias: str, table_name: str, rows_json: str) -> str:
                      "data_type": _AMO_TO_TYPE.get(cr["ExplicitDataType"], "String")}
                     for cr in col_rows]
 
-        old_size, new_size = _rebuild_datamodel_with_new_rows(
-            info, table_name, columns, rows
+        old_size, new_size = _rebuild_datamodel(
+            info,
+            table_updates={table_name: {"columns": columns, "rows": rows}},
         )
         info["modified"] = True
         col_names = [c["name"] for c in columns]
@@ -2591,6 +2649,50 @@ def pbix_datamodel_remove_measure(alias: str, measure_name: str) -> str:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+
+
+@mcp.tool()
+def pbix_datamodel_add_relationship(
+    alias: str,
+    from_table: str,
+    from_column: str,
+    to_table: str,
+    to_column: str,
+) -> str:
+    """Add a relationship between two tables. Rebuilds the DataModel.
+
+    Creates a cross-table relationship with R$ index tables in VertiPaq.
+    The from side is many (fact), the to side is one (dimension).
+
+    Args:
+        alias: The alias of the open file
+        from_table: Fact table name (many side)
+        from_column: Foreign key column in fact table
+        to_table: Dimension table name (one side)
+        to_column: Primary key column in dimension table
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
+
+        old_size, new_size = _rebuild_datamodel(
+            info,
+            extra_relationships=[{
+                "from_table": from_table, "from_column": from_column,
+                "to_table": to_table, "to_column": to_column,
+            }],
+        )
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Relationship added: {from_table}.{from_column} → {to_table}.{to_column}\n"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
 @mcp.tool()
