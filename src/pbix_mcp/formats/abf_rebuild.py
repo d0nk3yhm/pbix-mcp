@@ -572,7 +572,19 @@ def rebuild_abf_with_modified_sqlite(
         except OSError:
             pass
 
-    return rebuild_abf_with_replacement(abf_bytes, {"metadata.sqlitedb": new_sqlite_bytes})
+    # Use build_abf_clean to generate a fresh ABF structure.
+    # rebuild_abf_with_replacement produces corrupt ABFs (wrong offsets/structure).
+    from pbix_mcp.builder_v2 import build_abf_clean
+
+    file_log = list_abf_files(abf_bytes)
+    vertipaq_files: dict[str, bytes] = {}
+    for entry in file_log:
+        path = entry.get("Path", "")
+        if not path or "metadata.sqlitedb" in path.lower() or "db.xml" in path.lower() or "CryptKey" in path:
+            continue
+        vertipaq_files[path] = read_abf_file(abf_bytes, entry)
+
+    return build_abf_clean(new_sqlite_bytes, vertipaq_files)
 
 
 # ---------------------------------------------------------------------------
