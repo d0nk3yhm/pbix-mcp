@@ -112,7 +112,8 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | JSON/API data sources | **Stable** | `source_db` with `type: 'json'` — Import mode from REST APIs and JSON files |
 | Azure SQL data sources | **Stable** | `source_db` with `type: 'azuresql'` — Import and DirectQuery |
 | DirectQuery mode | **Stable** | `mode='directquery'` with SQL Server, PostgreSQL, and MySQL (via MariaDB ODBC 3.1) — live database queries, no refresh needed |
-| VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal, Boolean column types with correct dictionary encoding |
+| VertiPaq table data write (create) | **Stable** | String, Int64, Double, DateTime, Decimal, Boolean column types with correct dictionary encoding |
+| VertiPaq table data write (roundtrip) | **Blocked** | `set_table_data` and `update_table_rows` are blocked — replacing IDF/dictionary without H$ hierarchy rebuild causes DBCC dictionary check failure |
 | H$ attribute hierarchies | **Stable** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities; MaterializationType=0 |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
 | Visual add/remove | **Stable** | Cards, charts, shapes/buttons, images, textboxes, slicers — with full data bindings (projections + prototypeQuery) |
@@ -131,11 +132,11 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Password extraction | **Beta** | Regex scan of DAX measures for embedded passwords |
 | Row-Level Security (RLS) | **Beta** | Read/write roles, evaluate filter expressions against data |
 | Bookmark creation | **Beta** | Create/remove bookmarks with page targeting and visual visibility state |
-| Field Parameters | **Beta** | Create slicer-driven column/measure switchers via `pbix_datamodel_add_field_parameter` |
-| Calculation Groups | **Beta** | Dynamic measure modifiers (YTD, QTD, PY) via `pbix_datamodel_add_calculation_group` |
+| Field Parameters | **Blocked** | `pbix_datamodel_add_field_parameter` blocked — needs full DataModel rebuild to generate VertiPaq storage for new table |
+| Calculation Groups | **Blocked** | `pbix_datamodel_add_calculation_group` blocked — needs full DataModel rebuild to generate VertiPaq storage for new table |
 | TMDL Export | **Beta** | Export data model as Git-friendly TMDL text files via `pbix_export_tmdl` |
 | Custom Visuals | **Beta** | Import .pbiviz packages via `pbix_add_custom_visual`, place with `pbix_add_visual` |
-| Incremental Refresh | **Beta** | Configure date-based partition policies via `pbix_set_incremental_refresh` |
+| Incremental Refresh | **Blocked** | `pbix_set_incremental_refresh` blocked — requires DataMashup with RangeStart/RangeEnd M parameters |
 | Diagnostic tool (`pbix_doctor`) | **Stable** | 13-point comprehensive diagnostic — data sources, storage modes, columns, relationships, measures, RLS, VertiPaq row counts |
 
 ## Known Limitations
