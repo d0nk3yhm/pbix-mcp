@@ -1648,14 +1648,30 @@ def _apply_metadata_updates(
         ).fetchone()
         if col_info and col_info[0] in user_col_names:
             continue  # Will be updated below with proper stats
-        # System/other column: set row count and cardinality to match
+        # System/other column: update stats to match new row count
+        # RowNumber: DistinctStates=row_count, MaxDataID=row_count+2 (matching builder)
         conn.execute(
             """UPDATE ColumnStorage SET
                 Statistics_RowCount = ?,
-                Statistics_DistinctStates = ?
+                Statistics_DistinctStates = ?,
+                Statistics_MaxDataID = ?
                WHERE ID = ?""",
-            (row_count, row_count, cs_id)
+            (row_count, max(row_count, 1), row_count + 2, cs_id)
         )
+        # Also update RowNumber's AttributeHierarchyStorage.DistinctDataCount
+        if col_info:
+            col_id_sys = conn.execute(
+                "SELECT ID FROM [Column] WHERE ColumnStorageID = ?", (cs_id,)
+            ).fetchone()
+            if col_id_sys:
+                conn.execute(
+                    """UPDATE AttributeHierarchyStorage SET DistinctDataCount = ?
+                       WHERE ID IN (
+                           SELECT ah.AttributeHierarchyStorageID
+                           FROM AttributeHierarchy ah WHERE ah.ColumnID = ?
+                       )""",
+                    (row_count, col_id_sys[0]),
+                )
 
     # Now update user columns with detailed stats
     for col_def in columns:
@@ -1778,13 +1794,27 @@ def _apply_metadata_updates(
             if h_distinct > 0:
                 h_record_count = h_distinct + 3
                 h_seg_count = math.ceil(h_record_count / h_distinct)
+                # Compute min/max for AHS
+                sorted_vals = sorted(
+                    set(_val_key(v) for v in non_null),
+                    key=lambda x: x if isinstance(x, (int, float)) else (str(type(x)), x),
+                )
+                def _ahs_str(v):
+                    """Convert value to string for AHS, matching builder format."""
+                    if isinstance(v, float) and v == int(v):
+                        return str(int(v))
+                    return str(v)
+                min_val = _ahs_str(sorted_vals[0]) if sorted_vals else ""
+                max_val = _ahs_str(sorted_vals[-1]) if sorted_vals else ""
+                max_strlen = max((len(_ahs_str(v)) for v in sorted_vals), default=0)
                 conn.execute(
                     """UPDATE AttributeHierarchyStorage SET
                         MaterializationType = 0,
                         ColumnPositionToData = 0, ColumnDataToPosition = 1,
-                        DistinctDataCount = ?
+                        DistinctDataCount = ?,
+                        MinValue = ?, MaxValue = ?, StringValueMaxLength = ?
                        WHERE ID = ?""",
-                    (h_distinct, ahs_id),
+                    (h_distinct, min_val, max_val, max_strlen, ahs_id),
                 )
                 # Update SegmentMapStorage if it exists
                 conn.execute(
@@ -1797,6 +1827,18 @@ def _apply_metadata_updates(
                        )""",
                     (h_record_count, h_seg_count, h_distinct, h_table_id),
                 )
+
+    # --- Update main table SegmentMapStorage (row count changed) ---
+    conn.execute(
+        """UPDATE SegmentMapStorage SET
+            RecordCount = ?, SegmentCount = 1, RecordsPerSegment = ?
+           WHERE PartitionStorageID IN (
+               SELECT ps.ID FROM PartitionStorage ps
+               JOIN [Partition] p ON ps.PartitionID = p.ID
+               WHERE p.TableID = ?
+           )""",
+        (row_count, row_count, table_id),
+    )
 
 
 # ---------------------------------------------------------------------------
