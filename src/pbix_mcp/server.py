@@ -1844,7 +1844,7 @@ def pbix_get_model_schema(alias: str) -> str:
     try:
         info = _ensure_open(alias)
         from pbix_mcp.formats.model_reader import ModelReader, format_schema_table
-        model = ModelReader(info["path"])
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
         schema = model.schema
         return ToolResponse.ok(format_schema_table(schema)).to_text()
     except PBIXMCPError as e:
@@ -1863,7 +1863,7 @@ def pbix_get_model_measures(alias: str) -> str:
     try:
         info = _ensure_open(alias)
         from pbix_mcp.formats.model_reader import ModelReader, format_measures_table
-        model = ModelReader(info["path"])
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
         measures = model.dax_measures
         return ToolResponse.ok(format_measures_table(measures)).to_text()
     except PBIXMCPError as e:
@@ -1882,7 +1882,7 @@ def pbix_get_model_relationships(alias: str) -> str:
     try:
         info = _ensure_open(alias)
         from pbix_mcp.formats.model_reader import ModelReader, format_relationships_table
-        model = ModelReader(info["path"])
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
         rels = model.relationships
         return ToolResponse.ok(format_relationships_table(rels)).to_text()
     except PBIXMCPError as e:
@@ -1904,7 +1904,7 @@ def pbix_get_model_power_query(alias: str) -> str:
     try:
         info = _ensure_open(alias)
         from pbix_mcp.formats.model_reader import ModelReader, format_power_query_table
-        model = ModelReader(info["path"])
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
         pq = model.power_query
         return ToolResponse.ok(format_power_query_table(pq)).to_text()
     except PBIXMCPError as e:
@@ -1923,7 +1923,7 @@ def pbix_get_model_columns(alias: str) -> str:
     try:
         info = _ensure_open(alias)
         from pbix_mcp.formats.model_reader import ModelReader, format_dax_columns_table
-        model = ModelReader(info["path"])
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
         cols = model.dax_columns
         return ToolResponse.ok(format_dax_columns_table(cols)).to_text()
     except PBIXMCPError as e:
@@ -1950,7 +1950,7 @@ def pbix_get_table_data(alias: str, table_name: str, max_rows: int = 50) -> str:
                 UnsupportedFormatError.code,
             ).to_text()
         from pbix_mcp.formats.model_reader import ModelReader, format_table_data
-        model = ModelReader(info["path"])
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
         table_data = model.get_table(table_name, max_rows=max_rows)
         if not table_data["columns"] or not table_data["rows"]:
             return ToolResponse.ok(f"No data found in table '{table_name}'.").to_text()
@@ -2301,7 +2301,7 @@ def pbix_list_tables(alias: str) -> str:
     try:
         info = _ensure_open(alias)
         from pbix_mcp.formats.model_reader import ModelReader, format_statistics_table
-        model = ModelReader(info["path"])
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
         stats = model.statistics
         return ToolResponse.ok(format_statistics_table(stats)).to_text()
     except PBIXMCPError as e:
@@ -3393,7 +3393,7 @@ def _get_dax_context(alias: str) -> dict:
 
     info = _ensure_open(alias)
     from pbix_mcp.formats.model_reader import ModelReader
-    model = ModelReader(info["path"])
+    model = ModelReader(info["path"], work_dir=info.get("work_dir"))
 
     # Load measures
     measures_list = model.dax_measures
@@ -4385,7 +4385,7 @@ def pbix_get_password(alias: str) -> str:
     try:
         info = _ensure_open(alias)
         from pbix_mcp.formats.model_reader import ModelReader
-        model = ModelReader(info["path"])
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
 
         results = []
 
@@ -4718,7 +4718,7 @@ def pbix_doctor(alias: str) -> str:
             c.execute("""SELECT t.ID, t.Name FROM [Table] t
                          WHERE t.Name NOT LIKE 'H$%' AND t.Name NOT LIKE 'R$%'
                          AND t.ModelID = 1""")
-            abf_paths = [f["path"] for f in abf_files] if abf_files else []
+            abf_paths = [f.get("Path", "") for f in abf_files] if abf_files else []
             abf_str = "\n".join(abf_paths)
             missing = []
             for row in c.fetchall():

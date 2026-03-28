@@ -43,17 +43,29 @@ class ModelReader:
     measures, relationships, Power Query expressions, and table data.
     """
 
-    def __init__(self, pbix_path: str):
+    def __init__(self, pbix_path: str, work_dir: str | None = None):
         self._path = pbix_path
+        self._work_dir = work_dir
         self._dm_bytes: Optional[bytes] = None
         self._abf_bytes: Optional[bytes] = None
         self._metadata_db_bytes: Optional[bytes] = None
         self._metadata_cache: dict = {}
 
     def _ensure_datamodel(self):
-        """Extract and decompress the DataModel from the PBIX."""
+        """Extract and decompress the DataModel from the PBIX or work dir."""
         if self._abf_bytes is not None:
             return
+
+        # Prefer work directory DataModel (has unsaved modifications)
+        if self._work_dir:
+            import os
+            dm_path = os.path.join(self._work_dir, "DataModel")
+            if os.path.exists(dm_path):
+                with open(dm_path, "rb") as f:
+                    self._dm_bytes = f.read()
+                self._abf_bytes = decompress_datamodel(self._dm_bytes)
+                self._metadata_db_bytes = read_metadata_sqlite(self._abf_bytes)
+                return
 
         with zipfile.ZipFile(self._path, "r") as zf:
             # DataModel is stored as a ZIP entry
