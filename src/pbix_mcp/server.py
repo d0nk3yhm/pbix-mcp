@@ -2313,66 +2313,144 @@ def pbix_list_tables(alias: str) -> str:
 # ---- Section 8: DataModel WRITE tools (via XPress9 round-trip) ----
 
 def _modify_metadata_sqlite(
-    dm_path: str, modifier_fn: Callable[[sqlite3.Connection], None]
+    dm_path: str, modifier_fn: Callable[[sqlite3.Connection], None],
+    info: dict | None = None,
 ) -> tuple:
-    """Decompress DataModel, modify metadata.sqlitedb, recompress.
+    """Modify metadata via full DataModel rebuild.
+
+    Applies modifier_fn to a temporary copy of the current metadata to
+    determine the changes, then reads the modified measures/relationships
+    and rebuilds the entire DataModel via the builder pipeline.
+
+    This avoids ALL post-build ABF modification which causes
+    NullReferenceException at RunModelSchemaValidation.
 
     Args:
         dm_path: Path to the DataModel file inside the work_dir
         modifier_fn: Function that receives a sqlite3.Connection and should
                      make changes + commit.
+        info: Open file info dict (required for full rebuild)
 
     Returns:
-        Tuple of (original_dm_bytes, new_dm_bytes, new_abf_bytes)
+        Tuple of (original_dm_bytes, new_dm_bytes, None)
     """
-    from pbix_mcp.formats.abf_rebuild import (
-        rebuild_abf_with_modified_sqlite,
-    )
-    from pbix_mcp.formats.datamodel_roundtrip import compress_datamodel, decompress_datamodel
+    from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+    from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
 
     with open(dm_path, "rb") as f:
         dm_bytes = f.read()
 
-    # Decompress DataModel → raw ABF
-    abf = decompress_datamodel(dm_bytes)
+    if info is None:
+        work_dir = os.path.dirname(dm_path)
+        info = {"work_dir": work_dir, "path": dm_path}
 
-    # Use rebuild_abf_with_modified_sqlite which:
-    #   1. Extracts metadata.sqlitedb from ABF
-    #   2. Opens it with sqlite3, passes connection to modifier_fn
-    #   3. Rebuilds ABF with the modified sqlite file
-    def _sqlite_modifier(conn: sqlite3.Connection):
-        modifier_fn(conn)
-        # After any modification, update MAXID to the actual highest ID.
-        # PBI Desktop uses MAXID as its ID counter — new objects get MAXID+1.
-        max_id = 0
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall():
-            try:
-                val = conn.execute(
-                    f"SELECT MAX(ID) FROM [{row[0]}]"
-                ).fetchone()[0]
-                if val is not None and val > max_id:
-                    max_id = val
-            except Exception:
-                pass
-        if max_id > 0:
-            conn.execute(
-                "UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'",
-                (str(max_id),),
-            )
+    # Apply the modifier to a TEMPORARY copy of metadata to see what changed.
+    # Then rebuild the entire DataModel with the modified metadata's
+    # measures and relationships baked in.
+    abf = decompress_datamodel(dm_bytes)
+    meta_bytes = read_metadata_sqlite(abf)
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".sqlitedb")
+    try:
+        os.write(fd, meta_bytes)
+        os.close(fd)
+        fd = None
+
+        conn = sqlite3.connect(tmp_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            # Apply the modifier
+            modifier_fn(conn)
             conn.commit()
 
-    new_abf = rebuild_abf_with_modified_sqlite(abf, _sqlite_modifier)
+            # Read the MODIFIED measures (these will replace the builder's measures)
+            _AMO_TO_TYPE = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime",
+                            10: "Decimal", 11: "Boolean"}
 
-    # Recompress ABF → new DataModel
-    new_dm = compress_datamodel(new_abf)
+            modified_measures = []
+            for mrow in conn.execute(
+                "SELECT t.Name as tbl, m.Name, m.Expression, m.FormatString "
+                "FROM Measure m JOIN [Table] t ON m.TableID = t.ID"
+            ):
+                modified_measures.append({
+                    "table": mrow["tbl"], "name": mrow["Name"],
+                    "expression": mrow["Expression"],
+                    "format_string": mrow["FormatString"] or "",
+                })
 
-    # Write new DataModel back
+            # Read tables and relationships from modified metadata
+            modified_tables = []
+            for trow in conn.execute(
+                "SELECT ID, Name FROM [Table] WHERE ModelID = 1 "
+                "AND Name NOT LIKE 'H$%' AND Name NOT LIKE 'R$%' ORDER BY ID"
+            ):
+                cols = [{"name": c["ExplicitName"],
+                         "data_type": _AMO_TO_TYPE.get(c["ExplicitDataType"], "String")}
+                        for c in conn.execute(
+                            "SELECT ExplicitName, ExplicitDataType FROM [Column] "
+                            "WHERE TableID = ? AND Type = 1 ORDER BY ID", (trow["ID"],))]
+                modified_tables.append({"name": trow["Name"], "columns": cols})
+
+            modified_rels = []
+            for rrow in conn.execute(
+                "SELECT ft.Name as ft, fc.ExplicitName as fc, "
+                "tt.Name as tt, tc.ExplicitName as tc "
+                "FROM Relationship r "
+                "JOIN [Table] ft ON r.FromTableID = ft.ID "
+                "JOIN [Column] fc ON r.FromColumnID = fc.ID "
+                "JOIN [Table] tt ON r.ToTableID = tt.ID "
+                "JOIN [Column] tc ON r.ToColumnID = tc.ID"
+            ):
+                modified_rels.append({
+                    "from_table": rrow["ft"], "from_column": rrow["fc"],
+                    "to_table": rrow["tt"], "to_column": rrow["tc"],
+                })
+        finally:
+            conn.close()
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    # Now rebuild using the builder with the modified state.
+    # We pass all measures/rels as the "current" state — _rebuild_datamodel
+    # reads its own measures/rels from metadata, so we need to override.
+    from pbix_mcp.builder import PBIXBuilder
+    from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
+
+    builder = PBIXBuilder()
+    for tinfo in modified_tables:
+        tname = tinfo["name"]
+        try:
+            td = read_table_from_abf(abf, tname, meta_bytes)
+            existing_rows = [dict(zip(td["columns"], rv))
+                             for rv in td.get("rows", [])]
+            builder.add_table(tname, tinfo["columns"], rows=existing_rows)
+        except Exception:
+            builder.add_table(tname, tinfo["columns"], rows=[])
+
+    for m in modified_measures:
+        builder.add_measure(m["table"], m["name"], m["expression"], m["format_string"])
+
+    for r in modified_rels:
+        builder.add_relationship(
+            r["from_table"], r["from_column"], r["to_table"], r["to_column"]
+        )
+
+    new_pbix = builder.build()
+
+    import io
+    import zipfile
+    new_z = zipfile.ZipFile(io.BytesIO(new_pbix))
+    new_dm = new_z.read("DataModel")
+
     with open(dm_path, "wb") as f:
         f.write(new_dm)
 
-    return dm_bytes, new_dm, new_abf
+    return dm_bytes, new_dm, None
 
 
 @mcp.tool()
@@ -2458,7 +2536,7 @@ def pbix_datamodel_modify_metadata(alias: str, sql_statement: str) -> str:
             changes[0] = conn.total_changes
             conn.commit()
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_sql)
+        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_sql, info=info)
         info["modified"] = True
         return ToolResponse.ok(
             f"SQL executed successfully.\n"
@@ -2513,7 +2591,7 @@ def pbix_datamodel_modify_measure(
             c.execute(f"UPDATE Measure SET {', '.join(updates)} WHERE Name = ?", params)
             conn.commit()
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_modify)
+        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_modify, info=info)
         info["modified"] = True
         return ToolResponse.ok(
             f"Measure '{measure_name}' updated:\n"
@@ -2604,7 +2682,7 @@ def pbix_datamodel_add_measure(
             )
             conn.commit()
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_add)
+        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_add, info=info)
         info["modified"] = True
         return ToolResponse.ok(
             f"Measure '{measure_name}' added to table '{table_name}':\n"
@@ -2653,7 +2731,7 @@ def pbix_datamodel_remove_measure(alias: str, measure_name: str) -> str:
             c.execute("DELETE FROM Measure WHERE Name = ?", (measure_name,))
             conn.commit()
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_remove)
+        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_remove, info=info)
         info["modified"] = True
         return ToolResponse.ok(
             f"Measure '{measure_name}' removed from table '{old_info.get('table', '?')}':\n"
@@ -2903,7 +2981,7 @@ def pbix_datamodel_add_field_parameter(
 
             conn.commit()
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_add)
+        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_add, info=info)
         info["modified"] = True
 
         field_list = ", ".join(f["display"] for f in fields)
@@ -3045,7 +3123,7 @@ def pbix_datamodel_add_calculation_group(
 
             conn.commit()
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_add)
+        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_add, info=info)
         info["modified"] = True
 
         item_list = ", ".join(item["name"] for item in items)
@@ -3113,7 +3191,7 @@ def pbix_datamodel_modify_column(
             )
             conn.commit()
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_modify)
+        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_modify, info=info)
         info["modified"] = True
         return ToolResponse.ok(
             f"Column '{table_name}'.'{column_name}' updated:\n"
@@ -5179,7 +5257,7 @@ def pbix_set_incremental_refresh(
             policy_info["policy_id"] = policy_id
             policy_info["mode"] = mode
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_set)
+        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_set, info=info)
         info["modified"] = True
 
         detect_msg = f"\n  Change detection: {detect_changes_column}" if detect_changes_column else ""
