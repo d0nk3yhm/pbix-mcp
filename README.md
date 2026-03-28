@@ -382,6 +382,18 @@ with open('report.pbix', 'wb') as f:
 
 Supports all source types: `sqlserver`, `postgresql`, `mysql`, `mariadb`, `sqlite`, `csv`, `excel`, `json`, `azuresql`. Set `is_directquery=True` and `Mode=1` for DirectQuery, or `is_directquery=False` and `Mode=0` for Import.
 
+### Via MCP (Claude / Codex)
+
+Just ask in plain English:
+
+> "List all data sources in my report"
+
+> "Switch the Sales table from SQL Server to PostgreSQL on pg.example.com, database analytics, DirectQuery"
+
+> "Change the CSV path for Products to C:\Data\new_products.csv"
+
+The AI reads the current connections via `pbix_list_data_sources`, then calls `pbix_update_data_source` with the right parameters. No rebuild — only the connection metadata is updated.
+
 ### Supported Data Types
 
 | Type | Status | Dictionary Format |
