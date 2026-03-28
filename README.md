@@ -112,7 +112,8 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | JSON/API data sources | **Stable** | `source_db` with `type: 'json'` — Import mode from REST APIs and JSON files |
 | Azure SQL data sources | **Stable** | `source_db` with `type: 'azuresql'` — Import and DirectQuery |
 | DirectQuery mode | **Stable** | `mode='directquery'` with SQL Server, PostgreSQL, and MySQL (via MariaDB ODBC 3.1) — live database queries, no refresh needed |
-| VertiPaq table data write | **Stable** | String, Int64, Double, DateTime, Decimal, Boolean — both create and roundtrip (set_table_data, update_table_rows) with H$ hierarchy rebuild |
+| VertiPaq table data write (create) | **Stable** | String, Int64, Double, DateTime, Decimal, Boolean column types with correct dictionary encoding |
+| VertiPaq table data write (roundtrip) | **Blocked** | `set_table_data` / `update_table_rows` need full DataModel rebuild — partial updates cause DBCC failures |
 | H$ attribute hierarchies | **Stable** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities; MaterializationType=0 |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
 | Visual add/remove | **Stable** | Cards, charts, shapes/buttons, images, textboxes, slicers — with full data bindings (projections + prototypeQuery) |

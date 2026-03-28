@@ -1986,6 +1986,16 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
             Supported data_types: String, Int64, Float64, DateTime, Decimal, Boolean
     """
     try:
+        # Roundtrip table data write requires a full DataModel rebuild (IDF, IDFMETA,
+        # dictionaries, H$ hierarchies, ColumnStorage, DictionaryStorage,
+        # SegmentMapStorage, ColumnPartitionStorage — all must be consistent).
+        # The current update_table_in_abf does partial updates that PBI rejects.
+        # Blocked until full rebuild via builder pipeline is integrated.
+        return ToolResponse.error(
+            "set_table_data is not yet supported for roundtrip editing. "
+            "Use pbix_create to build files with the correct data upfront.",
+            "NOT_IMPLEMENTED"
+        ).to_text()
         info = _ensure_open(alias)
         data = json.loads(data_json)
         columns = data.get("columns", [])
@@ -2072,6 +2082,13 @@ def pbix_update_table_rows(alias: str, table_name: str, rows_json: str) -> str:
         rows = json.loads(rows_json)
         if not rows:
             return ToolResponse.error("rows must not be empty.", ABFRebuildError.code).to_text()
+
+        # Same as set_table_data — needs full DataModel rebuild.
+        return ToolResponse.error(
+            "update_table_rows is not yet supported for roundtrip editing. "
+            "Use pbix_create to build files with the correct data upfront.",
+            "NOT_IMPLEMENTED"
+        ).to_text()
 
         import sqlite3
 
