@@ -112,12 +112,13 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | JSON/API data sources | **Stable** | `source_db` with `type: 'json'` — Import mode from REST APIs and JSON files |
 | Azure SQL data sources | **Stable** | `source_db` with `type: 'azuresql'` — Import and DirectQuery |
 | DirectQuery mode | **Stable** | `mode='directquery'` with SQL Server, PostgreSQL, and MySQL (via MariaDB ODBC 3.1) — live database queries, no refresh needed |
-| VertiPaq table data write | **Stable** | Create and roundtrip (set_table_data, update_table_rows) — verified byte-exact against builder for all metadata storage tables |
+| VertiPaq table data write | **Stable** | Create and roundtrip (set_table_data, update_table_rows) via full builder rebuild |
+| Roundtrip DataModel modify | **Stable** | Add/remove tables, relationships, measures on existing files — all modifications go through full builder rebuild pipeline |
 | H$ attribute hierarchies | **Stable** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities; MaterializationType=0 |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
 | Visual add/remove | **Stable** | Cards, charts, shapes/buttons, images, textboxes, slicers — with full data bindings (projections + prototypeQuery) |
 | Visual property editing | **Stable** | Dot-path and full JSON |
-| DAX measure CRUD | **Stable** | Add, modify, remove via metadata SQL |
+| DAX measure CRUD | **Stable** | Add, modify, remove via full builder rebuild |
 | DAX evaluation (156 functions) | **Stable** | Best-effort evaluator; see accuracy notes below |
 | Metadata SQL read/write | **Stable** | Full SQLite access to tables, columns, relationships |
 | Default slicer filter extraction | **Stable** | Legacy Layout JSON and PBIR format |
@@ -129,14 +130,14 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | File save/repack | **Stable** | Auto-backup on overwrite, SecurityBindings auto-removed |
 | Calculated column evaluation | **Beta** | Per-row DAX expression evaluation; tested with synthetic data |
 | Password extraction | **Beta** | Regex scan of DAX measures for embedded passwords |
-| Row-Level Security (RLS) | **Beta** | Read/write roles, evaluate filter expressions against data |
+| Row-Level Security (RLS) | **Beta** | Read roles, evaluate filter expressions against data. Write (set_rls_role) triggers full rebuild — RLS rows not yet persisted by builder |
 | Bookmark creation | **Beta** | Create/remove bookmarks with page targeting and visual visibility state |
 | Field Parameters | **Blocked** | `pbix_datamodel_add_field_parameter` blocked — needs full DataModel rebuild to generate VertiPaq storage for new table |
 | Calculation Groups | **Blocked** | `pbix_datamodel_add_calculation_group` blocked — needs full DataModel rebuild to generate VertiPaq storage for new table |
 | TMDL Export | **Beta** | Export data model as Git-friendly TMDL text files via `pbix_export_tmdl` |
 | Custom Visuals | **Beta** | Import .pbiviz packages via `pbix_add_custom_visual`, place with `pbix_add_visual` |
 | Incremental Refresh | **Blocked** | `pbix_set_incremental_refresh` blocked — requires DataMashup with RangeStart/RangeEnd M parameters |
-| Diagnostic tool (`pbix_doctor`) | **Stable** | 13-point comprehensive diagnostic — data sources, storage modes, columns, relationships, measures, RLS, VertiPaq row counts |
+| Diagnostic tool (`pbix_doctor`) | **Stable** | 17-point comprehensive diagnostic — data sources, storage modes, columns, relationships, measures, RLS, VertiPaq row counts, table/storage consistency, referential integrity, Expression/DataMashup consistency, MAXID |
 
 ## Known Limitations
 
@@ -149,9 +150,11 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 - **CryptKey.bin** — the 144-byte RSA key BLOB cannot be generated without Microsoft's crypto infrastructure (`rskeymgmt`). A known-valid GUID-independent constant is used.
 - **Embedded VertiPaq data** — verified working with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase). Cross-table relationship lookups verified byte-exact against PBI Desktop ground truth
 - **RLE encoding** — disabled in the VertiPaq encoder (pure bitpack used). Slightly less space-efficient but correct
+- **RLS write (set_rls_role)** — triggers full DataModel rebuild but builder doesn't generate Role/TablePermission rows, so RLS roles are silently dropped. Read and evaluate work correctly.
+- **All DataModel modifications trigger full rebuild** — add_measure, modify_measure, set_rls_role, modify_column, set_table_data, update_table_rows, add/remove relationship/table all rebuild the entire DataModel via the builder pipeline. This ensures consistency but is slower for large models.
 
 
-## Tools (69)
+## Tools (72)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
@@ -165,8 +168,8 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 ### DataModel Read (8)
 `pbix_get_model_schema` · `pbix_get_model_measures` · `pbix_get_model_relationships` · `pbix_get_model_power_query` · `pbix_get_model_columns` · `pbix_get_table_data` · `pbix_list_tables` · `pbix_get_metadata`
 
-### DataModel Write (16)
-`pbix_datamodel_query_metadata` · `pbix_datamodel_modify_metadata` · `pbix_datamodel_add_measure` · `pbix_datamodel_modify_measure` · `pbix_datamodel_remove_measure` · `pbix_datamodel_modify_column` · `pbix_datamodel_decompress` · `pbix_datamodel_recompress` · `pbix_datamodel_replace_file` · `pbix_datamodel_extract_file` · `pbix_datamodel_list_abf_files` · `pbix_set_table_data` · `pbix_update_table_rows` · `pbix_datamodel_add_field_parameter` · `pbix_datamodel_add_calculation_group` · `pbix_export_tmdl`
+### DataModel Write (19)
+`pbix_datamodel_query_metadata` · `pbix_datamodel_modify_metadata` · `pbix_datamodel_add_measure` · `pbix_datamodel_modify_measure` · `pbix_datamodel_remove_measure` · `pbix_datamodel_modify_column` · `pbix_datamodel_add_relationship` · `pbix_datamodel_remove_relationship` · `pbix_datamodel_remove_table` · `pbix_datamodel_decompress` · `pbix_datamodel_recompress` · `pbix_datamodel_replace_file` · `pbix_datamodel_extract_file` · `pbix_datamodel_list_abf_files` · `pbix_set_table_data` · `pbix_update_table_rows` · `pbix_datamodel_add_field_parameter` · `pbix_datamodel_add_calculation_group` · `pbix_export_tmdl`
 
 ### Resources, Themes & Custom Visuals (7)
 `pbix_list_resources` · `pbix_get_theme` · `pbix_set_theme` · `pbix_get_linguistic_schema` · `pbix_set_linguistic_schema` · `pbix_add_custom_visual` · `pbix_remove_custom_visual`
