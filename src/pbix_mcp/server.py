@@ -110,9 +110,10 @@ def _repack_pbix(work_dir: str, output_path: str) -> None:
     # Files that must NOT be included in the final ZIP
     _EXCLUDE_FILES = {
         "DataModel.abf",     # temp file from pbix_datamodel_decompress
+        "metadata.sqlitedb", # extracted by ModelReader / tools — stale, causes PBI crash
     }
     # Suffixes that are temp artifacts
-    _EXCLUDE_SUFFIXES = (".abf", ".tmp", ".bak")
+    _EXCLUDE_SUFFIXES = (".abf", ".tmp", ".bak", ".sqlitedb")
 
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for root, dirs, files in os.walk(work_dir):
