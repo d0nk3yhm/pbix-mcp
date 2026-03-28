@@ -1672,55 +1672,91 @@ def _apply_metadata_updates(
             continue
         col_id, col_storage_id = col_row
 
-        # Calculate distinct states
+        # Calculate distinct count for H$ updates below
         values = [row.get(col_name) for row in rows]
         converted = [_convert_value_for_dict(v, data_type) for v in values]
-        has_nulls = nullable and any(v is None for v in converted)
         non_null = [v for v in converted if v is not None]
         unique_count = len(set(_val_key(v) for v in non_null))
-        distinct_states = unique_count + (1 if has_nulls else 0)
 
-        # Update ColumnStorage statistics
-        conn.execute(
-            """UPDATE ColumnStorage SET
-                Statistics_DistinctStates = ?,
-                Statistics_RowCount = ?,
-                Statistics_HasNulls = ?,
-                Statistics_MinDataID = 0,
-                Statistics_MaxDataID = ?
-               WHERE ID = ?""",
-            (distinct_states, row_count, 1 if has_nulls else 0,
-             distinct_states - 1, col_storage_id)
-        )
+        # Update ColumnStorage from IDFMETA (same approach as builder)
+        # The IDFMETA contains the EXACT statistics PBI needs — parsing it
+        # is more reliable than hand-computing values.
+        idfmeta_bytes = None
+        for path, data in encoded_files.items():
+            if path.endswith(f"column.{col_name}meta"):
+                idfmeta_bytes = data
+                break
 
-        # Update DictionaryStorage — critical for correct decoding
+        if idfmeta_bytes and len(idfmeta_bytes) >= 120:
+            try:
+                off = 6 + 8 + 6  # CP_OPEN + version + CS_OPEN
+                off += 8 + 8 + 4 + 4 + 8 + 8 + 8 + 1 + 4 + 6  # to SS fields
+                distinct_states = struct.unpack_from("<Q", idfmeta_bytes, off)[0]
+                off += 8
+                min_data_id = struct.unpack_from("<I", idfmeta_bytes, off)[0]
+                off += 4
+                max_data_id = struct.unpack_from("<I", idfmeta_bytes, off)[0]
+                off += 4
+                orig_min = struct.unpack_from("<I", idfmeta_bytes, off)[0]
+                off += 4
+                rle_sort_order = struct.unpack_from("<q", idfmeta_bytes, off)[0]
+                off += 8
+                ss_row_count = struct.unpack_from("<Q", idfmeta_bytes, off)[0]
+                off += 8
+                has_nulls = struct.unpack_from("<B", idfmeta_bytes, off)[0]
+                off += 1
+                rle_runs = struct.unpack_from("<Q", idfmeta_bytes, off)[0]
+                conn.execute(
+                    """UPDATE ColumnStorage SET
+                        Statistics_DistinctStates = ?,
+                        Statistics_MinDataID = ?,
+                        Statistics_MaxDataID = ?,
+                        Statistics_OriginalMinSegmentDataID = ?,
+                        Statistics_RLESortOrder = ?,
+                        Statistics_RowCount = ?,
+                        Statistics_HasNulls = ?,
+                        Statistics_RLERuns = ?
+                       WHERE ID = ?""",
+                    (distinct_states, min_data_id, max_data_id, orig_min,
+                     rle_sort_order, ss_row_count, has_nulls, rle_runs,
+                     col_storage_id),
+                )
+            except (struct.error, IndexError):
+                conn.execute(
+                    "UPDATE ColumnStorage SET Statistics_RowCount = ? WHERE ID = ?",
+                    (row_count, col_storage_id),
+                )
+
+        # Update DictionaryStorage — parse LastId from IDFMETA max_data_id
         dict_row = conn.execute(
             """SELECT ds.ID FROM DictionaryStorage ds
                WHERE ds.ColumnStorageID = ?""",
             (col_storage_id,)
         ).fetchone()
         if dict_row:
-            # IsOperatingOn32: 1 for Int64/Decimal/Boolean (4-byte dict entries)
             _OP32_TYPES = {"Int64", "Decimal", "Boolean"}
             is_op32 = 1 if data_type in _OP32_TYPES else 0
             dict_flags = 3 if data_type == "String" else 0
+            # Get dict size and LastId from IDFMETA
+            dict_size = 0
             for path, data in encoded_files.items():
                 if path.endswith(f"column.{col_name}.dict"):
-                    conn.execute(
-                        """UPDATE DictionaryStorage SET
-                            Size = ?,
-                            LastId = ?,
-                            BaseId = 0,
-                            Magnitude = 1.0,
-                            IsNullable = ?,
-                            IsUnique = 0,
-                            IsOperatingOn32 = ?,
-                            DictionaryFlags = ?
-                           WHERE ID = ?""",
-                        (len(data), unique_count - 1 + (1 if has_nulls else 0),
-                         1 if has_nulls else 0, is_op32, dict_flags, dict_row[0])
-                    )
+                    dict_size = len(data)
                     break
+            last_id = 0
+            if idfmeta_bytes and len(idfmeta_bytes) >= 95:
+                try:
+                    last_id = struct.unpack_from("<I", idfmeta_bytes, 91)[0]
+                except struct.error:
+                    pass
+            conn.execute(
+                """UPDATE DictionaryStorage SET
+                    Size = ?, LastId = ?, BaseId = 2, Magnitude = 0.0,
+                    IsNullable = 1, IsUnique = 0,
+                    IsOperatingOn32 = ?, DictionaryFlags = ?
+                   WHERE ID = ?""",
+                (dict_size, last_id, is_op32, dict_flags, dict_row[0]),
+            )
 
         # Note: StorageFile has no Size column; ABF file sizes are tracked
         # in the ABF VirtualDirectory and BackupLog, not in the SQLite metadata.
