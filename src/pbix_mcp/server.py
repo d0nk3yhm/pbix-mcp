@@ -1967,11 +1967,13 @@ def _rebuild_datamodel(
     extra_tables: list[dict] | None = None,
     extra_measures: list[dict] | None = None,
     extra_relationships: list[dict] | None = None,
+    remove_tables: set[str] | None = None,
+    remove_relationships: list[tuple[str, str, str, str]] | None = None,
 ) -> tuple[int, int]:
     """Rebuild the entire DataModel using the builder pipeline.
 
     Reads all existing tables, measures, relationships, and row data.
-    Applies updates/additions, then regenerates the DataModel from scratch.
+    Applies updates/additions/removals, then regenerates the DataModel from scratch.
 
     Args:
         info: Open file info dict from _ensure_open()
@@ -1979,6 +1981,8 @@ def _rebuild_datamodel(
         extra_tables: New tables to add: [{"name", "columns", "rows"}, ...]
         extra_measures: New measures: [{"table", "name", "expression", "format_string"}, ...]
         extra_relationships: New rels: [{"from_table", "from_column", "to_table", "to_column"}, ...]
+        remove_tables: Set of table names to exclude from rebuild
+        remove_relationships: List of (from_table, from_col, to_table, to_col) to exclude
 
     Returns (old_dm_size, new_dm_size).
     """
@@ -1991,6 +1995,8 @@ def _rebuild_datamodel(
     extra_tables = extra_tables or []
     extra_measures = extra_measures or []
     extra_relationships = extra_relationships or []
+    remove_tables = remove_tables or set()
+    remove_relationships = remove_relationships or []
 
     dm_path = os.path.join(info["work_dir"], "DataModel")
     with open(dm_path, "rb") as f:
@@ -2061,9 +2067,11 @@ def _rebuild_datamodel(
     # Build new DataModel via builder
     builder = PBIXBuilder()
 
-    # Add existing tables (with optional row updates)
+    # Add existing tables (with optional row updates), skip removed tables
     for tinfo in tables:
         tname = tinfo["name"]
+        if tname in remove_tables:
+            continue
         if tname in table_updates:
             upd = table_updates[tname]
             builder.add_table(tname, upd["columns"], rows=upd["rows"])
@@ -2083,15 +2091,22 @@ def _rebuild_datamodel(
     for et in extra_tables:
         builder.add_table(et["name"], et["columns"], rows=et.get("rows", []))
 
-    # Add all measures (existing + new)
+    # Add all measures (existing + new), skip measures on removed tables
     for m in measures:
-        builder.add_measure(m["table"], m["name"], m["expression"], m["format_string"])
+        if m["table"] not in remove_tables:
+            builder.add_measure(m["table"], m["name"], m["expression"], m["format_string"])
     for m in extra_measures:
         builder.add_measure(m["table"], m["name"], m["expression"],
                             m.get("format_string", ""))
 
-    # Add all relationships (existing + new)
+    # Add all relationships (existing + new), skip removed ones and those referencing removed tables
+    remove_rel_set = {(r[0], r[1], r[2], r[3]) for r in remove_relationships}
     for r in rels:
+        key = (r["from_table"], r["from_column"], r["to_table"], r["to_column"])
+        if key in remove_rel_set:
+            continue
+        if r["from_table"] in remove_tables or r["to_table"] in remove_tables:
+            continue
         builder.add_relationship(
             r["from_table"], r["from_column"], r["to_table"], r["to_column"]
         )
@@ -2687,6 +2702,76 @@ def pbix_datamodel_add_relationship(
         info["modified"] = True
         return ToolResponse.ok(
             f"Relationship added: {from_table}.{from_column} → {to_table}.{to_column}\n"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_datamodel_remove_relationship(
+    alias: str,
+    from_table: str,
+    from_column: str,
+    to_table: str,
+    to_column: str,
+) -> str:
+    """Remove a relationship between two tables. Rebuilds the DataModel.
+
+    Args:
+        alias: The alias of the open file
+        from_table: Fact table name (many side)
+        from_column: Foreign key column in fact table
+        to_table: Dimension table name (one side)
+        to_column: Primary key column in dimension table
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
+
+        old_size, new_size = _rebuild_datamodel(
+            info,
+            remove_relationships=[(from_table, from_column, to_table, to_column)],
+        )
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Relationship removed: {from_table}.{from_column} → {to_table}.{to_column}\n"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_datamodel_remove_table(alias: str, table_name: str) -> str:
+    """Remove a table and its measures/relationships from the DataModel.
+
+    Rebuilds the DataModel without the specified table. All measures hosted
+    on the table and all relationships referencing it are also removed.
+
+    Args:
+        alias: The alias of the open file
+        table_name: Name of the table to remove
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
+
+        old_size, new_size = _rebuild_datamodel(
+            info,
+            remove_tables={table_name},
+        )
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Table '{table_name}' removed (with its measures and relationships)\n"
             f"  DataModel: {old_size:,} → {new_size:,} bytes"
         ).to_text()
     except PBIXMCPError as e:
