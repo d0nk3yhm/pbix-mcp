@@ -1700,6 +1700,10 @@ def _apply_metadata_updates(
             (col_storage_id,)
         ).fetchone()
         if dict_row:
+            # IsOperatingOn32: 1 for Int64/Decimal/Boolean (4-byte dict entries)
+            _OP32_TYPES = {"Int64", "Decimal", "Boolean"}
+            is_op32 = 1 if data_type in _OP32_TYPES else 0
+            dict_flags = 3 if data_type == "String" else 0
             for path, data in encoded_files.items():
                 if path.endswith(f"column.{col_name}.dict"):
                     conn.execute(
@@ -1710,10 +1714,11 @@ def _apply_metadata_updates(
                             Magnitude = 1.0,
                             IsNullable = ?,
                             IsUnique = 0,
-                            IsOperatingOn32 = 0
+                            IsOperatingOn32 = ?,
+                            DictionaryFlags = ?
                            WHERE ID = ?""",
                         (len(data), unique_count - 1 + (1 if has_nulls else 0),
-                         1 if has_nulls else 0, dict_row[0])
+                         1 if has_nulls else 0, is_op32, dict_flags, dict_row[0])
                     )
                     break
 
