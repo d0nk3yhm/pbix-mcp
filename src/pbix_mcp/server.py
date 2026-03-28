@@ -4236,34 +4236,14 @@ def pbix_set_rls_role(
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found", DataModelCompressionError.code).to_text()
 
-        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite, rebuild_abf_with_replacement
-        from pbix_mcp.formats.datamodel_roundtrip import (
-            compress_datamodel,
-            decompress_datamodel,
-        )
-
-        with open(dm_path, "rb") as f:
-            dm = f.read()
-        abf = decompress_datamodel(dm)
-        db_bytes = read_metadata_sqlite(abf)
-
-        import sqlite3
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.write(db_bytes)
-        tmp.close()
-        try:
-            conn = sqlite3.connect(tmp.name)
+        def _do_set(conn: sqlite3.Connection):
             conn.row_factory = sqlite3.Row
-
-            # Find or create role
             role = conn.execute(
                 "SELECT ID FROM [Role] WHERE Name = ?", (role_name,)
             ).fetchone()
-
             if role:
                 role_id = role["ID"]
             else:
-                # Create new role
                 max_id = conn.execute("SELECT MAX(ID) FROM [Role]").fetchone()[0] or 0
                 role_id = max_id + 1
                 conn.execute(
@@ -4271,22 +4251,18 @@ def pbix_set_rls_role(
                     (role_id, role_name, description),
                 )
 
-            # Find table ID
             table_row = conn.execute(
                 "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
                 (table_name,)
             ).fetchone()
             if not table_row:
-                conn.close()
-                return ToolResponse.error(f"Table '{table_name}' not found", PBIXMCPError.code).to_text()
+                raise ValueError(f"Table '{table_name}' not found")
             table_id = table_row["ID"]
 
-            # Upsert table permission
             existing = conn.execute(
                 "SELECT ID FROM [TablePermission] WHERE RoleID = ? AND TableID = ?",
                 (role_id, table_id)
             ).fetchone()
-
             if existing:
                 conn.execute(
                     "UPDATE [TablePermission] SET FilterExpression = ? WHERE ID = ?",
@@ -4298,28 +4274,11 @@ def pbix_set_rls_role(
                     "INSERT INTO [TablePermission] (ID, RoleID, TableID, FilterExpression) VALUES (?, ?, ?, ?)",
                     (max_perm + 1, role_id, table_id, filter_expression),
                 )
-
             conn.commit()
 
-            # Read back and rebuild ABF
-            with open(tmp.name, "rb") as f:
-                new_db = f.read()
-            conn.close()
-
-            # Validate: evaluate the filter expression
-            from pbix_mcp.dax import engine as dax_engine
-            eng = dax_engine.DAXEngine()
-            logger.info("RLS role '%s' set on '%s': %s", role_name, table_name, filter_expression)
-
-            new_abf = rebuild_abf_with_replacement(abf, {"metadata.sqlitedb": new_db})
-            new_dm = compress_datamodel(new_abf)
-            with open(dm_path, "wb") as f:
-                f.write(new_dm)
-            info["modified"] = True
-
-            return ToolResponse.ok(f"RLS role '{role_name}' set on '{table_name}' with filter: {filter_expression}").to_text()
-        finally:
-            os.unlink(tmp.name)
+        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_set, info=info)
+        info["modified"] = True
+        return ToolResponse.ok(f"RLS role '{role_name}' set on '{table_name}' with filter: {filter_expression}").to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
