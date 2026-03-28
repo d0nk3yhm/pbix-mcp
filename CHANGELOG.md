@@ -9,7 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Full roundtrip modify** — existing PBIX files can now be heavily modified: add/remove tables, relationships, measures, update table data, add visuals, pages, themes, bookmarks, filters. All DataModel modifications go through the builder pipeline for guaranteed consistency.
-- **3 new tools**: `pbix_datamodel_add_relationship`, `pbix_datamodel_remove_relationship`, `pbix_datamodel_remove_table` — add/remove relationships and tables on existing files (72 tools total)
+- **5 new tools** (74 total):
+  - `pbix_datamodel_add_relationship` — add cross-table relationships with R$ indexes
+  - `pbix_datamodel_remove_relationship` — remove relationships
+  - `pbix_datamodel_remove_table` — remove tables with cascading measures/relationships
+  - `pbix_list_data_sources` — list all data source connections per table (type, server, database, mode)
+  - `pbix_update_data_source` — lightweight connection string switching (SQL Server, PostgreSQL, MySQL, CSV, Excel, JSON, SQLite, Azure SQL, Import/DirectQuery) without full DataModel rebuild
+- **Lightweight data source switching** — `pbix_update_data_source` modifies only `Partition.QueryDefinition` and `Partition.Mode` in the metadata. No VertiPaq rebuild. Verified live: MSSQL Import → PostgreSQL DirectQuery → CSV Import
 - **`_rebuild_datamodel()` pipeline** — centralized function for all DataModel modifications: supports table updates, new tables, new measures, new relationships, removals, and cascading deletes
 - **`pbix_doctor` 17-point diagnostics** — 4 new integrity checks: table/storage consistency, metadata referential integrity, Expression/DataMashup consistency, MAXID validation
 - **`ModelReader` work_dir support** — read tools now return fresh data after modifications (not stale original file)
