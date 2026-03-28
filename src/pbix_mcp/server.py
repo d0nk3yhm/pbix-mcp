@@ -1993,18 +1993,6 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
         if not columns or not rows:
             return ToolResponse.error("'columns' and 'rows' are required and must not be empty.", ABFRebuildError.code).to_text()
 
-        # set_table_data replaces VertiPaq column data (IDF + dictionary) but does
-        # NOT rebuild H$ attribute hierarchies, ColumnStorage/DictionaryStorage
-        # statistics, or HIDX hash indexes.  PBI rejects the file with
-        # PFE_XM_DBCC_COLUMN_DICTIONARY_FAILED.  Blocked until full rebuild is added.
-        return ToolResponse.error(
-            "set_table_data currently only replaces IDF/dictionary files without "
-            "rebuilding H$ hierarchies and storage statistics. This causes PBI Desktop "
-            "to reject the file (DBCC dictionary check fails). Use pbix_create to "
-            "build files with the correct data upfront.",
-            "NOT_IMPLEMENTED"
-        ).to_text()
-
         from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
         from pbix_mcp.formats.datamodel_roundtrip import compress_datamodel, decompress_datamodel
         from pbix_mcp.formats.vertipaq_encoder import update_table_in_abf
@@ -2084,15 +2072,6 @@ def pbix_update_table_rows(alias: str, table_name: str, rows_json: str) -> str:
         rows = json.loads(rows_json)
         if not rows:
             return ToolResponse.error("rows must not be empty.", ABFRebuildError.code).to_text()
-
-        # Same issue as set_table_data: replaces IDF/dictionary without H$ rebuild.
-        return ToolResponse.error(
-            "update_table_rows currently only replaces IDF/dictionary files without "
-            "rebuilding H$ hierarchies and storage statistics. This causes PBI Desktop "
-            "to reject the file (DBCC dictionary check fails). Use pbix_create to "
-            "build files with the correct data upfront.",
-            "NOT_IMPLEMENTED"
-        ).to_text()
 
         import sqlite3
 

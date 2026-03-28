@@ -906,6 +906,86 @@ def encode_nosplit_idfmeta(records_per_seg: list[int], bit_width: int,
 
 
 # ---------------------------------------------------------------------------
+# H$ attribute hierarchy encoder (for roundtrip updates)
+# ---------------------------------------------------------------------------
+
+def _encode_h_dollar_data(
+    col_name: str,
+    data_type: str,
+    rows: list[dict],
+) -> dict | None:
+    """Encode H$ POS_TO_ID and ID_TO_POS data for a column.
+
+    Uses the same dictionary ordering as _encode_column (insertion-order for
+    strings, sorted for numerics) so that dict_index values match.
+
+    Returns None if distinct == 0 (empty column).
+    Returns dict with pos_idf, pos_meta, itp_idf, itp_meta, distinct, h_record_count.
+    """
+    raw_vals = [row.get(col_name) for row in rows]
+    converted = [_convert_value_for_dict(v, data_type) for v in raw_vals]
+    non_null = [v for v in converted if v is not None]
+
+    # Build dictionary with same ordering as _encode_column
+    if data_type == "String":
+        seen: dict[object, int] = {}
+        for v in non_null:
+            key = _val_key(v)
+            if key not in seen:
+                seen[key] = len(seen)
+    else:
+        unique_sorted = sorted(
+            set(_val_key(v) for v in non_null),
+            key=lambda x: x if isinstance(x, (int, float)) else (str(type(x)), x),
+        )
+        seen = {v: i for i, v in enumerate(unique_sorted)}
+
+    distinct = len(seen)
+    if distinct == 0:
+        return None
+
+    # sorted_keys: always sorted for H$ regardless of dict ordering
+    sorted_keys = sorted(
+        seen.keys(),
+        key=lambda x: x if isinstance(x, (int, float)) else (str(type(x)), x),
+    )
+
+    # POS_TO_ID: sorted_pos -> data_id (dict_index + 3)
+    pos_to_id = [seen[sk] + 3 for sk in sorted_keys]
+
+    # ID_TO_POS: full array [0..distinct+2]
+    h_record_count = distinct + 3
+    id_to_pos_full = [0] * h_record_count
+    id_to_pos_full[1] = distinct  # sentinel
+    for sorted_pos, did in enumerate(pos_to_id):
+        if did < h_record_count:
+            id_to_pos_full[did] = sorted_pos
+
+    # Segment layout
+    h_rec_per_seg = distinct
+    h_seg_count = math.ceil(h_record_count / h_rec_per_seg)
+    h_rps = []
+    remaining = h_record_count
+    for _ in range(h_seg_count):
+        seg_rec = min(h_rec_per_seg, remaining)
+        h_rps.append(seg_rec)
+        remaining -= seg_rec
+
+    # POS_TO_ID values: sorted data_ids + padding
+    p2id_vals = list(pos_to_id) + [2] + [0] * (h_record_count - distinct - 1)
+    i2p_vals = list(id_to_pos_full)
+
+    return {
+        "pos_idf": encode_nosplit_idf(p2id_vals, 32, h_rps),
+        "pos_meta": encode_nosplit_idfmeta(h_rps, 32, is_relationship=False),
+        "itp_idf": encode_nosplit_idf(i2p_vals, 32, h_rps),
+        "itp_meta": encode_nosplit_idfmeta(h_rps, 32, is_relationship=False),
+        "distinct": distinct,
+        "h_record_count": h_record_count,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Column encoder (combines all pieces)
 # ---------------------------------------------------------------------------
 
@@ -1274,6 +1354,25 @@ def update_table_in_abf(
                     "meta": row["meta_fname"],
                     "dict": row["dict_fname"],
                 }
+
+        # For each user column, find the H$ table name pattern for ABF matching
+        h_table_patterns = {}  # col_name -> H$ table name pattern (for file_log matching)
+        for col_def in columns:
+            col_name = col_def["name"]
+            row = conn.execute(
+                """SELECT c.ID as col_id, ahs.SystemTableID as h_table_id
+                   FROM [Column] c
+                   JOIN AttributeHierarchy ah ON ah.ColumnID = c.ID
+                   JOIN AttributeHierarchyStorage ahs
+                        ON ah.AttributeHierarchyStorageID = ahs.ID
+                   WHERE c.TableID = ? AND c.ExplicitName = ?""",
+                (table_id, col_name),
+            ).fetchone()
+            if row and row["h_table_id"]:
+                # H$ files use pattern: H$Table (tid)$Col (cid)$(htid).tbl\...
+                h_pattern = f"H${table_name} ({table_id})${col_name} ({row['col_id']})"
+                h_table_patterns[col_name] = h_pattern
+
         conn.close()
     finally:
         os.unlink(tmp.name)
@@ -1387,6 +1486,34 @@ def update_table_in_abf(
                     if epath.endswith(f"column.{col_name}.dict"):
                         replacements[sp] = edata
                         break
+
+    # --- Encode and replace H$ attribute hierarchy files ---
+    for col_def in columns:
+        col_name = col_def["name"]
+        h_pattern = h_table_patterns.get(col_name)
+        if not h_pattern:
+            continue
+
+        h_data = _encode_h_dollar_data(col_name, col_def["data_type"], rows)
+        if h_data is None:
+            continue  # distinct==0, H$ stays as-is (MaterializationType=3)
+
+        # Map H$ encoded bytes to ABF file_log entries by matching Path pattern
+        h_file_map = {
+            "POS_TO_ID": {"idf": h_data["pos_idf"], "meta": h_data["pos_meta"]},
+            "ID_TO_POS": {"idf": h_data["itp_idf"], "meta": h_data["itp_meta"]},
+        }
+        for entry in file_log:
+            path = entry.get("Path", "")
+            sp = entry.get("StoragePath", "")
+            if not sp or h_pattern not in path:
+                continue
+            for h_col_name, h_files in h_file_map.items():
+                if h_col_name in path:
+                    if path.endswith(".idfmeta"):
+                        replacements[sp] = h_files["meta"]
+                    elif path.endswith(".idf"):
+                        replacements[sp] = h_files["idf"]
 
     # Replace the metadata.sqlitedb
     for entry in file_log:
@@ -1594,9 +1721,41 @@ def _apply_metadata_updates(
         # in the ABF VirtualDirectory and BackupLog, not in the SQLite metadata.
         # The ABF rebuild process handles updating those sizes automatically.
 
-        # Skip HIDX updates (we don't currently generate separate HIDX for updates;
-        # the hash index is embedded in the dictionary)
-        _dummy = None  # placeholder to keep indentation clean
+        # --- Update H$ metadata (AttributeHierarchyStorage, SegmentMapStorage) ---
+        ahs_row = conn.execute(
+            """SELECT ahs.ID, ahs.SystemTableID
+               FROM [Column] c
+               JOIN AttributeHierarchy ah ON ah.ColumnID = c.ID
+               JOIN AttributeHierarchyStorage ahs
+                    ON ah.AttributeHierarchyStorageID = ahs.ID
+               WHERE c.TableID = ? AND c.ExplicitName = ?""",
+            (table_id, col_name),
+        ).fetchone()
+        if ahs_row:
+            ahs_id, h_table_id = ahs_row
+            h_distinct = unique_count
+            if h_distinct > 0:
+                h_record_count = h_distinct + 3
+                h_seg_count = math.ceil(h_record_count / h_distinct)
+                conn.execute(
+                    """UPDATE AttributeHierarchyStorage SET
+                        MaterializationType = 0,
+                        ColumnPositionToData = 0, ColumnDataToPosition = 1,
+                        DistinctDataCount = ?
+                       WHERE ID = ?""",
+                    (h_distinct, ahs_id),
+                )
+                # Update SegmentMapStorage if it exists
+                conn.execute(
+                    """UPDATE SegmentMapStorage SET
+                        RecordCount = ?, SegmentCount = ?, RecordsPerSegment = ?
+                       WHERE PartitionStorageID IN (
+                           SELECT ps.ID FROM PartitionStorage ps
+                           JOIN [Partition] p ON ps.PartitionID = p.ID
+                           WHERE p.TableID = ?
+                       )""",
+                    (h_record_count, h_seg_count, h_distinct, h_table_id),
+                )
 
 
 # ---------------------------------------------------------------------------
