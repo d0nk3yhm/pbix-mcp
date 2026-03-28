@@ -1961,6 +1961,132 @@ def pbix_get_table_data(alias: str, table_name: str, max_rows: int = 50) -> str:
         return ToolResponse.error(str(e), DataModelCompressionError.code).to_text()
 
 
+def _rebuild_datamodel_with_new_rows(
+    info: dict,
+    target_table: str,
+    new_columns: list[dict],
+    new_rows: list[dict],
+) -> tuple[int, int]:
+    """Rebuild the entire DataModel using the builder, substituting one table's rows.
+
+    Reads existing table definitions, measures, relationships, and row data from
+    the current DataModel. Replaces the target table's data with new_rows. Uses
+    the builder's full pipeline to generate a completely fresh DataModel.
+
+    Returns (old_dm_size, new_dm_size).
+    """
+    from pbix_mcp.builder import PBIXBuilder
+    from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+    from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+    from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
+
+    dm_path = os.path.join(info["work_dir"], "DataModel")
+    with open(dm_path, "rb") as f:
+        dm_bytes = f.read()
+
+    abf = decompress_datamodel(dm_bytes)
+    meta_bytes = read_metadata_sqlite(abf)
+
+    # Read structure from metadata
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.write(meta_bytes)
+    tmp.close()
+    try:
+        conn = sqlite3.connect(tmp.name)
+        conn.row_factory = sqlite3.Row
+
+        _AMO_TO_TYPE = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime",
+                        10: "Decimal", 11: "Boolean"}
+
+        # Get all user tables
+        tables = []
+        for trow in conn.execute(
+            "SELECT ID, Name FROM [Table] WHERE ModelID = 1 "
+            "AND Name NOT LIKE 'H$%' AND Name NOT LIKE 'R$%' ORDER BY ID"
+        ):
+            tid, tname = trow["ID"], trow["Name"]
+            cols = []
+            for crow in conn.execute(
+                "SELECT ExplicitName, ExplicitDataType FROM [Column] "
+                "WHERE TableID = ? AND Type = 1 ORDER BY ID", (tid,)
+            ):
+                dt = _AMO_TO_TYPE.get(crow["ExplicitDataType"], "String")
+                cols.append({"name": crow["ExplicitName"], "data_type": dt})
+            tables.append({"name": tname, "columns": cols})
+
+        # Get measures
+        measures = []
+        for mrow in conn.execute(
+            "SELECT t.Name as tbl, m.Name, m.Expression, m.FormatString "
+            "FROM Measure m JOIN [Table] t ON m.TableID = t.ID"
+        ):
+            measures.append({
+                "table": mrow["tbl"], "name": mrow["Name"],
+                "expression": mrow["Expression"],
+                "format_string": mrow["FormatString"] or "",
+            })
+
+        # Get relationships
+        rels = []
+        for rrow in conn.execute(
+            "SELECT ft.Name as ft, fc.ExplicitName as fc, "
+            "tt.Name as tt, tc.ExplicitName as tc "
+            "FROM Relationship r "
+            "JOIN [Table] ft ON r.FromTableID = ft.ID "
+            "JOIN [Column] fc ON r.FromColumnID = fc.ID "
+            "JOIN [Table] tt ON r.ToTableID = tt.ID "
+            "JOIN [Column] tc ON r.ToColumnID = tc.ID"
+        ):
+            rels.append({
+                "from_table": rrow["ft"], "from_column": rrow["fc"],
+                "to_table": rrow["tt"], "to_column": rrow["tc"],
+            })
+
+        conn.close()
+    finally:
+        os.unlink(tmp.name)
+
+    # Build new DataModel via builder
+    builder = PBIXBuilder()
+    for tinfo in tables:
+        tname = tinfo["name"]
+        if tname == target_table:
+            builder.add_table(tname, new_columns, rows=new_rows)
+        else:
+            # Read existing row data from VertiPaq
+            try:
+                td = read_table_from_abf(abf, tname, meta_bytes)
+                existing_rows = []
+                for row_vals in td.get("rows", []):
+                    existing_rows.append(dict(zip(td["columns"], row_vals)))
+                builder.add_table(tname, tinfo["columns"], rows=existing_rows)
+            except Exception:
+                # If we can't read data, add table with no rows
+                builder.add_table(tname, tinfo["columns"], rows=[])
+
+    for m in measures:
+        builder.add_measure(m["table"], m["name"], m["expression"], m["format_string"])
+
+    for r in rels:
+        builder.add_relationship(
+            r["from_table"], r["from_column"], r["to_table"], r["to_column"]
+        )
+
+    new_pbix = builder.build()
+
+    # Extract new DataModel from builder output
+    import io
+    import zipfile
+    new_z = zipfile.ZipFile(io.BytesIO(new_pbix))
+    new_dm = new_z.read("DataModel")
+
+    # Write new DataModel
+    with open(dm_path, "wb") as f:
+        f.write(new_dm)
+
+    return len(dm_bytes), len(new_dm)
+
+
 @mcp.tool()
 def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
     """Write/replace actual row data in a table in the DataModel (VertiPaq).
@@ -1993,66 +2119,24 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
         if not columns or not rows:
             return ToolResponse.error("'columns' and 'rows' are required and must not be empty.", ABFRebuildError.code).to_text()
 
-        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
-        from pbix_mcp.formats.datamodel_roundtrip import compress_datamodel, decompress_datamodel
-        from pbix_mcp.formats.vertipaq_encoder import update_table_in_abf
-
         dm_path = os.path.join(info["work_dir"], "DataModel")
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
 
-        with open(dm_path, "rb") as f:
-            dm_bytes = f.read()
-
-        abf = decompress_datamodel(dm_bytes)
-
-        # Get partition number from existing ABF file listing
-        from pbix_mcp.formats.abf_rebuild import list_abf_files
-        file_log = list_abf_files(abf)
-        partition_num = None
-        tbl_prefix = f"{table_name}.tbl"
-        for entry in file_log:
-            path = entry.get("Path", entry.get("StoragePath", ""))
-            if tbl_prefix in path:
-                # Extract partition number from path like "Table.tbl\26.prt\..."
-                parts = path.replace("\\", "/").split("/")
-                for p in parts:
-                    if p.endswith(".prt"):
-                        try:
-                            partition_num = int(p.replace(".prt", ""))
-                        except ValueError:
-                            pass
-                        break
-                if partition_num is not None:
-                    break
-
-        if partition_num is None:
-            partition_num = 1  # Default for new tables
-
-        # Read existing metadata SQLite
-        meta_bytes = read_metadata_sqlite(abf)
-
-        # Encode and update ABF
-        new_abf = update_table_in_abf(abf, table_name, columns, rows, meta_bytes)
-
-        # Recompress
-        new_dm = compress_datamodel(new_abf)
-
-        with open(dm_path, "wb") as f:
-            f.write(new_dm)
-
+        old_size, new_size = _rebuild_datamodel_with_new_rows(
+            info, table_name, columns, rows
+        )
         info["modified"] = True
         return ToolResponse.ok(
             f"Table '{table_name}' data written: {len(rows)} rows, {len(columns)} columns\n"
-            f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes\n"
-            f"  ABF: {len(abf):,} → {len(new_abf):,} bytes"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
         ).to_text()
     except json.JSONDecodeError as e:
         return ToolResponse.error(f"Invalid JSON: {e}", ABFRebuildError.code).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", ABFRebuildError.code).to_text()
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
 @mcp.tool()
@@ -2073,78 +2157,65 @@ def pbix_update_table_rows(alias: str, table_name: str, rows_json: str) -> str:
         if not rows:
             return ToolResponse.error("rows must not be empty.", ABFRebuildError.code).to_text()
 
-        import sqlite3
-
-        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
-        from pbix_mcp.formats.datamodel_roundtrip import compress_datamodel, decompress_datamodel
-        from pbix_mcp.formats.vertipaq_encoder import update_table_in_abf
-
         dm_path = os.path.join(info["work_dir"], "DataModel")
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
 
+        # Read column definitions from existing metadata
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
         with open(dm_path, "rb") as f:
             dm_bytes = f.read()
-
         abf = decompress_datamodel(dm_bytes)
         meta_bytes = read_metadata_sqlite(abf)
 
-        # Read column definitions from metadata
-        import tempfile
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         tmp.write(meta_bytes)
         tmp.close()
         try:
             conn = sqlite3.connect(tmp.name)
             conn.row_factory = sqlite3.Row
-            cursor = conn.execute(
-                """SELECT c.ExplicitName, c.ExplicitDataType, c.IsNullable
+            _AMO_TO_TYPE = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime",
+                            10: "Decimal", 11: "Boolean"}
+            col_rows = conn.execute(
+                """SELECT c.ExplicitName, c.ExplicitDataType
                    FROM [Column] c
                    JOIN [Table] t ON c.TableID = t.ID
                    WHERE t.Name = ? AND c.Type = 1
                    ORDER BY c.ID""",
                 (table_name,)
-            )
-            col_rows = cursor.fetchall()
+            ).fetchall()
             conn.close()
         finally:
             os.unlink(tmp.name)
 
         if not col_rows:
-            return ToolResponse.error(f"Table '{table_name}' not found or has no user columns.", PBIXMCPError.code).to_text()
+            return ToolResponse.error(
+                f"Table '{table_name}' not found or has no user columns.",
+                "TABLE_NOT_FOUND"
+            ).to_text()
 
-        # Map ExplicitDataType codes to type names
-        type_map = {2: "String", 6: "Int64", 8: "Float64", 9: "DateTime",
-                    10: "Decimal", 11: "Boolean", 17: "String"}
-        columns = []
-        for cr in col_rows:
-            dt = cr["ExplicitDataType"] or 2
-            columns.append({
-                "name": cr["ExplicitName"],
-                "data_type": type_map.get(dt, "String"),
-                "nullable": bool(cr["IsNullable"]) if cr["IsNullable"] is not None else True
-            })
+        columns = [{"name": cr["ExplicitName"],
+                     "data_type": _AMO_TO_TYPE.get(cr["ExplicitDataType"], "String")}
+                    for cr in col_rows]
 
-        # Encode and update
-        new_abf = update_table_in_abf(abf, table_name, columns, rows, meta_bytes)
-        new_dm = compress_datamodel(new_abf)
-
-        with open(dm_path, "wb") as f:
-            f.write(new_dm)
-
+        old_size, new_size = _rebuild_datamodel_with_new_rows(
+            info, table_name, columns, rows
+        )
         info["modified"] = True
         col_names = [c["name"] for c in columns]
         return ToolResponse.ok(
             f"Table '{table_name}' updated: {len(rows)} rows, {len(columns)} columns\n"
             f"  Columns: {', '.join(col_names)}\n"
-            f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
         ).to_text()
     except json.JSONDecodeError as e:
         return ToolResponse.error(f"Invalid JSON: {e}", ABFRebuildError.code).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", ABFRebuildError.code).to_text()
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
 @mcp.tool()

@@ -1310,7 +1310,7 @@ def update_table_in_abf(
     """
     from pbix_mcp.formats.abf_rebuild import (
         list_abf_files,
-        rebuild_abf_with_replacement,
+        read_abf_file,
     )
 
     # --- Get the file log to find existing ABF paths for this table ---
@@ -1515,17 +1515,32 @@ def update_table_in_abf(
                     elif path.endswith(".idf"):
                         replacements[sp] = h_files["idf"]
 
-    # Replace the metadata.sqlitedb
+    # --- Rebuild ABF from scratch using build_abf_clean ---
+    # rebuild_abf_with_replacement corrupts the ABF structure (wrong offsets).
+    # Instead: extract all VertiPaq files, apply replacements, rebuild cleanly.
+    from pbix_mcp.builder_v2 import build_abf_clean
+
+    # Build a map of Path -> bytes for all VertiPaq files (excluding metadata/db.xml)
+    vertipaq_files: dict[str, bytes] = {}
+    storage_to_path: dict[str, str] = {}
     for entry in file_log:
-        if "metadata.sqlitedb" in entry.get("Path", "").lower():
-            replacements[entry["StoragePath"]] = updated_sqlite
-            break
+        path = entry.get("Path", "")
+        sp = entry.get("StoragePath", "")
+        if not path or not sp:
+            continue
+        if "metadata.sqlitedb" in path.lower() or "db.xml" in path.lower() or "CryptKey" in path:
+            continue
+        storage_to_path[sp] = path
 
-    if not replacements:
-        raise ValueError(f"No ABF files matched for table '{table_name}' columns. "
-                        f"Filenames searched: {col_filenames}")
+    # Extract all files, applying replacements where we have new data
+    for sp, path in storage_to_path.items():
+        if sp in replacements:
+            vertipaq_files[path] = replacements[sp]
+        else:
+            entry = next(e for e in file_log if e.get("StoragePath") == sp)
+            vertipaq_files[path] = read_abf_file(abf_bytes, entry)
 
-    return rebuild_abf_with_replacement(abf_bytes, replacements)
+    return build_abf_clean(updated_sqlite, vertipaq_files)
 
 
 def _find_partition_num(file_log: list[dict], table_name: str) -> int:
