@@ -66,16 +66,26 @@ _last_mtimes = _snapshot()
 
 from pbix_mcp.server import mcp  # noqa: E402
 
-# Inject reload check into every tool
+# Inject reload check into every tool (sync tools stay sync)
+import asyncio
+import inspect
+
 for _tool in mcp._tool_manager._tools.values():
     _fn = _tool.fn
 
     def _wrap(fn):
-        @functools.wraps(fn)
-        async def wrapper(*args, **kwargs):
-            _check_reload()
-            return await fn(*args, **kwargs)
-        return wrapper
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def async_wrapper(*args, **kwargs):
+                _check_reload()
+                return await fn(*args, **kwargs)
+            return async_wrapper
+        else:
+            @functools.wraps(fn)
+            def sync_wrapper(*args, **kwargs):
+                _check_reload()
+                return fn(*args, **kwargs)
+            return sync_wrapper
 
     _tool.fn = _wrap(_fn)
 
