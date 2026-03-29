@@ -321,9 +321,12 @@ class _ABFStructure:
 # ---------------------------------------------------------------------------
 
 def _xml_to_utf16_bytes(root: ET.Element) -> bytes:
-    """Serialise an ElementTree root to UTF-16-LE bytes (no BOM, no XML decl)."""
+    """Serialise an ElementTree root to UTF-16 bytes (with BOM)."""
     # ET.tostring with encoding="unicode" gives us a str
     xml_str = ET.tostring(root, encoding="unicode", xml_declaration=False)
+    # Note: .encode("utf-16") includes a BOM. This works for builder-generated
+    # ABFs. For PBI Desktop files, use splice_metadata_in_abf instead of
+    # rebuild_abf_with_replacement to avoid XML re-serialization entirely.
     return xml_str.encode("utf-16")
 
 
@@ -572,11 +575,10 @@ def rebuild_abf_with_modified_sqlite(
         except OSError:
             pass
 
-    # For metadata-only changes, rebuild_abf_with_replacement works correctly
-    # because only metadata.sqlitedb changes (VertiPaq binary data stays the same).
-    return rebuild_abf_with_replacement(
-        abf_bytes, {"metadata.sqlitedb": new_sqlite_bytes}
-    )
+    # Use binary splice — preserves exact ABF structure (XML formatting,
+    # offsets, BackupLog). Works for both builder-generated and PBI Desktop files.
+    from pbix_mcp.formats.abf_splice import splice_metadata_in_abf
+    return splice_metadata_in_abf(abf_bytes, new_sqlite_bytes)
 
 
 # ---------------------------------------------------------------------------

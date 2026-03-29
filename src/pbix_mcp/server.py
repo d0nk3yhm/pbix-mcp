@@ -2864,12 +2864,12 @@ def pbix_datamodel_modify_metadata(alias: str, sql_statement: str) -> str:
             changes[0] = conn.total_changes
             conn.commit()
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_sql, info=info)
+        old_size, new_size = _modify_metadata_only(dm_path, _do_sql)
         info["modified"] = True
         return ToolResponse.ok(
             f"SQL executed successfully.\n"
             f"  Changes: {changes[0]}\n"
-            f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
         ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
@@ -2919,13 +2919,13 @@ def pbix_datamodel_modify_measure(
             c.execute(f"UPDATE Measure SET {', '.join(updates)} WHERE Name = ?", params)
             conn.commit()
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_modify, info=info)
+        old_size, new_size = _modify_metadata_only(dm_path, _do_modify)
         info["modified"] = True
         return ToolResponse.ok(
             f"Measure '{measure_name}' updated:\n"
             f"  Old: {old_info.get('expression', '?')}\n"
             f"  New: {new_expression}\n"
-            f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
         ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
@@ -2971,19 +2971,14 @@ def pbix_datamodel_add_measure(
             if c.fetchone():
                 raise ValueError(f"Measure '{measure_name}' already exists")
 
-            # Get next ID (must be globally unique — use max across ALL tables)
-            max_id = 0
-            for row in c.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall():
-                try:
-                    val = c.execute(
-                        f"SELECT MAX(ID) FROM [{row[0]}]"
-                    ).fetchone()[0]
-                    if val is not None and val > max_id:
-                        max_id = val
-                except Exception:
-                    pass
+            # Get next ID from MAXID (PBI's global ID counter).
+            # MAXID is always >= the highest ID across all tables.
+            # Using MAX(ID) per table misses IDs in system tables like
+            # AttributeHierarchyStorage, SegmentMapStorage, etc.
+            maxid_row = c.execute(
+                "SELECT Value FROM DBPROPERTIES WHERE Name = 'MAXID'"
+            ).fetchone()
+            max_id = int(maxid_row[0]) if maxid_row else 0
             new_id = max_id + 1
 
             # Use Windows FILETIME timestamp (matching builder format)
@@ -3010,12 +3005,12 @@ def pbix_datamodel_add_measure(
             )
             conn.commit()
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_add, info=info)
+        old_size, new_size = _modify_metadata_only(dm_path, _do_add)
         info["modified"] = True
         return ToolResponse.ok(
             f"Measure '{measure_name}' added to table '{table_name}':\n"
             f"  Expression: {expression}\n"
-            f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
         ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
@@ -3059,12 +3054,12 @@ def pbix_datamodel_remove_measure(alias: str, measure_name: str) -> str:
             c.execute("DELETE FROM Measure WHERE Name = ?", (measure_name,))
             conn.commit()
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_remove, info=info)
+        old_size, new_size = _modify_metadata_only(dm_path, _do_remove)
         info["modified"] = True
         return ToolResponse.ok(
             f"Measure '{measure_name}' removed from table '{old_info.get('table', '?')}':\n"
             f"  Old expression: {old_info.get('expression', '?')}\n"
-            f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
         ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
@@ -3309,14 +3304,14 @@ def pbix_datamodel_add_field_parameter(
 
             conn.commit()
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_add, info=info)
+        old_size, new_size = _modify_metadata_only(dm_path, _do_add)
         info["modified"] = True
 
         field_list = ", ".join(f["display"] for f in fields)
         return ToolResponse.ok(
             f"Field parameter '{parameter_name}' created with {len(fields)} fields: {field_list}\n"
             f"  DAX: {dax_expr}\n"
-            f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes\n"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes\n"
             f"Use as a slicer to let users switch between these fields in visuals."
         ).to_text()
     except PBIXMCPError as e:
@@ -3451,14 +3446,14 @@ def pbix_datamodel_add_calculation_group(
 
             conn.commit()
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_add, info=info)
+        old_size, new_size = _modify_metadata_only(dm_path, _do_add)
         info["modified"] = True
 
         item_list = ", ".join(item["name"] for item in items)
         return ToolResponse.ok(
             f"Calculation group '{group_name}' created with {len(items)} items: {item_list}\n"
             f"  Precedence: {precedence}\n"
-            f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes\n"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes\n"
             f"Add to a slicer — measures in visuals will be modified by the selected item."
         ).to_text()
     except PBIXMCPError as e:
@@ -3519,12 +3514,12 @@ def pbix_datamodel_modify_column(
             )
             conn.commit()
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_modify, info=info)
+        old_size, new_size = _modify_metadata_only(dm_path, _do_modify)
         info["modified"] = True
         return ToolResponse.ok(
             f"Column '{table_name}'.'{column_name}' updated:\n"
             f"  {property_name} = {new_value}\n"
-            f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
         ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
@@ -4603,7 +4598,7 @@ def pbix_set_rls_role(
                 )
             conn.commit()
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_set, info=info)
+        old_size, new_size = _modify_metadata_only(dm_path, _do_set)
         info["modified"] = True
         return ToolResponse.ok(f"RLS role '{role_name}' set on '{table_name}' with filter: {filter_expression}").to_text()
     except PBIXMCPError as e:
@@ -5544,7 +5539,7 @@ def pbix_set_incremental_refresh(
             policy_info["policy_id"] = policy_id
             policy_info["mode"] = mode
 
-        dm_bytes, new_dm, new_abf = _modify_metadata_sqlite(dm_path, _do_set, info=info)
+        old_size, new_size = _modify_metadata_only(dm_path, _do_set)
         info["modified"] = True
 
         detect_msg = f"\n  Change detection: {detect_changes_column}" if detect_changes_column else ""
@@ -5553,7 +5548,7 @@ def pbix_set_incremental_refresh(
             f"  Archive: {archive_periods} {archive_granularity}(s)\n"
             f"  Refresh: {refresh_periods} {refresh_granularity}(s)\n"
             f"  Mode: {mode}{detect_msg}\n"
-            f"  DataModel: {len(dm_bytes):,} → {len(new_dm):,} bytes\n\n"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes\n\n"
             f"The table's M expression must filter on RangeStart/RangeEnd parameters.\n"
             f"Power BI will automatically create date-based partitions on first refresh."
         ).to_text()
