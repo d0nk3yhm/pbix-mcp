@@ -3003,6 +3003,11 @@ def pbix_datamodel_add_measure(
                  expression, format_string or None,
                  filetime, filetime, lineage_tag)
             )
+            # Update MAXID so subsequent adds get a fresh ID
+            c.execute(
+                "UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'",
+                (str(new_id),)
+            )
             conn.commit()
 
         old_size, new_size = _modify_metadata_only(dm_path, _do_add)

@@ -1518,7 +1518,21 @@ def update_table_in_abf(
     # --- Rebuild ABF from scratch using build_abf_clean ---
     # rebuild_abf_with_replacement corrupts the ABF structure (wrong offsets).
     # Instead: extract all VertiPaq files, apply replacements, rebuild cleanly.
+    import re
+
     from pbix_mcp.builder_v2 import build_abf_clean
+
+    # Extract db_id from original ABF's db.xml to preserve database identity
+    db_id = None
+    for entry in file_log:
+        path = entry.get("Path", "")
+        if "db.xml" in path.lower():
+            db_xml = read_abf_file(abf_bytes, entry)
+            text = db_xml.decode("utf-8", errors="ignore")
+            m = re.search(r"<Name>([0-9a-fA-F-]{36})</Name>", text)
+            if m:
+                db_id = m.group(1)
+            break
 
     # Build a map of Path -> bytes for all VertiPaq files (excluding metadata/db.xml)
     vertipaq_files: dict[str, bytes] = {}
@@ -1540,7 +1554,7 @@ def update_table_in_abf(
             entry = next(e for e in file_log if e.get("StoragePath") == sp)
             vertipaq_files[path] = read_abf_file(abf_bytes, entry)
 
-    return build_abf_clean(updated_sqlite, vertipaq_files)
+    return build_abf_clean(updated_sqlite, vertipaq_files, db_id=db_id)
 
 
 def _find_partition_num(file_log: list[dict], table_name: str) -> int:
