@@ -35,7 +35,13 @@ def _snapshot() -> dict[str, float]:
 
 
 def _reload_all():
-    """Reload every loaded pbix_mcp module (deepest submodules first)."""
+    """Reload every loaded pbix_mcp module (deepest submodules first).
+
+    Preserves server state (_OPEN_FILES) across reloads.
+    """
+    import pbix_mcp.server as srv
+    saved_state = getattr(srv, '_OPEN_FILES', {})
+
     mods = sorted(
         [n for n, m in sys.modules.items()
          if n.startswith("pbix_mcp") and isinstance(m, types.ModuleType)],
@@ -46,6 +52,10 @@ def _reload_all():
             importlib.reload(sys.modules[name])
         except Exception as e:
             print(f"[pbix-mcp] reload {name}: {e}", file=sys.stderr, flush=True)
+
+    # Restore server state
+    import pbix_mcp.server as srv_new
+    srv_new._OPEN_FILES = saved_state
 
 
 def _check_reload():

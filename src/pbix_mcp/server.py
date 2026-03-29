@@ -335,6 +335,570 @@ def _set_value_by_dot_path(obj: Any, path: str, value: Any) -> None:
         raise ValueError(f"Cannot set key '{final_key}' on {type(obj)}")
 
 
+# ---- Visual formatting helpers ----
+
+_DISPLAY_UNITS = {
+    "none": "1D", "thousands": "1000D", "millions": "1000000D",
+    "billions": "1000000000D", "trillions": "1000000000000D", "auto": "0D",
+}
+_LEGEND_POSITIONS = {
+    "top": "'Top'", "bottom": "'Bottom'", "left": "'Left'",
+    "right": "'Right'", "topCenter": "'TopCenter'",
+    "bottomCenter": "'BottomCenter'", "leftCenter": "'LeftCenter'",
+    "rightCenter": "'RightCenter'",
+}
+_ALIGNMENTS = {"left": "'Left'", "center": "'Center'", "right": "'Right'"}
+
+
+def _pbi_lit(value) -> dict:
+    """Convert a Python value to PBI Literal expression wrapper."""
+    if isinstance(value, bool):
+        raw = "true" if value else "false"
+    elif isinstance(value, int):
+        raw = f"{value}L"
+    elif isinstance(value, float):
+        raw = f"{value}D"
+    elif isinstance(value, str):
+        raw = f"'{value}'"
+    else:
+        raw = str(value)
+    return {"expr": {"Literal": {"Value": raw}}}
+
+
+def _pbi_props(mapping: dict, src: dict) -> dict:
+    """Build PBI properties dict from a key mapping and source values.
+
+    mapping: {pbi_property_name: (src_key, transform_fn_or_None)}
+    src: the user-provided dict for this formatting category
+    """
+    props = {}
+    for pbi_key, (src_key, transform) in mapping.items():
+        if src_key in src:
+            val = src[src_key]
+            if transform:
+                val = transform(val)
+            props[pbi_key] = _pbi_lit(val)
+    return props
+
+
+def _solid_color(hex_color: str) -> dict:
+    """Wrap a hex color in PBI's solid.color structure."""
+    return {"solid": {"color": _pbi_lit(hex_color)}}
+
+
+def _build_format_objects(fmt: dict) -> dict:
+    """Convert human-readable format dict to PBI objects structures.
+
+    Returns dict with two keys:
+      - "_objects": data formatting (labels, legend, axis, dataPoint, grid, etc.)
+      - "_vcObjects": visual container formatting (title, subtitle, background,
+        border, dropShadow, padding, spacing, visualHeader, divider, etc.)
+
+    All property names and value formats match PBI Desktop March 2026 ground truth.
+    Colors use {"solid": {"color": {"expr": {"Literal": {"Value": "'#hex'"}}}}}
+    """
+    objects: dict[str, list] = {}
+    vc_objects: dict[str, list] = {}
+
+    def _add(category: str, props: dict):
+        if props:
+            objects[category] = [{"properties": props}]
+
+    def _add_vc(category: str, props: dict):
+        if props:
+            vc_objects[category] = [{"properties": props}]
+
+    # ================================================================
+    # vcObjects — visual container formatting
+    # ================================================================
+
+    # --- title ---
+    if "title" in fmt:
+        t = fmt["title"]
+        props = {}
+        if "show" in t: props["show"] = _pbi_lit(t["show"])
+        if "text" in t: props["text"] = _pbi_lit(t["text"])
+        if "fontSize" in t: props["fontSize"] = _pbi_lit(float(t["fontSize"]))
+        if "color" in t: props["fontColor"] = _solid_color(t["color"])
+        if "fontFamily" in t: props["fontFamily"] = _pbi_lit(t["fontFamily"])
+        if "bold" in t: props["bold"] = _pbi_lit(t["bold"])
+        if "italic" in t: props["italic"] = _pbi_lit(t["italic"])
+        if "alignment" in t:
+            raw = _ALIGNMENTS.get(t["alignment"], f"'{t['alignment']}'")
+            props["alignment"] = {"expr": {"Literal": {"Value": raw}}}
+        if "heading" in t: props["heading"] = _pbi_lit(t["heading"])
+        if "titleWrap" in t: props["titleWrap"] = _pbi_lit(t["titleWrap"])
+        if "background" in t: props["background"] = _solid_color(t["background"])
+        _add_vc("title", props)
+
+    # --- subtitle ---
+    if "subtitle" in fmt:
+        s = fmt["subtitle"]
+        props = {}
+        if "show" in s: props["show"] = _pbi_lit(s["show"])
+        if "text" in s: props["text"] = _pbi_lit(s["text"])
+        if "fontSize" in s: props["fontSize"] = _pbi_lit(float(s["fontSize"]))
+        if "color" in s: props["fontColor"] = _solid_color(s["color"])
+        if "fontFamily" in s: props["fontFamily"] = _pbi_lit(s["fontFamily"])
+        if "titleWrap" in s: props["titleWrap"] = _pbi_lit(s["titleWrap"])
+        _add_vc("subTitle", props)
+
+    # --- background ---
+    if "background" in fmt:
+        bg = fmt["background"]
+        props = {}
+        if "color" in bg: props["color"] = _solid_color(bg["color"])
+        if "transparency" in bg: props["transparency"] = _pbi_lit(float(bg["transparency"]))
+        if "show" in bg: props["show"] = _pbi_lit(bg["show"])
+        else: props["show"] = _pbi_lit(True)
+        _add_vc("background", props)
+
+    # --- border ---
+    if "border" in fmt:
+        bd = fmt["border"]
+        props = {}
+        if "show" in bd: props["show"] = _pbi_lit(bd["show"])
+        if "color" in bd: props["color"] = _solid_color(bd["color"])
+        if "radius" in bd: props["radius"] = _pbi_lit(float(bd["radius"]))
+        if "width" in bd: props["width"] = _pbi_lit(float(bd["width"]))
+        _add_vc("border", props)
+
+    # --- dropShadow ---
+    if "dropShadow" in fmt:
+        ds = fmt["dropShadow"]
+        props = {}
+        if "show" in ds: props["show"] = _pbi_lit(ds["show"])
+        if "color" in ds: props["color"] = _solid_color(ds["color"])
+        if "position" in ds: props["position"] = _pbi_lit(ds["position"])
+        if "preset" in ds: props["preset"] = _pbi_lit(ds["preset"])
+        if "angle" in ds: props["angle"] = _pbi_lit(float(ds["angle"]))
+        if "blur" in ds: props["shadowBlur"] = _pbi_lit(float(ds["blur"]))
+        if "distance" in ds: props["shadowDistance"] = _pbi_lit(float(ds["distance"]))
+        if "spread" in ds: props["shadowSpread"] = _pbi_lit(float(ds["spread"]))
+        if "transparency" in ds: props["transparency"] = _pbi_lit(float(ds["transparency"]))
+        _add_vc("dropShadow", props)
+
+    # --- padding ---
+    if "padding" in fmt:
+        pd = fmt["padding"]
+        props = {}
+        if isinstance(pd, (int, float)):
+            for side in ("top", "bottom", "left", "right"):
+                props[side] = _pbi_lit(int(pd))
+        else:
+            if "top" in pd: props["top"] = _pbi_lit(int(pd["top"]))
+            if "bottom" in pd: props["bottom"] = _pbi_lit(int(pd["bottom"]))
+            if "left" in pd: props["left"] = _pbi_lit(int(pd["left"]))
+            if "right" in pd: props["right"] = _pbi_lit(int(pd["right"]))
+        _add_vc("padding", props)
+
+    # --- spacing ---
+    if "spacing" in fmt:
+        sp = fmt["spacing"]
+        props = {}
+        props["customizeSpacing"] = _pbi_lit(True)
+        if "belowTitle" in sp: props["spaceBelowTitle"] = _pbi_lit(int(sp["belowTitle"]))
+        if "belowSubTitle" in sp: props["spaceBelowSubTitle"] = _pbi_lit(int(sp["belowSubTitle"]))
+        if "belowTitleArea" in sp: props["spaceBelowTitleArea"] = _pbi_lit(int(sp["belowTitleArea"]))
+        if "vertical" in sp: props["verticalSpacing"] = _pbi_lit(int(sp["vertical"]))
+        _add_vc("spacing", props)
+
+    # --- divider ---
+    if "divider" in fmt:
+        dv = fmt["divider"]
+        props = {}
+        if "show" in dv: props["show"] = _pbi_lit(dv["show"])
+        if "color" in dv: props["color"] = _solid_color(dv["color"])
+        if "width" in dv: props["width"] = _pbi_lit(float(dv["width"]))
+        if "style" in dv: props["style"] = _pbi_lit(dv["style"])
+        if "ignorePadding" in dv: props["ignorePadding"] = _pbi_lit(dv["ignorePadding"])
+        _add_vc("divider", props)
+
+    # --- visualHeader ---
+    if "visualHeader" in fmt:
+        vh = fmt["visualHeader"]
+        props = {}
+        if "show" in vh: props["show"] = _pbi_lit(vh["show"])
+        for btn in ("showOptionsMenu", "showFocusModeButton", "showPinButton",
+                     "showFilterRestatementButton", "showTooltipButton",
+                     "showDrillUpButton", "showDrillDownLevelButton",
+                     "showDrillDownExpandButton", "showDrillToggleButton",
+                     "showDrillRoleSelector", "showVisualErrorButton",
+                     "showVisualWarningButton", "showVisualInformationButton",
+                     "showSeeDataLayoutToggleButton"):
+            if btn in vh: props[btn] = _pbi_lit(vh[btn])
+        _add_vc("visualHeader", props)
+
+    # --- visualTooltip ---
+    if "visualTooltip" in fmt:
+        vt = fmt["visualTooltip"]
+        props = {}
+        if "show" in vt: props["show"] = _pbi_lit(vt["show"])
+        if "type" in vt: props["type"] = _pbi_lit(vt["type"])
+        if "fontSize" in vt: props["fontSize"] = _pbi_lit(float(vt["fontSize"]))
+        if "titleFontColor" in vt: props["titleFontColor"] = _solid_color(vt["titleFontColor"])
+        if "valueFontColor" in vt: props["valueFontColor"] = _solid_color(vt["valueFontColor"])
+        if "actionFontColor" in vt: props["actionFontColor"] = _solid_color(vt["actionFontColor"])
+        if "background" in vt: props["background"] = _solid_color(vt["background"])
+        _add_vc("visualTooltip", props)
+
+    # --- stylePreset ---
+    if "stylePreset" in fmt:
+        _add_vc("stylePreset", {"name": _pbi_lit(fmt["stylePreset"])})
+
+    # --- general (vcObjects) ---
+    if "altText" in fmt:
+        _add_vc("general", {"altText": _pbi_lit(fmt["altText"])})
+
+    # --- lockAspect ---
+    if "lockAspect" in fmt:
+        _add_vc("lockAspect", {"show": _pbi_lit(fmt["lockAspect"])})
+
+    # ================================================================
+    # objects — data formatting
+    # ================================================================
+
+    # --- legend ---
+    if "legend" in fmt:
+        lg = fmt["legend"]
+        props = {}
+        if "show" in lg: props["show"] = _pbi_lit(lg["show"])
+        if "fontSize" in lg: props["fontSize"] = _pbi_lit(float(lg["fontSize"]))
+        if "color" in lg: props["fontColor"] = _solid_color(lg["color"])
+        if "fontFamily" in lg: props["fontFamily"] = _pbi_lit(lg["fontFamily"])
+        if "position" in lg:
+            raw = _LEGEND_POSITIONS.get(lg["position"], f"'{lg['position']}'")
+            props["position"] = {"expr": {"Literal": {"Value": raw}}}
+        _add("legend", props)
+
+    # --- dataLabels (labels) ---
+    if "dataLabels" in fmt:
+        dl = fmt["dataLabels"]
+        props = {}
+        if "show" in dl: props["show"] = _pbi_lit(dl["show"])
+        if "fontSize" in dl: props["fontSize"] = _pbi_lit(float(dl["fontSize"]))
+        if "color" in dl: props["color"] = _solid_color(dl["color"])
+        if "fontFamily" in dl: props["fontFamily"] = _pbi_lit(dl["fontFamily"])
+        if "displayUnits" in dl:
+            raw = _DISPLAY_UNITS.get(dl["displayUnits"], f"{dl['displayUnits']}D")
+            props["labelDisplayUnits"] = {"expr": {"Literal": {"Value": raw}}}
+        if "decimalPlaces" in dl: props["labelPrecision"] = _pbi_lit(int(dl["decimalPlaces"]))
+        _add("labels", props)
+
+    # --- categoryAxis ---
+    if "categoryAxis" in fmt:
+        ca = fmt["categoryAxis"]
+        props = {}
+        if "show" in ca: props["show"] = _pbi_lit(ca["show"])
+        if "fontSize" in ca: props["fontSize"] = _pbi_lit(float(ca["fontSize"]))
+        if "color" in ca: props["labelColor"] = _solid_color(ca["color"])
+        if "fontFamily" in ca: props["fontFamily"] = _pbi_lit(ca["fontFamily"])
+        if "title" in ca:
+            props["showAxisTitle"] = _pbi_lit(True)
+            props["axisTitle"] = _pbi_lit(ca["title"])
+        if "titleFontSize" in ca: props["titleFontSize"] = _pbi_lit(float(ca["titleFontSize"]))
+        if "gridlineShow" in ca: props["gridlineShow"] = _pbi_lit(ca["gridlineShow"])
+        if "innerPadding" in ca: props["innerPadding"] = _pbi_lit(int(ca["innerPadding"]))
+        if "invertAxis" in ca: props["invertAxis"] = _pbi_lit(ca["invertAxis"])
+        if "concatenateLabels" in ca: props["concatenateLabels"] = _pbi_lit(ca["concatenateLabels"])
+        if "axisType" in ca: props["axisType"] = _pbi_lit(ca["axisType"])
+        if "start" in ca: props["start"] = _pbi_lit(float(ca["start"]))
+        if "end" in ca: props["end"] = _pbi_lit(float(ca["end"]))
+        if "switchAxisPosition" in ca: props["switchAxisPosition"] = _pbi_lit(ca["switchAxisPosition"])
+        if "preferredCategoryWidth" in ca: props["preferredCategoryWidth"] = _pbi_lit(float(ca["preferredCategoryWidth"]))
+        _add("categoryAxis", props)
+
+    # --- valueAxis ---
+    if "valueAxis" in fmt:
+        va = fmt["valueAxis"]
+        props = {}
+        if "show" in va: props["show"] = _pbi_lit(va["show"])
+        if "fontSize" in va: props["fontSize"] = _pbi_lit(float(va["fontSize"]))
+        if "color" in va: props["labelColor"] = _solid_color(va["color"])
+        if "fontFamily" in va: props["fontFamily"] = _pbi_lit(va["fontFamily"])
+        if "displayUnits" in va:
+            raw = _DISPLAY_UNITS.get(va["displayUnits"], f"{va['displayUnits']}D")
+            props["labelDisplayUnits"] = {"expr": {"Literal": {"Value": raw}}}
+        if "title" in va:
+            props["showAxisTitle"] = _pbi_lit(True)
+            props["axisTitle"] = _pbi_lit(va["title"])
+        if "titleFontSize" in va: props["titleFontSize"] = _pbi_lit(float(va["titleFontSize"]))
+        if "gridlineShow" in va: props["gridlineShow"] = _pbi_lit(va["gridlineShow"])
+        if "start" in va: props["start"] = _pbi_lit(float(va["start"]))
+        if "end" in va: props["end"] = _pbi_lit(float(va["end"]))
+        if "switchAxisPosition" in va: props["switchAxisPosition"] = _pbi_lit(va["switchAxisPosition"])
+        if "decimalPlaces" in va: props["labelPrecision"] = _pbi_lit(int(va["decimalPlaces"]))
+        _add("valueAxis", props)
+
+    # --- dataColors (dataPoint) ---
+    if "dataColors" in fmt:
+        colors = fmt["dataColors"]
+        if isinstance(colors, list) and colors:
+            props = {"fill": _solid_color(colors[0])}
+            _add("dataPoint", props)
+
+    # --- grid (table/matrix) ---
+    if "grid" in fmt:
+        gr = fmt["grid"]
+        props = {}
+        if "gridVertical" in gr: props["gridVertical"] = _pbi_lit(gr["gridVertical"])
+        if "gridHorizontal" in gr: props["gridHorizontal"] = _pbi_lit(gr["gridHorizontal"])
+        if "rowPadding" in gr: props["rowPadding"] = _pbi_lit(int(gr["rowPadding"]))
+        if "outlineColor" in gr: props["outlineColor"] = _solid_color(gr["outlineColor"])
+        if "outlineWeight" in gr: props["outlineWeight"] = _pbi_lit(int(gr["outlineWeight"]))
+        if "textSize" in gr: props["textSize"] = _pbi_lit(float(gr["textSize"]))
+        _add("grid", props)
+
+    # --- columnHeaders (table/matrix) ---
+    if "columnHeaders" in fmt:
+        ch = fmt["columnHeaders"]
+        props = {}
+        if "bold" in ch: props["bold"] = _pbi_lit(ch["bold"])
+        if "fontSize" in ch: props["fontSize"] = _pbi_lit(float(ch["fontSize"]))
+        if "fontFamily" in ch: props["fontFamily"] = _pbi_lit(ch["fontFamily"])
+        if "fontColor" in ch: props["fontColor"] = _solid_color(ch["fontColor"])
+        if "backColor" in ch: props["backColor"] = _solid_color(ch["backColor"])
+        if "alignment" in ch: props["alignment"] = _pbi_lit(ch["alignment"])
+        if "autoSizeColumnWidth" in ch: props["autoSizeColumnWidth"] = _pbi_lit(ch["autoSizeColumnWidth"])
+        if "wordWrap" in ch: props["wordWrap"] = _pbi_lit(ch["wordWrap"])
+        _add("columnHeaders", props)
+
+    # --- values (table rows) ---
+    if "values" in fmt:
+        vl = fmt["values"]
+        props = {}
+        if "bold" in vl: props["bold"] = _pbi_lit(vl["bold"])
+        if "fontSize" in vl: props["fontSize"] = _pbi_lit(float(vl["fontSize"]))
+        if "fontFamily" in vl: props["fontFamily"] = _pbi_lit(vl["fontFamily"])
+        if "fontColor" in vl: props["fontColor"] = _solid_color(vl["fontColor"])
+        if "backColor" in vl: props["backColor"] = _solid_color(vl["backColor"])
+        if "wordWrap" in vl: props["wordWrap"] = _pbi_lit(vl["wordWrap"])
+        _add("values", props)
+
+    # --- total (table/matrix totals row) ---
+    if "total" in fmt:
+        tt = fmt["total"]
+        props = {}
+        if "show" in tt: props["show"] = _pbi_lit(tt["show"])
+        if "bold" in tt: props["bold"] = _pbi_lit(tt["bold"])
+        if "fontSize" in tt: props["fontSize"] = _pbi_lit(float(tt["fontSize"]))
+        if "fontColor" in tt: props["fontColor"] = _solid_color(tt["fontColor"])
+        if "backColor" in tt: props["backColor"] = _solid_color(tt["backColor"])
+        _add("total", props)
+
+    # --- outline ---
+    if "outline" in fmt:
+        ol = fmt["outline"]
+        props = {}
+        if "show" in ol: props["show"] = _pbi_lit(ol["show"])
+        if "weight" in ol: props["weight"] = _pbi_lit(int(ol["weight"]))
+        if "color" in ol: props["color"] = _solid_color(ol["color"])
+        _add("outline", props)
+
+    # --- shape (buttons, shapes) ---
+    if "shape" in fmt:
+        sh = fmt["shape"]
+        props = {}
+        if "map" in sh: props["map"] = _pbi_lit(sh["map"])
+        if "rotation" in sh: props["rotation"] = _pbi_lit(int(sh["rotation"]))
+        _add("shape", props)
+
+    # --- fill (shape fill) ---
+    if "fill" in fmt:
+        fl = fmt["fill"]
+        props = {}
+        if "color" in fl: props["fillColor"] = _solid_color(fl["color"])
+        if "transparency" in fl: props["transparency"] = _pbi_lit(float(fl["transparency"]))
+        if "show" in fl: props["show"] = _pbi_lit(fl["show"])
+        _add("fill", props)
+
+    # --- line (line charts) ---
+    if "line" in fmt:
+        ln = fmt["line"]
+        props = {}
+        if "lineStyle" in ln: props["lineStyle"] = _pbi_lit(ln["lineStyle"])
+        if "strokeWidth" in ln: props["strokeWidth"] = _pbi_lit(float(ln["strokeWidth"]))
+        if "joinType" in ln: props["joinType"] = _pbi_lit(int(ln["joinType"]))
+        if "showMarker" in ln: props["showMarker"] = _pbi_lit(ln["showMarker"])
+        if "markerShape" in ln: props["markerShape"] = _pbi_lit(ln["markerShape"])
+        if "markerSize" in ln: props["markerSize"] = _pbi_lit(int(ln["markerSize"]))
+        _add("lineStyles", props)
+
+    # --- categoryLabels (pie/donut) ---
+    if "categoryLabels" in fmt:
+        cl = fmt["categoryLabels"]
+        props = {}
+        if "show" in cl: props["show"] = _pbi_lit(cl["show"])
+        if "fontSize" in cl: props["fontSize"] = _pbi_lit(float(cl["fontSize"]))
+        if "color" in cl: props["categoryLabelFontColor"] = _solid_color(cl["color"])
+        if "fontFamily" in cl: props["fontFamily"] = _pbi_lit(cl["fontFamily"])
+        _add("categoryLabels", props)
+
+    # --- slices (pie/donut) ---
+    if "slices" in fmt:
+        sl = fmt["slices"]
+        props = {}
+        if "innerRadius" in sl: props["innerRadiusRatio"] = _pbi_lit(int(sl["innerRadius"]))
+        _add("slices", props)
+
+    # --- general (objects — action buttons) ---
+    if "action" in fmt:
+        ac = fmt["action"]
+        props = {}
+        if "type" in ac: props["type"] = _pbi_lit(ac["type"])
+        if "navigationSection" in ac: props["navigationSection"] = _pbi_lit(ac["navigationSection"])
+        if "bookmark" in ac: props["bookmark"] = _pbi_lit(ac["bookmark"])
+        _add("visualLink", props)
+
+    # --- smallMultiples ---
+    if "smallMultiples" in fmt:
+        sm = fmt["smallMultiples"]
+        props = {}
+        if "minWidth" in sm: props["minWidth"] = _pbi_lit(int(sm["minWidth"]))
+        if "maxWidth" in sm: props["maxWidth"] = _pbi_lit(int(sm["maxWidth"]))
+        if "minHeight" in sm: props["minHeight"] = _pbi_lit(int(sm["minHeight"]))
+        _add("smallMultiplesLayout", props)
+
+    # --- rowHeaders (matrix) ---
+    if "rowHeaders" in fmt:
+        rh = fmt["rowHeaders"]
+        props = {}
+        if "bold" in rh: props["bold"] = _pbi_lit(rh["bold"])
+        if "fontSize" in rh: props["fontSize"] = _pbi_lit(float(rh["fontSize"]))
+        if "fontFamily" in rh: props["fontFamily"] = _pbi_lit(rh["fontFamily"])
+        if "fontColor" in rh: props["fontColor"] = _solid_color(rh["fontColor"])
+        if "alignment" in rh: props["alignment"] = _pbi_lit(rh["alignment"])
+        _add("rowHeaders", props)
+
+    # --- subTotals (matrix) ---
+    if "subTotals" in fmt:
+        st = fmt["subTotals"]
+        props = {}
+        if "bold" in st: props["bold"] = _pbi_lit(st["bold"])
+        if "fontSize" in st: props["fontSize"] = _pbi_lit(float(st["fontSize"]))
+        if "fontColor" in st: props["fontColor"] = _solid_color(st["fontColor"])
+        if "backColor" in st: props["backColor"] = _solid_color(st["backColor"])
+        if "columnSubtotals" in st: props["columnSubtotals"] = _pbi_lit(st["columnSubtotals"])
+        if "rowSubtotals" in st: props["rowSubtotals"] = _pbi_lit(st["rowSubtotals"])
+        _add("subTotals", props)
+
+    # --- referenceLine ---
+    if "referenceLine" in fmt:
+        rl = fmt["referenceLine"]
+        props = {}
+        if "show" in rl: props["show"] = _pbi_lit(rl["show"])
+        if "displayName" in rl: props["displayName"] = _pbi_lit(rl["displayName"])
+        if "color" in rl: props["lineColor"] = _solid_color(rl["color"])
+        if "style" in rl: props["style"] = _pbi_lit(rl["style"])
+        if "width" in rl: props["width"] = _pbi_lit(float(rl["width"]))
+        if "transparency" in rl: props["transparency"] = _pbi_lit(float(rl["transparency"]))
+        if "position" in rl: props["position"] = _pbi_lit(rl["position"])
+        _add("y1AxisReferenceLine", props)
+
+    # --- donut ---
+    if "donut" in fmt:
+        dn = fmt["donut"]
+        props = {}
+        if "innerRadius" in dn: props["innerRadius"] = _pbi_lit(int(dn["innerRadius"]))
+        if "radius" in dn: props["radius"] = _pbi_lit(int(dn["radius"]))
+        if "maxSlices" in dn: props["maxSlicesVisible"] = _pbi_lit(int(dn["maxSlices"]))
+        _add("donut", props)
+
+    # --- bubbles (scatter chart) ---
+    if "bubbles" in fmt:
+        bb = fmt["bubbles"]
+        props = {}
+        if "size" in bb: props["bubbleSize"] = _pbi_lit(int(bb["size"]))
+        if "shape" in bb: props["markerShape"] = _pbi_lit(bb["shape"])
+        if "rangeType" in bb: props["markerRangeType"] = _pbi_lit(bb["rangeType"])
+        _add("bubbles", props)
+
+    # --- markers (scatter/line) ---
+    if "markers" in fmt:
+        mk = fmt["markers"]
+        props = {}
+        if "borderWidth" in mk: props["borderWidth"] = _pbi_lit(float(mk["borderWidth"]))
+        if "transparency" in mk: props["transparency"] = _pbi_lit(float(mk["transparency"]))
+        _add("markers", props)
+
+    # --- imageScaling ---
+    if "imageScaling" in fmt:
+        props = {"imageScalingType": _pbi_lit(fmt["imageScaling"])}
+        _add("imageScaling", props)
+
+    # --- card (new card visual styling) ---
+    if "card" in fmt and isinstance(fmt["card"], dict):
+        cd = fmt["card"]
+        props = {}
+        if "barShow" in cd: props["barShow"] = _pbi_lit(cd["barShow"])
+        if "barColor" in cd: props["barColor"] = _solid_color(cd["barColor"])
+        if "barWeight" in cd: props["barWeight"] = _pbi_lit(float(cd["barWeight"]))
+        if "cardPadding" in cd: props["cardPadding"] = _pbi_lit(float(cd["cardPadding"]))
+        if "outlineStyle" in cd: props["outlineStyle"] = _pbi_lit(float(cd["outlineStyle"]))
+        _add("card", props)
+
+    # --- cardTitle ---
+    if "cardTitle" in fmt:
+        ct = fmt["cardTitle"]
+        props = {}
+        if "color" in ct: props["color"] = _solid_color(ct["color"])
+        if "fontSize" in ct: props["fontSize"] = _pbi_lit(float(ct["fontSize"]))
+        _add("cardTitle", props)
+
+    # --- columnFormatting (table/matrix) ---
+    if "columnFormatting" in fmt:
+        cf = fmt["columnFormatting"]
+        props = {}
+        if "alignment" in cf: props["alignment"] = _pbi_lit(cf["alignment"])
+        if "displayUnits" in cf:
+            raw = _DISPLAY_UNITS.get(cf["displayUnits"], f"{cf['displayUnits']}D")
+            props["labelDisplayUnits"] = {"expr": {"Literal": {"Value": raw}}}
+        if "decimalPlaces" in cf: props["labelPrecision"] = _pbi_lit(int(cf["decimalPlaces"]))
+        if "styleHeader" in cf: props["styleHeader"] = _pbi_lit(cf["styleHeader"])
+        if "styleTotal" in cf: props["styleTotal"] = _pbi_lit(cf["styleTotal"])
+        _add("columnFormatting", props)
+
+    # --- zoom (scatter chart zoom slider) ---
+    if "zoom" in fmt:
+        _add("zoom", {"show": _pbi_lit(fmt["zoom"])})
+
+    # --- general.objects (image URL, layout, orientation) ---
+    if "general" in fmt and isinstance(fmt["general"], dict):
+        gn = fmt["general"]
+        props = {}
+        if "layout" in gn: props["layout"] = _pbi_lit(gn["layout"])
+        if "orientation" in gn: props["orientation"] = _pbi_lit(float(gn["orientation"]))
+        _add("general", props)
+
+    # --- visualLink (vcObjects — action buttons navigation) ---
+    if "visualLink" in fmt:
+        vl = fmt["visualLink"]
+        props = {}
+        if "show" in vl: props["show"] = _pbi_lit(vl["show"])
+        if "type" in vl: props["type"] = _pbi_lit(vl["type"])
+        if "tooltip" in vl: props["tooltip"] = _pbi_lit(vl["tooltip"])
+        if "showDefaultTooltip" in vl: props["showDefaultTooltip"] = _pbi_lit(vl["showDefaultTooltip"])
+        if "navigationSection" in vl: props["navigationSection"] = _pbi_lit(vl["navigationSection"])
+        if "bookmark" in vl: props["bookmark"] = _pbi_lit(vl["bookmark"])
+        _add_vc("visualLink", props)
+
+    # --- visualHeaderTooltip (vcObjects) ---
+    if "visualHeaderTooltip" in fmt:
+        vht = fmt["visualHeaderTooltip"]
+        props = {}
+        if "text" in vht: props["text"] = _pbi_lit(vht["text"])
+        if "type" in vht: props["type"] = _pbi_lit(vht["type"])
+        if "bold" in vht: props["bold"] = _pbi_lit(vht["bold"])
+        if "fontSize" in vht: props["fontSize"] = _pbi_lit(float(vht["fontSize"]))
+        if "fontFamily" in vht: props["fontFamily"] = _pbi_lit(vht["fontFamily"])
+        if "transparency" in vht: props["transparency"] = _pbi_lit(float(vht["transparency"]))
+        if "background" in vht: props["themedBackground"] = _solid_color(vht["background"])
+        if "titleFontColor" in vht: props["themedTitleFontColor"] = _solid_color(vht["titleFontColor"])
+        _add_vc("visualHeaderTooltip", props)
+
+    return {"_objects": objects, "_vcObjects": vc_objects}
+
+
 # ============================= MCP TOOLS ===================================
 
 # ---- Section 3: File Management ----
@@ -965,6 +1529,111 @@ def pbix_add_visual(
         page_name = page.get("displayName", f"Page {page_index}")
         return ToolResponse.ok(f"Added {visual_type} visual at ({x},{y}) {width}x{height} on '{page_name}' (index {idx})").to_text()
 
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
+
+
+@mcp.tool()
+def pbix_format_visual(
+    alias: str, page_index: int, visual_index: int, format_json: str
+) -> str:
+    """Format a visual with human-readable properties (colors, titles, fonts).
+
+    Converts simple formatting options to PBI's internal objects structure.
+    Merges with existing formatting — only specified properties are changed.
+
+    Args:
+        alias: The alias of the open file
+        page_index: Zero-based page index
+        visual_index: Zero-based visual index on the page
+        format_json: JSON object with formatting options. Supported keys:
+
+            title: {text, show, fontSize, color, fontFamily, bold, italic, alignment}
+            subtitle: {text, show, fontSize, color, fontFamily}
+            dataLabels: {show, fontSize, color, displayUnits, decimalPlaces}
+            legend: {show, position, fontSize, color}
+                position: "top", "bottom", "left", "right", "topCenter"
+            categoryAxis: {show, fontSize, color, title, gridlineShow, innerPadding,
+                invertAxis, axisType, start, end, switchAxisPosition}
+            valueAxis: {show, fontSize, displayUnits, title, gridlineShow, start, end,
+                decimalPlaces, switchAxisPosition}
+                displayUnits: "none", "thousands", "millions", "billions", "auto"
+            background: {color, transparency}
+            border: {show, color, radius, width}
+            dropShadow: {show, color, angle, blur, distance, spread, transparency,
+                position, preset}
+            padding: number | {top, bottom, left, right}
+            spacing: {belowTitle, belowSubTitle, belowTitleArea, vertical}
+            divider: {show, color, width, style, ignorePadding}
+            visualHeader: {show, showOptionsMenu, showFocusModeButton, showPinButton,
+                showFilterRestatementButton, showTooltipButton, showDrillUpButton, ...}
+            visualTooltip: {show, type, fontSize, titleFontColor, valueFontColor,
+                actionFontColor, background}
+            dataColors: ["#hex1", "#hex2", ...]
+            grid: {gridVertical, gridHorizontal, rowPadding, outlineColor, outlineWeight}
+            columnHeaders: {bold, fontSize, fontFamily, fontColor, backColor, alignment}
+            values: {bold, fontSize, fontFamily, fontColor, backColor, wordWrap}
+            total: {show, bold, fontSize, fontColor, backColor}
+            outline: {show, weight, color}
+            fill: {color, transparency, show}
+            line: {lineStyle, strokeWidth, showMarker, markerShape, markerSize}
+            categoryLabels: {show, fontSize, color, fontFamily}
+            slices: {innerRadius}
+            smallMultiples: {minWidth, maxWidth, minHeight}
+            stylePreset: "name"
+            altText: "description"
+            lockAspect: true/false
+
+            Example: {"title": {"text": "Sales", "fontSize": 16}, "dataLabels": {"show": true}}
+    """
+    try:
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError("No layout found")
+
+        sections = layout.get("sections", [])
+        if page_index < 0 or page_index >= len(sections):
+            raise LayoutParseError(f"Page index {page_index} out of range")
+
+        containers = sections[page_index].get("visualContainers", [])
+        if visual_index < 0 or visual_index >= len(containers):
+            raise LayoutParseError(f"Visual index {visual_index} out of range")
+
+        try:
+            fmt = json.loads(format_json)
+        except json.JSONDecodeError as e:
+            raise LayoutParseError(f"Invalid format_json: {e}")
+
+        vc = containers[visual_index]
+        config = _parse_visual_config(vc)
+        sv = config.setdefault("singleVisual", {})
+        existing_objects = sv.setdefault("objects", {})
+
+        result = _build_format_objects(fmt)
+        new_objects = result.get("_objects", {})
+        new_vc_objects = result.get("_vcObjects", {})
+
+        # Merge data formatting into singleVisual.objects
+        for category, entries in new_objects.items():
+            existing_objects[category] = entries
+
+        # Merge container formatting into singleVisual.vcObjects
+        if new_vc_objects:
+            existing_vc_objects = sv.setdefault("vcObjects", {})
+            for category, entries in new_vc_objects.items():
+                existing_vc_objects[category] = entries
+
+        vc["config"] = json.dumps(config, ensure_ascii=False)
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+
+        applied = list(new_objects.keys()) + list(new_vc_objects.keys())
+        return ToolResponse.ok(
+            f"Formatted visual {visual_index} on page {page_index}: {', '.join(applied)}"
+        ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
