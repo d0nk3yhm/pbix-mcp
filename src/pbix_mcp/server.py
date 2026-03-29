@@ -2387,6 +2387,9 @@ def pbix_get_theme(alias: str) -> str:
 def pbix_set_theme(alias: str, theme_json: str, filename: str = "CY24SU11.json") -> str:
     """Set the report theme JSON.
 
+    Writes to both BaseThemes and RegisteredResources if the theme file
+    exists in RegisteredResources (custom themes used by the report).
+
     Args:
         alias: The alias of the open file
         theme_json: Complete theme JSON string
@@ -2395,19 +2398,168 @@ def pbix_set_theme(alias: str, theme_json: str, filename: str = "CY24SU11.json")
     try:
         info = _ensure_open(alias)
         work_dir = info["work_dir"]
-        theme_dir = os.path.join(work_dir, "Report", "StaticResources", "SharedResources", "BaseThemes")
-        os.makedirs(theme_dir, exist_ok=True)
 
         try:
             theme = json.loads(theme_json)
         except json.JSONDecodeError as e:
             raise LayoutParseError(f"Invalid JSON: {e}")
 
-        fp = os.path.join(theme_dir, filename)
-        with open(fp, "w", encoding="utf-8") as fh:
+        written_to = []
+
+        # Write to BaseThemes
+        base_dir = os.path.join(work_dir, "Report", "StaticResources", "SharedResources", "BaseThemes")
+        os.makedirs(base_dir, exist_ok=True)
+        with open(os.path.join(base_dir, filename), "w", encoding="utf-8") as fh:
             json.dump(theme, fh, indent=2, ensure_ascii=False)
+        written_to.append("BaseThemes")
+
+        # Also write to RegisteredResources if the file exists there
+        reg_dir = os.path.join(work_dir, "Report", "StaticResources", "RegisteredResources")
+        reg_path = os.path.join(reg_dir, filename)
+        if os.path.exists(reg_path):
+            with open(reg_path, "w", encoding="utf-8") as fh:
+                json.dump(theme, fh, indent=2, ensure_ascii=False)
+            written_to.append("RegisteredResources")
+
         info["modified"] = True
-        return ToolResponse.ok(f"Theme saved to {filename}").to_text()
+        return ToolResponse.ok(f"Theme saved to {filename} ({', '.join(written_to)})").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_extract_colors(alias: str) -> str:
+    """Extract all colors from the report — theme, visuals, and page backgrounds.
+
+    Scans the theme JSON and every visual's objects/vcObjects for hex color
+    values. Returns a deduplicated list with locations so you know what to
+    change for a complete recolor.
+
+    Args:
+        alias: The alias of the open file
+    """
+    import re
+    try:
+        info = _ensure_open(alias)
+        work_dir = info["work_dir"]
+        colors: dict[str, list[str]] = {}  # hex -> [locations]
+
+        def _add(hex_color: str, location: str):
+            h = hex_color.upper()
+            colors.setdefault(h, []).append(location)
+
+        # Scan theme files
+        for subdir in ("SharedResources/BaseThemes", "RegisteredResources"):
+            theme_dir = os.path.join(work_dir, "Report", "StaticResources", subdir)
+            if os.path.isdir(theme_dir):
+                for f in os.listdir(theme_dir):
+                    if f.endswith(".json"):
+                        with open(os.path.join(theme_dir, f)) as fh:
+                            text = fh.read()
+                        for m in re.finditer(r'#[0-9A-Fa-f]{6}\b', text):
+                            _add(m.group(), f"theme:{f}")
+
+        # Scan layout
+        layout = _get_layout(work_dir)
+        if layout:
+            layout_str = json.dumps(layout)
+            # Find all hex colors in the entire layout
+            for m in re.finditer(r"'(#[0-9A-Fa-f]{6})'", layout_str):
+                _add(m.group(1), "layout")
+
+            # Per-visual breakdown
+            for si, sec in enumerate(layout.get("sections", [])):
+                page_name = sec.get("displayName", f"Page {si}")
+                for vi, vc in enumerate(sec.get("visualContainers", [])):
+                    config = _parse_visual_config(vc)
+                    sv = config.get("singleVisual", {})
+                    vtype = sv.get("visualType", "?")
+                    config_str = json.dumps(config)
+                    for m in re.finditer(r"'(#[0-9A-Fa-f]{6})'", config_str):
+                        _add(m.group(1), f"{page_name}[{vi}]:{vtype}")
+
+        lines = []
+        for hex_c in sorted(colors.keys()):
+            locs = sorted(set(colors[hex_c]))
+            lines.append(f"  {hex_c}  ({len(locs)} refs): {', '.join(locs[:5])}")
+
+        return ToolResponse.ok(
+            f"Found {len(colors)} unique colors:\n" + "\n".join(lines)
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_recolor(alias: str, color_map_json: str) -> str:
+    """Global find-and-replace of colors across the entire report.
+
+    Replaces hex colors in the theme (BaseThemes + RegisteredResources),
+    the report layout (all visuals, pages, config), and page configs.
+    Case-insensitive matching.
+
+    Args:
+        alias: The alias of the open file
+        color_map_json: JSON object mapping old hex colors to new ones, e.g.
+            {"#0F7C7B": "#C2185B", "#1AA6A5": "#E91E63", "#E7E4D8": "#F5E6F0"}
+    """
+    import re
+    try:
+        info = _ensure_open(alias)
+        work_dir = info["work_dir"]
+
+        try:
+            color_map = json.loads(color_map_json)
+        except json.JSONDecodeError as e:
+            raise LayoutParseError(f"Invalid color_map_json: {e}")
+
+        # Normalize keys to uppercase
+        cmap = {k.upper(): v for k, v in color_map.items()}
+        total_replacements = 0
+
+        def _replace_colors(text: str) -> tuple[str, int]:
+            count = 0
+            for old, new in cmap.items():
+                # Replace in both quoted and unquoted contexts (case-insensitive)
+                pattern = re.compile(re.escape(old), re.IGNORECASE)
+                text, n = pattern.subn(new, text)
+                count += n
+            return text, count
+
+        # Replace in theme files
+        for subdir in ("SharedResources/BaseThemes", "RegisteredResources"):
+            theme_dir = os.path.join(work_dir, "Report", "StaticResources", subdir)
+            if os.path.isdir(theme_dir):
+                for f in os.listdir(theme_dir):
+                    if f.endswith(".json"):
+                        fp = os.path.join(theme_dir, f)
+                        with open(fp, "r", encoding="utf-8") as fh:
+                            text = fh.read()
+                        new_text, n = _replace_colors(text)
+                        if n > 0:
+                            with open(fp, "w", encoding="utf-8") as fh:
+                                fh.write(new_text)
+                            total_replacements += n
+
+        # Replace in layout
+        layout = _get_layout(work_dir)
+        if layout:
+            layout_str = json.dumps(layout, ensure_ascii=False)
+            new_str, n = _replace_colors(layout_str)
+            if n > 0:
+                new_layout = json.loads(new_str)
+                _set_layout(work_dir, new_layout)
+                total_replacements += n
+
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Replaced {total_replacements} color occurrences "
+            f"({len(cmap)} colors mapped)"
+        ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
