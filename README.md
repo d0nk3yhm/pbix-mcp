@@ -114,12 +114,12 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Data source switching | **Stable** | `pbix_update_data_source` — lightweight connection string change without full DataModel rebuild. Switch between SQL Server, PostgreSQL, MySQL, CSV, Excel, JSON, SQLite, Azure SQL. Switch Import/DirectQuery mode. Verified with live MSSQL→PostgreSQL→CSV roundtrip |
 | DirectQuery mode | **Stable** | `mode='directquery'` with SQL Server, PostgreSQL, and MySQL (via MariaDB ODBC 3.1) — live database queries, no refresh needed |
 | VertiPaq table data write | **Stable** | Create and roundtrip (set_table_data, update_table_rows) via full builder rebuild |
-| Roundtrip DataModel modify | **Stable** | Add/remove tables, relationships, measures on existing files — all modifications go through full builder rebuild pipeline |
+| Roundtrip DataModel modify | **Stable** | Add/remove tables, relationships, measures on existing files. Metadata-only changes (measures, RLS, column properties) use binary splice for PBI Desktop files; structural changes use full builder rebuild |
 | H$ attribute hierarchies | **Stable** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities; MaterializationType=0 |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
 | Visual add/remove | **Stable** | Cards, charts, shapes/buttons, images, textboxes, slicers — with full data bindings (projections + prototypeQuery) |
 | Visual property editing | **Stable** | Dot-path and full JSON |
-| DAX measure CRUD | **Stable** | Add, modify, remove via full builder rebuild |
+| DAX measure CRUD | **Stable** | Add, modify, remove via binary splice (PBI Desktop files) or full builder rebuild. Sequential adds supported with automatic MAXID tracking |
 | DAX evaluation (156 functions) | **Stable** | Best-effort evaluator; see accuracy notes below |
 | Metadata SQL read/write | **Stable** | Full SQLite access to tables, columns, relationships |
 | Default slicer filter extraction | **Stable** | Legacy Layout JSON and PBIR format |
