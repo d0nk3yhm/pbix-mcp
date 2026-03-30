@@ -5771,6 +5771,314 @@ def pbix_get_password(alias: str) -> str:
 
 
 @mcp.tool()
+def pbix_document(alias: str, output_path: str = "") -> str:
+    """Auto-generate a comprehensive report documentation summary.
+
+    Assembles all report metadata into a structured document: tables with
+    row counts, column details, DAX measures with expressions, relationships,
+    data sources, pages with visual inventories, RLS roles, and theme colors.
+
+    Returns markdown in the response AND saves a .docx file to disk.
+
+    Args:
+        alias: The alias of the open file
+        output_path: Where to save the .docx file. Default: next to the PBIX.
+    """
+    import re
+    try:
+        info = _ensure_open(alias)
+        work_dir = info["work_dir"]
+        pbix_path = info["path"]
+
+        if not output_path:
+            output_path = os.path.splitext(pbix_path)[0] + "_documentation.docx"
+
+        md_lines: list[str] = []
+
+        def md(line: str = ""):
+            md_lines.append(line)
+
+        # --- Header ---
+        fname = os.path.basename(pbix_path)
+        md(f"# Report Documentation: {fname}")
+        md(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        md()
+
+        # --- Tables ---
+        md("## Data Model — Tables")
+        md()
+        try:
+            from pbix_mcp.formats.model_reader import ModelReader
+            model = ModelReader(pbix_path, work_dir=work_dir)
+            stats = model.statistics
+            data_tables = [t for t in stats if not t["TableName"].startswith(("H$", "R$", "U$", "LocalDateTable", "DateTableTemplate"))]
+
+            md("| Table | Columns | Rows |")
+            md("|-------|---------|------|")
+            for t in data_tables:
+                md(f"| {t['TableName']} | {t['ColumnCount']} | {t['RowCount']:,} |")
+            md()
+            md(f"*{len(data_tables)} data tables, {sum(t['RowCount'] for t in data_tables):,} total rows*")
+            md()
+        except Exception as e:
+            md(f"*Error reading tables: {e}*")
+            md()
+
+        # --- Schema ---
+        md("## Column Details")
+        md()
+        try:
+            schema = model.schema
+            by_table: dict[str, list] = {}
+            for col in schema:
+                tname = col["TableName"]
+                if tname.startswith(("H$", "R$", "U$", "LocalDateTable", "DateTableTemplate")):
+                    continue
+                by_table.setdefault(tname, []).append(col)
+
+            for tname in sorted(by_table.keys()):
+                cols = by_table[tname]
+                visible = [c for c in cols if not c.get("IsHidden") and "RowNumber" not in c["ColumnName"]]
+                if not visible:
+                    continue
+                md(f"### {tname}")
+                md()
+                md("| Column | Type |")
+                md("|--------|------|")
+                for c in visible:
+                    md(f"| {c['ColumnName']} | {c['DataType']} |")
+                md()
+        except Exception as e:
+            md(f"*Error reading schema: {e}*")
+            md()
+
+        # --- Measures ---
+        md("## DAX Measures")
+        md()
+        try:
+            measures = model.dax_measures
+            if measures:
+                md("| Table | Measure | Expression | Format |")
+                md("|-------|---------|------------|--------|")
+                for m in measures:
+                    expr = m["Expression"].replace("\n", " ").replace("|", "\\|")
+                    if len(expr) > 80:
+                        expr = expr[:77] + "..."
+                    fmt = m.get("FormatString", "") or ""
+                    md(f"| {m['TableName']} | **{m['Name']}** | `{expr}` | {fmt} |")
+                md()
+                md(f"*{len(measures)} measures*")
+            else:
+                md("*No DAX measures defined*")
+            md()
+        except Exception as e:
+            md(f"*Error reading measures: {e}*")
+            md()
+
+        # --- Relationships ---
+        md("## Relationships")
+        md()
+        try:
+            rels = model.relationships
+            if rels:
+                md("| From (Many) | | To (One) | Active |")
+                md("|-------------|---|----------|--------|")
+                for r in rels:
+                    active = "Yes" if r.get("IsActive") else "No"
+                    md(f"| {r['FromTableName']}.{r['FromColumnName']} | -> | {r['ToTableName']}.{r['ToColumnName']} | {active} |")
+                md()
+                md(f"*{len(rels)} relationships*")
+            else:
+                md("*No relationships*")
+            md()
+        except Exception as e:
+            md(f"*Error reading relationships: {e}*")
+            md()
+
+        # --- Data Sources ---
+        md("## Data Sources")
+        md()
+        try:
+            pq = model.power_query
+            if pq:
+                md("| Table | M Expression (excerpt) |")
+                md("|-------|----------------------|")
+                for p in pq:
+                    expr = p.get("Expression", "")
+                    if expr:
+                        # Find the Source = ... line (most informative)
+                        lines = expr.split("\n")
+                        source_line = next((l.strip() for l in lines if "Source" in l and "=" in l), lines[0].strip())
+                        if len(source_line) > 80:
+                            source_line = source_line[:77] + "..."
+                        md(f"| {p['TableName']} | `{source_line}` |")
+                md()
+            else:
+                md("*No Power Query expressions found*")
+            md()
+        except Exception:
+            md("*No data source information available*")
+            md()
+
+        # --- Pages & Visuals ---
+        md("## Report Pages & Visuals")
+        md()
+        layout = _get_layout(work_dir)
+        if layout:
+            for si, sec in enumerate(layout.get("sections", [])):
+                page_name = sec.get("displayName", f"Page {si}")
+                containers = sec.get("visualContainers", [])
+                w = sec.get("width", 1280)
+                h = sec.get("height", 720)
+                md(f"### {page_name} ({w}x{h})")
+                md()
+                if containers:
+                    md("| # | Type | Position | Size |")
+                    md("|---|------|----------|------|")
+                    for vi, vc in enumerate(containers):
+                        config = _parse_visual_config(vc)
+                        vtype = _get_visual_type(config)
+                        x, y = int(vc.get("x", 0)), int(vc.get("y", 0))
+                        vw, vh = int(vc.get("width", 0)), int(vc.get("height", 0))
+                        md(f"| {vi} | {vtype} | ({x},{y}) | {vw}x{vh} |")
+                else:
+                    md("*No visuals on this page*")
+                md()
+        else:
+            md("*No layout found*")
+            md()
+
+        # --- RLS Roles ---
+        md("## Row-Level Security")
+        md()
+        try:
+            meta = model._read_metadata()
+            if meta:
+                import sqlite3
+                conn = sqlite3.connect(":memory:")
+                conn.executescript("BEGIN;" if False else "")
+                # Write meta to temp
+                import tempfile
+                fd, tmp = tempfile.mkstemp(suffix=".db")
+                os.write(fd, meta)
+                os.close(fd)
+                conn = sqlite3.connect(tmp)
+                conn.row_factory = sqlite3.Row
+                roles = conn.execute("SELECT Name FROM Role").fetchall()
+                if roles:
+                    for role in roles:
+                        rname = role["Name"]
+                        perms = conn.execute(
+                            "SELECT t.Name as TableName, tp.FilterExpression "
+                            "FROM TablePermission tp JOIN Role r ON tp.RoleID=r.ID "
+                            "JOIN [Table] t ON tp.TableID=t.ID "
+                            "WHERE r.Name=?", (rname,)
+                        ).fetchall()
+                        md(f"**{rname}**")
+                        for p in perms:
+                            md(f"- `{p['TableName']}`: `{p['FilterExpression']}`")
+                        md()
+                else:
+                    md("*No RLS roles defined*")
+                conn.close()
+                os.unlink(tmp)
+            else:
+                md("*No metadata available for RLS*")
+        except Exception:
+            md("*No RLS roles defined*")
+        md()
+
+        # --- Theme Colors ---
+        md("## Theme Colors")
+        md()
+        data_colors = _load_theme_data_colors(work_dir)
+        if data_colors:
+            md("Data palette: " + ", ".join(f"`{c}`" for c in data_colors[:10]))
+        else:
+            md("*Default theme*")
+        md()
+
+        # --- Build markdown ---
+        markdown = "\n".join(md_lines)
+
+        # --- Build .docx ---
+        docx_msg = ""
+        try:
+            from docx import Document
+            from docx.shared import Pt
+
+            doc = Document()
+            style = doc.styles["Normal"]
+            style.font.name = "Segoe UI"
+            style.font.size = Pt(10)
+
+            doc.add_heading(f"Report Documentation: {fname}", level=0)
+
+            # Single-pass: process lines, collecting table rows inline
+            i = 0
+            while i < len(md_lines):
+                line = md_lines[i]
+
+                # Skip title (already added) and empty lines
+                if (line.startswith("# ") and not line.startswith("## ")) or not line.strip():
+                    i += 1
+                    continue
+
+                # Headings
+                if line.startswith("### "):
+                    doc.add_heading(line[4:], level=2)
+                    i += 1
+                    continue
+                if line.startswith("## "):
+                    doc.add_heading(line[3:], level=1)
+                    i += 1
+                    continue
+
+                # Table block: collect all consecutive | rows (including |--- separators)
+                if line.startswith("|"):
+                    rows = []
+                    while i < len(md_lines) and md_lines[i].startswith("|"):
+                        if "---|" not in md_lines[i]:
+                            cells = [c.strip() for c in md_lines[i].split("|")[1:-1]]
+                            rows.append(cells)
+                        i += 1
+                    if rows:
+                        table = doc.add_table(rows=len(rows), cols=len(rows[0]))
+                        table.style = "Light Grid Accent 1"
+                        for ri, row in enumerate(rows):
+                            for ci, cell in enumerate(row):
+                                clean = re.sub(r'[`*]', '', cell)
+                                table.rows[ri].cells[ci].text = clean
+                        doc.add_paragraph()  # spacing after table
+                    continue
+
+                # Italic text
+                if line.startswith("*") and line.endswith("*"):
+                    p = doc.add_paragraph(line.strip("*"))
+                    if p.runs:
+                        p.runs[0].italic = True
+                    i += 1
+                    continue
+
+                # Normal text
+                doc.add_paragraph(line)
+                i += 1
+
+            doc.save(output_path)
+            docx_msg = f"\n\nDocx saved to: {output_path}"
+        except ImportError:
+            docx_msg = "\n\n(python-docx not installed — skipping .docx generation. Install with: pip install python-docx)"
+        except Exception as e:
+            docx_msg = f"\n\n(Docx generation error: {e})"
+
+        return ToolResponse.ok(markdown + docx_msg).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
 def pbix_doctor(alias: str) -> str:
     """Run comprehensive diagnostics on an open PBIX/PBIT file.
 
