@@ -5792,6 +5792,178 @@ def pbix_get_password(alias: str) -> str:
 
 
 @mcp.tool()
+def pbix_performance(alias: str) -> str:
+    """Analyze report for performance issues and optimization opportunities.
+
+    Checks for oversized tables, high column counts, complex measures,
+    orphaned tables, inactive relationships, and wide schemas.
+
+    Args:
+        alias: The alias of the open file
+    """
+    import re as _re
+    try:
+        info = _ensure_open(alias)
+        work_dir = info["work_dir"]
+
+        from pbix_mcp.formats.model_reader import ModelReader
+        model = ModelReader(info["path"], work_dir=work_dir)
+
+        lines: list[str] = []
+        warnings = 0
+        infos = 0
+
+        def warn(msg: str):
+            nonlocal warnings
+            lines.append(f"  WARNING: {msg}")
+            warnings += 1
+
+        def info_msg(msg: str):
+            nonlocal infos
+            lines.append(f"  INFO: {msg}")
+            infos += 1
+
+        lines.append("# Performance Analysis\n")
+
+        # --- Table sizes ---
+        lines.append("## Table Sizes")
+        stats = model.statistics
+        data_tables = [t for t in stats if not t["TableName"].startswith(
+            ("H$", "R$", "U$", "LocalDateTable", "DateTableTemplate"))]
+        data_tables.sort(key=lambda t: t["RowCount"], reverse=True)
+
+        total_rows = sum(t["RowCount"] for t in data_tables)
+        total_cols = sum(t["ColumnCount"] for t in data_tables)
+        lines.append(f"  Total: {len(data_tables)} tables, {total_rows:,} rows, {total_cols} columns")
+
+        for t in data_tables:
+            name, rows, cols = t["TableName"], t["RowCount"], t["ColumnCount"]
+            flags = []
+            if rows > 1_000_000:
+                flags.append("LARGE (>1M rows)")
+            elif rows > 100_000:
+                flags.append("medium (>100K rows)")
+            if cols > 30:
+                flags.append(f"wide ({cols} columns)")
+            elif cols > 20:
+                flags.append(f"moderately wide ({cols} columns)")
+            if rows == 0:
+                flags.append("empty table")
+
+            if flags:
+                warn(f"{name}: {rows:,} rows, {cols} cols — {', '.join(flags)}")
+            else:
+                lines.append(f"  {name}: {rows:,} rows, {cols} cols")
+
+        # --- Column analysis ---
+        lines.append("\n## Column Analysis")
+        schema = model.schema
+        hidden_count = 0
+        calc_count = 0
+        by_type: dict[str, int] = {}
+        for col in schema:
+            if col["TableName"].startswith(("H$", "R$", "U$", "LocalDateTable", "DateTableTemplate")):
+                continue
+            dt = col["DataType"]
+            by_type[dt] = by_type.get(dt, 0) + 1
+            if col.get("IsHidden"):
+                hidden_count += 1
+            if col.get("IsCalculated"):
+                calc_count += 1
+
+        lines.append(f"  Types: {', '.join(f'{k}={v}' for k, v in sorted(by_type.items()))}")
+        if hidden_count:
+            info_msg(f"{hidden_count} hidden columns (keys, internal)")
+        if calc_count:
+            info_msg(f"{calc_count} calculated columns (evaluated at refresh)")
+
+        # String columns in large tables — high cardinality risk
+        for t in data_tables:
+            if t["RowCount"] > 50_000:
+                str_cols = [c for c in schema
+                            if c["TableName"] == t["TableName"]
+                            and c["DataType"] == "String"
+                            and not c.get("IsHidden")
+                            and "RowNumber" not in c["ColumnName"]]
+                if len(str_cols) > 5:
+                    warn(f"{t['TableName']}: {len(str_cols)} string columns on {t['RowCount']:,} rows — potential high cardinality")
+
+        # --- Measure complexity ---
+        lines.append("\n## Measure Complexity")
+        measures = model.dax_measures
+        if measures:
+            for m in measures:
+                expr = m["Expression"]
+                # Count table references
+                table_refs = set(_re.findall(r"'([^']+)'\[", expr))
+                table_refs |= set(_re.findall(r"\b([A-Za-z]\w+)\[", expr))
+                # Count function calls
+                func_calls = len(_re.findall(r"[A-Z]{2,}\s*\(", expr))
+                # Count nesting depth (rough — count opening parens)
+                max_depth = 0
+                depth = 0
+                for ch in expr:
+                    if ch == '(':
+                        depth += 1
+                        max_depth = max(max_depth, depth)
+                    elif ch == ')':
+                        depth -= 1
+
+                flags = []
+                if len(table_refs) > 3:
+                    flags.append(f"references {len(table_refs)} tables")
+                if func_calls > 10:
+                    flags.append(f"{func_calls} function calls")
+                elif func_calls > 5:
+                    flags.append(f"{func_calls} function calls")
+                if max_depth > 5:
+                    flags.append(f"nesting depth {max_depth}")
+                if len(expr) > 500:
+                    flags.append(f"{len(expr)} chars")
+
+                if flags:
+                    warn(f"Measure '{m['Name']}': {', '.join(flags)}")
+                else:
+                    lines.append(f"  {m['Name']}: {func_calls} functions, {len(table_refs)} table refs — OK")
+
+            lines.append(f"  {len(measures)} measures total")
+        else:
+            lines.append("  No measures defined")
+
+        # --- Relationships ---
+        lines.append("\n## Relationships")
+        rels = model.relationships
+        inactive = [r for r in rels if not r.get("IsActive")]
+        bidir = [r for r in rels if r.get("CrossFilteringBehavior") == 2]
+
+        lines.append(f"  {len(rels)} relationships total")
+        if inactive:
+            for r in inactive:
+                warn(f"Inactive: {r['FromTableName']}.{r['FromColumnName']} -> {r['ToTableName']}.{r['ToColumnName']}")
+        if bidir:
+            for r in bidir:
+                warn(f"Bidirectional: {r['FromTableName']} <-> {r['ToTableName']} — can cause ambiguity")
+
+        # Orphaned tables (no relationships)
+        rel_tables = set()
+        for r in rels:
+            rel_tables.add(r["FromTableName"])
+            rel_tables.add(r["ToTableName"])
+        for t in data_tables:
+            if t["TableName"] not in rel_tables and t["RowCount"] > 0:
+                info_msg(f"Orphaned table '{t['TableName']}' — no relationships, {t['RowCount']:,} rows")
+
+        # --- Summary ---
+        lines.insert(1, f"Summary: {warnings} warnings, {infos} info items\n")
+
+        return ToolResponse.ok("\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
 def pbix_diff(alias_a: str, alias_b: str) -> str:
     """Compare two open PBIX files and show what changed.
 
