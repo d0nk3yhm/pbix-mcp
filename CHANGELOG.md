@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.6] - 2026-03-30
+
+### Added
+- **`pbix_diff`** — compare two open PBIX files and show what changed (79 tools total). Compares tables (added/removed/row count changes), columns, DAX measures (added/removed/expression changes), relationships, pages & visuals, data sources, and theme colors. Both files must be open.
+
+### Verified
+- Adventure Works original vs modified: correctly detected 3 added measures + 1 added page
+- Briqlab original vs SG recolored: correctly detected 469 removed theme colors + 10 added
+
 ## [0.6.5] - 2026-03-30
 
 ### Added
