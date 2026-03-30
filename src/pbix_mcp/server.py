@@ -2430,12 +2430,49 @@ def pbix_set_theme(alias: str, theme_json: str, filename: str = "CY24SU11.json")
 
 
 @mcp.tool()
+def _load_theme_data_colors(work_dir: str) -> list[str]:
+    """Load dataColors from the active theme (RegisteredResources first, then BaseThemes)."""
+    for subdir in ("RegisteredResources", "SharedResources/BaseThemes"):
+        theme_dir = os.path.join(work_dir, "Report", "StaticResources", subdir)
+        if os.path.isdir(theme_dir):
+            for f in os.listdir(theme_dir):
+                if f.endswith(".json"):
+                    with open(os.path.join(theme_dir, f)) as fh:
+                        try:
+                            theme = json.load(fh)
+                            if "dataColors" in theme:
+                                return [c.upper() for c in theme["dataColors"]]
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+    return []
+
+
+def _resolve_theme_color(data_colors: list[str], color_id: int, percent: float) -> str:
+    """Resolve a ThemeDataColor reference to a hex color string."""
+    if color_id < len(data_colors):
+        base = data_colors[color_id]
+    else:
+        base = "#808080"
+    r, g, b = int(base[1:3], 16), int(base[3:5], 16), int(base[5:7], 16)
+    if percent > 0:
+        r = int(r + (255 - r) * percent)
+        g = int(g + (255 - g) * percent)
+        b = int(b + (255 - b) * percent)
+    elif percent < 0:
+        r = int(r * (1 + percent))
+        g = int(g * (1 + percent))
+        b = int(b * (1 + percent))
+    return f"#{max(0,min(255,r)):02X}{max(0,min(255,g)):02X}{max(0,min(255,b)):02X}"
+
+
+@mcp.tool()
 def pbix_extract_colors(alias: str) -> str:
     """Extract all colors from the report — theme, visuals, and page backgrounds.
 
     Scans the theme JSON and every visual's objects/vcObjects for hex color
-    values. Returns a deduplicated list with locations so you know what to
-    change for a complete recolor.
+    values. Also resolves ThemeDataColor references (ColorId + Percent) to
+    their actual rendered hex values. Returns a deduplicated list with
+    locations so you know what to change for a complete recolor.
 
     Args:
         alias: The alias of the open file
@@ -2445,6 +2482,7 @@ def pbix_extract_colors(alias: str) -> str:
         info = _ensure_open(alias)
         work_dir = info["work_dir"]
         colors: dict[str, list[str]] = {}  # hex -> [locations]
+        data_colors = _load_theme_data_colors(work_dir)
 
         def _add(hex_color: str, location: str):
             h = hex_color.upper()
@@ -2461,29 +2499,52 @@ def pbix_extract_colors(alias: str) -> str:
                         for m in re.finditer(r'#[0-9A-Fa-f]{6}\b', text):
                             _add(m.group(), f"theme:{f}")
 
-        # Scan layout
+        # Scan layout — both hex literals AND ThemeDataColor refs
         layout = _get_layout(work_dir)
         if layout:
-            layout_str = json.dumps(layout)
-            # Find all hex colors in the entire layout
-            for m in re.finditer(r"'(#[0-9A-Fa-f]{6})'", layout_str):
-                _add(m.group(1), "layout")
-
-            # Per-visual breakdown
             for si, sec in enumerate(layout.get("sections", [])):
                 page_name = sec.get("displayName", f"Page {si}")
+                # Page-level config
+                page_cfg_str = sec.get("config", "{}")
+                if isinstance(page_cfg_str, str):
+                    for m in re.finditer(r"'(#[0-9A-Fa-f]{6})'", page_cfg_str):
+                        _add(m.group(1), f"{page_name}:pageConfig")
+
                 for vi, vc in enumerate(sec.get("visualContainers", [])):
-                    config = _parse_visual_config(vc)
-                    sv = config.get("singleVisual", {})
-                    vtype = sv.get("visualType", "?")
-                    config_str = json.dumps(config)
+                    config_str = vc.get("config", "{}")
+                    if isinstance(config_str, dict):
+                        config_str = json.dumps(config_str)
+                    config = json.loads(config_str) if isinstance(config_str, str) else config_str
+                    sv = config.get("singleVisual", {}) if isinstance(config, dict) else {}
+                    vtype = sv.get("visualType", "?") if isinstance(sv, dict) else "?"
+                    loc = f"{page_name}[{vi}]:{vtype}"
+
+                    # Find hex literals
                     for m in re.finditer(r"'(#[0-9A-Fa-f]{6})'", config_str):
-                        _add(m.group(1), f"{page_name}[{vi}]:{vtype}")
+                        _add(m.group(1), loc)
+
+                    # Find ThemeDataColor refs (escaped JSON inside config strings)
+                    for m in re.finditer(
+                        r'"ThemeDataColor"\s*:\s*\{\s*"ColorId"\s*:\s*(\d+)\s*,\s*"Percent"\s*:\s*([-\d.]+)\s*\}',
+                        config_str
+                    ):
+                        cid, pct = int(m.group(1)), float(m.group(2))
+                        resolved = _resolve_theme_color(data_colors, cid, pct)
+                        _add(resolved, f"{loc} [ThemeDataColor:{cid},{pct}]")
+
+                    # Also check escaped variants (config stored as JSON string in JSON)
+                    for m in re.finditer(
+                        r'\\"ThemeDataColor\\"\s*:\s*\{\s*\\"ColorId\\"\s*:\s*(\d+)\s*,\s*\\"Percent\\"\s*:\s*([-\d.]+)\s*\}',
+                        config_str
+                    ):
+                        cid, pct = int(m.group(1)), float(m.group(2))
+                        resolved = _resolve_theme_color(data_colors, cid, pct)
+                        _add(resolved, f"{loc} [ThemeDataColor:{cid},{pct}]")
 
         lines = []
         for hex_c in sorted(colors.keys()):
             locs = sorted(set(colors[hex_c]))
-            lines.append(f"  {hex_c}  ({len(locs)} refs): {', '.join(locs[:5])}")
+            lines.append(f"  {hex_c}  ({len(locs)} refs): {', '.join(locs[:8])}")
 
         return ToolResponse.ok(
             f"Found {len(colors)} unique colors:\n" + "\n".join(lines)
@@ -2501,6 +2562,10 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
     Replaces hex colors in the theme (BaseThemes + RegisteredResources),
     the report layout (all visuals, pages, config), and page configs.
     Case-insensitive matching.
+
+    Also converts ThemeDataColor references to direct hex Literal values
+    when the resolved theme color is in the replacement map. This ensures
+    ALL color references are replaced, not just hex literals.
 
     Args:
         alias: The alias of the open file
@@ -2521,14 +2586,47 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
         cmap = {k.upper(): v for k, v in color_map.items()}
         total_replacements = 0
 
-        def _replace_colors(text: str) -> tuple[str, int]:
+        # Load theme dataColors for resolving ThemeDataColor refs
+        data_colors = _load_theme_data_colors(work_dir)
+
+        def _replace_hex(text: str) -> tuple[str, int]:
             count = 0
             for old, new in cmap.items():
-                # Replace in both quoted and unquoted contexts (case-insensitive)
                 pattern = re.compile(re.escape(old), re.IGNORECASE)
                 text, n = pattern.subn(new, text)
                 count += n
             return text, count
+
+        def _replace_theme_ref(m) -> str:
+            """Replace a ThemeDataColor ref with a Literal hex if it matches the color map."""
+            cid, pct = int(m.group(1)), float(m.group(2))
+            resolved = _resolve_theme_color(data_colors, cid, pct).upper()
+            # Check if this resolved color is in our replacement map
+            new_color = cmap.get(resolved)
+            if not new_color:
+                # Also check close matches (ThemeDataColor percent shifts
+                # produce slightly different hex than exact theme colors)
+                for old_c, new_c in cmap.items():
+                    if cid < len(data_colors) and data_colors[cid].upper() == old_c:
+                        new_color = new_c
+                        break
+            if new_color:
+                return f'"Literal":{{"Value":"\'{new_color}\'"}}'
+            return m.group(0)  # no match, keep original
+
+        def _replace_theme_ref_escaped(m) -> str:
+            """Same but for escaped JSON (config strings inside JSON)."""
+            cid, pct = int(m.group(1)), float(m.group(2))
+            resolved = _resolve_theme_color(data_colors, cid, pct).upper()
+            new_color = cmap.get(resolved)
+            if not new_color:
+                for old_c, new_c in cmap.items():
+                    if cid < len(data_colors) and data_colors[cid].upper() == old_c:
+                        new_color = new_c
+                        break
+            if new_color:
+                return f'\\"Literal\\":{{\\"Value\\":\\"\'{new_color}\'\\"}}'
+            return m.group(0)
 
         # Replace in theme files
         for subdir in ("SharedResources/BaseThemes", "RegisteredResources"):
@@ -2539,27 +2637,53 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                         fp = os.path.join(theme_dir, f)
                         with open(fp, "r", encoding="utf-8") as fh:
                             text = fh.read()
-                        new_text, n = _replace_colors(text)
+                        new_text, n = _replace_hex(text)
                         if n > 0:
                             with open(fp, "w", encoding="utf-8") as fh:
                                 fh.write(new_text)
                             total_replacements += n
 
-        # Replace in layout
+        # Replace in layout — hex colors + ThemeDataColor refs
         layout = _get_layout(work_dir)
         if layout:
             layout_str = json.dumps(layout, ensure_ascii=False)
-            new_str, n = _replace_colors(layout_str)
-            if n > 0:
-                new_layout = json.loads(new_str)
-                _set_layout(work_dir, new_layout)
-                total_replacements += n
+
+            # Replace hex literals
+            new_str, n = _replace_hex(layout_str)
+            total_replacements += n
+
+            # Replace ThemeDataColor references (non-escaped)
+            prev = new_str
+            new_str = re.sub(
+                r'"ThemeDataColor"\s*:\s*\{\s*"ColorId"\s*:\s*(\d+)\s*,\s*"Percent"\s*:\s*([-\d.]+)\s*\}',
+                _replace_theme_ref, new_str
+            )
+            total_replacements += (len(prev) - len(new_str)) // 10 if len(new_str) != len(prev) else 0
+
+            # Replace ThemeDataColor references (escaped — config strings)
+            prev = new_str
+            new_str = re.sub(
+                r'\\"ThemeDataColor\\"\s*:\s*\{\s*\\"ColorId\\"\s*:\s*(\d+)\s*,\s*\\"Percent\\"\s*:\s*([-\d.]+)\s*\}',
+                _replace_theme_ref_escaped, new_str
+            )
+            total_replacements += (len(prev) - len(new_str)) // 10 if len(new_str) != len(prev) else 0
+
+            # Count actual ThemeDataColor replacements properly
+            theme_refs_before = len(re.findall(r'ThemeDataColor', layout_str))
+            theme_refs_after = len(re.findall(r'ThemeDataColor', new_str))
+            theme_replaced = theme_refs_before - theme_refs_after
+
+            new_layout = json.loads(new_str)
+            _set_layout(work_dir, new_layout)
 
         info["modified"] = True
-        return ToolResponse.ok(
-            f"Replaced {total_replacements} color occurrences "
-            f"({len(cmap)} colors mapped)"
-        ).to_text()
+
+        parts = [f"Replaced {total_replacements} hex color occurrences"]
+        if theme_replaced > 0:
+            parts.append(f"{theme_replaced} ThemeDataColor refs converted to hex")
+        parts.append(f"({len(cmap)} colors mapped)")
+
+        return ToolResponse.ok(" + ".join(parts)).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:

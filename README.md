@@ -8,7 +8,7 @@
 
 An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python — no templates, no skeletons, no Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026.
 
-Exposes 75 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
+Exposes 77 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
@@ -119,6 +119,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
 | Visual add/remove | **Stable** | Cards, charts, shapes/buttons, images, textboxes, slicers — with full data bindings (projections + prototypeQuery) |
 | Visual formatting | **Stable** | `pbix_format_visual` — human-readable API for titles, backgrounds, borders, drop shadows, padding, spacing, data labels, legend, axis, colors, table headers, and 25+ more categories. Ground truth validated against 9 PBI Desktop templates |
+| Color extraction & recolor | **Stable** | `pbix_extract_colors` scans themes + all visuals for hex literals AND ThemeDataColor references (resolved to hex). `pbix_recolor` does global find-and-replace across themes + layout, converting ThemeDataColor refs to direct hex. Verified with full brand compliance recolor (531 colors → SG Armaturen palette) |
 | Visual property editing | **Stable** | Dot-path and full JSON |
 | DAX measure CRUD | **Stable** | Add, modify, remove via binary splice (PBI Desktop files) or full builder rebuild. Sequential adds supported with automatic MAXID tracking |
 | DAX evaluation (156 functions) | **Stable** | Best-effort evaluator; see accuracy notes below |
@@ -174,7 +175,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 `pbix_datamodel_query_metadata` · `pbix_datamodel_modify_metadata` · `pbix_datamodel_add_measure` · `pbix_datamodel_modify_measure` · `pbix_datamodel_remove_measure` · `pbix_datamodel_modify_column` · `pbix_datamodel_add_relationship` · `pbix_datamodel_remove_relationship` · `pbix_datamodel_remove_table` · `pbix_datamodel_decompress` · `pbix_datamodel_recompress` · `pbix_datamodel_replace_file` · `pbix_datamodel_extract_file` · `pbix_datamodel_list_abf_files` · `pbix_set_table_data` · `pbix_update_table_rows` · `pbix_datamodel_add_field_parameter` · `pbix_datamodel_add_calculation_group` · `pbix_export_tmdl`
 
 ### Resources, Themes & Custom Visuals (7)
-`pbix_list_resources` · `pbix_get_theme` · `pbix_set_theme` · `pbix_get_linguistic_schema` · `pbix_set_linguistic_schema` · `pbix_add_custom_visual` · `pbix_remove_custom_visual`
+`pbix_list_resources` · `pbix_get_theme` · `pbix_set_theme` · `pbix_extract_colors` · `pbix_recolor` · `pbix_get_linguistic_schema` · `pbix_set_linguistic_schema` · `pbix_add_custom_visual` · `pbix_remove_custom_visual`
 
 ### DataMashup (2)
 `pbix_get_m_code` · `pbix_set_m_code`
@@ -522,7 +523,7 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (75 tools)
+  server.py              # MCP server (77 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX builder (metadata, VertiPaq, layout, relationships)
   builder_v2.py          # Template-free ABF + ZIP generation
