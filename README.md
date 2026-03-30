@@ -133,7 +133,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | File save/repack | **Stable** | Auto-backup on overwrite, SecurityBindings auto-removed |
 | Calculated column evaluation | **Beta** | Per-row DAX expression evaluation; tested with synthetic data |
 | Password extraction | **Beta** | Regex scan of DAX measures for embedded passwords |
-| Row-Level Security (RLS) | **Beta** | Read roles, evaluate filter expressions against data. Write (set_rls_role) triggers full rebuild — RLS rows not yet persisted by builder |
+| Row-Level Security (RLS) | **Stable** | Read, write, and evaluate RLS roles. `set_rls_role` uses binary splice — roles persist across save/reopen. MAXID-based ID allocation. Verified on PBI Desktop files |
 | Bookmark creation | **Beta** | Create/remove bookmarks with page targeting and visual visibility state |
 | Field Parameters | **Blocked** | `pbix_datamodel_add_field_parameter` blocked — needs full DataModel rebuild to generate VertiPaq storage for new table |
 | Calculation Groups | **Blocked** | `pbix_datamodel_add_calculation_group` blocked — needs full DataModel rebuild to generate VertiPaq storage for new table |
