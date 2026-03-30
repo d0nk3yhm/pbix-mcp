@@ -5431,15 +5431,18 @@ def pbix_get_rls_roles(alias: str) -> str:
         db_bytes = read_metadata_sqlite(abf)
 
         import sqlite3
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.write(db_bytes)
-        tmp.close()
+        fd, tmp_path = tempfile.mkstemp(suffix=".db")
+        os.write(fd, db_bytes)
+        os.close(fd)
+        conn = None
         try:
-            conn = sqlite3.connect(tmp.name)
+            conn = sqlite3.connect(tmp_path)
             conn.row_factory = sqlite3.Row
 
             roles = conn.execute("SELECT * FROM [Role]").fetchall()
             if not roles:
+                conn.close()
+                conn = None
                 return ToolResponse.ok("No RLS roles defined in this file.").to_text()
 
             lines = [f"RLS Roles ({len(roles)}):\n"]
@@ -5448,21 +5451,20 @@ def pbix_get_rls_roles(alias: str) -> str:
                 role_name = role["Name"] if "Name" in role.keys() else f"Role {role_id}"
                 lines.append(f"  Role: {role_name} (ID={role_id})")
 
-                # Get table permissions for this role
                 perms = conn.execute(
                     "SELECT * FROM [TablePermission] WHERE RoleID = ?",
                     (role_id,)
                 ).fetchall()
                 for perm in perms:
                     table_id = perm["TableID"]
-                    filter_expr = perm.get("FilterExpression", perm.get("QueryExpression", ""))
-                    table_name = conn.execute(
+                    perm_keys = perm.keys()
+                    filter_expr = perm["FilterExpression"] if "FilterExpression" in perm_keys else (perm["QueryExpression"] if "QueryExpression" in perm_keys else "")
+                    trow = conn.execute(
                         "SELECT Name FROM [Table] WHERE ID = ?", (table_id,)
                     ).fetchone()
-                    tname = table_name["Name"] if table_name else f"Table {table_id}"
+                    tname = trow["Name"] if trow else f"Table {table_id}"
                     lines.append(f"    {tname}: {filter_expr}")
 
-                # Get role members
                 members = conn.execute(
                     "SELECT * FROM [RoleMembership] WHERE RoleID = ?",
                     (role_id,)
@@ -5471,9 +5473,15 @@ def pbix_get_rls_roles(alias: str) -> str:
                     lines.append(f"    Members: {len(members)}")
 
             conn.close()
+            conn = None
             return ToolResponse.ok("\n".join(lines)).to_text()
         finally:
-            os.unlink(tmp.name)
+            if conn:
+                conn.close()
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
@@ -5513,17 +5521,24 @@ def pbix_set_rls_role(
             role = conn.execute(
                 "SELECT ID FROM [Role] WHERE Name = ?", (role_name,)
             ).fetchone()
+            c = conn.cursor()
+            # Get MAXID for safe ID allocation
+            maxid_row = c.execute(
+                "SELECT Value FROM DBPROPERTIES WHERE Name = 'MAXID'"
+            ).fetchone()
+            max_id = int(maxid_row[0]) if maxid_row else 0
+
             if role:
                 role_id = role["ID"]
             else:
-                max_id = conn.execute("SELECT MAX(ID) FROM [Role]").fetchone()[0] or 0
-                role_id = max_id + 1
-                conn.execute(
+                max_id += 1
+                role_id = max_id
+                c.execute(
                     "INSERT INTO [Role] (ID, ModelID, Name, Description) VALUES (?, 1, ?, ?)",
                     (role_id, role_name, description),
                 )
 
-            table_row = conn.execute(
+            table_row = c.execute(
                 "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
                 (table_name,)
             ).fetchone()
@@ -5531,21 +5546,27 @@ def pbix_set_rls_role(
                 raise ValueError(f"Table '{table_name}' not found")
             table_id = table_row["ID"]
 
-            existing = conn.execute(
+            existing = c.execute(
                 "SELECT ID FROM [TablePermission] WHERE RoleID = ? AND TableID = ?",
                 (role_id, table_id)
             ).fetchone()
             if existing:
-                conn.execute(
+                c.execute(
                     "UPDATE [TablePermission] SET FilterExpression = ? WHERE ID = ?",
                     (filter_expression, existing["ID"]),
                 )
             else:
-                max_perm = conn.execute("SELECT MAX(ID) FROM [TablePermission]").fetchone()[0] or 0
-                conn.execute(
+                max_id += 1
+                c.execute(
                     "INSERT INTO [TablePermission] (ID, RoleID, TableID, FilterExpression) VALUES (?, ?, ?, ?)",
-                    (max_perm + 1, role_id, table_id, filter_expression),
+                    (max_id, role_id, table_id, filter_expression),
                 )
+
+            # Update MAXID
+            c.execute(
+                "UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'",
+                (str(max_id),)
+            )
             conn.commit()
 
         old_size, new_size = _modify_metadata_only(dm_path, _do_set)
