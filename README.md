@@ -158,7 +158,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 - **Most DataModel modifications trigger full rebuild** — add_measure, modify_measure, set_rls_role, modify_column, set_table_data, update_table_rows, add/remove relationship/table all rebuild the entire DataModel via the builder pipeline. Exception: `pbix_update_data_source` uses a lightweight metadata-only path (no rebuild).
 
 
-## Tools (74)
+## Tools (78)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
@@ -175,7 +175,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 ### DataModel Write (19)
 `pbix_datamodel_query_metadata` · `pbix_datamodel_modify_metadata` · `pbix_datamodel_add_measure` · `pbix_datamodel_modify_measure` · `pbix_datamodel_remove_measure` · `pbix_datamodel_modify_column` · `pbix_datamodel_add_relationship` · `pbix_datamodel_remove_relationship` · `pbix_datamodel_remove_table` · `pbix_datamodel_decompress` · `pbix_datamodel_recompress` · `pbix_datamodel_replace_file` · `pbix_datamodel_extract_file` · `pbix_datamodel_list_abf_files` · `pbix_set_table_data` · `pbix_update_table_rows` · `pbix_datamodel_add_field_parameter` · `pbix_datamodel_add_calculation_group` · `pbix_export_tmdl`
 
-### Resources, Themes & Custom Visuals (7)
+### Resources, Themes & Custom Visuals (9)
 `pbix_list_resources` · `pbix_get_theme` · `pbix_set_theme` · `pbix_extract_colors` · `pbix_recolor` · `pbix_get_linguistic_schema` · `pbix_set_linguistic_schema` · `pbix_add_custom_visual` · `pbix_remove_custom_visual`
 
 ### DataMashup (2)
@@ -187,7 +187,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 ### Incremental Refresh (2)
 `pbix_set_incremental_refresh` · `pbix_get_incremental_refresh`
 
-### Diagnostics & Security (2)
+### Diagnostics & Security (3)
 `pbix_doctor` · `pbix_document` · `pbix_get_password`
 
 ## Creating Reports
