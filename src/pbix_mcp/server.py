@@ -5908,7 +5908,7 @@ def pbix_document(alias: str, output_path: str = "") -> str:
                     if expr:
                         # Find the Source = ... line (most informative)
                         lines = expr.split("\n")
-                        source_line = next((l.strip() for l in lines if "Source" in l and "=" in l), lines[0].strip())
+                        source_line = next((ln.strip() for ln in lines if "Source" in ln and "=" in ln), lines[0].strip())
                         if len(source_line) > 80:
                             source_line = source_line[:77] + "..."
                         md(f"| {p['TableName']} | `{source_line}` |")
