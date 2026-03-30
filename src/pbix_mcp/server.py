@@ -5771,6 +5771,238 @@ def pbix_get_password(alias: str) -> str:
 
 
 @mcp.tool()
+def pbix_diff(alias_a: str, alias_b: str) -> str:
+    """Compare two open PBIX files and show what changed.
+
+    Compares tables, columns, measures, relationships, pages, visuals,
+    data sources, and theme colors between two files. Both files must
+    be open.
+
+    Args:
+        alias_a: The alias of the first file (baseline / "old")
+        alias_b: The alias of the second file (changed / "new")
+    """
+    try:
+        info_a = _ensure_open(alias_a)
+        info_b = _ensure_open(alias_b)
+
+        from pbix_mcp.formats.model_reader import ModelReader
+        model_a = ModelReader(info_a["path"], work_dir=info_a.get("work_dir"))
+        model_b = ModelReader(info_b["path"], work_dir=info_b.get("work_dir"))
+
+        lines: list[str] = []
+
+        def section(title: str):
+            lines.append(f"\n## {title}\n")
+
+        def added(item: str):
+            lines.append(f"  + {item}")
+
+        def removed(item: str):
+            lines.append(f"  - {item}")
+
+        def changed(item: str, old_val: str, new_val: str):
+            lines.append(f"  ~ {item}: {old_val} -> {new_val}")
+
+        name_a = os.path.basename(info_a["path"])
+        name_b = os.path.basename(info_b["path"])
+        lines.append(f"# Diff: {name_a} vs {name_b}")
+
+        # --- Tables ---
+        section("Tables")
+        try:
+            stats_a = {t["TableName"]: t for t in model_a.statistics
+                       if not t["TableName"].startswith(("H$", "R$", "U$", "LocalDateTable", "DateTableTemplate"))}
+            stats_b = {t["TableName"]: t for t in model_b.statistics
+                       if not t["TableName"].startswith(("H$", "R$", "U$", "LocalDateTable", "DateTableTemplate"))}
+
+            for name in sorted(set(stats_b) - set(stats_a)):
+                t = stats_b[name]
+                added(f"{name} ({t['ColumnCount']} cols, {t['RowCount']:,} rows)")
+            for name in sorted(set(stats_a) - set(stats_b)):
+                t = stats_a[name]
+                removed(f"{name} ({t['ColumnCount']} cols, {t['RowCount']:,} rows)")
+            for name in sorted(set(stats_a) & set(stats_b)):
+                a, b = stats_a[name], stats_b[name]
+                changes = []
+                if a["ColumnCount"] != b["ColumnCount"]:
+                    changes.append(f"columns {a['ColumnCount']}->{b['ColumnCount']}")
+                if a["RowCount"] != b["RowCount"]:
+                    changes.append(f"rows {a['RowCount']:,}->{b['RowCount']:,}")
+                if changes:
+                    changed(name, "", ", ".join(changes))
+
+            if not any(ln.startswith("  ") for ln in lines if lines.index(ln) > len(lines) - 10):
+                lines.append("  (no changes)")
+        except Exception as e:
+            lines.append(f"  Error: {e}")
+
+        # --- Columns ---
+        section("Columns")
+        try:
+            def _col_set(model):
+                result = {}
+                for c in model.schema:
+                    tn = c["TableName"]
+                    if tn.startswith(("H$", "R$", "U$", "LocalDateTable", "DateTableTemplate")):
+                        continue
+                    if c.get("IsHidden") or "RowNumber" in c["ColumnName"]:
+                        continue
+                    result[f"{tn}.{c['ColumnName']}"] = c["DataType"]
+                return result
+
+            cols_a = _col_set(model_a)
+            cols_b = _col_set(model_b)
+
+            for col in sorted(set(cols_b) - set(cols_a)):
+                added(f"{col} ({cols_b[col]})")
+            for col in sorted(set(cols_a) - set(cols_b)):
+                removed(f"{col} ({cols_a[col]})")
+            for col in sorted(set(cols_a) & set(cols_b)):
+                if cols_a[col] != cols_b[col]:
+                    changed(col, cols_a[col], cols_b[col])
+
+            added_count = len(set(cols_b) - set(cols_a))
+            removed_count = len(set(cols_a) - set(cols_b))
+            if added_count == 0 and removed_count == 0:
+                lines.append("  (no changes)")
+        except Exception as e:
+            lines.append(f"  Error: {e}")
+
+        # --- Measures ---
+        section("Measures")
+        try:
+            meas_a = {m["Name"]: m for m in model_a.dax_measures}
+            meas_b = {m["Name"]: m for m in model_b.dax_measures}
+
+            for name in sorted(set(meas_b) - set(meas_a)):
+                m = meas_b[name]
+                expr = m["Expression"].replace("\n", " ")[:60]
+                added(f"{name} = {expr}")
+            for name in sorted(set(meas_a) - set(meas_b)):
+                removed(name)
+            for name in sorted(set(meas_a) & set(meas_b)):
+                if meas_a[name]["Expression"] != meas_b[name]["Expression"]:
+                    old_expr = meas_a[name]["Expression"].replace("\n", " ")[:40]
+                    new_expr = meas_b[name]["Expression"].replace("\n", " ")[:40]
+                    changed(name, old_expr, new_expr)
+
+            if not meas_a and not meas_b:
+                lines.append("  (no measures in either file)")
+            elif len(set(meas_b) - set(meas_a)) == 0 and len(set(meas_a) - set(meas_b)) == 0:
+                has_expr_changes = any(meas_a[n]["Expression"] != meas_b[n]["Expression"]
+                                       for n in set(meas_a) & set(meas_b))
+                if not has_expr_changes:
+                    lines.append("  (no changes)")
+        except Exception as e:
+            lines.append(f"  Error: {e}")
+
+        # --- Relationships ---
+        section("Relationships")
+        try:
+            def _rel_key(r):
+                return f"{r['FromTableName']}.{r['FromColumnName']}->{r['ToTableName']}.{r['ToColumnName']}"
+
+            rels_a = {_rel_key(r): r for r in model_a.relationships}
+            rels_b = {_rel_key(r): r for r in model_b.relationships}
+
+            for key in sorted(set(rels_b) - set(rels_a)):
+                added(key)
+            for key in sorted(set(rels_a) - set(rels_b)):
+                removed(key)
+            for key in sorted(set(rels_a) & set(rels_b)):
+                if rels_a[key].get("IsActive") != rels_b[key].get("IsActive"):
+                    changed(key, f"active={rels_a[key].get('IsActive')}", f"active={rels_b[key].get('IsActive')}")
+
+            if len(set(rels_b) - set(rels_a)) == 0 and len(set(rels_a) - set(rels_b)) == 0:
+                lines.append("  (no changes)")
+        except Exception as e:
+            lines.append(f"  Error: {e}")
+
+        # --- Pages & Visuals ---
+        section("Pages & Visuals")
+        try:
+            layout_a = _get_layout(info_a.get("work_dir", "")) or {}
+            layout_b = _get_layout(info_b.get("work_dir", "")) or {}
+
+            pages_a = {s.get("displayName", f"Page {i}"): s
+                       for i, s in enumerate(layout_a.get("sections", []))}
+            pages_b = {s.get("displayName", f"Page {i}"): s
+                       for i, s in enumerate(layout_b.get("sections", []))}
+
+            for pname in sorted(set(pages_b) - set(pages_a)):
+                vc_count = len(pages_b[pname].get("visualContainers", []))
+                added(f"Page '{pname}' ({vc_count} visuals)")
+            for pname in sorted(set(pages_a) - set(pages_b)):
+                removed(f"Page '{pname}'")
+            for pname in sorted(set(pages_a) & set(pages_b)):
+                vc_a = len(pages_a[pname].get("visualContainers", []))
+                vc_b = len(pages_b[pname].get("visualContainers", []))
+                if vc_a != vc_b:
+                    changed(f"Page '{pname}'", f"{vc_a} visuals", f"{vc_b} visuals")
+
+            if len(set(pages_b) - set(pages_a)) == 0 and len(set(pages_a) - set(pages_b)) == 0:
+                has_visual_changes = any(
+                    len(pages_a[p].get("visualContainers", [])) != len(pages_b[p].get("visualContainers", []))
+                    for p in set(pages_a) & set(pages_b)
+                )
+                if not has_visual_changes:
+                    lines.append("  (no changes)")
+        except Exception as e:
+            lines.append(f"  Error: {e}")
+
+        # --- Data Sources ---
+        section("Data Sources")
+        try:
+            pq_a = {p["TableName"]: p.get("Expression", "") for p in model_a.power_query}
+            pq_b = {p["TableName"]: p.get("Expression", "") for p in model_b.power_query}
+
+            for tname in sorted(set(pq_b) - set(pq_a)):
+                added(f"{tname} (new query)")
+            for tname in sorted(set(pq_a) - set(pq_b)):
+                removed(f"{tname}")
+            for tname in sorted(set(pq_a) & set(pq_b)):
+                if pq_a[tname] != pq_b[tname]:
+                    changed(tname, "M expression modified", "")
+
+            if len(set(pq_b) - set(pq_a)) == 0 and len(set(pq_a) - set(pq_b)) == 0:
+                has_pq_changes = any(pq_a[t] != pq_b[t] for t in set(pq_a) & set(pq_b))
+                if not has_pq_changes:
+                    lines.append("  (no changes)")
+        except Exception as e:
+            lines.append(f"  Error: {e}")
+
+        # --- Theme ---
+        section("Theme Colors")
+        try:
+            work_a = info_a.get("work_dir", "")
+            work_b = info_b.get("work_dir", "")
+            colors_a = set(_load_theme_data_colors(work_a))
+            colors_b = set(_load_theme_data_colors(work_b))
+
+            for c in sorted(colors_b - colors_a):
+                added(c)
+            for c in sorted(colors_a - colors_b):
+                removed(c)
+            if colors_a == colors_b:
+                lines.append("  (no changes)")
+        except Exception as e:
+            lines.append(f"  Error: {e}")
+
+        # --- Summary ---
+        adds = sum(1 for ln in lines if ln.startswith("  + "))
+        removes = sum(1 for ln in lines if ln.startswith("  - "))
+        changes = sum(1 for ln in lines if ln.startswith("  ~ "))
+        lines.insert(1, f"\nSummary: {adds} added, {removes} removed, {changes} changed")
+
+        return ToolResponse.ok("\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
 def pbix_document(alias: str, output_path: str = "") -> str:
     """Auto-generate a comprehensive report documentation summary.
 

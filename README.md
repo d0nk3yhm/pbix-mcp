@@ -8,7 +8,7 @@
 
 An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python — no templates, no skeletons, no Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026.
 
-Exposes 78 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
+Exposes 79 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
@@ -140,6 +140,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | TMDL Export | **Beta** | Export data model as Git-friendly TMDL text files via `pbix_export_tmdl` |
 | Custom Visuals | **Beta** | Import .pbiviz packages via `pbix_add_custom_visual`, place with `pbix_add_visual` |
 | Incremental Refresh | **Blocked** | `pbix_set_incremental_refresh` blocked — requires DataMashup with RangeStart/RangeEnd M parameters |
+| Report diff (`pbix_diff`) | **Stable** | Compare two PBIX files — tables, columns, measures, relationships, pages/visuals, data sources, theme colors. Shows added/removed/changed |
 | Report documentation (`pbix_document`) | **Stable** | Auto-generate full report documentation (markdown + .docx) — tables, columns, measures, relationships, data sources, pages/visuals, RLS roles, theme colors |
 | Diagnostic tool (`pbix_doctor`) | **Stable** | 17-point comprehensive diagnostic — data sources, storage modes, columns, relationships, measures, RLS, VertiPaq row counts, table/storage consistency, referential integrity, Expression/DataMashup consistency, MAXID |
 
@@ -158,7 +159,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 - **Most DataModel modifications trigger full rebuild** — add_measure, modify_measure, set_rls_role, modify_column, set_table_data, update_table_rows, add/remove relationship/table all rebuild the entire DataModel via the builder pipeline. Exception: `pbix_update_data_source` uses a lightweight metadata-only path (no rebuild).
 
 
-## Tools (78)
+## Tools (79)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
@@ -187,8 +188,8 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 ### Incremental Refresh (2)
 `pbix_set_incremental_refresh` · `pbix_get_incremental_refresh`
 
-### Diagnostics & Security (3)
-`pbix_doctor` · `pbix_document` · `pbix_get_password`
+### Diagnostics & Security (4)
+`pbix_doctor` · `pbix_document` · `pbix_diff` · `pbix_get_password`
 
 ## Creating Reports
 
@@ -524,7 +525,7 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (78 tools)
+  server.py              # MCP server (79 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX builder (metadata, VertiPaq, layout, relationships)
   builder_v2.py          # Template-free ABF + ZIP generation
