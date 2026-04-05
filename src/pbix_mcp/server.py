@@ -2429,7 +2429,6 @@ def pbix_set_theme(alias: str, theme_json: str, filename: str = "CY24SU11.json")
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
 def _load_theme_data_colors(work_dir: str) -> list[str]:
     """Load dataColors from the active theme (RegisteredResources first, then BaseThemes)."""
     for subdir in ("RegisteredResources", "SharedResources/BaseThemes"):
