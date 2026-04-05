@@ -8,7 +8,7 @@
 
 An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python — no templates, no skeletons, no Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026.
 
-Exposes 87 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
+Exposes 88 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
@@ -140,6 +140,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Field Parameters | **Blocked** | `pbix_datamodel_add_field_parameter` blocked — needs full DataModel rebuild to generate VertiPaq storage for new table |
 | Calculation Groups | **Blocked** | `pbix_datamodel_add_calculation_group` blocked — needs full DataModel rebuild to generate VertiPaq storage for new table |
 | TMDL Export | **Beta** | Export data model as Git-friendly TMDL text files via `pbix_export_tmdl` |
+| PBIP Export | **Stable** | Convert PBIX to PBIP (Power BI Project) folder structure via `pbix_export_pbip` — full TMDL semantic model + report layout + static resources, ready for Git |
 | Custom Visuals | **Beta** | Import .pbiviz packages via `pbix_add_custom_visual`, place with `pbix_add_visual` |
 | Incremental Refresh | **Blocked** | `pbix_set_incremental_refresh` blocked — requires DataMashup with RangeStart/RangeEnd M parameters |
 | Report diff (`pbix_diff`) | **Stable** | Compare two PBIX files — tables, columns, measures, relationships, pages/visuals, data sources, theme colors. Shows added/removed/changed |
@@ -176,8 +177,8 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 ### DataModel Read (16)
 `pbix_get_model_schema` · `pbix_get_model_measures` · `pbix_get_model_relationships` · `pbix_get_model_power_query` · `pbix_get_model_columns` · `pbix_get_table_data` · `pbix_list_tables` · `pbix_get_metadata` · `pbix_list_data_sources` · `pbix_update_data_source` · `pbix_export_table_csv` · `pbix_export_all_tables_csv` · `pbix_find_value` · `pbix_query_table` · `pbix_table_stats` · `pbix_data_diff`
 
-### DataModel Write (20)
-`pbix_datamodel_query_metadata` · `pbix_datamodel_modify_metadata` · `pbix_datamodel_add_measure` · `pbix_datamodel_modify_measure` · `pbix_datamodel_remove_measure` · `pbix_datamodel_modify_column` · `pbix_datamodel_add_relationship` · `pbix_datamodel_remove_relationship` · `pbix_datamodel_remove_table` · `pbix_datamodel_decompress` · `pbix_datamodel_recompress` · `pbix_datamodel_replace_file` · `pbix_datamodel_extract_file` · `pbix_datamodel_list_abf_files` · `pbix_set_table_data` · `pbix_update_table_rows` · `pbix_datamodel_add_field_parameter` · `pbix_datamodel_add_calculation_group` · `pbix_export_tmdl` · `pbix_replace_value`
+### DataModel Write (21)
+`pbix_datamodel_query_metadata` · `pbix_datamodel_modify_metadata` · `pbix_datamodel_add_measure` · `pbix_datamodel_modify_measure` · `pbix_datamodel_remove_measure` · `pbix_datamodel_modify_column` · `pbix_datamodel_add_relationship` · `pbix_datamodel_remove_relationship` · `pbix_datamodel_remove_table` · `pbix_datamodel_decompress` · `pbix_datamodel_recompress` · `pbix_datamodel_replace_file` · `pbix_datamodel_extract_file` · `pbix_datamodel_list_abf_files` · `pbix_set_table_data` · `pbix_update_table_rows` · `pbix_datamodel_add_field_parameter` · `pbix_datamodel_add_calculation_group` · `pbix_export_tmdl` · `pbix_export_pbip` · `pbix_replace_value`
 
 ### Resources, Themes & Custom Visuals (9)
 `pbix_list_resources` · `pbix_get_theme` · `pbix_set_theme` · `pbix_extract_colors` · `pbix_recolor` · `pbix_get_linguistic_schema` · `pbix_set_linguistic_schema` · `pbix_add_custom_visual` · `pbix_remove_custom_visual`
@@ -528,7 +529,7 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (87 tools)
+  server.py              # MCP server (88 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX builder (metadata, VertiPaq, layout, relationships)
   builder_v2.py          # Template-free ABF + ZIP generation

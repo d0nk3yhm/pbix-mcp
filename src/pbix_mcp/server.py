@@ -7649,10 +7649,65 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
 
     # ---- model.tmdl ----
     culture = model_row[1] if model_row and model_row[1] else "en-US"
+    c.execute(
+        "SELECT DefaultPowerBIDataSourceVersion, DiscourageImplicitMeasures, "
+        "SourceQueryCulture, DataAccessOptions FROM Model LIMIT 1"
+    )
+    model_props = c.fetchone()
 
     with open(os.path.join(output_dir, "model.tmdl"), "w", encoding="utf-8") as f:
         f.write("model Model\n")
         f.write(f"\tculture: {culture}\n")
+        if model_props:
+            dsv = model_props[0]
+            # DefaultPowerBIDataSourceVersion: 2 = powerBI_V3
+            dsv_map = {1: "powerBI_V1", 2: "powerBI_V3"}
+            if dsv in dsv_map:
+                f.write(f"\tdefaultPowerBIDataSourceVersion: {dsv_map[dsv]}\n")
+            if model_props[1]:
+                f.write("\tdiscourageImplicitMeasures\n")
+            sqc = model_props[2]
+            if sqc:
+                f.write(f"\tsourceQueryCulture: {sqc}\n")
+            dao = model_props[3]
+            if dao:
+                import json as _json
+                try:
+                    dao_obj = _json.loads(dao)
+                    if dao_obj:
+                        f.write("\tdataAccessOptions\n")
+                        if dao_obj.get("legacyRedirects"):
+                            f.write("\t\tlegacyRedirects\n")
+                        if dao_obj.get("returnErrorValuesAsNull"):
+                            f.write("\t\treturnErrorValuesAsNull\n")
+                except Exception:
+                    pass
+
+    # ---- expressions.tmdl (shared M parameters) ----
+    c.execute(
+        "SELECT Name, Expression, Description, LineageTag FROM Expression "
+        "WHERE ModelID = 1 ORDER BY ID"
+    )
+    exprs = c.fetchall()
+    if exprs:
+        lines = []
+        for e_name, e_expr, e_desc, e_tag in exprs:
+            if e_expr:
+                expr_lines = e_expr.strip().split("\n")
+                if len(expr_lines) == 1:
+                    lines.append(f"expression {_tmdl_escape(e_name)} =")
+                    lines.append(f"\t\t{expr_lines[0]}")
+                else:
+                    lines.append(f"expression {_tmdl_escape(e_name)} =")
+                    for el in expr_lines:
+                        lines.append(f"\t\t{el}")
+                # Note: TMDL expression objects do not support 'description'
+                if e_tag:
+                    lines.append(f"\tlineageTag: {e_tag}")
+                lines.append("")
+        if lines:
+            with open(os.path.join(output_dir, "expressions.tmdl"), "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
 
     # ---- tables/ ----
     tables_dir = os.path.join(output_dir, "tables")
@@ -7666,8 +7721,8 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
         if table_name.startswith(("H$", "R$", "U$")):
             continue
         lines = [f"table '{_tmdl_escape(table_name)}'"]
-        if table_desc:
-            lines.append(f"\tdescription: {table_desc}")
+        # Note: PBI Desktop's TMDL parser rejects 'description' on tables
+        # even though the TOM model supports it — skip to avoid load errors
         if is_hidden:
             lines.append("\tisHidden")
         lines.append("")
@@ -7711,8 +7766,7 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
                 lines.append("\t\tisKey")
             if fmt_str:
                 lines.append(f"\t\tformatString: {fmt_str}")
-            if col_desc:
-                lines.append(f"\t\tdescription: {col_desc}")
+            # Note: PBI Desktop's TMDL parser rejects 'description' on columns
             lines.append("")
             stats["columns"] += 1
 
@@ -7727,8 +7781,7 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
             lines.append(f"\tmeasure '{_tmdl_escape(m_name)}' = {m_expr}")
             if m_fmt:
                 lines.append(f"\t\tformatString: {m_fmt}")
-            if m_desc:
-                lines.append(f"\t\tdescription: {m_desc}")
+            # Note: PBI Desktop's TMDL parser rejects 'description' on measures
             if m_hidden:
                 lines.append("\t\tisHidden")
             if m_folder:
@@ -7746,10 +7799,11 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
             p_name, p_query, p_mode, p_type = part
             if p_query:
                 mode_str = "directQuery" if p_mode == 1 else "import"
-                if p_type == 4:
-                    # Calculated partition
+                if p_type == 2:
+                    # Calculated partition (DAX)
                     lines.append(f"\tpartition '{_tmdl_escape(p_name)}' = calculated")
                 else:
+                    # Type 4 = M (Power Query), default
                     lines.append(f"\tpartition '{_tmdl_escape(p_name)}' = m")
                     lines.append(f"\t\tmode: {mode_str}")
                 lines.append("\t\tsource =")
@@ -7784,7 +7838,9 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
             lines.append(f"\ttoColumn: '{_tmdl_escape(to_tbl)}'.'{_tmdl_escape(to_col)}'")
             if not is_active:
                 lines.append("\tisActive: false")
-            cfb_map = {0: "oneDirection", 1: "bothDirections", 2: "automatic"}
+            # TOM CrossFilteringBehavior: 1=OneDirection (default), 2=BothDirections, 3=Automatic
+            # Only emit non-default values in TMDL
+            cfb_map = {2: "bothDirections", 3: "automatic"}
             if cross_filter in cfb_map:
                 lines.append(f"\tcrossFilteringBehavior: {cfb_map[cross_filter]}")
             lines.append("")
@@ -7801,8 +7857,7 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
         os.makedirs(roles_dir, exist_ok=True)
         for role_id, role_name, role_desc in roles:
             lines = [f"role '{_tmdl_escape(role_name)}'"]
-            if role_desc:
-                lines.append(f"\tdescription: {role_desc}")
+            # Note: PBI Desktop's TMDL parser rejects 'description' on roles
 
             c.execute(
                 "SELECT t.Name, tp.FilterExpression FROM TablePermission tp "
@@ -8126,6 +8181,214 @@ def pbix_export_tmdl(alias: str, output_path: str = "") -> str:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+
+
+def _sanitize_pbir_name(name: str) -> str:
+    """Make a name safe for PBIR folder/file naming (word chars or hyphens only)."""
+    import re as _re
+    sanitized = _re.sub(r'[^\w\-]', '_', name)
+    if not sanitized:
+        sanitized = "unnamed"
+    return sanitized[:50]
+
+
+def _pbix_config_to_pbir_visual(config: dict, x: float, y: float, w: float, h: float, z: float = 0) -> dict:
+    """Convert a PBIX visualContainer config dict to a PBIR visual.json dict."""
+    pbir_name = config.get("name", "visual")
+    single_visual = config.get("singleVisual", {})
+    visual_type = single_visual.get("visualType", "unknown")
+
+    # PBIR visual structure
+    visual_obj: dict = {
+        "visualType": visual_type,
+    }
+
+    # Preserve drillFilterOtherVisuals if present
+    if "drillFilterOtherVisuals" in single_visual:
+        visual_obj["drillFilterOtherVisuals"] = single_visual["drillFilterOtherVisuals"]
+
+    # Build query structure from prototypeQuery + projections
+    proto = single_visual.get("prototypeQuery")
+    projections = single_visual.get("projections")
+    if proto or projections:
+        query: dict = {"queryState": {}}
+        if projections:
+            # Translate projections to queryState role mappings
+            for role_name, role_items in projections.items():
+                query["queryState"][role_name] = {"projections": role_items}
+        visual_obj["query"] = query
+        if proto:
+            visual_obj["query"]["sortDefinition"] = {"sort": [], "isDefaultSort": True}
+            # Add prototypeQuery as dataViewMappings source
+            visual_obj["query"]["queryRef"] = proto
+    else:
+        visual_obj["query"] = {"queryState": {}}
+
+    # Copy data formatting (objects)
+    if "objects" in single_visual:
+        visual_obj["objects"] = single_visual["objects"]
+
+    # visualContainerObjects = vcObjects (title, background, border, etc.)
+    result: dict = {
+        "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/1.0.0/schema.json",
+        "name": pbir_name,
+        "position": {"x": x, "y": y, "z": z, "width": w, "height": h},
+        "visual": visual_obj,
+    }
+    if "vcObjects" in single_visual:
+        result["visualContainerObjects"] = single_visual["vcObjects"]
+
+    return result
+
+
+@mcp.tool()
+def pbix_export_pbip(alias: str, output_dir: str = "") -> str:
+    """Convert a PBIX to PBIP (Power BI Project) folder structure.
+
+    Creates a PBIP project with:
+      - {name}.pbip            (root pointer JSON)
+      - {name}.Report/         (report layout + static resources)
+      - {name}.SemanticModel/  (semantic model as TMDL)
+      - .gitignore             (standard PBIP ignores)
+
+    PBIP is Microsoft's folder-based format for Git version control and CI/CD.
+
+    Args:
+        alias: The alias of the open file
+        output_dir: Target directory. Defaults to <pbix_dir>/<name>_pbip/
+    """
+    try:
+        info = _ensure_open(alias)
+        work_dir = info["work_dir"]
+        pbix_path = info["path"]
+
+        base_name = os.path.splitext(os.path.basename(pbix_path))[0]
+        # Strip spaces and special chars for safer folder names
+        safe_base = "".join(c if c.isalnum() or c in "-_" else "_" for c in base_name)
+
+        if not output_dir:
+            pbix_dir = os.path.dirname(pbix_path)
+            output_dir = os.path.join(pbix_dir, f"{safe_base}_pbip")
+
+        # Clean or create output directory
+        if os.path.exists(output_dir):
+            import shutil
+            shutil.rmtree(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+
+        report_dir = os.path.join(output_dir, f"{safe_base}.Report")
+        model_dir = os.path.join(output_dir, f"{safe_base}.SemanticModel")
+        os.makedirs(report_dir, exist_ok=True)
+        os.makedirs(model_dir, exist_ok=True)
+
+        # --- 1. Export TMDL to SemanticModel/definition/ ---
+        dm_path = os.path.join(work_dir, "DataModel")
+        tmdl_stats = {"tables": 0, "columns": 0, "measures": 0, "relationships": 0, "roles": 0}
+        if os.path.exists(dm_path):
+            from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+            from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+            with open(dm_path, "rb") as f:
+                dm_bytes = f.read()
+            abf = decompress_datamodel(dm_bytes)
+            db_bytes = read_metadata_sqlite(abf)
+
+            tmdl_def_dir = os.path.join(model_dir, "definition")
+            os.makedirs(tmdl_def_dir, exist_ok=True)
+
+            fd, tmp_db = tempfile.mkstemp(suffix=".db")
+            os.write(fd, db_bytes)
+            os.close(fd)
+            try:
+                conn = sqlite3.connect(tmp_db)
+                tmdl_stats = _export_tmdl_from_sqlite(conn, tmdl_def_dir)
+                conn.close()
+            finally:
+                try:
+                    os.unlink(tmp_db)
+                except OSError:
+                    pass
+
+        # --- 2. Create definition.pbism (semantic model descriptor) ---
+        pbism_content = {
+            "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/semanticModel/definitionProperties/1.0.0/schema.json",
+            "version": "4.1",
+            "settings": {}
+        }
+        with open(os.path.join(model_dir, "definition.pbism"), "w", encoding="utf-8") as f:
+            json.dump(pbism_content, f, indent=2)
+
+        # --- 3. Copy StaticResources to Report folder ---
+        pbix_static = os.path.join(work_dir, "Report", "StaticResources")
+        if os.path.isdir(pbix_static):
+            import shutil
+            dest_static = os.path.join(report_dir, "StaticResources")
+            shutil.copytree(pbix_static, dest_static)
+
+        # --- 4. Create definition.pbir (report descriptor with byPath ref to model) ---
+        pbir_content = {
+            "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definitionProperties/2.0.0/schema.json",
+            "version": "1.0",
+            "datasetReference": {
+                "byPath": {
+                    "path": f"../{safe_base}.SemanticModel"
+                }
+            }
+        }
+        with open(os.path.join(report_dir, "definition.pbir"), "w", encoding="utf-8") as f:
+            json.dump(pbir_content, f, indent=2)
+
+        # --- 5. Report layout (legacy format) ---
+        # Use the original PBIX Layout JSON directly as report.json.
+        # PBIR decomposed format (version 4.0) has rendering bugs in PBI Desktop,
+        # so we use legacy format (version 1.0) with the full Layout JSON.
+        layout = _get_layout(work_dir)
+        if not layout:
+            return ToolResponse.error("No layout found in PBIX", "LAYOUT_MISSING").to_text()
+
+        sections = layout.get("sections", [])
+        with open(os.path.join(report_dir, "report.json"), "w", encoding="utf-8") as f:
+            json.dump(layout, f, indent=2, ensure_ascii=False)
+
+        # --- 7. Root .pbip file ---
+        pbip_content = {
+            "$schema": "https://developer.microsoft.com/json-schemas/fabric/pbip/pbipProperties/1.0.0/schema.json",
+            "version": "1.0",
+            "artifacts": [
+                {"report": {"path": f"{safe_base}.Report"}}
+            ],
+            "settings": {"enableAutoRecovery": True}
+        }
+        with open(os.path.join(output_dir, f"{safe_base}.pbip"), "w", encoding="utf-8") as f:
+            json.dump(pbip_content, f, indent=2)
+
+        # --- 8. .gitignore ---
+        with open(os.path.join(output_dir, ".gitignore"), "w", encoding="utf-8") as f:
+            f.write("**/.pbi/localSettings.json\n")
+            f.write("**/.pbi/cache.abf\n")
+
+        # Count output
+        total_pages = len(sections)
+        total_visuals = sum(len(s.get("visualContainers", [])) for s in sections)
+
+        summary = (
+            f"PBIP project exported to: {output_dir}\n\n"
+            f"  {safe_base}.pbip                     (root)\n"
+            f"  {safe_base}.Report/\n"
+            f"    definition.pbir                    (report descriptor)\n"
+            f"    report.json                        ({total_pages} pages, {total_visuals} visuals)\n"
+            f"  {safe_base}.SemanticModel/\n"
+            f"    definition.pbism                   (model descriptor)\n"
+            f"    definition/                        (TMDL)\n"
+            f"      {tmdl_stats['tables']} tables, {tmdl_stats['columns']} columns, "
+            f"{tmdl_stats['measures']} measures, {tmdl_stats['relationships']} relationships, "
+            f"{tmdl_stats['roles']} roles\n"
+        )
+        return ToolResponse.ok(summary).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "PBIP_EXPORT_ERROR").to_text()
 
 
 # ---- Section 11: MCP main ----
