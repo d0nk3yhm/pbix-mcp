@@ -3200,6 +3200,763 @@ def pbix_get_table_data(alias: str, table_name: str, max_rows: int = 50) -> str:
         return ToolResponse.error(str(e), DataModelCompressionError.code).to_text()
 
 
+def _format_csv_value(val, delimiter: str = ",") -> str:
+    """Format a single value for CSV output."""
+    if val is None:
+        return ""
+    if isinstance(val, (int, float)):
+        return str(val)
+    from datetime import date, datetime
+    if isinstance(val, (datetime, date)):
+        return val.isoformat()
+    s = str(val)
+    # Quote if contains delimiter, quote, or newline
+    if delimiter in s or '"' in s or "\n" in s or "\r" in s:
+        s = s.replace('"', '""')
+        return f'"{s}"'
+    return s
+
+
+def _is_system_table(name: str) -> bool:
+    """Check if a table is a system/internal table (hidden from users)."""
+    return name.startswith(("H$", "R$", "U$", "LocalDateTable", "DateTableTemplate"))
+
+
+@mcp.tool()
+def pbix_export_table_csv(
+    alias: str, table_name: str, output_path: str, delimiter: str = ","
+) -> str:
+    """Export a table's data to a CSV file.
+
+    Writes all rows of the table (no row limit) with headers. Strings are
+    quoted when they contain the delimiter, quotes, or newlines. Dates are
+    formatted as ISO 8601. Works on Import files only (not DirectQuery).
+
+    Args:
+        alias: The alias of the open file
+        table_name: Name of the table to export
+        output_path: Absolute path for the CSV file
+        delimiter: Field delimiter (default ',')
+    """
+    try:
+        info = _ensure_open(alias)
+        if info.get("is_directquery"):
+            return ToolResponse.error(
+                "This file uses DirectQuery — table data is not stored locally.",
+                UnsupportedFormatError.code,
+            ).to_text()
+
+        from pbix_mcp.formats.model_reader import ModelReader
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
+        table_data = model.get_table(table_name, max_rows=0)
+
+        if not table_data["columns"]:
+            return ToolResponse.error(
+                f"Table '{table_name}' not found.", "TABLE_NOT_FOUND"
+            ).to_text()
+
+        cols = table_data["columns"]
+        rows = table_data["rows"]
+
+        with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+            f.write(delimiter.join(_format_csv_value(c, delimiter) for c in cols) + "\n")
+            for row in rows:
+                f.write(delimiter.join(_format_csv_value(v, delimiter) for v in row) + "\n")
+
+        file_size = os.path.getsize(output_path)
+        return ToolResponse.ok(
+            f"Exported '{table_name}' to {output_path}\n"
+            f"  {len(rows):,} rows × {len(cols)} columns ({file_size:,} bytes)"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "CSV_EXPORT_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_export_all_tables_csv(alias: str, output_dir: str) -> str:
+    """Export every data table in the model to separate CSV files.
+
+    Creates one CSV per table in the output directory. Skips system tables
+    (H$, R$, U$, LocalDateTable, DateTableTemplate). Works on Import files only.
+
+    Args:
+        alias: The alias of the open file
+        output_dir: Absolute path for the output directory (created if missing)
+    """
+    try:
+        info = _ensure_open(alias)
+        if info.get("is_directquery"):
+            return ToolResponse.error(
+                "This file uses DirectQuery — table data is not stored locally.",
+                UnsupportedFormatError.code,
+            ).to_text()
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        from pbix_mcp.formats.model_reader import ModelReader
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
+        stats = model.statistics
+        data_tables = [t for t in stats if not _is_system_table(t["TableName"])]
+
+        exported = []
+        errors = []
+        for t in data_tables:
+            tname = t["TableName"]
+            try:
+                safe_name = "".join(c if c.isalnum() or c in "-_. " else "_" for c in tname)
+                csv_path = os.path.join(output_dir, f"{safe_name}.csv")
+                tdata = model.get_table(tname, max_rows=0)
+                if not tdata["columns"]:
+                    continue
+                with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+                    f.write(",".join(_format_csv_value(c) for c in tdata["columns"]) + "\n")
+                    for row in tdata["rows"]:
+                        f.write(",".join(_format_csv_value(v) for v in row) + "\n")
+                exported.append(f"  {tname}: {len(tdata['rows']):,} rows -> {safe_name}.csv")
+            except Exception as e:
+                errors.append(f"  {tname}: {e}")
+
+        msg = f"Exported {len(exported)} tables to {output_dir}\n" + "\n".join(exported)
+        if errors:
+            msg += "\n\nErrors:\n" + "\n".join(errors)
+        return ToolResponse.ok(msg).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "CSV_EXPORT_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_find_value(
+    alias: str, search_value: str, case_sensitive: bool = False, max_matches: int = 100
+) -> str:
+    """Search for a value across all tables and columns in the model.
+
+    Returns all table.column locations where the value appears, with the
+    number of matching rows per column. Works on Import files only.
+
+    Args:
+        alias: The alias of the open file
+        search_value: The value to search for (string comparison)
+        case_sensitive: If False (default), compares case-insensitively
+        max_matches: Maximum locations to report (default 100)
+    """
+    try:
+        info = _ensure_open(alias)
+        if info.get("is_directquery"):
+            return ToolResponse.error(
+                "This file uses DirectQuery — table data is not stored locally.",
+                UnsupportedFormatError.code,
+            ).to_text()
+
+        from pbix_mcp.formats.model_reader import ModelReader
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
+        stats = model.statistics
+        data_tables = [t for t in stats if not _is_system_table(t["TableName"])]
+
+        needle = search_value if case_sensitive else search_value.lower()
+        matches: list[tuple[str, str, int, list]] = []  # (table, col, count, samples)
+
+        for t in data_tables:
+            tname = t["TableName"]
+            try:
+                tdata = model.get_table(tname, max_rows=0)
+                cols = tdata["columns"]
+                for ci, cname in enumerate(cols):
+                    count = 0
+                    samples = []
+                    for row in tdata["rows"]:
+                        val = row[ci]
+                        if val is None:
+                            continue
+                        s = str(val) if case_sensitive else str(val).lower()
+                        if needle in s:
+                            count += 1
+                            if len(samples) < 3:
+                                samples.append(str(val))
+                    if count > 0:
+                        matches.append((tname, cname, count, samples))
+                        if len(matches) >= max_matches:
+                            break
+                if len(matches) >= max_matches:
+                    break
+            except Exception:
+                continue
+
+        if not matches:
+            return ToolResponse.ok(f"No matches found for '{search_value}'.").to_text()
+
+        lines = [f"Found '{search_value}' in {len(matches)} location(s):\n"]
+        for tname, cname, count, samples in matches:
+            sample_str = ", ".join(f"'{s}'" for s in samples[:3])
+            lines.append(f"  {tname}.{cname}: {count:,} matches (e.g. {sample_str})")
+        return ToolResponse.ok("\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "SEARCH_ERROR").to_text()
+
+
+def _parse_where_clause(where: str) -> list[dict]:
+    """Parse a simple SQL-like WHERE clause into conditions.
+
+    Supports: column = 'value', column != 'value', column > N, column < N,
+    column >= N, column <= N, column IN ('a', 'b'), column LIKE '%x%'
+    joined by AND/OR. Returns list of {col, op, value, connector} dicts.
+    """
+    import re as _re
+    if not where.strip():
+        return []
+
+    # Tokenize by AND/OR (preserving connectors)
+    parts = _re.split(r'\s+(AND|OR)\s+', where, flags=_re.IGNORECASE)
+    conditions = []
+    for i, part in enumerate(parts):
+        if part.upper() in ("AND", "OR"):
+            continue
+        connector = "AND"
+        if i > 0:
+            connector = parts[i - 1].upper()
+
+        # Match: col OP value
+        m = _re.match(r"\s*([a-zA-Z_][\w\s\-\.]*?)\s*(IN|LIKE|!=|>=|<=|>|<|=)\s*(.+)\s*$", part, _re.IGNORECASE)
+        if not m:
+            raise ValueError(f"Can't parse condition: '{part}'")
+        col = m.group(1).strip()
+        op = m.group(2).upper()
+        val = m.group(3).strip()
+
+        # Parse value
+        if op == "IN":
+            # ('a', 'b', 'c')
+            val = val.strip("()")
+            items = [x.strip().strip("'\"") for x in val.split(",")]
+            parsed_val = items
+        elif val.startswith("'") and val.endswith("'"):
+            parsed_val = val[1:-1]
+        elif val.startswith('"') and val.endswith('"'):
+            parsed_val = val[1:-1]
+        else:
+            # Try number
+            try:
+                parsed_val = float(val) if "." in val else int(val)
+            except ValueError:
+                parsed_val = val
+        conditions.append({"col": col, "op": op, "value": parsed_val, "connector": connector})
+    return conditions
+
+
+def _eval_condition(row_val, op: str, value) -> bool:
+    """Evaluate a single condition against a row value."""
+    if row_val is None:
+        return False
+    try:
+        if op == "=":
+            return str(row_val) == str(value)
+        if op == "!=":
+            return str(row_val) != str(value)
+        if op == ">":
+            return float(row_val) > float(value)
+        if op == ">=":
+            return float(row_val) >= float(value)
+        if op == "<":
+            return float(row_val) < float(value)
+        if op == "<=":
+            return float(row_val) <= float(value)
+        if op == "IN":
+            return str(row_val) in [str(x) for x in value]
+        if op == "LIKE":
+            # Convert SQL LIKE to regex
+            import re as _re
+            pattern = _re.escape(str(value)).replace("%", ".*").replace("_", ".")
+            return bool(_re.match(f"^{pattern}$", str(row_val), _re.IGNORECASE))
+    except (ValueError, TypeError):
+        return False
+    return False
+
+
+@mcp.tool()
+def pbix_query_table(
+    alias: str,
+    table_name: str,
+    where: str = "",
+    columns: str = "",
+    max_rows: int = 100,
+    order_by: str = "",
+) -> str:
+    """Filter table rows with a SQL-like WHERE clause.
+
+    Supports operators: =, !=, >, >=, <, <=, LIKE, IN. Conditions joined
+    by AND/OR. Column values can be strings ('USA'), numbers (42), or
+    lists for IN (('USA', 'Canada')).
+
+    Args:
+        alias: The alias of the open file
+        table_name: Name of the table to query
+        where: WHERE clause, e.g. "Country = 'USA' AND Amount > 1000"
+        columns: Comma-separated columns to return (empty = all)
+        max_rows: Maximum rows to return (default 100)
+        order_by: Column name to sort by (optional, append ' DESC' for descending)
+    """
+    try:
+        info = _ensure_open(alias)
+        if info.get("is_directquery"):
+            return ToolResponse.error(
+                "This file uses DirectQuery — table data is not stored locally.",
+                UnsupportedFormatError.code,
+            ).to_text()
+
+        from pbix_mcp.formats.model_reader import ModelReader
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
+        tdata = model.get_table(table_name, max_rows=0)
+
+        if not tdata["columns"]:
+            return ToolResponse.error(
+                f"Table '{table_name}' not found.", "TABLE_NOT_FOUND"
+            ).to_text()
+
+        all_cols = tdata["columns"]
+        col_idx = {c: i for i, c in enumerate(all_cols)}
+
+        # Parse WHERE
+        conditions = _parse_where_clause(where) if where else []
+        for c in conditions:
+            if c["col"] not in col_idx:
+                return ToolResponse.error(
+                    f"Column '{c['col']}' not found in table '{table_name}'", "COLUMN_NOT_FOUND"
+                ).to_text()
+
+        # Filter rows
+        filtered = []
+        for row in tdata["rows"]:
+            if not conditions:
+                filtered.append(row)
+                continue
+            # Eval AND/OR — simple left-to-right
+            result = _eval_condition(row[col_idx[conditions[0]["col"]]],
+                                     conditions[0]["op"], conditions[0]["value"])
+            for cond in conditions[1:]:
+                val = row[col_idx[cond["col"]]]
+                r = _eval_condition(val, cond["op"], cond["value"])
+                if cond["connector"] == "AND":
+                    result = result and r
+                else:
+                    result = result or r
+            if result:
+                filtered.append(row)
+
+        # Column projection
+        if columns.strip():
+            proj_cols = [c.strip() for c in columns.split(",")]
+            for c in proj_cols:
+                if c not in col_idx:
+                    return ToolResponse.error(
+                        f"Column '{c}' not found", "COLUMN_NOT_FOUND"
+                    ).to_text()
+            proj_idx = [col_idx[c] for c in proj_cols]
+            filtered = [[r[i] for i in proj_idx] for r in filtered]
+            out_cols = proj_cols
+        else:
+            out_cols = all_cols
+
+        # ORDER BY
+        if order_by.strip():
+            ob = order_by.strip()
+            reverse = False
+            if ob.upper().endswith(" DESC"):
+                ob = ob[:-5].strip()
+                reverse = True
+            elif ob.upper().endswith(" ASC"):
+                ob = ob[:-4].strip()
+            if ob not in [c for c in out_cols]:
+                return ToolResponse.error(
+                    f"ORDER BY column '{ob}' not in output", "COLUMN_NOT_FOUND"
+                ).to_text()
+            ob_idx = out_cols.index(ob)
+            filtered.sort(key=lambda r: (r[ob_idx] is None, r[ob_idx]), reverse=reverse)
+
+        total = len(filtered)
+        shown = filtered[:max_rows]
+
+        # Format output
+        from pbix_mcp.formats.model_reader import format_table_data
+        formatted = format_table_data({"columns": out_cols, "rows": shown}, max_rows=max_rows)
+        header = f"Query returned {total:,} rows"
+        if total > max_rows:
+            header += f" (showing first {max_rows})"
+        return ToolResponse.ok(f"{header}\n\n{formatted}").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "QUERY_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_table_stats(alias: str, table_name: str) -> str:
+    """Profile a table — per-column stats (min/max/avg/distinct/nulls).
+
+    For strings: distinct count, null count, min/max length, top 5 values.
+    For numbers: min/max/avg/sum/null count.
+    For dates: min/max/null count.
+
+    Args:
+        alias: The alias of the open file
+        table_name: Name of the table to profile
+    """
+    try:
+        info = _ensure_open(alias)
+        if info.get("is_directquery"):
+            return ToolResponse.error(
+                "This file uses DirectQuery — table data is not stored locally.",
+                UnsupportedFormatError.code,
+            ).to_text()
+
+        from collections import Counter
+        from datetime import date, datetime
+
+        from pbix_mcp.formats.model_reader import ModelReader
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
+        tdata = model.get_table(table_name, max_rows=0)
+
+        if not tdata["columns"]:
+            return ToolResponse.error(
+                f"Table '{table_name}' not found.", "TABLE_NOT_FOUND"
+            ).to_text()
+
+        cols = tdata["columns"]
+        rows = tdata["rows"]
+        total_rows = len(rows)
+
+        lines = [f"# Stats for '{table_name}' ({total_rows:,} rows, {len(cols)} columns)\n"]
+
+        for ci, cname in enumerate(cols):
+            values = [r[ci] for r in rows]
+            nulls = sum(1 for v in values if v is None)
+            non_null = [v for v in values if v is not None]
+
+            if not non_null:
+                lines.append(f"## {cname}")
+                lines.append(f"  All {total_rows:,} values are null")
+                lines.append("")
+                continue
+
+            # Detect type from first non-null value
+            sample = non_null[0]
+            if isinstance(sample, (int, float)) and not isinstance(sample, bool):
+                vals = [float(v) for v in non_null]
+                mn, mx = min(vals), max(vals)
+                avg = sum(vals) / len(vals)
+                lines.append(f"## {cname} (numeric)")
+                lines.append(f"  count={len(non_null):,}, nulls={nulls:,}")
+                lines.append(f"  min={mn:g}, max={mx:g}, avg={avg:.2f}, sum={sum(vals):g}")
+                lines.append(f"  distinct={len(set(vals)):,}")
+            elif isinstance(sample, (datetime, date)):
+                lines.append(f"## {cname} (datetime)")
+                lines.append(f"  count={len(non_null):,}, nulls={nulls:,}")
+                lines.append(f"  min={min(non_null)}, max={max(non_null)}")
+                lines.append(f"  distinct={len(set(non_null)):,}")
+            else:
+                # String
+                strs = [str(v) for v in non_null]
+                lens = [len(s) for s in strs]
+                distinct = set(strs)
+                counter = Counter(strs)
+                top = counter.most_common(5)
+                lines.append(f"## {cname} (string)")
+                lines.append(f"  count={len(non_null):,}, nulls={nulls:,}, distinct={len(distinct):,}")
+                lines.append(f"  length: min={min(lens)}, max={max(lens)}, avg={sum(lens)/len(lens):.1f}")
+                lines.append(f"  top 5: {', '.join(f'{v!r} ({c})' for v, c in top)}")
+            lines.append("")
+
+        return ToolResponse.ok("\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "STATS_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_data_diff(alias_a: str, alias_b: str, table_name: str, key_columns: str) -> str:
+    """Diff row data between the same table in two PBIX files.
+
+    Matches rows by key_columns (comma-separated), then reports:
+    - Added rows (in B, not in A)
+    - Removed rows (in A, not in B)
+    - Changed rows (same key, different values)
+
+    Args:
+        alias_a: Alias of the first (old) file
+        alias_b: Alias of the second (new) file
+        table_name: Table to diff (must exist in both files)
+        key_columns: Comma-separated columns to match rows by
+    """
+    try:
+        info_a = _ensure_open(alias_a)
+        info_b = _ensure_open(alias_b)
+        if info_a.get("is_directquery") or info_b.get("is_directquery"):
+            return ToolResponse.error(
+                "DirectQuery files don't store data locally.",
+                UnsupportedFormatError.code,
+            ).to_text()
+
+        from pbix_mcp.formats.model_reader import ModelReader
+        model_a = ModelReader(info_a["path"], work_dir=info_a.get("work_dir"))
+        model_b = ModelReader(info_b["path"], work_dir=info_b.get("work_dir"))
+
+        t_a = model_a.get_table(table_name, max_rows=0)
+        t_b = model_b.get_table(table_name, max_rows=0)
+
+        if not t_a["columns"]:
+            return ToolResponse.error(f"Table '{table_name}' not in file A", "TABLE_NOT_FOUND").to_text()
+        if not t_b["columns"]:
+            return ToolResponse.error(f"Table '{table_name}' not in file B", "TABLE_NOT_FOUND").to_text()
+
+        keys = [k.strip() for k in key_columns.split(",")]
+        cols_a, cols_b = t_a["columns"], t_b["columns"]
+
+        for k in keys:
+            if k not in cols_a:
+                return ToolResponse.error(f"Key column '{k}' not in table A", "COLUMN_NOT_FOUND").to_text()
+            if k not in cols_b:
+                return ToolResponse.error(f"Key column '{k}' not in table B", "COLUMN_NOT_FOUND").to_text()
+
+        key_idx_a = [cols_a.index(k) for k in keys]
+        key_idx_b = [cols_b.index(k) for k in keys]
+
+        def row_key(row, key_idx):
+            return tuple(str(row[i]) for i in key_idx)
+
+        map_a = {row_key(r, key_idx_a): r for r in t_a["rows"]}
+        map_b = {row_key(r, key_idx_b): r for r in t_b["rows"]}
+
+        added_keys = set(map_b) - set(map_a)
+        removed_keys = set(map_a) - set(map_b)
+        common_keys = set(map_a) & set(map_b)
+
+        # Compare common rows by value
+        common_cols = [c for c in cols_a if c in cols_b]
+        changed = []
+        for k in common_keys:
+            ra, rb = map_a[k], map_b[k]
+            row_changes = []
+            for cname in common_cols:
+                va = ra[cols_a.index(cname)]
+                vb = rb[cols_b.index(cname)]
+                if str(va) != str(vb):
+                    row_changes.append((cname, va, vb))
+            if row_changes:
+                changed.append((k, row_changes))
+
+        lines = [
+            f"# Data diff: '{table_name}' (key: {key_columns})",
+            "",
+            f"File A: {len(t_a['rows']):,} rows",
+            f"File B: {len(t_b['rows']):,} rows",
+            "",
+            f"Summary: {len(added_keys)} added, {len(removed_keys)} removed, {len(changed)} changed",
+        ]
+
+        if added_keys:
+            lines.append(f"\n## Added ({len(added_keys)}):")
+            for k in sorted(list(added_keys))[:20]:
+                lines.append(f"  + {' / '.join(k)}")
+            if len(added_keys) > 20:
+                lines.append(f"  ... and {len(added_keys) - 20} more")
+
+        if removed_keys:
+            lines.append(f"\n## Removed ({len(removed_keys)}):")
+            for k in sorted(list(removed_keys))[:20]:
+                lines.append(f"  - {' / '.join(k)}")
+            if len(removed_keys) > 20:
+                lines.append(f"  ... and {len(removed_keys) - 20} more")
+
+        if changed:
+            lines.append(f"\n## Changed ({len(changed)}):")
+            for k, row_changes in changed[:20]:
+                lines.append(f"  ~ {' / '.join(k)}")
+                for cname, va, vb in row_changes:
+                    lines.append(f"      {cname}: {va!r} -> {vb!r}")
+            if len(changed) > 20:
+                lines.append(f"  ... and {len(changed) - 20} more")
+
+        return ToolResponse.ok("\n".join(lines)).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "DIFF_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_replace_value(
+    alias: str,
+    table_name: str,
+    column_name: str,
+    old_value: str,
+    new_value: str,
+    case_sensitive: bool = True,
+) -> str:
+    """Find and replace ALL occurrences of a value in a column.
+
+    Reads the table, replaces all rows where the column matches old_value,
+    and writes the updated data back via DataModel rebuild.
+
+    LIMITATION: Uses the full rebuild pipeline — works on builder-created
+    files but may break PBI Desktop files with SQL Server imports (destroys
+    M expressions). For PBI Desktop files, use with caution.
+
+    Args:
+        alias: The alias of the open file
+        table_name: Name of the table
+        column_name: Name of the column to modify
+        old_value: Value to find (exact match)
+        new_value: Value to replace with
+        case_sensitive: If False, matches strings case-insensitively (default True)
+    """
+    try:
+        info = _ensure_open(alias)
+        if info.get("is_directquery"):
+            return ToolResponse.error(
+                "This file uses DirectQuery — table data is not stored locally.",
+                UnsupportedFormatError.code,
+            ).to_text()
+
+        from pbix_mcp.formats.model_reader import ModelReader
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
+        tdata = model.get_table(table_name, max_rows=0)
+
+        if not tdata["columns"]:
+            return ToolResponse.error(
+                f"Table '{table_name}' not found.", "TABLE_NOT_FOUND"
+            ).to_text()
+
+        cols = tdata["columns"]
+        if column_name not in cols:
+            return ToolResponse.error(
+                f"Column '{column_name}' not found in table '{table_name}'. "
+                f"Available: {', '.join(cols)}",
+                "COLUMN_NOT_FOUND"
+            ).to_text()
+
+        col_idx = cols.index(column_name)
+
+        # Replace values in rows
+        replaced = 0
+        if case_sensitive:
+            def matches(v):
+                return str(v) == old_value
+        else:
+            needle = old_value.lower()
+            def matches(v):
+                return str(v).lower() == needle
+
+        # Detect target data type from first non-null sample
+        sample = next((r[col_idx] for r in tdata["rows"] if r[col_idx] is not None), None)
+
+        # Coerce new_value to match column type
+        def coerce(v):
+            if sample is None:
+                return v
+            if isinstance(sample, bool):
+                return v.lower() in ("true", "1", "yes")
+            if isinstance(sample, int):
+                return int(v)
+            if isinstance(sample, float):
+                return float(v)
+            return v
+
+        try:
+            new_val_typed = coerce(new_value)
+        except (ValueError, TypeError) as e:
+            return ToolResponse.error(
+                f"new_value '{new_value}' cannot be converted to column type: {e}",
+                "TYPE_MISMATCH"
+            ).to_text()
+
+        # Rebuild rows as list-of-dicts (required by _rebuild_datamodel)
+        new_rows = []
+        for row in tdata["rows"]:
+            row_dict = dict(zip(cols, row))
+            if matches(row_dict[column_name]):
+                row_dict[column_name] = new_val_typed
+                replaced += 1
+            new_rows.append(row_dict)
+
+        if replaced == 0:
+            return ToolResponse.ok(
+                f"No matches found — '{old_value}' not in {table_name}.{column_name}"
+            ).to_text()
+
+        # Get column definitions from metadata for _rebuild_datamodel
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        with open(dm_path, "rb") as f:
+            dm_bytes = f.read()
+        abf = decompress_datamodel(dm_bytes)
+        meta_bytes = read_metadata_sqlite(abf)
+
+        fd, tmp_path = tempfile.mkstemp(suffix=".db")
+        os.write(fd, meta_bytes)
+        os.close(fd)
+        try:
+            conn = sqlite3.connect(tmp_path)
+            conn.row_factory = sqlite3.Row
+            _AMO_TO_TYPE = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime",
+                            10: "Decimal", 11: "Boolean"}
+            col_rows = conn.execute(
+                """SELECT c.ExplicitName, c.ExplicitDataType
+                   FROM [Column] c
+                   JOIN [Table] t ON c.TableID = t.ID
+                   WHERE t.Name = ? AND c.Type = 1
+                   ORDER BY c.ID""",
+                (table_name,)
+            ).fetchall()
+            conn.close()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        if not col_rows:
+            return ToolResponse.error(
+                f"Table '{table_name}' has no user columns.", "TABLE_NOT_FOUND"
+            ).to_text()
+
+        columns_def = [
+            {"name": cr["ExplicitName"],
+             "data_type": _AMO_TO_TYPE.get(cr["ExplicitDataType"], "String")}
+            for cr in col_rows
+        ]
+
+        # Filter new_rows to only include columns that exist in columns_def
+        # (tdata may include RowNumber/hidden cols that columns_def excludes)
+        valid_names = {c["name"] for c in columns_def}
+        filtered_rows = [
+            {k: v for k, v in r.items() if k in valid_names}
+            for r in new_rows
+        ]
+
+        old_size, new_size = _rebuild_datamodel(
+            info,
+            table_updates={table_name: {"columns": columns_def, "rows": filtered_rows}},
+        )
+        info["modified"] = True
+
+        return ToolResponse.ok(
+            f"Replaced {replaced:,} occurrences of '{old_value}' with '{new_value}' "
+            f"in {table_name}.{column_name}\n"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "REPLACE_ERROR").to_text()
+
+
 def _rebuild_datamodel(
     info: dict,
     table_updates: dict[str, dict] | None = None,
