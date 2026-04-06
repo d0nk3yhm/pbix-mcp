@@ -5032,103 +5032,35 @@ def pbix_datamodel_add_field_parameter(
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
 
-        # Field parameters create a new table in metadata, but adding a table
-        # requires VertiPaq data files in the ABF (H$ hierarchies, partition data).
-        # Without them, PBI crashes with TMCacheManager::CreateEmptyCollectionsForAllParents.
-        # This tool currently only modifies metadata — it needs a full DataModel rebuild
-        # to generate VertiPaq storage for the new table.  Block until that's implemented.
-        return ToolResponse.error(
-            "Field parameters require creating a new table with VertiPaq storage. "
-            "This tool currently only modifies metadata — use pbix_create with the "
-            "field parameter table defined upfront, or add field parameters in PBI Desktop.",
-            "NOT_IMPLEMENTED"
-        ).to_text()
-
-        # Build DAX expression for display purposes
-        rows_dax = []
+        # Build row data for the field parameter table
+        rows = []
         for i, f in enumerate(fields):
-            ref = f["ref"]
-            display = f["display"].replace('"', '""')
-            if "'" not in ref and "[" in ref:
-                tbl = ref.split("[")[0]
-                col = ref.split("[")[1].rstrip("]")
-                ref = f"'{tbl}'[{col}]"
-            rows_dax.append(f'    ("{display}", NAMEOF({ref}), {i})')
-        dax_expr = "{\n" + ",\n".join(rows_dax) + "\n}"
+            rows.append({
+                parameter_name: f["display"],
+                f"{parameter_name} Fields": f["ref"],
+                f"{parameter_name} Order": i,
+            })
 
-        # Build M expression — field parameters need a valid M #table() so the
-        # M engine can parse the partition on file load.  The DAX NAMEOF/tuple
-        # syntax cannot go into QueryDefinition (the M engine rejects it).
-        m_cols = (
-            f'type table [{parameter_name} = text, '
-            f'{parameter_name} Fields = text, '
-            f'{parameter_name} Order = number]'
+        # Create the table via _rebuild_datamodel (full VertiPaq storage)
+        extra_table = {
+            "name": parameter_name,
+            "columns": [
+                {"name": parameter_name, "data_type": "String"},
+                {"name": f"{parameter_name} Fields", "data_type": "String"},
+                {"name": f"{parameter_name} Order", "data_type": "Int64"},
+            ],
+            "rows": rows,
+        }
+
+        old_size, new_size = _rebuild_datamodel(
+            info,
+            extra_tables=[extra_table],
         )
-        m_rows = []
-        for i, f in enumerate(fields):
-            display_m = f["display"].replace('"', '""')
-            ref_m = f["ref"].replace('"', '""')
-            m_rows.append(f'{{"{display_m}", "{ref_m}", {i}}}')
-        m_expr = f"let\n    Source = #table({m_cols}, {{{', '.join(m_rows)}}})\nin\n    Source"
-
-        def _do_add(conn: sqlite3.Connection):
-            c = conn.cursor()
-
-            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM [Table]")
-            table_id = c.fetchone()[0]
-
-            c.execute(
-                "INSERT INTO [Table] (ID, ModelID, Name, IsHidden, "
-                "ModifiedTime, StructureModifiedTime, SystemFlags, "
-                "ShowAsVariationsOnly, IsPrivate, "
-                "CalculationGroupID, ExcludeFromModelRefresh) "
-                "VALUES (?, 1, ?, 0, datetime('now'), datetime('now'), 0, 0, 0, 0, 0)",
-                (table_id, parameter_name)
-            )
-
-            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM [Column]")
-            col_base_id = c.fetchone()[0]
-
-            c.execute(
-                "INSERT INTO [Column] (ID, TableID, ExplicitName, ExplicitDataType, "
-                "Type, IsHidden, IsAvailableInMDX, ModifiedTime, StructureModifiedTime) "
-                "VALUES (?, ?, ?, 2, 2, 0, 1, datetime('now'), datetime('now'))",
-                (col_base_id, table_id, parameter_name)
-            )
-            c.execute(
-                "INSERT INTO [Column] (ID, TableID, ExplicitName, ExplicitDataType, "
-                "Type, IsHidden, IsAvailableInMDX, ModifiedTime, StructureModifiedTime) "
-                "VALUES (?, ?, ?, 2, 2, 1, 0, datetime('now'), datetime('now'))",
-                (col_base_id + 1, table_id, f"{parameter_name} Fields")
-            )
-            c.execute(
-                "INSERT INTO [Column] (ID, TableID, ExplicitName, ExplicitDataType, "
-                "Type, IsHidden, IsAvailableInMDX, ModifiedTime, StructureModifiedTime) "
-                "VALUES (?, ?, ?, 6, 2, 1, 0, datetime('now'), datetime('now'))",
-                (col_base_id + 2, table_id, f"{parameter_name} Order")
-            )
-
-            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM [Partition]")
-            part_id = c.fetchone()[0]
-
-            # Use M expression (not DAX) — the M engine parses QueryDefinition on load
-            c.execute(
-                "INSERT INTO [Partition] (ID, TableID, Name, "
-                "Type, Mode, State, ModifiedTime, RefreshedTime, "
-                "QueryDefinition) "
-                "VALUES (?, ?, ?, 2, 0, 1, datetime('now'), datetime('now'), ?)",
-                (part_id, table_id, parameter_name, m_expr)
-            )
-
-            conn.commit()
-
-        old_size, new_size = _modify_metadata_only(dm_path, _do_add)
         info["modified"] = True
 
         field_list = ", ".join(f["display"] for f in fields)
         return ToolResponse.ok(
             f"Field parameter '{parameter_name}' created with {len(fields)} fields: {field_list}\n"
-            f"  DAX: {dax_expr}\n"
             f"  DataModel: {old_size:,} → {new_size:,} bytes\n"
             f"Use as a slicer to let users switch between these fields in visuals."
         ).to_text()
@@ -5171,100 +5103,78 @@ def pbix_datamodel_add_calculation_group(
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
 
-        # Calculation groups create a new table in metadata, but adding a table
-        # requires VertiPaq data files in the ABF (H$ hierarchies, partition data).
-        # Without them, PBI crashes with TMCacheManager::CreateEmptyCollectionsForAllParents.
-        # This tool currently only modifies metadata — it needs a full DataModel rebuild.
-        return ToolResponse.error(
-            "Calculation groups require creating a new table with VertiPaq storage. "
-            "This tool currently only modifies metadata — use pbix_create with the "
-            "calculation group defined upfront, or add calculation groups in PBI Desktop.",
-            "NOT_IMPLEMENTED"
-        ).to_text()
+        # Build row data for the calculation group table
+        # Calc groups have 2 columns: Name (text) and Ordinal (int)
+        rows = []
+        for i, item in enumerate(items):
+            rows.append({
+                "Name": item["name"],
+                "Ordinal": i,
+            })
 
-        def _do_add(conn: sqlite3.Connection):
+        extra_table = {
+            "name": group_name,
+            "columns": [
+                {"name": "Name", "data_type": "String"},
+                {"name": "Ordinal", "data_type": "Int64"},
+            ],
+            "rows": rows,
+        }
+
+        # Create table via _rebuild_datamodel (full VertiPaq storage)
+        old_size, new_size = _rebuild_datamodel(
+            info,
+            extra_tables=[extra_table],
+        )
+
+        # Now add CalculationGroup + CalculationItem metadata via splice
+        # (these are metadata-only — no VertiPaq impact)
+        def _do_calc_group(conn: sqlite3.Connection):
+            conn.row_factory = sqlite3.Row
             c = conn.cursor()
 
-            # Check if group name already exists
-            c.execute("SELECT ID FROM [Table] WHERE Name = ?", (group_name,))
-            if c.fetchone():
-                raise ValueError(f"Table '{group_name}' already exists")
+            maxid_row = c.execute("SELECT Value FROM DBPROPERTIES WHERE Name = 'MAXID'").fetchone()
+            max_id = int(maxid_row[0]) if maxid_row else 0
 
-            # Get next IDs
-            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM [Table]")
-            table_id = c.fetchone()[0]
-
-            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM CalculationGroup")
-            cg_id = c.fetchone()[0]
+            # Find the table we just created
+            trow = c.execute(
+                "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1", (group_name,)
+            ).fetchone()
+            if not trow:
+                raise PBIXMCPError(f"Table '{group_name}' not found after rebuild", "INTERNAL_ERROR")
+            table_id = trow["ID"]
 
             # Create CalculationGroup
+            max_id += 1
+            cg_id = max_id
             c.execute(
-                "INSERT INTO CalculationGroup (ID, TableID, Precedence, "
-                "ModifiedTime) VALUES (?, ?, ?, datetime('now'))",
-                (cg_id, table_id, precedence)
+                "INSERT INTO CalculationGroup (ID, TableID, Precedence, ModifiedTime) "
+                "VALUES (?, ?, ?, ?)",
+                (cg_id, table_id, precedence, int(datetime.now().timestamp() * 1e7)),
             )
 
-            # Create the table with CalculationGroupID set
+            # Link table to calculation group
             c.execute(
-                "INSERT INTO [Table] (ID, ModelID, Name, IsHidden, "
-                "ModifiedTime, StructureModifiedTime, SystemFlags, "
-                "ShowAsVariationsOnly, IsPrivate, "
-                "CalculationGroupID, ExcludeFromModelRefresh) "
-                "VALUES (?, 1, ?, 0, datetime('now'), datetime('now'), 0, 0, 0, ?, 0)",
-                (table_id, group_name, cg_id)
-            )
-
-            # Create the Name column (shows item names in slicers)
-            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM [Column]")
-            col_id = c.fetchone()[0]
-
-            c.execute(
-                "INSERT INTO [Column] (ID, TableID, ExplicitName, ExplicitDataType, "
-                "Type, IsHidden, IsAvailableInMDX, ModifiedTime, StructureModifiedTime) "
-                "VALUES (?, ?, 'Name', 2, 2, 0, 1, datetime('now'), datetime('now'))",
-                (col_id, table_id)
-            )
-
-            # Create Ordinal column (for sorting)
-            c.execute(
-                "INSERT INTO [Column] (ID, TableID, ExplicitName, ExplicitDataType, "
-                "Type, IsHidden, IsAvailableInMDX, ModifiedTime, StructureModifiedTime) "
-                "VALUES (?, ?, 'Ordinal', 6, 2, 1, 0, datetime('now'), datetime('now'))",
-                (col_id + 1, table_id)
+                "UPDATE [Table] SET CalculationGroupID = ? WHERE ID = ?",
+                (cg_id, table_id),
             )
 
             # Create CalculationItems
-            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM CalculationItem")
-            item_base_id = c.fetchone()[0]
-
             for i, item in enumerate(items):
+                max_id += 1
                 c.execute(
                     "INSERT INTO CalculationItem (ID, CalculationGroupID, Name, "
                     "Expression, Ordinal, ModifiedTime) "
-                    "VALUES (?, ?, ?, ?, ?, datetime('now'))",
-                    (item_base_id + i, cg_id, item["name"], item["expression"], i)
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (max_id, cg_id, item["name"], item["expression"], i,
+                     int(datetime.now().timestamp() * 1e7)),
                 )
 
-            # Partition: calc groups need a valid M partition so file opens
-            c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM [Partition]")
-            part_id = c.fetchone()[0]
-            m_expr = (
-                "let\n"
-                "    Source = #table(type table [Name = text, Ordinal = number], {})\n"
-                "in\n"
-                "    Source"
-            )
-            c.execute(
-                "INSERT INTO [Partition] (ID, TableID, Name, "
-                "Type, Mode, State, ModifiedTime, RefreshedTime, "
-                "QueryDefinition) "
-                "VALUES (?, ?, ?, 2, 0, 1, datetime('now'), datetime('now'), ?)",
-                (part_id, table_id, group_name, m_expr)
-            )
-
+            c.execute("UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'", (str(max_id),))
             conn.commit()
 
-        old_size, new_size = _modify_metadata_only(dm_path, _do_add)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        _modify_metadata_only(dm_path, _do_calc_group)
         info["modified"] = True
 
         item_list = ", ".join(item["name"] for item in items)
