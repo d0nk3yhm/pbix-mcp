@@ -147,7 +147,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Partition Management | **Partial** | List/remove partitions via `pbix_get_partitions`, `pbix_remove_partition`. `pbix_add_partition` blocked for PBIX (needs PartitionStorage in VertiPaq), works for PBIP/TMDL export |
 | Sensitivity Labels | **Stable** | Strip MSIP sensitivity labels via `pbix_save(strip_sensitivity_label=True)` |
 | Custom Visuals | **Beta** | Import .pbiviz packages via `pbix_add_custom_visual`, place with `pbix_add_visual` |
-| Incremental Refresh | **Partial** | `pbix_set_incremental_refresh` works for files with data sources (source_csv/source_db). Requires DataMashup with RangeStart/RangeEnd M parameters — not available for embedded-only files |
+| Incremental Refresh | **Stable** | `pbix_set_incremental_refresh` / `pbix_get_incremental_refresh` — configure archive/refresh windows with change detection. Requires data source (source_csv/source_db); embedded-only files cannot use incremental refresh (same as PBI Desktop) |
 | Report diff (`pbix_diff`) | **Stable** | Compare two PBIX files — tables, columns, measures, relationships, pages/visuals, data sources, theme colors. Shows added/removed/changed |
 | Report documentation (`pbix_document`) | **Stable** | Auto-generate full report documentation (markdown + .docx) — tables, columns, measures, relationships, data sources, pages/visuals, RLS roles, theme colors |
 | Performance analysis (`pbix_performance`) | **Stable** | Flags oversized tables, empty tables, wide schemas, high-cardinality strings, complex measures, inactive/bidirectional relationships, orphaned tables |
