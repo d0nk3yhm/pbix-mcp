@@ -5,10 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.6] - 2026-04-07
+## [0.8.7] - 2026-04-07
 
 ### Fixed
-- **`pbix_recolor` table row contrast** — contrast pass now checks `backColorPrimary` vs `fontColorPrimary` and `backColorSecondary` vs `fontColorSecondary` in table/matrix `values` objects. Also checks `columnHeaders.backColor` vs `fontColor`. Previously only checked `vcObjects.background` vs title text, missing table row text that became unreadable after recoloring (e.g., dark text on dark purple rows).
+- **`pbix_recolor` chart axis/legend contrast on dark backgrounds** — when a chart has a dark background (`luminance < 0.15`), injects explicit `categoryAxis.labelColor`, `valueAxis.labelColor`, and `legend.labelColor` set to readable white/dark text. Previously only fixed existing axis color entries but didn't inject new ones, so charts with no explicit axis colors inherited the (now-dark) theme foreground and became unreadable.
+- **`pbix_recolor` table row contrast** — contrast pass now checks `backColorPrimary` vs `fontColorPrimary` and `backColorSecondary` vs `fontColorSecondary` in table/matrix `values` objects. Also checks `columnHeaders.backColor` vs `fontColor`.
+- **Contrast pass `objects` reference** — used `sv.setdefault("objects", {})` instead of `sv.get("objects", {})` so injected entries are actually attached to the config and saved.
 
 ## [0.8.5] - 2026-04-07
 

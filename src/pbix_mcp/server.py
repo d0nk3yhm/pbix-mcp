@@ -3025,8 +3025,9 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                     try:
                         config = _parse_visual_config(vc)
                         sv = config.get("singleVisual", {})
+                        vtype = sv.get("visualType", "")
                         vc_objs = sv.get("vcObjects", {})
-                        objects = sv.get("objects", {})
+                        objects = sv.setdefault("objects", {})
                         changed = False
 
                         # Extract background color
@@ -3104,6 +3105,8 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                         if chart_bg and re.match(r'^#[0-9A-Fa-f]{6}$', chart_bg):
                             chart_bg_lum = _hex_luminance(chart_bg)
                             ideal = _readable_text_color(chart_bg)
+
+                            # Fix existing axis/label text colors
                             for obj_cat in ("categoryAxis", "valueAxis", "legend", "dataLabels"):
                                 for entry in objects.get(obj_cat, []):
                                     props = entry.get("properties", {})
@@ -3120,6 +3123,32 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                                                     contrast_fixes += 1
                                         except (KeyError, TypeError, AttributeError):
                                             pass
+
+                            # Inject text color for chart elements that have NO explicit
+                            # color but would inherit unreadable theme foreground.
+                            # Only for chart visuals (not cards, tables, textboxes).
+                            _chart_vis_types = {
+                                "clusteredBarChart", "clusteredColumnChart", "stackedBarChart",
+                                "stackedColumnChart", "hundredPercentStackedBarChart",
+                                "hundredPercentStackedColumnChart", "lineChart", "areaChart",
+                                "stackedAreaChart", "lineClusteredColumnComboChart",
+                                "lineStackedColumnComboChart", "pieChart", "donutChart",
+                                "treemap", "waterfallChart", "funnel", "scatterChart",
+                                "ribbonChart",
+                            }
+                            if vtype in _chart_vis_types and (chart_bg_lum < 0.15 or _contrast_ratio(chart_bg_lum, _hex_luminance(new_data_colors[0] if new_data_colors else "#000000")) < 3.0):
+                                color_map_items = {
+                                    "categoryAxis": "labelColor",
+                                    "valueAxis": "labelColor",
+                                    "legend": "labelColor",
+                                }
+                                for obj_cat, color_key in color_map_items.items():
+                                    if obj_cat not in objects:
+                                        objects[obj_cat] = [{"properties": {
+                                            color_key: _solid_color(ideal),
+                                        }}]
+                                        changed = True
+                                        contrast_fixes += 1
 
                         # Check table alternating row contrast (backColor vs fontColor pairs)
                         for val_entry in objects.get("values", []):
