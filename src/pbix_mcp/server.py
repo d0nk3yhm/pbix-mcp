@@ -3121,6 +3121,40 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                                         except (KeyError, TypeError, AttributeError):
                                             pass
 
+                        # Check table alternating row contrast (backColor vs fontColor pairs)
+                        for val_entry in objects.get("values", []):
+                            vprops = val_entry.get("properties", {})
+                            for bg_key, fg_key in (
+                                ("backColorPrimary", "fontColorPrimary"),
+                                ("backColorSecondary", "fontColorSecondary"),
+                            ):
+                                try:
+                                    bg_val = vprops[bg_key]["solid"]["color"]["expr"]["Literal"]["Value"].strip("'")
+                                    fg_val = vprops[fg_key]["solid"]["color"]["expr"]["Literal"]["Value"].strip("'")
+                                    if re.match(r'^#[0-9A-Fa-f]{6}$', bg_val) and re.match(r'^#[0-9A-Fa-f]{6}$', fg_val):
+                                        ratio = _contrast_ratio(_hex_luminance(bg_val), _hex_luminance(fg_val))
+                                        if ratio < 3.0:
+                                            vprops[fg_key] = _solid_color(_readable_text_color(bg_val))
+                                            changed = True
+                                            contrast_fixes += 1
+                                except (KeyError, TypeError, AttributeError):
+                                    pass
+
+                        # Check column header contrast (backColor vs fontColor)
+                        for hdr_entry in objects.get("columnHeaders", []):
+                            hprops = hdr_entry.get("properties", {})
+                            try:
+                                hbg = hprops["backColor"]["solid"]["color"]["expr"]["Literal"]["Value"].strip("'")
+                                hfg = hprops["fontColor"]["solid"]["color"]["expr"]["Literal"]["Value"].strip("'")
+                                if re.match(r'^#[0-9A-Fa-f]{6}$', hbg) and re.match(r'^#[0-9A-Fa-f]{6}$', hfg):
+                                    ratio = _contrast_ratio(_hex_luminance(hbg), _hex_luminance(hfg))
+                                    if ratio < 3.0:
+                                        hprops["fontColor"] = _solid_color(_readable_text_color(hbg))
+                                        changed = True
+                                        contrast_fixes += 1
+                            except (KeyError, TypeError, AttributeError):
+                                pass
+
                         if changed:
                             vc["config"] = json.dumps(config, ensure_ascii=False)
                     except Exception:
