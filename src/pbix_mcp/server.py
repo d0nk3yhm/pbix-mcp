@@ -84,7 +84,7 @@ def _extract_pbix(pbix_path: str, work_dir: str) -> None:
         zf.extractall(work_dir)
 
 
-def _repack_pbix(work_dir: str, output_path: str) -> None:
+def _repack_pbix(work_dir: str, output_path: str, strip_sensitivity_label: bool = False) -> None:
     """Repack work_dir into a PBIX/PBIT ZIP file."""
     # Delete SecurityBindings — Power BI Desktop rejects modified files
     # that still have the original SecurityBindings
@@ -106,6 +106,21 @@ def _repack_pbix(work_dir: str, output_path: str) -> None:
             )
             with open(ct_path, "w", encoding="utf-8") as f:
                 f.write(ct_xml)
+
+    # Strip MSIP sensitivity label from docProps/custom.xml
+    if strip_sensitivity_label:
+        custom_path = os.path.join(work_dir, "docProps", "custom.xml")
+        if os.path.exists(custom_path):
+            import re
+            with open(custom_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            # Remove all MSIP_Label properties
+            content = re.sub(
+                r'<property[^>]*name="MSIP_Label_[^"]*"[^>]*>.*?</property>',
+                "", content
+            )
+            with open(custom_path, "w", encoding="utf-8") as f:
+                f.write(content)
 
     # Files that must NOT be included in the final ZIP
     _EXCLUDE_FILES = {
@@ -1001,7 +1016,8 @@ def pbix_open(file_path: str, alias: str = "") -> str:
 
 
 @mcp.tool()
-def pbix_save(alias: str, output_path: str = "", overwrite: bool = False, backup: bool = True) -> str:
+def pbix_save(alias: str, output_path: str = "", overwrite: bool = False, backup: bool = True,
+              strip_sensitivity_label: bool = False) -> str:
     """Save/repack the modified PBIX/PBIT file.
 
     Creates an automatic .bak backup before overwriting (unless backup=False).
@@ -1012,6 +1028,7 @@ def pbix_save(alias: str, output_path: str = "", overwrite: bool = False, backup
         output_path: Where to save. Empty = overwrite original.
         overwrite: If False (default), refuse to overwrite an existing file
         backup: If True (default), create a .bak backup before overwriting
+        strip_sensitivity_label: If True, remove MSIP sensitivity labels from the file
     """
     try:
         info = _ensure_open(alias)
@@ -1029,7 +1046,7 @@ def pbix_save(alias: str, output_path: str = "", overwrite: bool = False, backup
             backup_path = target + ".bak"
             shutil.copy2(target, backup_path)
 
-        _repack_pbix(work_dir, target)
+        _repack_pbix(work_dir, target, strip_sensitivity_label=strip_sensitivity_label)
         info["modified"] = False
         size = os.path.getsize(target)
         return ToolResponse.ok(f"Saved '{alias}' to {target} ({size:,} bytes)").to_text()
@@ -6447,6 +6464,871 @@ def pbix_evaluate_rls(
             return ToolResponse.ok("\n".join(lines)).to_text()
         finally:
             os.unlink(tmp.name)
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+# ---- Section 10b: Perspectives ----
+
+
+def _read_metadata_db(alias: str):
+    """Helper: decompress DataModel and return a temp SQLite connection + path.
+
+    Caller MUST close conn and os.unlink(tmp_path) when done.
+    """
+    info = _ensure_open(alias)
+    dm_path = os.path.join(info["work_dir"], "DataModel")
+    if not os.path.exists(dm_path):
+        raise PBIXMCPError("No DataModel found", DataModelCompressionError.code)
+
+    from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+    from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+    with open(dm_path, "rb") as f:
+        dm = f.read()
+    abf = decompress_datamodel(dm)
+    db_bytes = read_metadata_sqlite(abf)
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".db")
+    os.write(fd, db_bytes)
+    os.close(fd)
+    conn = sqlite3.connect(tmp_path)
+    conn.row_factory = sqlite3.Row
+    return info, conn, tmp_path
+
+
+@mcp.tool()
+def pbix_get_perspectives(alias: str) -> str:
+    """Get all perspectives with their included tables, columns, and measures.
+
+    Args:
+        alias: The alias of the open file
+    """
+    try:
+        info, conn, tmp_path = _read_metadata_db(alias)
+        try:
+            perspectives = conn.execute("SELECT ID, Name, Description FROM Perspective ORDER BY ID").fetchall()
+            if not perspectives:
+                return ToolResponse.ok("No perspectives defined in this file.").to_text()
+
+            lines = [f"Perspectives ({len(perspectives)}):\n"]
+            for p in perspectives:
+                pid, pname, pdesc = p["ID"], p["Name"], p["Description"]
+                lines.append(f"  {pname}" + (f" — {pdesc}" if pdesc else ""))
+
+                ptables = conn.execute(
+                    "SELECT pt.ID, pt.IncludeAll, t.Name FROM PerspectiveTable pt "
+                    "JOIN [Table] t ON pt.TableID = t.ID "
+                    "WHERE pt.PerspectiveID = ? ORDER BY t.Name", (pid,)
+                ).fetchall()
+                for pt in ptables:
+                    ptid, include_all, tname = pt["ID"], pt["IncludeAll"], pt["Name"]
+                    if include_all:
+                        lines.append(f"    {tname} (all columns/measures)")
+                    else:
+                        cols = conn.execute(
+                            "SELECT c.ExplicitName FROM PerspectiveColumn pc "
+                            "JOIN [Column] c ON pc.ColumnID = c.ID "
+                            "WHERE pc.PerspectiveTableID = ? ORDER BY c.ExplicitName", (ptid,)
+                        ).fetchall()
+                        measures = conn.execute(
+                            "SELECT m.Name FROM PerspectiveMeasure pm "
+                            "JOIN Measure m ON pm.MeasureID = m.ID "
+                            "WHERE pm.PerspectiveTableID = ? ORDER BY m.Name", (ptid,)
+                        ).fetchall()
+                        col_names = [c["ExplicitName"] for c in cols]
+                        meas_names = [m["Name"] for m in measures]
+                        items = col_names + [f"[M] {m}" for m in meas_names]
+                        lines.append(f"    {tname}: {', '.join(items) if items else '(no specific items)'}")
+                lines.append("")
+
+            return ToolResponse.ok("\n".join(lines)).to_text()
+        finally:
+            conn.close()
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_add_perspective(
+    alias: str,
+    name: str,
+    tables_json: str = "[]",
+    description: str = "",
+) -> str:
+    """Add a perspective — a filtered view of the model for different user groups.
+
+    Args:
+        alias: The alias of the open file
+        name: Name for the perspective (e.g. "Sales Analyst", "Executive View")
+        tables_json: JSON array of tables to include, e.g.
+            '[{"table": "Sales"}, {"table": "Product", "columns": ["Name", "Category"]}]'
+            If columns/measures are omitted for a table, all are included.
+            Optional per-table fields: "columns" (list), "measures" (list)
+        description: Optional description
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        tables_spec = json.loads(tables_json) if tables_json else []
+
+        def _do_add(conn: sqlite3.Connection):
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            # Check if perspective already exists
+            existing = c.execute("SELECT ID FROM Perspective WHERE Name = ?", (name,)).fetchone()
+            if existing:
+                raise PBIXMCPError(f"Perspective '{name}' already exists", "DUPLICATE")
+
+            # Get MAXID
+            maxid_row = c.execute("SELECT Value FROM DBPROPERTIES WHERE Name = 'MAXID'").fetchone()
+            max_id = int(maxid_row[0]) if maxid_row else 0
+
+            # Create Perspective
+            max_id += 1
+            persp_id = max_id
+            c.execute(
+                "INSERT INTO Perspective (ID, ModelID, Name, Description, ModifiedTime) "
+                "VALUES (?, 1, ?, ?, ?)",
+                (persp_id, name, description or None, int(datetime.now().timestamp() * 1e7)),
+            )
+
+            # Add tables
+            for tspec in tables_spec:
+                tname = tspec.get("table", "")
+                trow = c.execute(
+                    "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1", (tname,)
+                ).fetchone()
+                if not trow:
+                    raise PBIXMCPError(f"Table '{tname}' not found", "TABLE_NOT_FOUND")
+                table_id = trow["ID"]
+
+                specific_cols = tspec.get("columns", [])
+                specific_meas = tspec.get("measures", [])
+                include_all = 1 if (not specific_cols and not specific_meas) else 0
+
+                max_id += 1
+                pt_id = max_id
+                c.execute(
+                    "INSERT INTO PerspectiveTable (ID, PerspectiveID, TableID, IncludeAll, ModifiedTime) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (pt_id, persp_id, table_id, include_all, int(datetime.now().timestamp() * 1e7)),
+                )
+
+                if specific_cols:
+                    for col_name in specific_cols:
+                        crow = c.execute(
+                            "SELECT ID FROM [Column] WHERE TableID = ? AND (ExplicitName = ? OR InferredName = ?)",
+                            (table_id, col_name, col_name),
+                        ).fetchone()
+                        if crow:
+                            max_id += 1
+                            c.execute(
+                                "INSERT INTO PerspectiveColumn (ID, PerspectiveTableID, ColumnID, ModifiedTime) "
+                                "VALUES (?, ?, ?, ?)",
+                                (max_id, pt_id, crow["ID"], int(datetime.now().timestamp() * 1e7)),
+                            )
+
+                if specific_meas:
+                    for meas_name in specific_meas:
+                        mrow = c.execute(
+                            "SELECT ID FROM Measure WHERE TableID = ? AND Name = ?",
+                            (table_id, meas_name),
+                        ).fetchone()
+                        if mrow:
+                            max_id += 1
+                            c.execute(
+                                "INSERT INTO PerspectiveMeasure (ID, PerspectiveTableID, MeasureID, ModifiedTime) "
+                                "VALUES (?, ?, ?, ?)",
+                                (max_id, pt_id, mrow["ID"], int(datetime.now().timestamp() * 1e7)),
+                            )
+
+            # Update MAXID
+            c.execute("UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'", (str(max_id),))
+            conn.commit()
+
+        old_size, new_size = _modify_metadata_only(dm_path, _do_add)
+        info["modified"] = True
+        n_tables = len(tables_spec)
+        return ToolResponse.ok(
+            f"Perspective '{name}' created with {n_tables} table(s)."
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_remove_perspective(alias: str, name: str) -> str:
+    """Remove a perspective and all its included table/column/measure references.
+
+    Args:
+        alias: The alias of the open file
+        name: Name of the perspective to remove
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+
+        def _do_remove(conn: sqlite3.Connection):
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            row = c.execute("SELECT ID FROM Perspective WHERE Name = ?", (name,)).fetchone()
+            if not row:
+                raise PBIXMCPError(f"Perspective '{name}' not found", "NOT_FOUND")
+            pid = row["ID"]
+
+            # Get PerspectiveTable IDs for cascade delete
+            pt_ids = [r["ID"] for r in c.execute(
+                "SELECT ID FROM PerspectiveTable WHERE PerspectiveID = ?", (pid,)
+            ).fetchall()]
+
+            for pt_id in pt_ids:
+                c.execute("DELETE FROM PerspectiveColumn WHERE PerspectiveTableID = ?", (pt_id,))
+                c.execute("DELETE FROM PerspectiveMeasure WHERE PerspectiveTableID = ?", (pt_id,))
+                c.execute("DELETE FROM PerspectiveHierarchy WHERE PerspectiveTableID = ?", (pt_id,))
+
+            c.execute("DELETE FROM PerspectiveTable WHERE PerspectiveID = ?", (pid,))
+            c.execute("DELETE FROM Perspective WHERE ID = ?", (pid,))
+            conn.commit()
+
+        old_size, new_size = _modify_metadata_only(dm_path, _do_remove)
+        info["modified"] = True
+        return ToolResponse.ok(f"Perspective '{name}' removed.").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+# ---- Section 10c: User Hierarchies ----
+
+
+@mcp.tool()
+def pbix_get_hierarchies(alias: str) -> str:
+    """Get all user hierarchies with their levels and columns.
+
+    Args:
+        alias: The alias of the open file
+    """
+    try:
+        info, conn, tmp_path = _read_metadata_db(alias)
+        try:
+            hierarchies = conn.execute(
+                "SELECT h.ID, h.Name, h.IsHidden, h.Description, t.Name as TableName "
+                "FROM Hierarchy h JOIN [Table] t ON h.TableID = t.ID "
+                "ORDER BY t.Name, h.Name"
+            ).fetchall()
+            if not hierarchies:
+                return ToolResponse.ok("No user hierarchies defined in this file.").to_text()
+
+            lines = [f"Hierarchies ({len(hierarchies)}):\n"]
+            for h in hierarchies:
+                hid = h["ID"]
+                hidden = " (hidden)" if h["IsHidden"] else ""
+                desc = f" — {h['Description']}" if h["Description"] else ""
+                lines.append(f"  {h['TableName']}.{h['Name']}{hidden}{desc}")
+
+                levels = conn.execute(
+                    "SELECT l.Ordinal, l.Name, c.ExplicitName as ColumnName "
+                    "FROM Level l LEFT JOIN [Column] c ON l.ColumnID = c.ID "
+                    "WHERE l.HierarchyID = ? ORDER BY l.Ordinal", (hid,)
+                ).fetchall()
+                for lv in levels:
+                    lines.append(f"    {lv['Ordinal']}: {lv['Name']} → {lv['ColumnName']}")
+                lines.append("")
+
+            return ToolResponse.ok("\n".join(lines)).to_text()
+        finally:
+            conn.close()
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_add_hierarchy(
+    alias: str,
+    table_name: str,
+    hierarchy_name: str,
+    levels_json: str,
+) -> str:
+    """Create a user hierarchy (drill-down path) on a table.
+
+    WARNING: This tool is blocked for PBIX files opened in PBI Desktop.
+    Adding hierarchies requires H$ system tables in VertiPaq storage which
+    cannot be created via metadata-only modification. The hierarchy metadata
+    is written correctly but PBI Desktop will reject the file on open.
+    Works for PBIP/TMDL export (pbix_export_pbip, pbix_export_tmdl).
+
+    Args:
+        alias: The alias of the open file
+        table_name: Table to add the hierarchy to
+        hierarchy_name: Name for the hierarchy (e.g. "Geography", "Date Hierarchy")
+        levels_json: JSON array of levels in drill-down order, e.g.
+            '[{"name": "Country", "column": "Country"},
+              {"name": "State", "column": "State-Province"},
+              {"name": "City", "column": "City"}]'
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        levels = json.loads(levels_json)
+        if not levels:
+            return ToolResponse.error("levels_json must contain at least one level", "INVALID_INPUT").to_text()
+
+        def _do_add(conn: sqlite3.Connection):
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            trow = c.execute(
+                "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1", (table_name,)
+            ).fetchone()
+            if not trow:
+                raise PBIXMCPError(f"Table '{table_name}' not found", "TABLE_NOT_FOUND")
+            table_id = trow["ID"]
+
+            # Check duplicate
+            existing = c.execute(
+                "SELECT ID FROM Hierarchy WHERE TableID = ? AND Name = ?",
+                (table_id, hierarchy_name),
+            ).fetchone()
+            if existing:
+                raise PBIXMCPError(f"Hierarchy '{hierarchy_name}' already exists on '{table_name}'", "DUPLICATE")
+
+            # Get MAXID
+            maxid_row = c.execute("SELECT Value FROM DBPROPERTIES WHERE Name = 'MAXID'").fetchone()
+            max_id = int(maxid_row[0]) if maxid_row else 0
+
+            # Create Hierarchy
+            max_id += 1
+            hier_id = max_id
+            c.execute(
+                "INSERT INTO Hierarchy (ID, TableID, Name, IsHidden, State, ModifiedTime, StructureModifiedTime) "
+                "VALUES (?, ?, ?, 0, 1, ?, ?)",
+                (hier_id, table_id, hierarchy_name,
+                 int(datetime.now().timestamp() * 1e7),
+                 int(datetime.now().timestamp() * 1e7)),
+            )
+
+            # Create Levels
+            for ordinal, lspec in enumerate(levels):
+                lname = lspec.get("name", f"Level {ordinal}")
+                col_name = lspec.get("column", "")
+
+                crow = c.execute(
+                    "SELECT ID FROM [Column] WHERE TableID = ? AND (ExplicitName = ? OR InferredName = ?)",
+                    (table_id, col_name, col_name),
+                ).fetchone()
+                if not crow:
+                    raise PBIXMCPError(
+                        f"Column '{col_name}' not found in table '{table_name}'",
+                        "COLUMN_NOT_FOUND",
+                    )
+
+                max_id += 1
+                c.execute(
+                    "INSERT INTO Level (ID, HierarchyID, Ordinal, Name, ColumnID, ModifiedTime) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (max_id, hier_id, ordinal, lname, crow["ID"],
+                     int(datetime.now().timestamp() * 1e7)),
+                )
+
+            c.execute("UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'", (str(max_id),))
+            conn.commit()
+
+        old_size, new_size = _modify_metadata_only(dm_path, _do_add)
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Hierarchy '{hierarchy_name}' created on '{table_name}' with {len(levels)} levels."
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_remove_hierarchy(alias: str, table_name: str, hierarchy_name: str) -> str:
+    """Remove a user hierarchy and all its levels.
+
+    Args:
+        alias: The alias of the open file
+        table_name: Table the hierarchy belongs to
+        hierarchy_name: Name of the hierarchy to remove
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+
+        def _do_remove(conn: sqlite3.Connection):
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            trow = c.execute(
+                "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1", (table_name,)
+            ).fetchone()
+            if not trow:
+                raise PBIXMCPError(f"Table '{table_name}' not found", "TABLE_NOT_FOUND")
+
+            hrow = c.execute(
+                "SELECT ID FROM Hierarchy WHERE TableID = ? AND Name = ?",
+                (trow["ID"], hierarchy_name),
+            ).fetchone()
+            if not hrow:
+                raise PBIXMCPError(f"Hierarchy '{hierarchy_name}' not found on '{table_name}'", "NOT_FOUND")
+
+            c.execute("DELETE FROM Level WHERE HierarchyID = ?", (hrow["ID"],))
+            c.execute("DELETE FROM Hierarchy WHERE ID = ?", (hrow["ID"],))
+            conn.commit()
+
+        old_size, new_size = _modify_metadata_only(dm_path, _do_remove)
+        info["modified"] = True
+        return ToolResponse.ok(f"Hierarchy '{hierarchy_name}' removed from '{table_name}'.").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+# ---- Section 10d: Cultures & Translations ----
+
+
+@mcp.tool()
+def pbix_get_cultures(alias: str) -> str:
+    """Get all cultures (languages) with translation counts.
+
+    Args:
+        alias: The alias of the open file
+    """
+    try:
+        info, conn, tmp_path = _read_metadata_db(alias)
+        try:
+            cultures = conn.execute("SELECT ID, Name FROM Culture ORDER BY Name").fetchall()
+            if not cultures:
+                return ToolResponse.ok("No cultures defined in this file.").to_text()
+
+            lines = [f"Cultures ({len(cultures)}):\n"]
+            for cu in cultures:
+                cid, cname = cu["ID"], cu["Name"]
+                count = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM ObjectTranslation WHERE CultureID = ?", (cid,)
+                ).fetchone()["cnt"]
+                lines.append(f"  {cname} — {count} translation(s)")
+
+                # Show sample translations
+                samples = conn.execute(
+                    "SELECT ot.ObjectType, ot.Property, ot.Value, "
+                    "COALESCE(t.Name, c2.ExplicitName, m.Name, h.Name) as ObjName "
+                    "FROM ObjectTranslation ot "
+                    "LEFT JOIN [Table] t ON ot.ObjectID = t.ID AND ot.ObjectType = 3 "
+                    "LEFT JOIN [Column] c2 ON ot.ObjectID = c2.ID AND ot.ObjectType = 4 "
+                    "LEFT JOIN Measure m ON ot.ObjectID = m.ID AND ot.ObjectType = 8 "
+                    "LEFT JOIN Hierarchy h ON ot.ObjectID = h.ID AND ot.ObjectType = 9 "
+                    "WHERE ot.CultureID = ? LIMIT 5", (cid,)
+                ).fetchall()
+                type_map = {3: "Table", 4: "Column", 8: "Measure", 9: "Hierarchy", 10: "Level"}
+                prop_map = {1: "Caption", 2: "Description", 3: "DisplayFolder"}
+                for s in samples:
+                    otype = type_map.get(s["ObjectType"], f"Type{s['ObjectType']}")
+                    prop = prop_map.get(s["Property"], f"Prop{s['Property']}")
+                    lines.append(f"    {otype} '{s['ObjName']}' {prop} = \"{s['Value']}\"")
+                lines.append("")
+
+            return ToolResponse.ok("\n".join(lines)).to_text()
+        finally:
+            conn.close()
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_add_culture(alias: str, culture_name: str) -> str:
+    """Add a culture (language) for translations.
+
+    Args:
+        alias: The alias of the open file
+        culture_name: BCP-47 culture code (e.g. "nb-NO", "de-DE", "fr-FR", "ja-JP")
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+
+        def _do_add(conn: sqlite3.Connection):
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            existing = c.execute("SELECT ID FROM Culture WHERE Name = ?", (culture_name,)).fetchone()
+            if existing:
+                raise PBIXMCPError(f"Culture '{culture_name}' already exists", "DUPLICATE")
+
+            maxid_row = c.execute("SELECT Value FROM DBPROPERTIES WHERE Name = 'MAXID'").fetchone()
+            max_id = int(maxid_row[0]) if maxid_row else 0
+            max_id += 1
+            c.execute(
+                "INSERT INTO Culture (ID, ModelID, Name, ModifiedTime, StructureModifiedTime) "
+                "VALUES (?, 1, ?, ?, ?)",
+                (max_id, culture_name,
+                 int(datetime.now().timestamp() * 1e7),
+                 int(datetime.now().timestamp() * 1e7)),
+            )
+            c.execute("UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'", (str(max_id),))
+            conn.commit()
+
+        old_size, new_size = _modify_metadata_only(dm_path, _do_add)
+        info["modified"] = True
+        return ToolResponse.ok(f"Culture '{culture_name}' added.").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_add_translations(alias: str, culture_name: str, translations_json: str) -> str:
+    """Add translated names/descriptions for model objects in a culture.
+
+    Args:
+        alias: The alias of the open file
+        culture_name: Target culture (e.g. "nb-NO")
+        translations_json: JSON array of translations, e.g.
+            '[{"object": "Sales", "type": "table", "property": "caption", "value": "Salg"},
+              {"object": "Sales.Amount", "type": "column", "property": "caption", "value": "Beloep"}]'
+            type: "table", "column", "measure", "hierarchy"
+            property: "caption" (display name), "description", "displayFolder"
+            For columns/measures: use "Table.Column" or "Table.Measure" dot notation
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        translations = json.loads(translations_json)
+
+        # TOM ObjectTranslation.ObjectType: 3=Table, 4=Column, 8=Measure, 9=Hierarchy, 10=Level
+        type_map = {"table": 3, "column": 4, "measure": 8, "hierarchy": 9, "level": 10}
+        # TOM ObjectTranslation.Property enum: 1=Caption, 2=Description, 3=DisplayFolder
+        prop_map = {"caption": 1, "description": 2, "displayfolder": 3}
+
+        def _do_add(conn: sqlite3.Connection):
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            culture_row = c.execute("SELECT ID FROM Culture WHERE Name = ?", (culture_name,)).fetchone()
+            if not culture_row:
+                raise PBIXMCPError(f"Culture '{culture_name}' not found. Add it first with pbix_add_culture.", "NOT_FOUND")
+            culture_id = culture_row["ID"]
+
+            maxid_row = c.execute("SELECT Value FROM DBPROPERTIES WHERE Name = 'MAXID'").fetchone()
+            max_id = int(maxid_row[0]) if maxid_row else 0
+            added = 0
+
+            for tr in translations:
+                obj_ref = tr.get("object", "")
+                obj_type_str = tr.get("type", "").lower()
+                prop_str = tr.get("property", "caption").lower()
+                value = tr.get("value", "")
+
+                obj_type = type_map.get(obj_type_str)
+                prop_code = prop_map.get(prop_str, 0)
+                if obj_type is None:
+                    continue
+
+                # Resolve object name to ID
+                obj_id = None
+                if obj_type == 3:  # Table
+                    row = c.execute("SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1", (obj_ref,)).fetchone()
+                    if row:
+                        obj_id = row["ID"]
+                elif obj_type == 4:  # Column (Table.Column)
+                    parts = obj_ref.split(".", 1)
+                    if len(parts) == 2:
+                        trow = c.execute("SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1", (parts[0],)).fetchone()
+                        if trow:
+                            crow = c.execute(
+                                "SELECT ID FROM [Column] WHERE TableID = ? AND (ExplicitName = ? OR InferredName = ?)",
+                                (trow["ID"], parts[1], parts[1]),
+                            ).fetchone()
+                            if crow:
+                                obj_id = crow["ID"]
+                elif obj_type == 8:  # Measure (Table.Measure)
+                    parts = obj_ref.split(".", 1)
+                    if len(parts) == 2:
+                        trow = c.execute("SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1", (parts[0],)).fetchone()
+                        if trow:
+                            mrow = c.execute(
+                                "SELECT ID FROM Measure WHERE TableID = ? AND Name = ?",
+                                (trow["ID"], parts[1]),
+                            ).fetchone()
+                            if mrow:
+                                obj_id = mrow["ID"]
+                elif obj_type == 9:  # Hierarchy (Table.Hierarchy)
+                    parts = obj_ref.split(".", 1)
+                    if len(parts) == 2:
+                        trow = c.execute("SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1", (parts[0],)).fetchone()
+                        if trow:
+                            hrow = c.execute(
+                                "SELECT ID FROM Hierarchy WHERE TableID = ? AND Name = ?",
+                                (trow["ID"], parts[1]),
+                            ).fetchone()
+                            if hrow:
+                                obj_id = hrow["ID"]
+
+                if obj_id is None:
+                    continue
+
+                # Upsert: check if translation exists
+                existing = c.execute(
+                    "SELECT ID FROM ObjectTranslation WHERE CultureID = ? AND ObjectID = ? AND ObjectType = ? AND Property = ?",
+                    (culture_id, obj_id, obj_type, prop_code),
+                ).fetchone()
+                if existing:
+                    c.execute(
+                        "UPDATE ObjectTranslation SET Value = ?, ModifiedTime = ? WHERE ID = ?",
+                        (value, int(datetime.now().timestamp() * 1e7), existing["ID"]),
+                    )
+                else:
+                    max_id += 1
+                    c.execute(
+                        "INSERT INTO ObjectTranslation (ID, CultureID, ObjectID, ObjectType, Property, Value, ModifiedTime) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (max_id, culture_id, obj_id, obj_type, prop_code, value,
+                         int(datetime.now().timestamp() * 1e7)),
+                    )
+                added += 1
+
+            c.execute("UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'", (str(max_id),))
+            conn.commit()
+
+        old_size, new_size = _modify_metadata_only(dm_path, _do_add)
+        info["modified"] = True
+        return ToolResponse.ok(f"Added/updated {len(translations)} translation(s) for culture '{culture_name}'.").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_remove_culture(alias: str, culture_name: str) -> str:
+    """Remove a culture and all its translations.
+
+    Args:
+        alias: The alias of the open file
+        culture_name: Culture code to remove (e.g. "nb-NO")
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+
+        def _do_remove(conn: sqlite3.Connection):
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            row = c.execute("SELECT ID FROM Culture WHERE Name = ?", (culture_name,)).fetchone()
+            if not row:
+                raise PBIXMCPError(f"Culture '{culture_name}' not found", "NOT_FOUND")
+            c.execute("DELETE FROM ObjectTranslation WHERE CultureID = ?", (row["ID"],))
+            c.execute("DELETE FROM Culture WHERE ID = ?", (row["ID"],))
+            conn.commit()
+
+        old_size, new_size = _modify_metadata_only(dm_path, _do_remove)
+        info["modified"] = True
+        return ToolResponse.ok(f"Culture '{culture_name}' and all its translations removed.").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+# ---- Section 10e: Partition Management ----
+
+
+@mcp.tool()
+def pbix_get_partitions(alias: str) -> str:
+    """Get all partitions with table, type, mode, and M expression.
+
+    Args:
+        alias: The alias of the open file
+    """
+    try:
+        info, conn, tmp_path = _read_metadata_db(alias)
+        try:
+            partitions = conn.execute(
+                "SELECT p.Name, p.Type, p.Mode, p.QueryDefinition, t.Name as TableName "
+                "FROM Partition p JOIN [Table] t ON p.TableID = t.ID "
+                "WHERE t.Name NOT LIKE 'H$%' AND t.Name NOT LIKE 'R$%' AND t.Name NOT LIKE 'U$%' "
+                "ORDER BY t.Name, p.Name"
+            ).fetchall()
+            if not partitions:
+                return ToolResponse.ok("No partitions found.").to_text()
+
+            type_map = {1: "Query", 2: "Calculated", 3: "None", 4: "M"}
+            mode_map = {0: "Import", 1: "DirectQuery", 2: "Dual"}
+
+            lines = [f"Partitions ({len(partitions)}):\n"]
+            current_table = None
+            for p in partitions:
+                tname = p["TableName"]
+                if tname != current_table:
+                    current_table = tname
+                    lines.append(f"  {tname}:")
+
+                ptype = type_map.get(p["Type"], f"Type{p['Type']}")
+                pmode = mode_map.get(p["Mode"], f"Mode{p['Mode']}")
+                qd = p["QueryDefinition"]
+                expr_preview = (qd[:80] + "...") if qd and len(qd) > 80 else (qd or "(none)")
+                lines.append(f"    {p['Name']} [{ptype}/{pmode}]: {expr_preview}")
+
+            return ToolResponse.ok("\n".join(lines)).to_text()
+        finally:
+            conn.close()
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_add_partition(
+    alias: str,
+    table_name: str,
+    partition_name: str,
+    expression: str,
+    mode: str = "import",
+) -> str:
+    """Add a new M (Power Query) partition to a table.
+
+    WARNING: This tool is blocked for PBIX files opened in PBI Desktop.
+    Adding partitions requires PartitionStorage objects in VertiPaq which
+    cannot be created via metadata-only modification. The partition metadata
+    is written correctly but PBI Desktop will reject the file on open.
+    Works for PBIP/TMDL export (pbix_export_pbip, pbix_export_tmdl).
+
+    Args:
+        alias: The alias of the open file
+        table_name: Table to add the partition to
+        partition_name: Name for the new partition
+        expression: M (Power Query) expression for the partition
+        mode: "import" (default) or "directQuery"
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        mode_code = 1 if mode.lower() == "directquery" else 0
+
+        def _do_add(conn: sqlite3.Connection):
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            trow = c.execute(
+                "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1", (table_name,)
+            ).fetchone()
+            if not trow:
+                raise PBIXMCPError(f"Table '{table_name}' not found", "TABLE_NOT_FOUND")
+
+            existing = c.execute(
+                "SELECT ID FROM Partition WHERE TableID = ? AND Name = ?",
+                (trow["ID"], partition_name),
+            ).fetchone()
+            if existing:
+                raise PBIXMCPError(f"Partition '{partition_name}' already exists on '{table_name}'", "DUPLICATE")
+
+            maxid_row = c.execute("SELECT Value FROM DBPROPERTIES WHERE Name = 'MAXID'").fetchone()
+            max_id = int(maxid_row[0]) if maxid_row else 0
+            max_id += 1
+
+            c.execute(
+                "INSERT INTO Partition (ID, TableID, Name, Type, Mode, State, "
+                "ModifiedTime, RefreshedTime, QueryDefinition) "
+                "VALUES (?, ?, ?, 4, ?, 1, ?, ?, ?)",
+                (max_id, trow["ID"], partition_name, mode_code,
+                 int(datetime.now().timestamp() * 1e7),
+                 int(datetime.now().timestamp() * 1e7),
+                 expression),
+            )
+
+            c.execute("UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'", (str(max_id),))
+            conn.commit()
+
+        old_size, new_size = _modify_metadata_only(dm_path, _do_add)
+        info["modified"] = True
+        return ToolResponse.ok(f"Partition '{partition_name}' added to '{table_name}'.").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_remove_partition(alias: str, table_name: str, partition_name: str) -> str:
+    """Remove a partition from a table.
+
+    Will not delete the last remaining partition of a table.
+
+    Args:
+        alias: The alias of the open file
+        table_name: Table the partition belongs to
+        partition_name: Name of the partition to remove
+    """
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+
+        def _do_remove(conn: sqlite3.Connection):
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            trow = c.execute(
+                "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1", (table_name,)
+            ).fetchone()
+            if not trow:
+                raise PBIXMCPError(f"Table '{table_name}' not found", "TABLE_NOT_FOUND")
+
+            prow = c.execute(
+                "SELECT ID FROM Partition WHERE TableID = ? AND Name = ?",
+                (trow["ID"], partition_name),
+            ).fetchone()
+            if not prow:
+                raise PBIXMCPError(f"Partition '{partition_name}' not found on '{table_name}'", "NOT_FOUND")
+
+            # Guard: don't delete last partition
+            count = c.execute(
+                "SELECT COUNT(*) as cnt FROM Partition WHERE TableID = ?", (trow["ID"],)
+            ).fetchone()["cnt"]
+            if count <= 1:
+                raise PBIXMCPError(
+                    f"Cannot delete the last partition of table '{table_name}'",
+                    "LAST_PARTITION",
+                )
+
+            c.execute("DELETE FROM Partition WHERE ID = ?", (prow["ID"],))
+            conn.commit()
+
+        old_size, new_size = _modify_metadata_only(dm_path, _do_remove)
+        info["modified"] = True
+        return ToolResponse.ok(f"Partition '{partition_name}' removed from '{table_name}'.").to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
