@@ -61,32 +61,28 @@ DAX evaluation returns extended results:
 |------|-----------|---------|----------|
 | `pbix_save` | `overwrite` | `False` | Refuses to overwrite existing files unless explicit |
 | `pbix_save` | `backup` | `True` | Creates .bak backup before overwriting |
+| `pbix_save` | `strip_sensitivity_label` | `False` | Removes MSIP sensitivity labels when True |
 | `pbix_close` | `force` | `False` | Refuses to close with unsaved changes |
 
-## Tool Categories
+## Tool Categories (101 tools)
 
 ### Create & File Management (5)
-- `pbix_create` — Create PBIX from scratch with tables, measures, row data
-- `pbix_open` — Extract PBIX to temp dir for editing
-- `pbix_save` — Repack temp dir into PBIX (safe defaults)
-- `pbix_close` — Release temp dir (force flag for dirty state)
-- `pbix_list_open` — Show all open file sessions
+`pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
 
-### Report Layout & Visuals (20)
-Visual CRUD, page management, filters, positions, bookmarks (add/remove), settings.
+### Report Layout & Visuals (21)
+Visual CRUD, page management, filters, positions, bookmarks (add/remove), settings, layout read/write, default filter extraction.
 
 ### DAX Engine (4)
 Measure evaluation, per-dimension evaluation, calculated columns, cache management.
 
-### DataModel Read (8)
-Schema, measures, relationships, Power Query, columns, table data.
+### DataModel Read (16)
+Schema, measures, relationships, Power Query, columns, table data, data sources, metadata, CSV export (single/all), value search, SQL-like query, table profiling, data diff.
 
-### DataModel Write (16)
-Metadata SQL, measure CRUD, column modification, field parameters, calculation groups,
-TMDL export, decompress/recompress, ABF file ops.
+### DataModel Write (21)
+Metadata SQL read/write, measure CRUD, column modification, relationship CRUD, table removal, field parameters, calculation groups, TMDL export, PBIP export, decompress/recompress, ABF file ops, table data write, value replace.
 
-### Resources, Themes & Custom Visuals (7)
-Static resources, theme read/write, linguistic schema, custom visual import/remove.
+### Resources, Themes & Custom Visuals (9)
+Static resources, theme read/write, color extraction/recolor, linguistic schema, custom visual import/remove.
 
 ### DataMashup (2)
 M code read/write.
@@ -94,8 +90,20 @@ M code read/write.
 ### Row-Level Security (3)
 RLS role CRUD, filter expression evaluation against data.
 
-### Incremental Refresh (2)
-Set/get incremental refresh policies with archive/refresh windows and change detection.
+### Perspectives (3)
+Create/list/remove perspectives for filtered model views.
 
-### Diagnostics & Security (2)
-8-point health check, password extraction.
+### User Hierarchies (3)
+Create/list/remove drill-down hierarchies (e.g. Country > State > City).
+
+### Cultures & Translations (4)
+Add cultures, translate table/column/measure names, list/remove cultures.
+
+### Partition Management (3)
+List/remove M partitions. `pbix_add_partition` blocked for PBIX (needs PartitionStorage), works for PBIP/TMDL export.
+
+### Incremental Refresh (2)
+Get/set incremental refresh policies. `pbix_set_incremental_refresh` blocked — requires DataMashup with RangeStart/RangeEnd M parameters.
+
+### Diagnostics & Security (5)
+17-point diagnostic (`pbix_doctor`), report documentation (`pbix_document`), file diff (`pbix_diff`), performance analysis (`pbix_performance`), password extraction (`pbix_get_password`).
