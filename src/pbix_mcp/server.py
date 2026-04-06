@@ -2734,6 +2734,15 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
         # Load theme dataColors for resolving ThemeDataColor refs
         data_colors = _load_theme_data_colors(work_dir)
 
+        # Auto-extend: map ALL theme palette colors, not just user-provided ones.
+        # Unmapped theme colors get assigned from the new palette (cycling).
+        if data_colors:
+            new_palette = list(dict.fromkeys(cmap.values()))  # unique new colors, in order
+            if new_palette:
+                for i, dc in enumerate(data_colors):
+                    if dc.upper() not in cmap:
+                        cmap[dc.upper()] = new_palette[i % len(new_palette)]
+
         def _replace_hex(text: str) -> tuple[str, int]:
             count = 0
             for old, new in cmap.items():
@@ -2835,6 +2844,17 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                         config = _parse_visual_config(vc)
                         sv = config.get("singleVisual", {})
                         vtype = sv.get("visualType", "")
+
+                        # Apply grid outlineColor to table/matrix visuals
+                        if vtype in ("tableEx", "pivotTable") and new_data_colors:
+                            tbl_objects = sv.setdefault("objects", {})
+                            if "grid" not in tbl_objects:
+                                tbl_objects["grid"] = [{"properties": {
+                                    "outlineColor": _solid_color(new_data_colors[0]),
+                                }}]
+                                vc["config"] = json.dumps(config, ensure_ascii=False)
+                                visuals_colored += 1
+                            continue
 
                         # Only process chart visuals that render data series
                         chart_types = {
