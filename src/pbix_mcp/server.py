@@ -646,7 +646,10 @@ def _build_format_objects(fmt: dict) -> dict:
         _add("valueAxis", props)
 
     # --- dataColors (dataPoint) ---
-    if "dataColors" in fmt:
+    # NOTE: Multi-color dataColors with per-series/per-category selectors
+    # are handled in pbix_format_visual directly (needs visual projections).
+    # This only handles the single-color fallback.
+    if "dataColors" in fmt and not fmt.get("_skip_datacolors"):
         colors = fmt["dataColors"]
         if isinstance(colors, list) and colors:
             props = {"fill": _solid_color(colors[0])}
@@ -1632,6 +1635,78 @@ def pbix_format_visual(
         config = _parse_visual_config(vc)
         sv = config.setdefault("singleVisual", {})
         existing_objects = sv.setdefault("objects", {})
+
+        # Handle dataColors with per-series/per-category selectors
+        colors = fmt.get("dataColors") if isinstance(fmt, dict) else None
+        if isinstance(colors, list) and len(colors) > 1:
+            projections = sv.get("projections", {})
+            proto = sv.get("prototypeQuery", {})
+            selects = proto.get("Select", [])
+
+            # Build dataPoint entries with selectors
+            dp_entries = []
+
+            # Determine selector type based on visual projections
+            y_refs = [p.get("queryRef", "") for p in projections.get("Y", [])]
+            cat_refs = [p.get("queryRef", "") for p in projections.get("Category", [])]
+
+            if len(y_refs) > 1:
+                # Multi-measure chart (column chart with Revenue + Cost)
+                # Selector: {"metadata": "Table.Measure"}
+                for i, y_ref in enumerate(y_refs):
+                    if i < len(colors):
+                        entry = {"properties": {"fill": _solid_color(colors[i])}}
+                        entry["selector"] = {"metadata": y_ref}
+                        dp_entries.append(entry)
+
+            elif len(cat_refs) >= 1 and len(colors) > 1:
+                # Single-measure chart with category axis (donut, bar by category)
+                # Need to find unique category values from the data
+                # Selector: {"data": [{scopeId: {Comparison: ...}}]}
+                cat_ref = cat_refs[0]  # e.g. "Products.Category"
+                parts = cat_ref.split(".")
+                if len(parts) == 2:
+                    entity, prop = parts
+                    # Try to get unique values from the table data
+                    try:
+                        from pbix_mcp.formats.model_reader import ModelReader
+                        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
+                        td = model.get_table(entity)
+                        col_idx = td["columns"].index(prop)
+                        unique_vals = sorted(set(
+                            row[col_idx] for row in td["rows"]
+                            if row[col_idx] is not None
+                        ))
+                        for i, val in enumerate(unique_vals):
+                            if i < len(colors):
+                                entry = {"properties": {"fill": _solid_color(colors[i])}}
+                                entry["selector"] = {
+                                    "data": [{
+                                        "scopeId": {
+                                            "Comparison": {
+                                                "ComparisonKind": 0,
+                                                "Left": {
+                                                    "Column": {
+                                                        "Expression": {
+                                                            "SourceRef": {"Entity": entity}
+                                                        },
+                                                        "Property": prop,
+                                                    }
+                                                },
+                                                "Right": {
+                                                    "Literal": {"Value": f"'{val}'"}
+                                                },
+                                            }
+                                        }
+                                    }]
+                                }
+                                dp_entries.append(entry)
+                    except Exception:
+                        pass  # Fall through to single-color
+
+            if dp_entries:
+                existing_objects["dataPoint"] = dp_entries
+                fmt["_skip_datacolors"] = True  # Skip the single-color fallback
 
         result = _build_format_objects(fmt)
         new_objects = result.get("_objects", {})
@@ -2744,6 +2819,111 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
             theme_replaced = theme_refs_before - theme_refs_after
 
             new_layout = json.loads(new_str)
+
+            # --- Inject per-selector dataPoint entries for chart visuals ---
+            # After text replacement, walk each visual and ensure chart series/categories
+            # get explicit color assignments from the new theme palette.
+            new_data_colors = _load_theme_data_colors(work_dir)
+            if not new_data_colors:
+                # Build palette from the replacement values
+                new_data_colors = list(dict.fromkeys(cmap.values()))
+
+            visuals_colored = 0
+            for section in new_layout.get("sections", []):
+                for vc in section.get("visualContainers", []):
+                    try:
+                        config = _parse_visual_config(vc)
+                        sv = config.get("singleVisual", {})
+                        vtype = sv.get("visualType", "")
+
+                        # Only process chart visuals that render data series
+                        chart_types = {
+                            "clusteredBarChart", "clusteredColumnChart", "stackedBarChart",
+                            "stackedColumnChart", "hundredPercentStackedBarChart",
+                            "hundredPercentStackedColumnChart", "lineChart", "areaChart",
+                            "stackedAreaChart", "lineClusteredColumnComboChart",
+                            "lineStackedColumnComboChart", "pieChart", "donutChart",
+                            "treemap", "waterfallChart", "funnel", "scatterChart",
+                            "ribbonChart",
+                        }
+                        if vtype not in chart_types:
+                            continue
+
+                        projections = sv.get("projections", {})
+                        if not projections:
+                            continue
+
+                        # Check if visual already has per-selector dataPoint entries
+                        objects = sv.get("objects", {})
+                        existing_dp = objects.get("dataPoint", [])
+                        has_selectors = any(e.get("selector") for e in existing_dp)
+                        if has_selectors:
+                            continue  # Already has explicit per-selector colors
+
+                        dp_entries = []
+                        y_refs = [p.get("queryRef", "") for p in projections.get("Y", []) if p.get("queryRef")]
+                        cat_refs = [p.get("queryRef", "") for p in projections.get("Category", []) if p.get("queryRef")]
+                        series_refs = [p.get("queryRef", "") for p in projections.get("Series", []) if p.get("queryRef")]
+
+                        if len(y_refs) > 1:
+                            # Multi-measure chart: assign colors by measure
+                            for i, y_ref in enumerate(y_refs):
+                                color = new_data_colors[i % len(new_data_colors)] if new_data_colors else "#808080"
+                                entry = {
+                                    "properties": {"fill": _solid_color(color)},
+                                    "selector": {"metadata": y_ref},
+                                }
+                                dp_entries.append(entry)
+
+                        elif vtype in ("pieChart", "donutChart", "treemap", "funnel") and cat_refs:
+                            # Category-based chart: assign colors per category value
+                            cat_ref = cat_refs[0]
+                            parts = cat_ref.split(".")
+                            if len(parts) == 2:
+                                entity, prop = parts
+                                try:
+                                    from pbix_mcp.formats.model_reader import ModelReader
+                                    model = ModelReader(info["path"], work_dir=work_dir)
+                                    td = model.get_table(entity)
+                                    col_idx = td["columns"].index(prop)
+                                    unique_vals = sorted(set(
+                                        row[col_idx] for row in td["rows"]
+                                        if row[col_idx] is not None
+                                    ))
+                                    for i, val in enumerate(unique_vals):
+                                        color = new_data_colors[i % len(new_data_colors)] if new_data_colors else "#808080"
+                                        entry = {
+                                            "properties": {"fill": _solid_color(color)},
+                                            "selector": {
+                                                "data": [{
+                                                    "scopeId": {
+                                                        "Comparison": {
+                                                            "ComparisonKind": 0,
+                                                            "Left": {
+                                                                "Column": {
+                                                                    "Expression": {"SourceRef": {"Entity": entity}},
+                                                                    "Property": prop,
+                                                                }
+                                                            },
+                                                            "Right": {
+                                                                "Literal": {"Value": f"'{val}'"}
+                                                            },
+                                                        }
+                                                    }
+                                                }]
+                                            },
+                                        }
+                                        dp_entries.append(entry)
+                                except Exception:
+                                    pass
+
+                        if dp_entries:
+                            sv.setdefault("objects", {})["dataPoint"] = dp_entries
+                            vc["config"] = json.dumps(config, ensure_ascii=False)
+                            visuals_colored += 1
+                    except Exception:
+                        continue  # Skip visuals with parse errors
+
             _set_layout(work_dir, new_layout)
 
         info["modified"] = True
@@ -2751,6 +2931,8 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
         parts = [f"Replaced {total_replacements} hex color occurrences"]
         if theme_replaced > 0:
             parts.append(f"{theme_replaced} ThemeDataColor refs converted to hex")
+        if visuals_colored > 0:
+            parts.append(f"{visuals_colored} chart(s) got per-series/category colors")
         parts.append(f"({len(cmap)} colors mapped)")
 
         return ToolResponse.ok(" + ".join(parts)).to_text()
