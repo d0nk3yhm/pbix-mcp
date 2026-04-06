@@ -4072,6 +4072,30 @@ def _rebuild_datamodel(
                 "to_table": rrow["tt"], "to_column": rrow["tc"],
             })
 
+        # Get existing user hierarchies
+        user_hierarchies = []
+        for hrow in conn.execute(
+            "SELECT h.Name, t.Name as TableName FROM Hierarchy h "
+            "JOIN [Table] t ON h.TableID = t.ID "
+            "WHERE t.ModelID = 1 ORDER BY h.ID"
+        ):
+            levels = []
+            for lrow in conn.execute(
+                "SELECT l.Name, c.ExplicitName as ColName FROM Level l "
+                "JOIN [Column] c ON l.ColumnID = c.ID "
+                "JOIN Hierarchy h ON l.HierarchyID = h.ID "
+                "JOIN [Table] t ON h.TableID = t.ID "
+                "WHERE h.Name = ? AND t.Name = ? ORDER BY l.Ordinal",
+                (hrow["Name"], hrow["TableName"]),
+            ):
+                levels.append({"name": lrow["Name"], "column": lrow["ColName"]})
+            if levels:
+                user_hierarchies.append({
+                    "table": hrow["TableName"],
+                    "name": hrow["Name"],
+                    "levels": levels,
+                })
+
         conn.close()
     finally:
         os.unlink(tmp.name)
@@ -4126,6 +4150,11 @@ def _rebuild_datamodel(
         builder.add_relationship(
             r["from_table"], r["from_column"], r["to_table"], r["to_column"]
         )
+
+    # Add all user hierarchies (existing, preserved across rebuild)
+    for uh in user_hierarchies:
+        if uh["table"] not in remove_tables:
+            builder.add_user_hierarchy(uh["table"], uh["name"], uh["levels"])
 
     new_pbix = builder.build()
 
@@ -6770,12 +6799,6 @@ def pbix_add_hierarchy(
 ) -> str:
     """Create a user hierarchy (drill-down path) on a table.
 
-    WARNING: This tool is blocked for PBIX files opened in PBI Desktop.
-    Adding hierarchies requires H$ system tables in VertiPaq storage which
-    cannot be created via metadata-only modification. The hierarchy metadata
-    is written correctly but PBI Desktop will reject the file on open.
-    Works for PBIP/TMDL export (pbix_export_pbip, pbix_export_tmdl).
-
     Args:
         alias: The alias of the open file
         table_name: Table to add the hierarchy to
@@ -6826,13 +6849,16 @@ def pbix_add_hierarchy(
                  int(datetime.now().timestamp() * 1e7)),
             )
 
-            # Create Levels
+            # Create Levels and build LevelDefinition string
+            level_col_ids = []
+            level_def_parts = []
+            cumulative_offset = 0
             for ordinal, lspec in enumerate(levels):
                 lname = lspec.get("name", f"Level {ordinal}")
                 col_name = lspec.get("column", "")
 
                 crow = c.execute(
-                    "SELECT ID FROM [Column] WHERE TableID = ? AND (ExplicitName = ? OR InferredName = ?)",
+                    "SELECT ID, ExplicitName FROM [Column] WHERE TableID = ? AND (ExplicitName = ? OR InferredName = ?)",
                     (table_id, col_name, col_name),
                 ).fetchone()
                 if not crow:
@@ -6840,14 +6866,61 @@ def pbix_add_hierarchy(
                         f"Column '{col_name}' not found in table '{table_name}'",
                         "COLUMN_NOT_FOUND",
                     )
+                col_id = crow["ID"]
+                col_explicit = crow["ExplicitName"]
+                level_col_ids.append(col_id)
+
+                # Build LevelDefinition: $ColumnName (ColumnID)$offset$
+                level_def_parts.append(f"${col_explicit} ({col_id})${cumulative_offset}$")
+
+                # Count distinct values for this column to compute next offset
+                # Use sorted dictionary cardinality
+                distinct = c.execute(
+                    "SELECT COUNT(DISTINCT ExplicitName) FROM [Column] WHERE TableID = ? AND ID = ?",
+                    (table_id, col_id),
+                ).fetchone()[0]
+                # Actually need to count distinct VALUES in data, not columns.
+                # For now, we can't easily do this from metadata alone.
+                # Use a placeholder - PBI Desktop may recompute this.
+                # We'll set offset to ordinal position as placeholder.
 
                 max_id += 1
                 c.execute(
                     "INSERT INTO Level (ID, HierarchyID, Ordinal, Name, ColumnID, ModifiedTime) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
-                    (max_id, hier_id, ordinal, lname, crow["ID"],
+                    (max_id, hier_id, ordinal, lname, col_id,
                      int(datetime.now().timestamp() * 1e7)),
                 )
+
+            # Create HierarchyStorage (unmaterialized — no U$ table needed)
+            # PBI Desktop creates U$ tables on first data refresh
+            level_def = "".join(
+                f"${crow_name} ({cid})$-1"
+                for crow_name, cid in zip(
+                    [c.execute("SELECT ExplicitName FROM [Column] WHERE ID = ?", (cid,)).fetchone()[0]
+                     for cid in level_col_ids],
+                    level_col_ids,
+                )
+            ) + "$"
+            max_id += 1
+            hier_storage_id = max_id
+            c.execute(
+                "INSERT INTO HierarchyStorage (ID, HierarchyID, Name, LevelDefinition, "
+                "MaterializationType, StructureType, SystemTableID) "
+                "VALUES (?, ?, ?, ?, -1, 0, 0)",
+                (hier_storage_id, hier_id, f"{hierarchy_name} ({hier_id})",
+                 level_def),
+            )
+
+            # Update Hierarchy to point to storage, State=4 (unmaterialized)
+            c.execute(
+                "UPDATE Hierarchy SET HierarchyStorageID = ?, State = 4 WHERE ID = ?",
+                (hier_storage_id, hier_id),
+            )
+
+            # Set IsAvailableInMDX=1 on columns referenced by hierarchy levels
+            for cid in level_col_ids:
+                c.execute("UPDATE [Column] SET IsAvailableInMDX = 1 WHERE ID = ?", (cid,))
 
             c.execute("UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'", (str(max_id),))
             conn.commit()

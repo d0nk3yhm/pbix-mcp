@@ -29,6 +29,7 @@ import sqlite3
 import struct
 import tempfile
 import uuid
+import warnings
 import zipfile
 
 # AMO data-type codes used in metadata.sqlitedb
@@ -78,6 +79,7 @@ class PBIXBuilder:
         self._tables: list[dict] = []
         self._measures: list[dict] = []
         self._relationships: list[dict] = []
+        self._user_hierarchies: list[dict] = []
         self._pages: list[dict] = []
 
     def add_table(
@@ -162,6 +164,29 @@ class PBIXBuilder:
             "from_column": from_column,
             "to_table": to_table,
             "to_column": to_column,
+        })
+        return self
+
+    def add_user_hierarchy(
+        self,
+        table: str,
+        name: str,
+        levels: list[dict],
+    ) -> "PBIXBuilder":
+        """Add a user-defined drill-down hierarchy to a table.
+
+        Args:
+            table: Table name (must exist via add_table)
+            name: Hierarchy name (e.g. "Geography", "Product Categories")
+            levels: List of {"name": str, "column": str} dicts in drill-down order.
+                    e.g. [{"name": "Country", "column": "Country"},
+                          {"name": "State", "column": "State"},
+                          {"name": "City", "column": "City"}]
+        """
+        self._user_hierarchies.append({
+            "table": table,
+            "name": name,
+            "levels": levels,
         })
         return self
 
@@ -578,6 +603,7 @@ class PBIXBuilder:
         # Compression class IDs determined through binary format analysis
         new_sqlite_bytes, vertipaq_files = _modify_metadata_and_encode(
             sqlite_bytes, tables, measures, relationships,
+            user_hierarchies=self._user_hierarchies,
             compression_class_a=0xABA5A,
             compression_class_b=0xABA5B,
         )
@@ -928,6 +954,7 @@ def _modify_metadata_and_encode(
     tables: list[dict],
     measures: list[dict],
     relationships: list[dict],
+    user_hierarchies: list[dict] | None = None,
     compression_class_a: int = 0xABA5A,
     compression_class_b: int = 0xABA5B,
 ) -> tuple[bytes, dict[str, bytes]]:
@@ -1304,6 +1331,14 @@ def _modify_metadata_and_encode(
             # ============================================================
             # INSERT user columns (Type=1)
             # ============================================================
+            # Determine which columns are used in user hierarchies
+            # (they need IsAvailableInMDX=1)
+            _hier_cols = set()
+            for _uh in (user_hierarchies or []):
+                if _uh["table"] == tname:
+                    for _lv in _uh["levels"]:
+                        _hier_cols.add(_lv["column"])
+
             for col_idx, col_def in enumerate(tdef["columns"]):
                 col_name = col_def["name"]
                 data_type = col_def.get("data_type", "String")
@@ -1362,7 +1397,7 @@ def _modify_metadata_and_encode(
                         -1, 0, 0,
                         ?, ?, 1,
                         ?, 0, NULL, NULL,
-                        0, 0, 0,
+                        ?, 0, 0,
                         ?, ?, 31240512000000000,
                         0, 0, ?,
                         NULL, NULL, NULL,
@@ -1374,6 +1409,7 @@ def _modify_metadata_and_encode(
                      2,  # SummarizeBy: 2=None (default for all user columns)
                      cs_id,
                      col_name,  # SourceColumn
+                     1 if col_name in _hier_cols else 0,  # IsAvailableInMDX
                      _FIXED_TIMESTAMP, _FIXED_TIMESTAMP,
                      col_idx,  # DisplayOrdinal
                      str(uuid.uuid4())),  # LineageTag only; SourceLineageTag = NULL
@@ -2159,6 +2195,106 @@ def _modify_metadata_and_encode(
                     (ahs_id, ah_id, distinct, h_table_id,
                      min_val, max_val, max_strlen),
                 )
+
+        # ============================================================
+        # Create U$ system tables for user-defined hierarchies
+        # ============================================================
+        for uhier in (user_hierarchies or []):
+            uh_table_name = uhier["table"]
+            uh_name = uhier["name"]
+            uh_levels = uhier["levels"]
+
+            if uh_table_name not in table_id_map:
+                warnings.warn(f"Hierarchy '{uh_name}': table '{uh_table_name}' not found, skipping")
+                continue
+
+            parent_table_id = table_id_map[uh_table_name]
+
+            # Resolve level columns and compute LevelDefinition offsets
+            level_col_ids = []
+            level_col_names = []
+            level_offsets = []
+            cumulative = 0
+            tdef = next(t for t in tables if t["name"] == uh_table_name)
+            tdef_col_names = [col["name"] for col in tdef["columns"]]
+
+            for lspec in uh_levels:
+                col_name = lspec["column"]
+                if col_name not in tdef_col_names:
+                    warnings.warn(f"Hierarchy '{uh_name}': column '{col_name}' not found in '{uh_table_name}', skipping hierarchy")
+                    break
+                col_id = column_id_map.get(uh_table_name, {}).get(col_name)
+                if col_id is None:
+                    warnings.warn(f"Hierarchy '{uh_name}': column '{col_name}' ID not found, skipping hierarchy")
+                    break
+                level_col_ids.append(col_id)
+                level_col_names.append(col_name)
+                level_offsets.append(cumulative)
+
+                # Count distinct values for this column to compute next offset
+                col_idx = tdef_col_names.index(col_name)
+                distinct_vals = set()
+                for row in tdef["rows"]:
+                    val = row.get(col_name)
+                    if val is not None:
+                        distinct_vals.add(val)
+                cumulative += len(distinct_vals)
+            else:
+                # Only execute if the for loop completed without break
+                # Build LevelDefinition string
+                level_def_parts = []
+                for i, (col_name, col_id, offset) in enumerate(zip(level_col_names, level_col_ids, level_offsets)):
+                    level_def_parts.append(f"${col_name} ({col_id})${offset}$")
+                level_def = "".join(level_def_parts)
+
+                # Create Hierarchy metadata
+                hier_id = alloc.next()
+                c.execute(
+                    """INSERT INTO Hierarchy (ID, TableID, Name, IsHidden, State,
+                        ModifiedTime, StructureModifiedTime)
+                    VALUES (?, ?, ?, 0, 1, ?, ?)""",
+                    (hier_id, parent_table_id, uh_name,
+                     _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
+                )
+
+                # Create Level rows
+                for ordinal, lspec in enumerate(uh_levels):
+                    level_id = alloc.next()
+                    c.execute(
+                        """INSERT INTO Level (ID, HierarchyID, Ordinal, Name, ColumnID,
+                            ModifiedTime)
+                        VALUES (?, ?, ?, ?, ?, ?)""",
+                        (level_id, hier_id, ordinal, lspec["name"],
+                         level_col_ids[ordinal], _FIXED_TIMESTAMP),
+                    )
+
+                # HierarchyStorage — unmaterialized (no U$ table)
+                # PBI Desktop creates U$ tables only on data refresh.
+                # LevelDefinition offsets = -1 means "not yet computed".
+                level_def_unmat = "".join(
+                    f"${col_name} ({col_id})$-1"
+                    for col_name, col_id in zip(level_col_names, level_col_ids)
+                ) + "$"
+                hier_storage_id = alloc.next()
+                c.execute(
+                    """INSERT INTO HierarchyStorage (
+                        ID, HierarchyID, Name, LevelDefinition,
+                        MaterializationType, StructureType, SystemTableID
+                    ) VALUES (?, ?, ?, ?, -1, 0, 0)""",
+                    (hier_storage_id, hier_id, f"{uh_name} ({hier_id})",
+                     level_def_unmat),
+                )
+
+                # Link Hierarchy to storage and set State=4 (unmaterialized)
+                c.execute(
+                    "UPDATE Hierarchy SET HierarchyStorageID = ?, State = 4 WHERE ID = ?",
+                    (hier_storage_id, hier_id),
+                )
+
+                # IsAvailableInMDX=1 is set during column creation for hierarchy columns
+                # (see _hier_cols set built before the column INSERT loop)
+
+                # Note: No U$ table needed. PBI Desktop creates it on first data refresh.
 
         # ============================================================
         # Create R$ system tables for each relationship

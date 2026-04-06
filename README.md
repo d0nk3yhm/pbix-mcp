@@ -142,7 +142,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | TMDL Export | **Stable** | Export data model as Git-friendly TMDL text files via `pbix_export_tmdl`. Validated with Adventure Works DW 2020 — correct partition types, CrossFilteringBehavior, model properties, shared expressions |
 | PBIP Export | **Stable** | Convert PBIX to PBIP (Power BI Project) folder structure via `pbix_export_pbip` — full TMDL semantic model + report layout + static resources, ready for Git |
 | Perspectives | **Stable** | Create/list/remove perspectives via `pbix_add_perspective`, `pbix_get_perspectives`, `pbix_remove_perspective` |
-| User Hierarchies | **Partial** | List/remove hierarchies via `pbix_get_hierarchies`, `pbix_remove_hierarchy`. `pbix_add_hierarchy` blocked for PBIX (needs H$ VertiPaq tables), works for PBIP/TMDL export |
+| User Hierarchies | **Stable** | Create/list/remove drill-down hierarchies via `pbix_add_hierarchy`, `pbix_get_hierarchies`, `pbix_remove_hierarchy`. Works with builder-created and PBI Desktop files |
 | Cultures & Translations | **Stable** | Add cultures, translate table/column/measure names via `pbix_add_culture`, `pbix_add_translations`, `pbix_get_cultures`, `pbix_remove_culture` |
 | Partition Management | **Partial** | List/remove partitions via `pbix_get_partitions`, `pbix_remove_partition`. `pbix_add_partition` blocked for PBIX (needs PartitionStorage in VertiPaq), works for PBIP/TMDL export |
 | Sensitivity Labels | **Stable** | Strip MSIP sensitivity labels via `pbix_save(strip_sensitivity_label=True)` |
@@ -164,7 +164,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 - **CryptKey.bin** — the 144-byte RSA key BLOB cannot be generated without Microsoft's crypto infrastructure (`rskeymgmt`). A known-valid GUID-independent constant is used.
 - **Embedded VertiPaq data** — verified working with 11 tables, 72 columns, 13 relationships, 121K+ rows (Adventure Works DW 2020) and 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase)
 - **RLE encoding** — disabled in the VertiPaq encoder (pure bitpack used). Slightly less space-efficient but correct
-- **Adding hierarchies/partitions to PBIX** — `pbix_add_hierarchy` and `pbix_add_partition` are blocked for PBIX files (need H$/PartitionStorage VertiPaq structures). They work for PBIP/TMDL export. Reading and removing existing hierarchies/partitions works.
+- **Adding partitions to PBIX** — `pbix_add_partition` is blocked for PBIX files (needs PartitionStorage in VertiPaq). Works for PBIP/TMDL export. Reading and removing existing partitions works.
 - **Full DataModel rebuild** — `set_table_data`, `update_table_rows`, `add/remove_relationship`, `remove_table` trigger a full DataModel rebuild via the builder pipeline. Most other tools (`add_measure`, `modify_measure`, `modify_column`, `set_rls_role`, `add_perspective`, `add_culture`, `add_translations`, `update_data_source`, etc.) use a lightweight metadata-only path.
 
 
