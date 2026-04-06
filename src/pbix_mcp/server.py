@@ -2442,6 +2442,56 @@ def pbix_set_theme(alias: str, theme_json: str, filename: str = "CY24SU11.json")
                 json.dump(theme, fh, indent=2, ensure_ascii=False)
             written_to.append("RegisteredResources")
 
+        # Update layout config to reference the theme
+        layout = _get_layout(work_dir)
+        if layout:
+            # Ensure resourcePackages includes SharedResources with theme
+            theme_name = theme.get("name", filename.replace(".json", ""))
+            rp = layout.get("resourcePackages", [])
+
+            # Find or create SharedResources package
+            shared_pkg = None
+            for pkg in rp:
+                inner = pkg.get("resourcePackage", pkg)
+                if inner.get("name") == "SharedResources" or inner.get("type") in (2, "SharedResources"):
+                    shared_pkg = inner
+                    break
+            if shared_pkg is None:
+                shared_pkg = {"name": "SharedResources", "type": 2, "items": [], "disabled": False}
+                rp.append({"resourcePackage": shared_pkg})
+                layout["resourcePackages"] = rp
+
+            # Ensure theme item exists in SharedResources
+            items = shared_pkg.get("items", [])
+            theme_item_found = False
+            for item in items:
+                if item.get("type") in (202, "BaseTheme"):
+                    item["name"] = theme_name
+                    item["path"] = f"BaseThemes/{filename}"
+                    theme_item_found = True
+                    break
+            if not theme_item_found:
+                items.append({"type": 202, "path": f"BaseThemes/{filename}", "name": theme_name})
+                shared_pkg["items"] = items
+
+            # Update config.themeCollection
+            config_str = layout.get("config", "{}")
+            try:
+                config = json.loads(config_str) if isinstance(config_str, str) else config_str
+            except json.JSONDecodeError:
+                config = {}
+            config["themeCollection"] = {
+                "baseTheme": {
+                    "name": theme_name,
+                    "version": {"visual": "1.0.0", "report": "1.0.0", "page": "1.0.0"},
+                    "type": 2
+                }
+            }
+            layout["config"] = json.dumps(config, ensure_ascii=False)
+
+            _set_layout(work_dir, layout)
+            written_to.append("layout config")
+
         info["modified"] = True
         return ToolResponse.ok(f"Theme saved to {filename} ({', '.join(written_to)})").to_text()
     except PBIXMCPError as e:
