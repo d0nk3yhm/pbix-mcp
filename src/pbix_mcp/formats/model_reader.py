@@ -268,6 +268,9 @@ class ModelReader:
         result = []
         for tm in tables_meta:
             table_name = tm["TableName"]
+            # Skip internal system tables (H$=attribute hierarchy, R$=relationship, U$=user hierarchy)
+            if table_name.startswith(("H$", "R$", "U$")):
+                continue
             table_id = tm["ID"]
             col_count = tm["ColumnCount"]
             first_col_id = tm.get("FirstDataColID")

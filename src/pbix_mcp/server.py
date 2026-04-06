@@ -1048,6 +1048,8 @@ def pbix_save(alias: str, output_path: str = "", overwrite: bool = False, backup
 
         _repack_pbix(work_dir, target, strip_sensitivity_label=strip_sensitivity_label)
         info["modified"] = False
+        # Clear DAX cache since data may have changed
+        _dax_cache.pop(alias, None)
         size = os.path.getsize(target)
         return ToolResponse.ok(f"Saved '{alias}' to {target} ({size:,} bytes)").to_text()
     except PBIXMCPError as e:
@@ -1078,6 +1080,8 @@ def pbix_close(alias: str, force: bool = False) -> str:
         shutil.rmtree(work_dir, ignore_errors=True)
         logger.info("Closed '%s'", alias)
         del _open_files[alias]
+        # Clear DAX cache to avoid stale data on reopen
+        _dax_cache.pop(alias, None)
         return ToolResponse.ok(f"Closed '{alias}'.").to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
@@ -4096,6 +4100,25 @@ def _rebuild_datamodel(
                     "levels": levels,
                 })
 
+        # Get existing RLS roles
+        rls_roles = []
+        for rrow in conn.execute(
+            "SELECT r.Name, r.Description FROM Role r WHERE r.ModelID = 1"
+        ):
+            perms = conn.execute(
+                "SELECT t.Name as TableName, tp.FilterExpression "
+                "FROM TablePermission tp JOIN [Table] t ON tp.TableID = t.ID "
+                "WHERE tp.RoleID = (SELECT ID FROM Role WHERE Name = ?)",
+                (rrow["Name"],),
+            ).fetchall()
+            for p in perms:
+                rls_roles.append({
+                    "role_name": rrow["Name"],
+                    "description": rrow["Description"] or "",
+                    "table_name": p["TableName"],
+                    "filter_expression": p["FilterExpression"],
+                })
+
         conn.close()
     finally:
         os.unlink(tmp.name)
@@ -4167,6 +4190,43 @@ def _rebuild_datamodel(
     # Write new DataModel
     with open(dm_path, "wb") as f:
         f.write(new_dm)
+
+    # Re-apply RLS roles (builder doesn't support them, so splice after rebuild)
+    if rls_roles:
+        def _restore_rls(conn: sqlite3.Connection):
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            maxid_row = c.execute("SELECT Value FROM DBPROPERTIES WHERE Name = 'MAXID'").fetchone()
+            max_id = int(maxid_row[0]) if maxid_row else 0
+
+            roles_created = {}  # role_name -> role_id
+            for rls in rls_roles:
+                rname = rls["role_name"]
+                if rname not in roles_created:
+                    max_id += 1
+                    roles_created[rname] = max_id
+                    c.execute(
+                        "INSERT INTO Role (ID, ModelID, Name, Description) VALUES (?, 1, ?, ?)",
+                        (max_id, rname, rls.get("description") or None),
+                    )
+
+                role_id = roles_created[rname]
+                trow = c.execute(
+                    "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
+                    (rls["table_name"],),
+                ).fetchone()
+                if trow and rls.get("filter_expression"):
+                    max_id += 1
+                    c.execute(
+                        "INSERT INTO TablePermission (ID, RoleID, TableID, FilterExpression) "
+                        "VALUES (?, ?, ?, ?)",
+                        (max_id, role_id, trow["ID"], rls["filter_expression"]),
+                    )
+
+            c.execute("UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'", (str(max_id),))
+            conn.commit()
+
+        _modify_metadata_only(dm_path, _restore_rls)
 
     return len(dm_bytes), len(new_dm)
 
