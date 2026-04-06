@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.5] - 2026-04-06
+
+### Fixed
+- **`pbix_format_visual` dataColors per-selector support** — multi-measure charts now get per-series `dataPoint` entries with `{"selector": {"metadata": "Table.Measure"}}`. Multi-category charts (donut, pie, treemap, funnel) get per-category entries with `{"selector": {"data": [{scopeId: {Comparison: ...}}]}}`. Single-color fallback preserved for simple charts.
+- **`pbix_recolor` per-visual dataPoint injection** — after replacing hex colors and ThemeDataColor references, walks every chart visual and injects per-selector `dataPoint` entries from the new theme palette. Ensures ALL chart series/categories get explicit colors after recoloring. Supports clusteredBarChart, clusteredColumnChart, stackedBarChart, lineChart, pieChart, donutChart, treemap, funnel, scatterChart, ribbonChart, and all combo/stacked variants.
+
+### Verified
+- End-to-end recolor: create report with multi-measure bar + donut by category → set theme → recolor with palette map → verify per-selector entries in saved PBIX → PBI Desktop renders correct colors
+- toy_store_blue.pbix → red palette: 54 hex replacements + 0 remaining ThemeDataColor refs + 2 charts got per-series/category colors
+
 ## [0.8.4] - 2026-04-06
 
 ### Unblocked
