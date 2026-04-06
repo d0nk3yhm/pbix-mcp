@@ -5159,9 +5159,9 @@ def pbix_datamodel_add_calculation_group(
                 (cg_id, table_id),
             )
 
-            # Calculation group tables require Partition Type=2 (Calculated)
+            # Calculation group tables require Partition Type=7 (CalculationGroup source)
             c.execute(
-                "UPDATE Partition SET Type = 2, QueryDefinition = NULL WHERE TableID = ?",
+                "UPDATE Partition SET Type = 7, QueryDefinition = NULL, DataView = 3 WHERE TableID = ?",
                 (table_id,),
             )
 
