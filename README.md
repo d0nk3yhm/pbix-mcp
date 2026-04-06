@@ -137,8 +137,8 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Password extraction | **Beta** | Regex scan of DAX measures for embedded passwords |
 | Row-Level Security (RLS) | **Stable** | Read, write, and evaluate RLS roles. `set_rls_role` uses binary splice — roles persist across save/reopen. MAXID-based ID allocation. Verified on PBI Desktop files |
 | Bookmark creation | **Beta** | Create/remove bookmarks with page targeting and visual visibility state |
-| Field Parameters | **Blocked** | `pbix_datamodel_add_field_parameter` blocked — needs full DataModel rebuild to generate VertiPaq storage for new table |
-| Calculation Groups | **Blocked** | `pbix_datamodel_add_calculation_group` blocked — needs full DataModel rebuild to generate VertiPaq storage for new table |
+| Field Parameters | **Stable** | Create field parameter tables via `pbix_datamodel_add_field_parameter` — uses full DataModel rebuild for VertiPaq storage |
+| Calculation Groups | **Stable** | Create calculation groups via `pbix_datamodel_add_calculation_group` — table + CalculationItem DAX expressions |
 | TMDL Export | **Stable** | Export data model as Git-friendly TMDL text files via `pbix_export_tmdl`. Validated with Adventure Works DW 2020 — correct partition types, CrossFilteringBehavior, model properties, shared expressions |
 | PBIP Export | **Stable** | Convert PBIX to PBIP (Power BI Project) folder structure via `pbix_export_pbip` — full TMDL semantic model + report layout + static resources, ready for Git |
 | Perspectives | **Stable** | Create/list/remove perspectives via `pbix_add_perspective`, `pbix_get_perspectives`, `pbix_remove_perspective` |
@@ -147,7 +147,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Partition Management | **Partial** | List/remove partitions via `pbix_get_partitions`, `pbix_remove_partition`. `pbix_add_partition` blocked for PBIX (needs PartitionStorage in VertiPaq), works for PBIP/TMDL export |
 | Sensitivity Labels | **Stable** | Strip MSIP sensitivity labels via `pbix_save(strip_sensitivity_label=True)` |
 | Custom Visuals | **Beta** | Import .pbiviz packages via `pbix_add_custom_visual`, place with `pbix_add_visual` |
-| Incremental Refresh | **Blocked** | `pbix_set_incremental_refresh` blocked — requires DataMashup with RangeStart/RangeEnd M parameters |
+| Incremental Refresh | **Partial** | `pbix_set_incremental_refresh` works for files with data sources (source_csv/source_db). Requires DataMashup with RangeStart/RangeEnd M parameters — not available for embedded-only files |
 | Report diff (`pbix_diff`) | **Stable** | Compare two PBIX files — tables, columns, measures, relationships, pages/visuals, data sources, theme colors. Shows added/removed/changed |
 | Report documentation (`pbix_document`) | **Stable** | Auto-generate full report documentation (markdown + .docx) — tables, columns, measures, relationships, data sources, pages/visuals, RLS roles, theme colors |
 | Performance analysis (`pbix_performance`) | **Stable** | Flags oversized tables, empty tables, wide schemas, high-cardinality strings, complex measures, inactive/bidirectional relationships, orphaned tables |
