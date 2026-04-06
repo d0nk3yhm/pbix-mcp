@@ -4228,6 +4228,9 @@ def _rebuild_datamodel(
 
         _modify_metadata_only(dm_path, _restore_rls)
 
+    # Clear DAX cache — rebuild changes data
+    _dax_cache.clear()
+
     return len(dm_bytes), len(new_dm)
 
 
@@ -4441,6 +4444,9 @@ def _modify_metadata_only(
 
     with open(dm_path, "wb") as f:
         f.write(new_dm)
+
+    # Clear DAX cache — metadata changes may affect measure evaluation
+    _dax_cache.clear()
 
     return len(dm_bytes), len(new_dm)
 
