@@ -5159,6 +5159,12 @@ def pbix_datamodel_add_calculation_group(
                 (cg_id, table_id),
             )
 
+            # Calculation group tables require Partition Type=2 (Calculated)
+            c.execute(
+                "UPDATE Partition SET Type = 2, QueryDefinition = NULL WHERE TableID = ?",
+                (table_id,),
+            )
+
             # Create CalculationItems
             for i, item in enumerate(items):
                 max_id += 1
@@ -5169,6 +5175,9 @@ def pbix_datamodel_add_calculation_group(
                     (max_id, cg_id, item["name"], item["expression"], i,
                      int(datetime.now().timestamp() * 1e7)),
                 )
+
+            # Calculation groups require DiscourageImplicitMeasures=1 on the Model
+            c.execute("UPDATE Model SET DiscourageImplicitMeasures = 1 WHERE ID = 1")
 
             c.execute("UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'", (str(max_id),))
             conn.commit()

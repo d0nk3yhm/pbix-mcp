@@ -138,7 +138,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Row-Level Security (RLS) | **Stable** | Read, write, and evaluate RLS roles. `set_rls_role` uses binary splice — roles persist across save/reopen. MAXID-based ID allocation. Verified on PBI Desktop files |
 | Bookmark creation | **Beta** | Create/remove bookmarks with page targeting and visual visibility state |
 | Field Parameters | **Stable** | Create field parameter tables via `pbix_datamodel_add_field_parameter` — uses full DataModel rebuild for VertiPaq storage |
-| Calculation Groups | **Stable** | Create calculation groups via `pbix_datamodel_add_calculation_group` — table + CalculationItem DAX expressions |
+| Calculation Groups | **Blocked** | `pbix_datamodel_add_calculation_group` — needs CalculationGroup partition source type (Type=5 + correct XMLA format). Table creation works but partition metadata needs ground-truth analysis |
 | TMDL Export | **Stable** | Export data model as Git-friendly TMDL text files via `pbix_export_tmdl`. Validated with Adventure Works DW 2020 — correct partition types, CrossFilteringBehavior, model properties, shared expressions |
 | PBIP Export | **Stable** | Convert PBIX to PBIP (Power BI Project) folder structure via `pbix_export_pbip` — full TMDL semantic model + report layout + static resources, ready for Git |
 | Perspectives | **Stable** | Create/list/remove perspectives via `pbix_add_perspective`, `pbix_get_perspectives`, `pbix_remove_perspective` |
