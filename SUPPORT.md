@@ -20,7 +20,7 @@
 - DAX measure read/write/evaluate (156 functions, best-effort)
 - Calculated table evaluation (DATATABLE, GENERATESERIES, CALENDAR, field parameters)
 - Metadata SQL read/write
-- Table data read (via PBIXRay)
+- Table data read (native VertiPaq decoder)
 - VertiPaq table data write (String, Int64, Double, DateTime, Decimal, Boolean)
 - ABF archive manipulation (list, extract, replace, build from scratch)
 - DataMashup (M code) read/write

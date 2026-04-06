@@ -124,7 +124,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Color extraction & recolor | **Stable** | `pbix_extract_colors` scans themes + all visuals for hex literals AND ThemeDataColor references (resolved to hex). `pbix_recolor` does global find-and-replace across themes + layout, converting ThemeDataColor refs to direct hex. Verified with full brand compliance recolor (531 colors → SG Armaturen palette) |
 | Visual property editing | **Stable** | Dot-path and full JSON |
 | DAX measure CRUD | **Stable** | Add, modify, remove via binary splice (PBI Desktop files) or full builder rebuild. Sequential adds supported with automatic MAXID tracking |
-| DAX evaluation (156 functions) | **Stable** | Best-effort evaluator; see accuracy notes below |
+| DAX evaluation (156 functions) | **Stable API** | Best-effort semantic parity — stable API, practical evaluation for common DAX patterns; see accuracy notes below |
 | Metadata SQL read/write | **Stable** | Full SQLite access to tables, columns, relationships |
 | Default slicer filter extraction | **Stable** | Legacy Layout JSON and PBIR format |
 | Table data read | **Stable** | Native VertiPaq decoder — all materialized tables (no external dependencies) |
@@ -558,7 +558,7 @@ src/pbix_mcp/
   formats/
     abf_rebuild.py       # ABF archive reader and rebuilder
     datamodel_roundtrip.py  # XPress9 compress/decompress
-    metadata_schema.py   # SQLite metadata schema (63 tables)
+    metadata_schema.py   # SQLite metadata schema (68 tables)
     model_reader.py      # Native VertiPaq table data reader (replaces PBIXRay)
     vertipaq_decoder.py  # VertiPaq IDF/dictionary/HIDX decoder
     vertipaq_encoder.py  # VertiPaq column encoding + NoSplit<N> encoder

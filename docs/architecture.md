@@ -34,7 +34,7 @@ src/pbix_mcp/
 2. Report/Layout is parsed as JSON for visual/page operations
 3. DataModel is XPress9-compressed; decompress to get ABF archive
 4. ABF contains SQLite metadata + VertiPaq column data
-5. PBIXRay reads materialized table data from VertiPaq
+5. Native VertiPaq decoder (vertipaq_decoder.py + model_reader.py) reads materialized table data
 6. calc_tables.py evaluates calculated tables/columns from metadata DAX
 7. DAX engine evaluates measures against the loaded data
 
@@ -47,7 +47,7 @@ src/pbix_mcp/
 
 ### Creating a PBIX
 
-**Everything is generated from scratch** — no templates or skeletons. The entire PBIX binary format has been reversed and reimplemented: PBIX ZIP shell, ABF binary container (signature, header, VirtualDirectory, BackupLog), XMLA database document (db.xml), metadata SQLite (63 system tables), VertiPaq column storage, and report layout JSON. The only non-generated artifact is a 144-byte CryptKey constant (Microsoft RSA key BLOB, GUID-independent).
+**Everything is generated from scratch** — no templates or skeletons. The entire PBIX binary format has been reversed and reimplemented: PBIX ZIP shell, ABF binary container (signature, header, VirtualDirectory, BackupLog), XMLA database document (db.xml), metadata SQLite (68 system tables), VertiPaq column storage, and report layout JSON. The only non-generated artifact is a 144-byte CryptKey constant (Microsoft RSA key BLOB, GUID-independent).
 
 1. `PBIXBuilder` generates clean SQLite metadata (DATASOURCEVERSION=2) — only user-specified tables, columns, and measures
 2. Key PBI annotations are written: PBI_IsFromSource (ObjectType=7), PBI_ResultType, SummarizationSetBy, PBI_QueryOrder, __PBI_TimeIntelligenceEnabled
