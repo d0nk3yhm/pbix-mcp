@@ -691,6 +691,8 @@ def _build_format_objects(fmt: dict) -> dict:
         if "outlineColor" in gr: props["outlineColor"] = _solid_color(gr["outlineColor"])
         if "outlineWeight" in gr: props["outlineWeight"] = _pbi_lit(int(gr["outlineWeight"]))
         if "textSize" in gr: props["textSize"] = _pbi_lit(float(gr["textSize"]))
+        if "gridHorizontalColor" in gr: props["gridHorizontalColor"] = _solid_color(gr["gridHorizontalColor"])
+        if "gridVerticalColor" in gr: props["gridVerticalColor"] = _solid_color(gr["gridVerticalColor"])
         _add("grid", props)
 
     # --- columnHeaders (table/matrix) ---
@@ -717,6 +719,11 @@ def _build_format_objects(fmt: dict) -> dict:
         if "fontColor" in vl: props["fontColor"] = _solid_color(vl["fontColor"])
         if "backColor" in vl: props["backColor"] = _solid_color(vl["backColor"])
         if "wordWrap" in vl: props["wordWrap"] = _pbi_lit(vl["wordWrap"])
+        # Alternating row colors
+        if "backColorPrimary" in vl: props["backColorPrimary"] = _solid_color(vl["backColorPrimary"])
+        if "backColorSecondary" in vl: props["backColorSecondary"] = _solid_color(vl["backColorSecondary"])
+        if "fontColorPrimary" in vl: props["fontColorPrimary"] = _solid_color(vl["fontColorPrimary"])
+        if "fontColorSecondary" in vl: props["fontColorSecondary"] = _solid_color(vl["fontColorSecondary"])
         _add("values", props)
 
     # --- total (table/matrix totals row) ---
@@ -1622,9 +1629,11 @@ def pbix_format_visual(
             visualTooltip: {show, type, fontSize, titleFontColor, valueFontColor,
                 actionFontColor, background}
             dataColors: ["#hex1", "#hex2", ...]
-            grid: {gridVertical, gridHorizontal, rowPadding, outlineColor, outlineWeight}
+            grid: {gridVertical, gridHorizontal, rowPadding, outlineColor, outlineWeight,
+                gridHorizontalColor, gridVerticalColor}
             columnHeaders: {bold, fontSize, fontFamily, fontColor, backColor, alignment}
-            values: {bold, fontSize, fontFamily, fontColor, backColor, wordWrap}
+            values: {bold, fontSize, fontFamily, fontColor, backColor, wordWrap,
+                backColorPrimary, backColorSecondary, fontColorPrimary, fontColorSecondary}
             total: {show, bold, fontSize, fontColor, backColor}
             outline: {show, weight, color}
             fill: {color, transparency, show}
@@ -2871,15 +2880,45 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                         sv = config.get("singleVisual", {})
                         vtype = sv.get("visualType", "")
 
-                        # Apply grid outlineColor to table/matrix visuals
+                        # Apply themed row colors to table/matrix visuals
                         if vtype in ("tableEx", "pivotTable") and new_data_colors:
                             tbl_objects = sv.setdefault("objects", {})
+                            primary = new_data_colors[0]
+
+                            # Grid styling
                             if "grid" not in tbl_objects:
                                 tbl_objects["grid"] = [{"properties": {
-                                    "outlineColor": _solid_color(new_data_colors[0]),
+                                    "outlineColor": _solid_color(primary),
+                                    "gridHorizontalColor": _solid_color(primary),
                                 }}]
-                                vc["config"] = json.dumps(config, ensure_ascii=False)
-                                visuals_colored += 1
+
+                            # Alternating row colors: primary tint (25%) and lighter tint (10%)
+                            if "values" not in tbl_objects:
+                                pr, pg, pb = int(primary[1:3], 16), int(primary[3:5], 16), int(primary[5:7], 16)
+                                # Row primary: 25% tint of palette color
+                                rp = f"#{int(pr + (255-pr)*0.75):02X}{int(pg + (255-pg)*0.75):02X}{int(pb + (255-pb)*0.75):02X}"
+                                # Row secondary: 10% tint (very light)
+                                rs = f"#{int(pr + (255-pr)*0.90):02X}{int(pg + (255-pg)*0.90):02X}{int(pb + (255-pb)*0.90):02X}"
+                                # Text colors: readable against each row bg
+                                fp = _readable_text_color(rp)
+                                fs = _readable_text_color(rs)
+                                tbl_objects["values"] = [{"properties": {
+                                    "backColorPrimary": _solid_color(rp),
+                                    "backColorSecondary": _solid_color(rs),
+                                    "fontColorPrimary": _solid_color(fp),
+                                    "fontColorSecondary": _solid_color(fs),
+                                }}]
+
+                            # Column headers: palette primary bg, readable text
+                            if "columnHeaders" not in tbl_objects:
+                                tbl_objects["columnHeaders"] = [{"properties": {
+                                    "fontColor": _solid_color(_readable_text_color(primary)),
+                                    "backColor": _solid_color(primary),
+                                    "bold": _pbi_lit(True),
+                                }}]
+
+                            vc["config"] = json.dumps(config, ensure_ascii=False)
+                            visuals_colored += 1
                             continue
 
                         # Only process chart visuals that render data series
