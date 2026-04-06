@@ -8,7 +8,7 @@
 
 An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python — no templates, no skeletons, no Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026.
 
-Exposes 88 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
+Exposes 101 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
@@ -141,6 +141,11 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Calculation Groups | **Blocked** | `pbix_datamodel_add_calculation_group` blocked — needs full DataModel rebuild to generate VertiPaq storage for new table |
 | TMDL Export | **Beta** | Export data model as Git-friendly TMDL text files via `pbix_export_tmdl` |
 | PBIP Export | **Stable** | Convert PBIX to PBIP (Power BI Project) folder structure via `pbix_export_pbip` — full TMDL semantic model + report layout + static resources, ready for Git |
+| Perspectives | **Stable** | Create/list/remove perspectives via `pbix_add_perspective`, `pbix_get_perspectives`, `pbix_remove_perspective` |
+| User Hierarchies | **Partial** | List/remove hierarchies via `pbix_get_hierarchies`, `pbix_remove_hierarchy`. `pbix_add_hierarchy` blocked for PBIX (needs H$ VertiPaq tables), works for PBIP/TMDL export |
+| Cultures & Translations | **Stable** | Add cultures, translate table/column/measure names via `pbix_add_culture`, `pbix_add_translations`, `pbix_get_cultures`, `pbix_remove_culture` |
+| Partition Management | **Partial** | List/remove partitions via `pbix_get_partitions`, `pbix_remove_partition`. `pbix_add_partition` blocked for PBIX (needs PartitionStorage in VertiPaq), works for PBIP/TMDL export |
+| Sensitivity Labels | **Stable** | Strip MSIP sensitivity labels via `pbix_save(strip_sensitivity_label=True)` |
 | Custom Visuals | **Beta** | Import .pbiviz packages via `pbix_add_custom_visual`, place with `pbix_add_visual` |
 | Incremental Refresh | **Blocked** | `pbix_set_incremental_refresh` blocked — requires DataMashup with RangeStart/RangeEnd M parameters |
 | Report diff (`pbix_diff`) | **Stable** | Compare two PBIX files — tables, columns, measures, relationships, pages/visuals, data sources, theme colors. Shows added/removed/changed |
@@ -188,6 +193,18 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 
 ### Row-Level Security (3)
 `pbix_get_rls_roles` · `pbix_set_rls_role` · `pbix_evaluate_rls`
+
+### Perspectives (3)
+`pbix_get_perspectives` · `pbix_add_perspective` · `pbix_remove_perspective`
+
+### User Hierarchies (3)
+`pbix_get_hierarchies` · `pbix_add_hierarchy` · `pbix_remove_hierarchy`
+
+### Cultures & Translations (4)
+`pbix_get_cultures` · `pbix_add_culture` · `pbix_add_translations` · `pbix_remove_culture`
+
+### Partition Management (3)
+`pbix_get_partitions` · `pbix_add_partition` · `pbix_remove_partition`
 
 ### Incremental Refresh (2)
 `pbix_set_incremental_refresh` · `pbix_get_incremental_refresh`
@@ -529,7 +546,7 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (88 tools)
+  server.py              # MCP server (101 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX builder (metadata, VertiPaq, layout, relationships)
   builder_v2.py          # Template-free ABF + ZIP generation
