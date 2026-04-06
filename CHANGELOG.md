@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] - 2026-04-06
+
+### Fixed
+- **DAX cache staleness** — cache cleared on `pbix_close`, `pbix_save`, and all mutation paths. DAX evaluations now always reflect current data after `set_table_data` or other mutations.
+- **RLS persistence across rebuilds** — `_rebuild_datamodel` reads existing RLS roles and re-applies them via metadata splice. RLS roles no longer silently dropped after `set_table_data` or `update_table_rows`.
+- **System tables hidden** — H$/R$/U$ internal tables filtered from `pbix_list_tables` output.
+
+### Documentation
+- Fixed metadata table count: 63 → 68 across README, architecture.md, limitations.md
+- Rewrote tool-contracts.md: all 101 tools with correct category counts
+- Replaced stale PBIXRay references with native VertiPaq decoder
+- Clarified DAX stability label to "Stable API / best-effort semantic parity"
+
+### Verified
+- Full 16-step roundtrip regression: create → RLS → DAX → save → close → reopen → verify DAX + RLS → mutate data → verify DAX reflects change → verify RLS survives rebuild → second roundtrip → PBI Desktop validation
+
 ## [0.8.2] - 2026-04-06
 
 ### Fixed
