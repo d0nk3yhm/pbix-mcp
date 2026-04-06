@@ -156,16 +156,16 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 ## Known Limitations
 
 - **DAX engine is best-effort** — designed for practical evaluation, not semantic parity with Analysis Services. Unsupported functions return `None` with status `"unsupported"`, circular references raise `DAXEvaluationError`. See [docs/supported-dax.md](docs/supported-dax.md) for full details.
-- **PBIR format** is read-only for filter extraction; layout write requires legacy format
+- **PBIR format** — PBI Desktop (March 2026) has rendering bugs with PBIR decomposed format. PBIP export uses legacy report format (version 1.0) which works reliably.
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
 - **Opening existing DirectQuery files** — layout, measures, and metadata editing work; DAX evaluation and table reads return clear errors since data lives in the remote source (this is inherent to DirectQuery — the data isn't in the file)
 - **Creating DirectQuery files** — fully working with SQL Server (LocalDB), PostgreSQL 16, and MySQL 9.6 (via MariaDB adapter); requires a running database server and initial data snapshot
 - **CryptKey.bin** — the 144-byte RSA key BLOB cannot be generated without Microsoft's crypto infrastructure (`rskeymgmt`). A known-valid GUID-independent constant is used.
-- **Embedded VertiPaq data** — verified working with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase). Cross-table relationship lookups verified byte-exact against PBI Desktop ground truth
+- **Embedded VertiPaq data** — verified working with 11 tables, 72 columns, 13 relationships, 121K+ rows (Adventure Works DW 2020) and 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase)
 - **RLE encoding** — disabled in the VertiPaq encoder (pure bitpack used). Slightly less space-efficient but correct
-- **RLS write (set_rls_role)** — triggers full DataModel rebuild but builder doesn't generate Role/TablePermission rows, so RLS roles are silently dropped. Read and evaluate work correctly.
-- **Most DataModel modifications trigger full rebuild** — add_measure, modify_measure, set_rls_role, modify_column, set_table_data, update_table_rows, add/remove relationship/table all rebuild the entire DataModel via the builder pipeline. Exception: `pbix_update_data_source` uses a lightweight metadata-only path (no rebuild).
+- **Adding hierarchies/partitions to PBIX** — `pbix_add_hierarchy` and `pbix_add_partition` are blocked for PBIX files (need H$/PartitionStorage VertiPaq structures). They work for PBIP/TMDL export. Reading and removing existing hierarchies/partitions works.
+- **Full DataModel rebuild** — `set_table_data`, `update_table_rows`, `add/remove_relationship`, `remove_table` trigger a full DataModel rebuild via the builder pipeline. Most other tools (`add_measure`, `modify_measure`, `modify_column`, `set_rls_role`, `add_perspective`, `add_culture`, `add_translations`, `update_data_source`, etc.) use a lightweight metadata-only path.
 
 
 ## Tools (101)
