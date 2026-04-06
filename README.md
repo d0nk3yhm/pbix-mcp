@@ -132,14 +132,14 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | XPress9 decompress/recompress | **Stable** | Byte-exact round-trip verified |
 | ABF archive manipulation | **Stable** | List, extract, replace internal files |
 | DataMashup (M code) editing | **Stable** | Read/write Power Query expressions |
-| File save/repack | **Stable** | Auto-backup on overwrite, SecurityBindings auto-removed |
+| File save/repack | **Stable** | Auto-backup on overwrite, SecurityBindings auto-removed, optional MSIP sensitivity label stripping |
 | Calculated column evaluation | **Beta** | Per-row DAX expression evaluation; tested with synthetic data |
 | Password extraction | **Beta** | Regex scan of DAX measures for embedded passwords |
 | Row-Level Security (RLS) | **Stable** | Read, write, and evaluate RLS roles. `set_rls_role` uses binary splice — roles persist across save/reopen. MAXID-based ID allocation. Verified on PBI Desktop files |
 | Bookmark creation | **Beta** | Create/remove bookmarks with page targeting and visual visibility state |
 | Field Parameters | **Blocked** | `pbix_datamodel_add_field_parameter` blocked — needs full DataModel rebuild to generate VertiPaq storage for new table |
 | Calculation Groups | **Blocked** | `pbix_datamodel_add_calculation_group` blocked — needs full DataModel rebuild to generate VertiPaq storage for new table |
-| TMDL Export | **Beta** | Export data model as Git-friendly TMDL text files via `pbix_export_tmdl` |
+| TMDL Export | **Stable** | Export data model as Git-friendly TMDL text files via `pbix_export_tmdl`. Validated with Adventure Works DW 2020 — correct partition types, CrossFilteringBehavior, model properties, shared expressions |
 | PBIP Export | **Stable** | Convert PBIX to PBIP (Power BI Project) folder structure via `pbix_export_pbip` — full TMDL semantic model + report layout + static resources, ready for Git |
 | Perspectives | **Stable** | Create/list/remove perspectives via `pbix_add_perspective`, `pbix_get_perspectives`, `pbix_remove_perspective` |
 | User Hierarchies | **Partial** | List/remove hierarchies via `pbix_get_hierarchies`, `pbix_remove_hierarchy`. `pbix_add_hierarchy` blocked for PBIX (needs H$ VertiPaq tables), works for PBIP/TMDL export |
