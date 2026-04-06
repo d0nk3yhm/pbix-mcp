@@ -168,7 +168,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 - **Most DataModel modifications trigger full rebuild** — add_measure, modify_measure, set_rls_role, modify_column, set_table_data, update_table_rows, add/remove relationship/table all rebuild the entire DataModel via the builder pipeline. Exception: `pbix_update_data_source` uses a lightweight metadata-only path (no rebuild).
 
 
-## Tools (87)
+## Tools (101)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
