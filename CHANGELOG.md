@@ -5,15 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.5] - 2026-04-06
+## [0.8.5] - 2026-04-07
+
+### Added
+- **`pbix_recolor` automatic text contrast** — after recoloring, walks every visual and checks text-vs-background contrast using WCAG 2.0 luminance. Fixes title, subtitle, card label, axis/legend colors that would be unreadable (e.g., white text on light amber). Uses contrast ratio threshold of 3.0 (WCAG AA for large text).
+- **`pbix_recolor` auto-extend palette** — unmapped theme `dataColors` are automatically assigned to new palette colors by cycling. Eliminates stray old-palette colors in donut/pie category series and card backgrounds without requiring the user to map every single theme color.
+- **`pbix_recolor` table/matrix grid styling** — injects `grid.outlineColor` for `tableEx` and `pivotTable` visuals that have no explicit grid formatting.
 
 ### Fixed
 - **`pbix_format_visual` dataColors per-selector support** — multi-measure charts now get per-series `dataPoint` entries with `{"selector": {"metadata": "Table.Measure"}}`. Multi-category charts (donut, pie, treemap, funnel) get per-category entries with `{"selector": {"data": [{scopeId: {Comparison: ...}}]}}`. Single-color fallback preserved for simple charts.
-- **`pbix_recolor` per-visual dataPoint injection** — after replacing hex colors and ThemeDataColor references, walks every chart visual and injects per-selector `dataPoint` entries from the new theme palette. Ensures ALL chart series/categories get explicit colors after recoloring. Supports clusteredBarChart, clusteredColumnChart, stackedBarChart, lineChart, pieChart, donutChart, treemap, funnel, scatterChart, ribbonChart, and all combo/stacked variants.
+- **`pbix_recolor` per-visual dataPoint injection** — after replacing hex colors and ThemeDataColor references, walks every chart visual and injects per-selector `dataPoint` entries from the new theme palette. Ensures ALL chart series/categories get explicit colors after recoloring. Supports 18 chart types.
 
 ### Verified
-- End-to-end recolor: create report with multi-measure bar + donut by category → set theme → recolor with palette map → verify per-selector entries in saved PBIX → PBI Desktop renders correct colors
-- toy_store_blue.pbix → red palette: 54 hex replacements + 0 remaining ThemeDataColor refs + 2 charts got per-series/category colors
+- End-to-end Ocean Blue → Sunset recolor: 40 hex replacements + 2 contrast fixes + zero old palette colors remaining. Light amber card auto-switched from white to dark text.
+- toy_store_blue → red: 51 hex replacements + 4 charts colored + 2 tables grid-styled + zero blue colors remaining
 
 ## [0.8.4] - 2026-04-06
 

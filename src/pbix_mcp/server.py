@@ -396,6 +396,32 @@ def _pbi_props(mapping: dict, src: dict) -> dict:
     return props
 
 
+def _hex_luminance(hex_color: str) -> float:
+    """Relative luminance of a hex color (WCAG 2.0 formula). Range 0..1."""
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        return 0.5
+    r, g, b = int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255
+    # sRGB linearization
+    r = r / 12.92 if r <= 0.03928 else ((r + 0.055) / 1.055) ** 2.4
+    g = g / 12.92 if g <= 0.03928 else ((g + 0.055) / 1.055) ** 2.4
+    b = b / 12.92 if b <= 0.03928 else ((b + 0.055) / 1.055) ** 2.4
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _contrast_ratio(lum1: float, lum2: float) -> float:
+    """WCAG contrast ratio between two luminances."""
+    lighter = max(lum1, lum2)
+    darker = min(lum1, lum2)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _readable_text_color(bg_hex: str) -> str:
+    """Return '#FFFFFF' or a dark color for readable text on a background."""
+    lum = _hex_luminance(bg_hex)
+    return "#FFFFFF" if lum < 0.35 else "#1A1A1A"
+
+
 def _solid_color(hex_color: str) -> dict:
     """Wrap a hex color in PBI's solid.color structure."""
     return {"solid": {"color": _pbi_lit(hex_color)}}
@@ -2944,6 +2970,123 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                     except Exception:
                         continue  # Skip visuals with parse errors
 
+            # --- Contrast readability pass ---
+            # Walk each visual and fix text vs background contrast issues.
+            # If a card/chart has a dark background, text should be light; vice versa.
+            contrast_fixes = 0
+            for section in new_layout.get("sections", []):
+                # Page background contrast
+                pg_config_str = section.get("config", "{}")
+                try:
+                    pg_config = json.loads(pg_config_str) if isinstance(pg_config_str, str) else pg_config_str
+                except Exception:
+                    pg_config = {}
+
+                for vc in section.get("visualContainers", []):
+                    try:
+                        config = _parse_visual_config(vc)
+                        sv = config.get("singleVisual", {})
+                        vc_objs = sv.get("vcObjects", {})
+                        objects = sv.get("objects", {})
+                        changed = False
+
+                        # Extract background color
+                        bg_hex = None
+                        bg_entries = vc_objs.get("background", [])
+                        for be in bg_entries:
+                            try:
+                                bg_hex = be["properties"]["color"]["solid"]["color"]["expr"]["Literal"]["Value"].strip("'")
+                            except (KeyError, TypeError, AttributeError):
+                                pass
+
+                        if bg_hex and re.match(r'^#[0-9A-Fa-f]{6}$', bg_hex):
+                            ideal_text = _readable_text_color(bg_hex)
+                            bg_lum = _hex_luminance(bg_hex)
+
+                            # Fix title font color
+                            title_entries = vc_objs.get("title", [])
+                            for te in title_entries:
+                                props = te.get("properties", {})
+                                fc = props.get("fontColor", {})
+                                try:
+                                    cur = fc["solid"]["color"]["expr"]["Literal"]["Value"].strip("'")
+                                    if re.match(r'^#[0-9A-Fa-f]{6}$', cur):
+                                        text_lum = _hex_luminance(cur)
+                                        ratio = _contrast_ratio(bg_lum, text_lum)
+                                        if ratio < 3.0:  # WCAG AA minimum for large text
+                                            props["fontColor"] = _solid_color(ideal_text)
+                                            changed = True
+                                            contrast_fixes += 1
+                                except (KeyError, TypeError, AttributeError):
+                                    pass
+
+                            # Fix subtitle font color
+                            sub_entries = vc_objs.get("subTitle", [])
+                            for se in sub_entries:
+                                props = se.get("properties", {})
+                                fc = props.get("fontColor", {})
+                                try:
+                                    cur = fc["solid"]["color"]["expr"]["Literal"]["Value"].strip("'")
+                                    if re.match(r'^#[0-9A-Fa-f]{6}$', cur):
+                                        text_lum = _hex_luminance(cur)
+                                        ratio = _contrast_ratio(bg_lum, text_lum)
+                                        if ratio < 3.0:
+                                            props["fontColor"] = _solid_color(ideal_text)
+                                            changed = True
+                                            contrast_fixes += 1
+                                except (KeyError, TypeError, AttributeError):
+                                    pass
+
+                            # Fix card calloutValue / label colors (card visuals)
+                            for obj_cat in ("labels", "calloutValue", "categoryLabels"):
+                                for entry in objects.get(obj_cat, []):
+                                    props = entry.get("properties", {})
+                                    for color_key in ("color", "fontColor", "labelColor"):
+                                        fc = props.get(color_key, {})
+                                        try:
+                                            cur = fc["solid"]["color"]["expr"]["Literal"]["Value"].strip("'")
+                                            if re.match(r'^#[0-9A-Fa-f]{6}$', cur):
+                                                text_lum = _hex_luminance(cur)
+                                                ratio = _contrast_ratio(bg_lum, text_lum)
+                                                if ratio < 3.0:
+                                                    props[color_key] = _solid_color(ideal_text)
+                                                    changed = True
+                                                    contrast_fixes += 1
+                                        except (KeyError, TypeError, AttributeError):
+                                            pass
+
+                        # Also check chart axis/label colors vs chart background
+                        chart_bg = None
+                        for be in bg_entries:
+                            try:
+                                chart_bg = be["properties"]["color"]["solid"]["color"]["expr"]["Literal"]["Value"].strip("'")
+                            except (KeyError, TypeError, AttributeError):
+                                pass
+                        if chart_bg and re.match(r'^#[0-9A-Fa-f]{6}$', chart_bg):
+                            chart_bg_lum = _hex_luminance(chart_bg)
+                            ideal = _readable_text_color(chart_bg)
+                            for obj_cat in ("categoryAxis", "valueAxis", "legend", "dataLabels"):
+                                for entry in objects.get(obj_cat, []):
+                                    props = entry.get("properties", {})
+                                    for color_key in ("labelColor", "fontColor", "color"):
+                                        fc = props.get(color_key, {})
+                                        try:
+                                            cur = fc["solid"]["color"]["expr"]["Literal"]["Value"].strip("'")
+                                            if re.match(r'^#[0-9A-Fa-f]{6}$', cur):
+                                                text_lum = _hex_luminance(cur)
+                                                ratio = _contrast_ratio(chart_bg_lum, text_lum)
+                                                if ratio < 3.0:
+                                                    props[color_key] = _solid_color(ideal)
+                                                    changed = True
+                                                    contrast_fixes += 1
+                                        except (KeyError, TypeError, AttributeError):
+                                            pass
+
+                        if changed:
+                            vc["config"] = json.dumps(config, ensure_ascii=False)
+                    except Exception:
+                        continue
+
             _set_layout(work_dir, new_layout)
 
         info["modified"] = True
@@ -2953,6 +3096,8 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
             parts.append(f"{theme_replaced} ThemeDataColor refs converted to hex")
         if visuals_colored > 0:
             parts.append(f"{visuals_colored} chart(s) got per-series/category colors")
+        if contrast_fixes > 0:
+            parts.append(f"{contrast_fixes} text contrast fix(es)")
         parts.append(f"({len(cmap)} colors mapped)")
 
         return ToolResponse.ok(" + ".join(parts)).to_text()
