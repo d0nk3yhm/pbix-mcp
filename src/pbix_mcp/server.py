@@ -2765,6 +2765,7 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
         # Normalize keys to uppercase
         cmap = {k.upper(): v for k, v in color_map.items()}
         total_replacements = 0
+        contrast_fixes = 0
 
         # Load theme dataColors for resolving ThemeDataColor refs
         data_colors = _load_theme_data_colors(work_dir)
@@ -2828,6 +2829,26 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                             text = fh.read()
                         new_text, n = _replace_hex(text)
                         if n > 0:
+                            # Fix theme foreground/textClasses contrast vs background
+                            try:
+                                theme_obj = json.loads(new_text)
+                                bg = theme_obj.get("background", "#FFFFFF")
+                                fg = theme_obj.get("foreground", "#000000")
+                                if isinstance(bg, str) and isinstance(fg, str):
+                                    bg_lum = _hex_luminance(bg)
+                                    fg_lum = _hex_luminance(fg)
+                                    if _contrast_ratio(bg_lum, fg_lum) < 3.0:
+                                        ideal = _readable_text_color(bg)
+                                        theme_obj["foreground"] = ideal
+                                        # Also fix textClasses
+                                        tc = theme_obj.get("textClasses", {})
+                                        for cls in tc.values():
+                                            if isinstance(cls, dict) and "color" in cls:
+                                                cls["color"] = ideal
+                                        new_text = json.dumps(theme_obj, indent=2, ensure_ascii=False)
+                                        contrast_fixes += 1
+                            except (json.JSONDecodeError, ValueError):
+                                pass
                             with open(fp, "w", encoding="utf-8") as fh:
                                 fh.write(new_text)
                             total_replacements += n
@@ -3012,7 +3033,6 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
             # --- Contrast readability pass ---
             # Walk each visual and fix text vs background contrast issues.
             # If a card/chart has a dark background, text should be light; vice versa.
-            contrast_fixes = 0
             for section in new_layout.get("sections", []):
                 # Page background contrast
                 pg_config_str = section.get("config", "{}")
@@ -3038,6 +3058,39 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                                 bg_hex = be["properties"]["color"]["solid"]["color"]["expr"]["Literal"]["Value"].strip("'")
                             except (KeyError, TypeError, AttributeError):
                                 pass
+
+                        # Strip borders from all visuals by default during recolor.
+                        # Borders are a design choice — if users want them, they
+                        # can set them explicitly via pbix_format_visual.
+                        border_entries = vc_objs.get("border", [])
+                        for brd in border_entries:
+                            brd_props = brd.get("properties", {})
+                            if "show" in brd_props:
+                                brd_props["show"] = _pbi_lit(False)
+                                changed = True
+
+                        # Pie/donut charts have hardcoded gray leader lines that
+                        # clash with dark backgrounds. Remove background from
+                        # these charts — their slices provide all the color.
+                        if vtype in ("pieChart", "donutChart") and bg_entries:
+                            for be in bg_entries:
+                                be_props = be.get("properties", {})
+                                be_props["show"] = _pbi_lit(False)
+                            # Fix labels and title to be dark (page bg is typically light)
+                            for te in vc_objs.get("title", []):
+                                te_props = te.get("properties", {})
+                                if "fontColor" in te_props:
+                                    te_props["fontColor"] = _solid_color("#1A1A1A")
+                            for le in objects.get("labels", []):
+                                le_props = le.get("properties", {})
+                                if "color" in le_props:
+                                    le_props["color"] = _solid_color("#1A1A1A")
+                            for le in objects.get("legend", []):
+                                le_props = le.get("properties", {})
+                                if "labelColor" in le_props:
+                                    le_props["labelColor"] = _solid_color("#1A1A1A")
+                            bg_hex = None
+                            changed = True
 
                         if bg_hex and re.match(r'^#[0-9A-Fa-f]{6}$', bg_hex):
                             ideal_text = _readable_text_color(bg_hex)
@@ -3096,12 +3149,14 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                                             pass
 
                         # Also check chart axis/label colors vs chart background
+                        # Skip for pie/donut — their bg was stripped above
                         chart_bg = None
-                        for be in bg_entries:
-                            try:
-                                chart_bg = be["properties"]["color"]["solid"]["color"]["expr"]["Literal"]["Value"].strip("'")
-                            except (KeyError, TypeError, AttributeError):
-                                pass
+                        if vtype not in ("pieChart", "donutChart"):
+                            for be in bg_entries:
+                                try:
+                                    chart_bg = be["properties"]["color"]["solid"]["color"]["expr"]["Literal"]["Value"].strip("'")
+                                except (KeyError, TypeError, AttributeError):
+                                    pass
                         if chart_bg and re.match(r'^#[0-9A-Fa-f]{6}$', chart_bg):
                             chart_bg_lum = _hex_luminance(chart_bg)
                             ideal = _readable_text_color(chart_bg)
@@ -3141,6 +3196,7 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                                     "categoryAxis": "labelColor",
                                     "valueAxis": "labelColor",
                                     "legend": "labelColor",
+                                    "labels": "color",
                                 }
                                 for obj_cat, color_key in color_map_items.items():
                                     if obj_cat not in objects:
@@ -3149,6 +3205,25 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                                         }}]
                                         changed = True
                                         contrast_fixes += 1
+                                    else:
+                                        # Exists but may lack a color — add it if missing or unreadable
+                                        for entry in objects[obj_cat]:
+                                            eprops = entry.get("properties", {})
+                                            if color_key not in eprops:
+                                                eprops[color_key] = _solid_color(ideal)
+                                                changed = True
+                                                contrast_fixes += 1
+                                            else:
+                                                try:
+                                                    cur = eprops[color_key]["solid"]["color"]["expr"]["Literal"]["Value"].strip("'")
+                                                    if re.match(r'^#[0-9A-Fa-f]{6}$', cur):
+                                                        ratio = _contrast_ratio(chart_bg_lum, _hex_luminance(cur))
+                                                        if ratio < 3.0:
+                                                            eprops[color_key] = _solid_color(ideal)
+                                                            changed = True
+                                                            contrast_fixes += 1
+                                                except (KeyError, TypeError, AttributeError):
+                                                    pass
 
                         # Check table alternating row contrast (backColor vs fontColor pairs)
                         for val_entry in objects.get("values", []):
