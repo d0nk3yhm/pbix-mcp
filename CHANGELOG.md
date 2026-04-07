@@ -5,18 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.8] - 2026-04-07
+## [0.9.0] - 2026-04-07
+
+### Added
+- **`pbix_add_visual` image auto-embed** — image visuals with `sourcePath` in config automatically embed the local file into `RegisteredResources`, register it in `Content_Types.xml`, add `resourcePackages` entry, and reference via `ResourcePackageItem`. Adds `layouts`, `drillFilterOtherVisuals`, `filters` to match PBI Desktop ground truth.
+- **`pbix_format_visual` alternating row colors** — `values.backColorPrimary/Secondary`, `fontColorPrimary/Secondary` for explicit table row styling. `grid.gridHorizontalColor/gridVerticalColor`.
+- **`pbix_add_visual` bounds clamping** — visual positions are clamped to page dimensions so visuals never go off-page.
+- **Builder explicit page dimensions** — `_build_layout()` now sets `width: 1280, height: 720` on pages (previously omitted, causing PBI Desktop to use narrower defaults).
 
 ### Changed
-- **`pbix_recolor` strips borders by default** — all visual borders are set to `show=false` during recolor. Borders are a design choice; users can re-enable them via `pbix_format_visual` with `border: {show: true}`.
-- **`pbix_recolor` removes pie/donut backgrounds** — pie and donut chart backgrounds are disabled during recolor. PBI Desktop uses hardcoded gray leader lines that clash with dark backgrounds. Slices are already colored by dataPoint. Users can still set backgrounds explicitly via `pbix_format_visual`.
-- **`pbix_recolor` theme foreground contrast** — after recoloring theme files, checks `foreground` vs `background` contrast. If unreadable, sets `foreground` and `textClasses` colors to readable values. Fixes leader lines, axis defaults, and other theme-inherited text.
+- **`pbix_recolor` strips borders by default** — all visual borders set to `show=false` during recolor. Users can re-enable via `pbix_format_visual`.
+- **`pbix_recolor` removes pie/donut backgrounds** — PBI Desktop uses hardcoded gray leader lines that clash with dark backgrounds. Slices are already colored by dataPoint.
+- **`pbix_recolor` card defaults** — title hidden, categoryLabels shown (less redundant). calloutValue and categoryLabels get readable colors on dark backgrounds.
+- **`pbix_recolor` theme foreground contrast** — checks `foreground` vs `background` after recoloring theme. Fixes theme-inherited text (leader lines, axis defaults, textClasses).
 
 ### Fixed
-- **`pbix_recolor` chart axis/legend contrast on dark backgrounds** — injects `categoryAxis.labelColor`, `valueAxis.labelColor`, `legend.labelColor`, and `labels.color` when chart background is dark and no explicit text colors exist. Handles both missing entries and existing entries with unreadable colors. Skipped for pie/donut (bg stripped).
+- **`pbix_recolor` chart axis/legend/labels contrast** — injects `categoryAxis.labelColor`, `valueAxis.labelColor`, `legend.labelColor`, and `labels.color` when chart background is dark. Handles both missing and existing entries with unreadable colors. Skipped for pie/donut (bg stripped).
 - **`pbix_recolor` table row contrast** — checks `backColorPrimary`/`Secondary` vs `fontColorPrimary`/`Secondary` and `columnHeaders.backColor` vs `fontColor`.
-- **Contrast pass `objects` reference** — `sv.setdefault("objects", {})` instead of `sv.get("objects", {})`.
-- **Contrast pass `vtype` variable** — was undefined in the contrast loop, preventing chart-type-specific logic from running.
+- **Contrast pass `objects` reference** — `sv.setdefault("objects", {})` instead of detached `sv.get("objects", {})`.
+- **Contrast pass `vtype` variable** — was undefined, preventing chart-type-specific logic.
+
+### Verified
+- Kitchen Equipment report: created, themed, recolored to Emerald via MCP — all cards, charts, tables, and logo image correct. 5-image dice pattern placement verified in PBI Desktop.
 
 ## [0.8.5] - 2026-04-07
 
