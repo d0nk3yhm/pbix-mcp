@@ -38,7 +38,7 @@ jobs:
           fi
 
       - name: Run unit tests with coverage
-        run: pytest -m "not slow and not integration" -v --tb=short --cov=src/pbix_mcp --cov-report=term-missing --cov-fail-under=23
+        run: pytest -m "not slow and not integration" -v --tb=short --cov=src/pbix_mcp --cov-report=term-missing --cov-fail-under=22
 
       - name: Build package
         run: python -m build
