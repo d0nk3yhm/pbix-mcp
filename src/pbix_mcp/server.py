@@ -1630,15 +1630,12 @@ def pbix_add_visual(
                 if not any(i.get("name") == item_name for i in items):
                     items.append({"type": 100, "path": item_name, "name": item_name})
 
-        # Clamp position to stay within safe page bounds.
-        # PBI Desktop renders ~92% of declared width as usable area.
+        # Clamp position to stay within page bounds.
         page = sections[page_index]
         page_w = page.get("width", 1280)
         page_h = page.get("height", 720)
-        safe_w = int(page_w * 0.92)
-        safe_h = int(page_h * 0.97)
-        x = min(float(x), safe_w - width)
-        y = min(float(y), safe_h - height)
+        x = min(float(x), page_w - width)
+        y = min(float(y), page_h - height)
         x = max(0.0, x)
         y = max(0.0, y)
 
