@@ -1630,9 +1630,28 @@ def pbix_add_visual(
                 if not any(i.get("name") == item_name for i in items):
                     items.append({"type": 100, "path": item_name, "name": item_name})
 
+        # Clamp position to stay within safe page bounds.
+        # PBI Desktop renders ~92% of declared width as usable area.
+        page = sections[page_index]
+        page_w = page.get("width", 1280)
+        page_h = page.get("height", 720)
+        safe_w = int(page_w * 0.92)
+        safe_h = int(page_h * 0.97)
+        x = min(float(x), safe_w - width)
+        y = min(float(y), safe_h - height)
+        x = max(0.0, x)
+        y = max(0.0, y)
+
+        # Update layouts position if present (image visuals)
+        if "layouts" in config:
+            for lay in config["layouts"]:
+                pos = lay.get("position", {})
+                pos["x"] = x
+                pos["y"] = y
+
         container = {
-            "x": float(x),
-            "y": float(y),
+            "x": x,
+            "y": y,
             "z": 0,
             "width": float(width),
             "height": float(height),
@@ -1641,7 +1660,6 @@ def pbix_add_visual(
         if visual_type == "image":
             container["filters"] = "[]"
 
-        page = sections[page_index]
         page.setdefault("visualContainers", []).append(container)
         _set_layout(info["work_dir"], layout)
         info["modified"] = True

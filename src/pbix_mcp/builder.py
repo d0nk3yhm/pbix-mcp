@@ -245,6 +245,8 @@ class PBIXBuilder:
                 "displayName": page["name"],
                 "name": f"ReportSection{i + 1}",
                 "ordinal": i,
+                "width": page.get("width", 1280),
+                "height": page.get("height", 720),
                 "visualContainers": containers,
             })
 
