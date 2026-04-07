@@ -3148,6 +3148,32 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                                         except (KeyError, TypeError, AttributeError):
                                             pass
 
+                            # Card defaults: show categoryLabels, hide title (less
+                            # redundant). Set readable colors for both labels and
+                            # calloutValue on dark backgrounds.
+                            if vtype == "card":
+                                # Hide title by default (categoryLabels shows the name)
+                                title_entries = vc_objs.get("title", [])
+                                for te in title_entries:
+                                    te_props = te.get("properties", {})
+                                    if "show" not in te_props or te_props.get("show", {}).get("expr", {}).get("Literal", {}).get("Value") == "true":
+                                        te_props["show"] = _pbi_lit(False)
+                                        changed = True
+                                # Set categoryLabels color for readability
+                                if "categoryLabels" not in objects:
+                                    cat_props = {"show": _pbi_lit(True)}
+                                    if bg_lum < 0.25:
+                                        cat_props["color"] = _solid_color(ideal_text)
+                                        contrast_fixes += 1
+                                    objects["categoryLabels"] = [{"properties": cat_props}]
+                                    changed = True
+                                if bg_lum < 0.25 and "calloutValue" not in objects:
+                                    objects["calloutValue"] = [{"properties": {
+                                        "color": _solid_color(ideal_text),
+                                    }}]
+                                    changed = True
+                                    contrast_fixes += 1
+
                         # Also check chart axis/label colors vs chart background
                         # Skip for pie/donut — their bg was stripped above
                         chart_bg = None
