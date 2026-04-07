@@ -1569,13 +1569,77 @@ def pbix_add_visual(
             except json.JSONDecodeError:
                 raise LayoutParseError("Invalid config_json")
 
+        # Image visuals: embed the image file and set up ResourcePackageItem
+        if visual_type == "image":
+            sv = config["singleVisual"]
+            sv.setdefault("drillFilterOtherVisuals", True)
+            config.setdefault("layouts", [{"id": 0, "position": {
+                "x": float(x), "y": float(y), "z": 0,
+                "width": float(width), "height": float(height),
+            }}])
+
+            # Check if config has a local file path to embed
+            img_url = (sv.get("objects", {}).get("general", [{}])[0]
+                       .get("properties", {}).get("imageUrl", {}))
+            src_path = img_url.get("sourcePath", "")  # custom field for local files
+            if src_path and os.path.isfile(src_path):
+                import shutil as _shutil
+                ext = os.path.splitext(src_path)[1].lower()
+                # Generate unique filename
+                item_name = f"{visual_name}{ext}"
+                # Copy to RegisteredResources
+                res_dir = os.path.join(info["work_dir"], "Report", "StaticResources", "RegisteredResources")
+                os.makedirs(res_dir, exist_ok=True)
+                _shutil.copy2(src_path, os.path.join(res_dir, item_name))
+
+                # Set imageUrl to ResourcePackageItem
+                sv.setdefault("objects", {})["general"] = [{"properties": {
+                    "imageUrl": {"expr": {"ResourcePackageItem": {
+                        "PackageName": "RegisteredResources",
+                        "PackageType": 1,
+                        "ItemName": item_name,
+                    }}}
+                }}]
+
+                # Update Content_Types.xml for this extension
+                ct_path = os.path.join(info["work_dir"], "[Content_Types].xml")
+                if os.path.exists(ct_path):
+                    with open(ct_path, "r", encoding="utf-8") as f:
+                        ct_xml = f.read()
+                    ext_no_dot = ext.lstrip(".")
+                    if f'Extension="{ext_no_dot}"' not in ct_xml:
+                        ct_xml = ct_xml.replace(
+                            '<Default Extension="json"',
+                            f'<Default Extension="{ext_no_dot}" ContentType=""/><Default Extension="json"',
+                        )
+                        with open(ct_path, "w", encoding="utf-8") as f:
+                            f.write(ct_xml)
+
+                # Add to resourcePackages in layout
+                rp = layout.setdefault("resourcePackages", [])
+                reg_pkg = None
+                for pkg in rp:
+                    inner = pkg.get("resourcePackage", pkg)
+                    if inner.get("name") == "RegisteredResources":
+                        reg_pkg = inner
+                        break
+                if reg_pkg is None:
+                    reg_pkg = {"name": "RegisteredResources", "type": 1, "items": [], "disabled": False}
+                    rp.append({"resourcePackage": reg_pkg})
+                items = reg_pkg.setdefault("items", [])
+                if not any(i.get("name") == item_name for i in items):
+                    items.append({"type": 100, "path": item_name, "name": item_name})
+
         container = {
-            "x": x,
-            "y": y,
-            "width": width,
-            "height": height,
+            "x": float(x),
+            "y": float(y),
+            "z": 0,
+            "width": float(width),
+            "height": float(height),
             "config": json.dumps(config, ensure_ascii=False),
         }
+        if visual_type == "image":
+            container["filters"] = "[]"
 
         page = sections[page_index]
         page.setdefault("visualContainers", []).append(container)
