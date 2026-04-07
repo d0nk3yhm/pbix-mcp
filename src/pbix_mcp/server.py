@@ -1569,6 +1569,35 @@ def pbix_add_visual(
             except json.JSONDecodeError:
                 raise LayoutParseError("Invalid config_json")
 
+        # Textbox visuals: normalize paragraphs structure for Fabric compatibility
+        if visual_type == "textbox":
+            sv = config["singleVisual"]
+            sv.setdefault("drillFilterOtherVisuals", True)
+            config.setdefault("layouts", [{"id": 0, "position": {
+                "x": float(x), "y": float(y), "z": 0,
+                "width": float(width), "height": float(height),
+            }}])
+
+            # Normalize paragraphs: fix double-nesting, px→pt, strip unsupported keys
+            gen = sv.get("objects", {}).get("general", [])
+            for entry in gen:
+                props = entry.get("properties", {})
+                paras = props.get("paragraphs", [])
+                # Fix double-nested {"paragraphs": [...]} → [...]
+                if isinstance(paras, dict) and "paragraphs" in paras:
+                    paras = paras["paragraphs"]
+                    props["paragraphs"] = paras
+                if isinstance(paras, list):
+                    for para in paras:
+                        # Remove horizontalTextAlignment (Fabric rejects it)
+                        para.pop("horizontalTextAlignment", None)
+                        for tr in para.get("textRuns", []):
+                            ts = tr.get("textStyle", {})
+                            # Convert px to pt for Fabric
+                            fs = ts.get("fontSize", "")
+                            if isinstance(fs, str) and fs.endswith("px"):
+                                ts["fontSize"] = fs.replace("px", "pt")
+
         # Image visuals: embed the image file and set up ResourcePackageItem
         if visual_type == "image":
             sv = config["singleVisual"]
