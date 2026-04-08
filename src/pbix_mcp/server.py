@@ -2878,14 +2878,20 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
         # Load theme dataColors for resolving ThemeDataColor refs
         data_colors = _load_theme_data_colors(work_dir)
 
-        # Auto-extend: map ALL theme palette colors, not just user-provided ones.
-        # Unmapped theme colors get assigned from the new palette (cycling).
+        # Auto-extend: map unmapped OLD theme palette colors to new palette.
+        # Only applies when the user is doing a real recolor (not identity map).
+        # Skip colors that are already target values (already correct).
         if data_colors:
-            new_palette = list(dict.fromkeys(cmap.values()))  # unique new colors, in order
-            if new_palette:
-                for i, dc in enumerate(data_colors):
-                    if dc.upper() not in cmap:
-                        cmap[dc.upper()] = new_palette[i % len(new_palette)]
+            # Check if this is a real recolor (at least one key != value)
+            is_real_recolor = any(k != v.upper() for k, v in cmap.items())
+            if is_real_recolor:
+                target_values = {v.upper() for v in cmap.values()}
+                new_palette = list(dict.fromkeys(cmap.values()))
+                if new_palette:
+                    for i, dc in enumerate(data_colors):
+                        dc_upper = dc.upper()
+                        if dc_upper not in cmap and dc_upper not in target_values:
+                            cmap[dc_upper] = new_palette[i % len(new_palette)]
 
         def _replace_hex(text: str) -> tuple[str, int]:
             count = 0
@@ -2997,9 +3003,26 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
             # After text replacement, walk each visual and ensure chart series/categories
             # get explicit color assignments from the new theme palette.
             new_data_colors = _load_theme_data_colors(work_dir)
-            if not new_data_colors:
-                # Build palette from the replacement values
-                new_data_colors = list(dict.fromkeys(cmap.values()))
+            # If theme palette lacks diversity, try rebuilding from original + cmap
+            if new_data_colors and len(set(c.upper() for c in new_data_colors)) <= 2 and data_colors:
+                rebuilt = [cmap.get(dc.upper(), dc) for dc in data_colors]
+                if len(set(c.upper() for c in rebuilt)) > len(set(c.upper() for c in new_data_colors)):
+                    new_data_colors = rebuilt
+            # If still empty or single-color, use cmap values spread, or a default palette
+            if not new_data_colors or len(set(c.upper() for c in new_data_colors)) <= 1:
+                unique_targets = list(dict.fromkeys(cmap.values()))
+                if len(unique_targets) >= 3:
+                    new_data_colors = unique_targets
+                else:
+                    # Generate a gradient from the primary color
+                    primary = unique_targets[0] if unique_targets else "#4E79A7"
+                    pr, pg, pb = int(primary[1:3], 16), int(primary[3:5], 16), int(primary[5:7], 16)
+                    new_data_colors = []
+                    for pct in [0.0, 0.15, 0.30, 0.45, 0.60, 0.75, 0.85, 0.93]:
+                        r = int(pr + (255 - pr) * pct)
+                        g = int(pg + (255 - pg) * pct)
+                        b = int(pb + (255 - pb) * pct)
+                        new_data_colors.append(f"#{r:02X}{g:02X}{b:02X}")
 
             visuals_colored = 0
             for section in new_layout.get("sections", []):
@@ -3080,16 +3103,18 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                         series_refs = [p.get("queryRef", "") for p in projections.get("Series", []) if p.get("queryRef")]
 
                         if len(y_refs) > 1:
-                            # Multi-measure chart: assign colors by measure
+                            # Multi-measure chart: spread colors evenly across palette
+                            n = len(y_refs)
+                            spread = max(len(new_data_colors) // max(n, 1), 1) if new_data_colors else 1
                             for i, y_ref in enumerate(y_refs):
-                                color = new_data_colors[i % len(new_data_colors)] if new_data_colors else "#808080"
+                                color = new_data_colors[(i * spread) % len(new_data_colors)] if new_data_colors else "#808080"
                                 entry = {
                                     "properties": {"fill": _solid_color(color)},
                                     "selector": {"metadata": y_ref},
                                 }
                                 dp_entries.append(entry)
 
-                        elif vtype in ("pieChart", "donutChart", "treemap", "funnel") and cat_refs:
+                        elif cat_refs and len(y_refs) <= 1:
                             # Category-based chart: assign colors per category value
                             cat_ref = cat_refs[0]
                             parts = cat_ref.split(".")
@@ -3104,8 +3129,10 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                                         row[col_idx] for row in td["rows"]
                                         if row[col_idx] is not None
                                     ))
+                                    n_vals = len(unique_vals)
+                                    spread = max(len(new_data_colors) // max(n_vals, 1), 1) if new_data_colors else 1
                                     for i, val in enumerate(unique_vals):
-                                        color = new_data_colors[i % len(new_data_colors)] if new_data_colors else "#808080"
+                                        color = new_data_colors[(i * spread) % len(new_data_colors)] if new_data_colors else "#808080"
                                         entry = {
                                             "properties": {"fill": _solid_color(color)},
                                             "selector": {
