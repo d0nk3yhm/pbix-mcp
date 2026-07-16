@@ -271,6 +271,45 @@ HashInfo:
 
 String dictionary entries use **insertion order** (order values first appear in the source data), not sorted order. This is critical for correct H$ hierarchy alignment.
 
+### Compressed string pages (canonical Huffman)
+
+When a page's uncompressed character store grows large (Power BI Desktop
+switches above ~16 KB of UTF-16 text), the page is stored Huffman-compressed
+instead. The format is documented publicly in Microsoft's open specification
+[MS-XLDM §2.7.4 — Huffman Compression](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-xldm/f70b41f2-ca64-44a1-9e6f-53e63f6a5ee9).
+
+```
+CompressedStrings:
+  u32:  store_total_bits          (end-of-stream sentinel; last string's end)
+  u32:  character_set_type_id     (0x000ABA91 single, 0x000ABA92 general)
+  u64:  len_compressed_buffer
+  u8:   character_set_used        (only when type == 0x000ABA91)
+  u32:  ui_decode_bits            (primary-table width hint, ≤ 12)
+  u8[128]: encode_array           (256 nibble-packed code lengths, 2–15 bits)
+  u64:  buffer_size               (== len_compressed_buffer)
+  u8[]: compressed_string_buffer  (bitstream; adjacent bytes pair-swapped)
+```
+
+- **encode_array**: 128 bytes; low nibble of byte *i* is the code length for
+  symbol `2i`, high nibble for `2i+1`. Length 0 = symbol unused.
+- **Canonical codes**: sort `(length, symbol)` ascending; start at code 0 and
+  increment, left-shifting on each length increase (MS-XLDM §2.7.4.1.5).
+- **Bit order**: codes are packed MSB-first (big-endian); the resulting byte
+  buffer then has every adjacent pair swapped (`2k ↔ 2k+1`) on disk. Buffer
+  length is `ceil(total_bits/8)` rounded up to even, plus 2.
+- **Charset modes**: *single* (`0x000ABA91`) Huffman-encodes only the low byte
+  of each UTF-16 character and stores the common high byte once as
+  `character_set_used` (used for Latin text); *general* (`0x000ABA92`) encodes
+  every byte of the UTF-16LE stream.
+- **Record handles**: for compressed pages, the record-handle offset is the
+  string's **start bit** (not char offset). Pages hold at most 2^19 UTF-16
+  characters; larger dictionaries split across multiple compressed pages that
+  share one trailing record-handle vector.
+
+This layer delegates the canonical-Huffman codec to the MIT
+[`xmhuffman`](https://github.com/Hugoberry/xmhuffman-cython) primitive, the
+same way the ZIP layer delegates XPress9 to `xpress9-python`.
+
 ## H$ System Tables (Attribute Hierarchies)
 
 Each user column with MaterializationType=0 has an H$ system table:
