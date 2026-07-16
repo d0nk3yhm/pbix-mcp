@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast tests (189 pass, 8 skip, 19 slow/integration deselected)
+# Fast tests (190 pass, 8 skip, 19 slow/integration deselected)
 pytest -m "not slow"
 
 # With coverage
