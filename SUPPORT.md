@@ -25,6 +25,7 @@
 - ABF archive manipulation (list, extract, replace, build from scratch)
 - DataMashup (M code) read/write
 - XPress9 DataModel decompress/recompress (byte-exact round-trip)
+- Huffman-compressed string dictionaries read/write (MS-XLDM §2.7.4, via `xmhuffman`)
 
 ### Beta
 - Calculated column evaluation (per-row DAX; tested with synthetic data only)

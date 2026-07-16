@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast tests (194 pass, 8 skip, 19 slow/integration deselected)
+# Fast tests (194 pass, 9 skip, 19 slow/integration deselected)
 pytest -m "not slow"
 
 # With coverage
@@ -48,7 +48,7 @@ ruff check src/ tests/
 python -m mypy src/pbix_mcp/ --ignore-missing-imports
 ```
 
-mypy has 168 errors (CI baseline is 175 — see `.github/workflows/ci.yml`). CI fails if error count exceeds 175. Tracked for gradual cleanup.
+mypy has 169 errors (CI baseline is 175 — see `.github/workflows/ci.yml`). CI fails if error count exceeds 175. Tracked for gradual cleanup.
 
 ## Adding a New DAX Function
 
