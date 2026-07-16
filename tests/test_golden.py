@@ -583,5 +583,365 @@ class TestPBIXWithData:
         assert "Total" in measures
 
 
+class TestMeasureFormatString:
+    """Regression: Measure.FormatString must persist end-to-end (was hardcoded NULL)."""
+
+    @staticmethod
+    def _measures_from_pbix(pbix_bytes):
+        """Read (Name, FormatString, Description) rows back out of a built PBIX."""
+        import io
+        import sqlite3
+        import tempfile
+        import zipfile
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        zf = zipfile.ZipFile(io.BytesIO(pbix_bytes))
+        abf = decompress_datamodel(zf.read("DataModel"))
+        meta = read_metadata_sqlite(abf)
+        tmp = tempfile.mktemp(suffix=".db")
+        with open(tmp, "wb") as f:
+            f.write(meta)
+        try:
+            conn = sqlite3.connect(tmp)
+            rows = conn.execute(
+                "SELECT Name, FormatString, Description FROM [Measure]"
+            ).fetchall()
+            conn.close()
+        finally:
+            os.unlink(tmp)
+        return {name: (fmt, desc) for name, fmt, desc in rows}
+
+    def test_format_string_persisted(self):
+        """format_string= must land in Measure.FormatString, not Description."""
+        from pbix_mcp.builder import PBIXBuilder
+
+        builder = PBIXBuilder()
+        builder.add_table("Sales", [
+            {"name": "Amount", "data_type": "Double"},
+        ], rows=[{"Amount": 100.0}, {"Amount": 250.5}])
+        builder.add_measure("Sales", "Revenue", "SUM(Sales[Amount])",
+                            "Total revenue", format_string="$#,0.00")
+        builder.add_measure("Sales", "Margin Pct", "0.42",
+                            format_string="0.0%")
+        builder.add_measure("Sales", "Plain", "COUNTROWS(Sales)")
+        builder.add_page("P1")
+
+        # Downstream contract: stored under 'format_string' key, None default
+        assert builder._measures[0]["format_string"] == "$#,0.00"
+        assert builder._measures[1]["format_string"] == "0.0%"
+        assert builder._measures[2]["format_string"] is None
+
+        got = self._measures_from_pbix(builder.build())
+        assert got["Revenue"] == ("$#,0.00", "Total revenue")
+        assert got["Margin Pct"][0] == "0.0%"
+        # No explicit format -> NULL, and description must NOT be polluted
+        assert got["Plain"][0] is None
+
+    def test_format_string_is_keyword_only(self):
+        """A 5th positional arg must fail instead of silently landing somewhere."""
+        from pbix_mcp.builder import PBIXBuilder
+
+        builder = PBIXBuilder()
+        builder.add_table("T", [{"name": "A", "data_type": "Int64"}],
+                          rows=[{"A": 1}])
+        with pytest.raises(TypeError):
+            builder.add_measure("T", "M", "SUM(T[A])", "desc", "$#,0")  # noqa: B026
+
+    def test_empty_format_string_means_no_format(self):
+        """format_string='' is treated as no explicit format (NULL, not '')."""
+        from pbix_mcp.builder import PBIXBuilder
+
+        builder = PBIXBuilder()
+        builder.add_table("T", [{"name": "A", "data_type": "Int64"}],
+                          rows=[{"A": 1}])
+        builder.add_measure("T", "M", "SUM(T[A])", format_string="")
+        builder.add_page("P1")
+        got = self._measures_from_pbix(builder.build())
+        assert got["M"][0] is None
+
+
+class TestVertiPaqStringStoreRegression:
+    """Regressions for the DBCC string-store corruption fixes (v0.9.3).
+
+    Conventions verified against PBI Desktop ground truth:
+    - basic_measures.pbix fixture (54 H$ files) and the public corpus
+      IT_Support.pbix (nullable string columns Body/Answer).
+    """
+
+    def test_store_longest_string_counts_utf16_code_units(self):
+        """Non-BMP strings (emoji) occupy 2 UTF-16 code units per char; the
+        string-store header must count code units, not Python chars, or AS
+        rejects the table at load."""
+        import struct
+
+        from pbix_mcp.formats.vertipaq_encoder import _encode_string_dictionary
+
+        blob = _encode_string_dictionary(["\U0001F525" * 5, "abc"])
+        # header: dict_type s4 + hash_info 6*i4 + store_string_count s8 +
+        # f_store_compressed u1 -> store_longest_string s8 at offset 37
+        longest = struct.unpack_from("<q", blob, 37)[0]
+        assert longest == 10  # 5 emoji x 2 code units, NOT 5 chars
+
+    def test_nullable_column_bit_width_covers_null_state(self):
+        """NULL occupies raw index 0 with values shifted to 1..N, so a column
+        with 2 distinct values + NULL needs 2 bits, not 1 (overflow = DBCC
+        corruption). Round-trips the IDF to prove no value was truncated."""
+        from pbix_mcp.formats.vertipaq_decoder import decode_idf, decode_idfmeta
+        from pbix_mcp.formats.vertipaq_encoder import encode_table_data
+
+        rows = [{"S": None}, {"S": "a"}, {"S": "b"}]
+        files = encode_table_data(
+            "T", 1, [{"name": "S", "data_type": "String", "nullable": True}],
+            rows, u32_a=0xABA5A, u32_b_start=0)
+        meta = decode_idfmeta(files["T.tbl\\1.prt\\column.Smeta"])
+        assert meta["has_nulls"] is True
+        assert meta["bit_width"] >= 2  # 3 states need 2 bits
+        # raw indices must round-trip: null->0, values 1..2
+        idx = decode_idf(files["T.tbl\\1.prt\\column.S"],
+                         meta["bit_width"], 3)
+        assert idx == [0, 1, 2]
+
+    def test_nullable_column_max_data_id_excludes_null_state(self):
+        """PBI Desktop ground truth (IT_Support Body: 11917 dict entries,
+        max_data_id=11919 = 3 + N - 1): max_data_id must not count the null
+        state."""
+        from pbix_mcp.formats.vertipaq_decoder import decode_idfmeta
+        from pbix_mcp.formats.vertipaq_encoder import _encode_column
+
+        enc = _encode_column("S", "String", True, [None, "a", "b"])
+        m = decode_idfmeta(enc["idfmeta"])
+        assert m["min_data_id"] == 3
+        assert m["max_data_id"] == 4  # 3 + 2 distinct - 1
+
+    def test_hs_pos_to_id_pads_with_zeros(self):
+        """Desktop pads the H$ POS_TO_ID record stream with zeros only
+        (54/54 ground-truth files) — never the reserved id 2."""
+        import struct
+
+        from pbix_mcp.formats.vertipaq_encoder import _encode_h_dollar_data
+
+        out = _encode_h_dollar_data(
+            "S", "String", [{"S": "b"}, {"S": "a"}, {"S": "c"}])
+        raw = out["pos_idf"]
+        # NoSplit<32> layout: per segment, u64 word_count then word_count u64
+        # words of packed u32 records. 3 distinct -> segments [3, 3] records.
+        records = []
+        off = 0
+        seg_records = [3, 3]  # rec_per_seg = distinct, RecordCount = distinct+3
+        for rec in seg_records:
+            wc = struct.unpack_from("<Q", raw, off)[0]
+            off += 8
+            vals = struct.unpack_from(f"<{wc * 2}I", raw, off)
+            records.extend(vals[:rec])
+            off += wc * 8
+        # segment 1: sorted data_ids for insertion dict [b=3, a=4, c=5]
+        # sorted (a, b, c) -> [4, 3, 5]; segment 2: zero padding only.
+        assert records == [4, 3, 5, 0, 0, 0]
+        assert 2 not in records  # reserved id 2 must never be a record
+
+    def test_empty_string_canonicalizes_to_null(self):
+        """PBI Desktop never writes "" into a string dictionary (0 occurrences
+        across all string columns of 4 real Desktop-built dashboards); AS
+        rejects dictionaries containing a zero-length record at load. Empty
+        strings must canonicalize to NULL/blank."""
+        from pbix_mcp.formats.vertipaq_decoder import (
+            decode_dictionary,
+            decode_idf,
+            decode_idfmeta,
+        )
+        from pbix_mcp.formats.vertipaq_encoder import encode_table_data
+
+        rows = [{"S": ""}, {"S": "a"}, {"S": "target_0"}]
+        files = encode_table_data(
+            "T", 1, [{"name": "S", "data_type": "String", "nullable": True}],
+            rows, u32_a=0xABA5A, u32_b_start=0)
+        _, vals = decode_dictionary(files["T.tbl\\1.prt\\column.S.dict"])
+        assert vals == ["a", "target_0"]  # no "" entry
+        meta = decode_idfmeta(files["T.tbl\\1.prt\\column.Smeta"])
+        assert meta["has_nulls"] is True
+        idx = decode_idf(files["T.tbl\\1.prt\\column.S"], meta["bit_width"], 3)
+        assert idx == [0, 1, 2]  # "" row -> null slot 0
+
+    def test_nullable_column_hierarchy_has_blank_member(self):
+        """PBI Desktop ground truth (IT_Support Body/Answer): a nullable
+        column's H$ hierarchy contains the BLANK member (reserved id 2) at
+        sorted position 0, with RecordsPerSegment=distinct+1. Without it,
+        VALUES()/SUMMARIZECOLUMNS fail against the live engine."""
+        import struct
+
+        from pbix_mcp.formats.vertipaq_encoder import _encode_h_dollar_data
+
+        out = _encode_h_dollar_data(
+            "S", "String", [{"S": "b"}, {"S": None}, {"S": "a"}])
+        raw = out["pos_idf"]
+        # 2 distinct + blank -> positions [blank, a, b];
+        # RecordCount = 2+3 = 5, segments [3, 2]
+        records = []
+        off = 0
+        for rec in [3, 2]:
+            wc = struct.unpack_from("<Q", raw, off)[0]
+            off += 8
+            vals = struct.unpack_from(f"<{wc * 2}I", raw, off)
+            records.extend(vals[:rec])
+            off += wc * 8
+        # insertion dict: b=3, a=4; sorted (a, b) -> blank(2), a(4), b(3)
+        assert records == [2, 4, 3, 0, 0]
+
+    def test_nullable_column_idfmeta_compression_info_is_2(self):
+        """Desktop writes compression_info=2 exactly for has_nulls columns
+        (3 otherwise) — verified across all 23 IT_Support fact columns."""
+        import struct
+
+        from pbix_mcp.formats.vertipaq_encoder import encode_table_data
+
+        def comp_info(meta):
+            # CP hdr+ver, CS hdr, records, one, u32_a, iterator, bookmark,
+            # alloc, used, resize -> compression_info
+            pos = 6 + 8 + 6 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 1
+            return struct.unpack_from("<I", meta, pos)[0]
+
+        nullable = encode_table_data(
+            "T", 1, [{"name": "S", "data_type": "String", "nullable": True}],
+            [{"S": None}, {"S": "a"}], u32_a=0xABA5A, u32_b_start=0)
+        plain = encode_table_data(
+            "T", 1, [{"name": "S", "data_type": "String", "nullable": True}],
+            [{"S": "b"}, {"S": "a"}], u32_a=0xABA5A, u32_b_start=0)
+        assert comp_info(nullable["T.tbl\\1.prt\\column.Smeta"]) == 2
+        assert comp_info(plain["T.tbl\\1.prt\\column.Smeta"]) == 3
+
+    def test_rs_relationship_index_uses_dictionary_order(self):
+        """R$ slots are indexed by FK data_id = dictionary INSERTION order for
+        strings (PBI Desktop ground truth: 400/400 insertion vs 0/400 sorted).
+        A sorted-order R$ silently joins wrong rows when insertion != sorted."""
+        import io
+        import struct
+        import zipfile
+
+        from pbix_mcp.builder import PBIXBuilder
+        from pbix_mcp.formats.abf_rebuild import (
+            list_abf_files,
+            read_abf_file,
+        )
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        b = PBIXBuilder()
+        # FK insertion order kZ, kM, kA deliberately != sorted order
+        b.add_table("T", [{"name": "S", "data_type": "String"},
+                          {"name": "N", "data_type": "Int64"}],
+                    rows=[{"S": "kZ", "N": 1}, {"S": "kM", "N": 10},
+                          {"S": "kA", "N": 100}])
+        b.add_table("Dim", [{"name": "Key", "data_type": "String"},
+                            {"name": "Label", "data_type": "String"}],
+                    rows=[{"Key": "kZ", "Label": "LZ"},
+                          {"Key": "kM", "Label": "LM"},
+                          {"Key": "kA", "Label": "LA"}])
+        b.add_relationship("T", "S", "Dim", "Key")
+        b.add_page("P1")
+        pbix = b.build()
+
+        abf = decompress_datamodel(
+            zipfile.ZipFile(io.BytesIO(pbix)).read("DataModel"))
+        rs_idf = [f for f in list_abf_files(abf)
+                  if str(f.get("Path")).startswith("R$")
+                  and str(f.get("Path")).endswith(".idf")]
+        assert rs_idf, "R$ idf not found"
+        raw = read_abf_file(abf, rs_idf[0])
+        # NoSplit<N>: u64 word count + N-bit packed values.
+        # max TO row index = 3 -> bit width 2 (aligned).
+        wc = struct.unpack_from("<Q", raw, 0)[0]
+        words = struct.unpack_from(f"<{wc}Q", raw, 8)
+        nbits = 2
+        per = 64 // nbits
+        mask = (1 << nbits) - 1
+        vals = [(w >> (k * nbits)) & mask for w in words for k in range(per)]
+        # slots 3..5 = data_ids of kZ(3), kM(4), kA(5) -> TO rows 1, 2, 3
+        # (Dim rows are in the same order). Sorted order would give [3, 2, 1].
+        assert vals[3:6] == [1, 2, 3]
+
+    def test_empty_table_creates_no_phantom_hs_tables(self):
+        """rows=[] must not leave H$ table shells with dangling
+        SegmentMapStorage references (MaterializationType=3 => no H$ table)."""
+        import io
+        import sqlite3
+        import tempfile
+        import zipfile
+
+        from pbix_mcp.builder import PBIXBuilder
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        b = PBIXBuilder()
+        b.add_table("E", [{"name": "S", "data_type": "String"},
+                          {"name": "N", "data_type": "Int64"}], rows=[])
+        b.add_page("P1")
+        with pytest.warns(UserWarning):
+            pbix = b.build()
+
+        zf = zipfile.ZipFile(io.BytesIO(pbix))
+        abf = decompress_datamodel(zf.read("DataModel"))
+        meta = read_metadata_sqlite(abf)
+        tmp = tempfile.mktemp(suffix=".db")
+        with open(tmp, "wb") as f:
+            f.write(meta)
+        try:
+            conn = sqlite3.connect(tmp)
+            hs = conn.execute(
+                "SELECT Name FROM [Table] WHERE Name LIKE 'H$E%'"
+            ).fetchall()
+            # every PartitionStorage.SegmentMapStorageID must resolve
+            dangling = conn.execute(
+                """SELECT ps.ID FROM PartitionStorage ps
+                   LEFT JOIN SegmentMapStorage sms
+                     ON ps.SegmentMapStorageID = sms.ID
+                   WHERE ps.SegmentMapStorageID != 0 AND sms.ID IS NULL"""
+            ).fetchall()
+            conn.close()
+        finally:
+            os.unlink(tmp)
+        assert hs == []  # no phantom H$ shells for empty columns
+        assert dangling == []  # no dangling storage references
+
+
+class TestAddTableRowValidation:
+    """Regression: malformed rows must fail fast in add_table with a clear error
+    (was: cryptic \"'list' object has no attribute 'keys'\" deep in save())."""
+
+    def _builder(self):
+        from pbix_mcp.builder import PBIXBuilder
+        return PBIXBuilder()
+
+    def test_list_row_rejected(self):
+        with pytest.raises(TypeError) as exc:
+            self._builder().add_table("Sales", [
+                {"name": "Amount", "data_type": "Int64"},
+            ], rows=[[100]])
+        msg = str(exc.value)
+        assert "Sales" in msg
+        assert "row 0" in msg
+        assert "dict" in msg
+        assert "col1" in msg  # example payload
+
+    def test_tuple_row_rejected(self):
+        with pytest.raises(TypeError):
+            self._builder().add_table("T", [
+                {"name": "A", "data_type": "Int64"},
+            ], rows=[(1,)])
+
+    def test_offending_row_index_reported(self):
+        with pytest.raises(TypeError) as exc:
+            self._builder().add_table("T", [
+                {"name": "A", "data_type": "Int64"},
+            ], rows=[{"A": 1}, {"A": 2}, [3]])
+        assert "row 2" in str(exc.value)
+
+    def test_valid_dict_rows_still_accepted(self):
+        b = self._builder()
+        b.add_table("T", [{"name": "A", "data_type": "Int64"}],
+                    rows=[{"A": 1}, {"A": 2}])
+        assert b._tables[-1]["rows"] == [{"A": 1}, {"A": 2}]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

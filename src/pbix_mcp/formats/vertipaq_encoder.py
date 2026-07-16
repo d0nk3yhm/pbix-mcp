@@ -175,7 +175,14 @@ def _convert_value_for_dict(value, data_type: str):
         return None
 
     if data_type == "String":
-        return str(value)
+        # Canonicalize empty string to NULL (blank). PBI Desktop never writes
+        # "" into a string dictionary (0 occurrences across every string
+        # column of 4 real Desktop-built dashboards in the public corpus) —
+        # its importer canonicalizes empty text to blank, and AS rejects
+        # dictionaries containing a zero-length record at load
+        # (PFE_XM_DBCC_STRINGSTORE_CORRUPT).
+        s = str(value)
+        return s if s != "" else None
     elif data_type == "Int64":
         return int(value)
     elif data_type == "Boolean":
@@ -287,8 +294,12 @@ def _encode_string_dictionary(unique_strings: list[str]) -> bytes:
         encoded = (s + "\x00").encode("utf-16-le")
         char_buf += encoded
 
-    # Find longest string (in characters, EXCLUDING null terminator - matching AS format)
-    longest = max((len(s) for s in unique_strings), default=0)
+    # Find longest string in UTF-16 CODE UNITS, excluding the null terminator
+    # (matching AS format). Python len() counts characters, which under-reports
+    # non-BMP text (emoji/surrogate pairs: 1 char = 2 code units) and makes the
+    # string store fail AS's load-time consistency check.
+    longest = max((len(s.encode("utf-16-le")) // 2 for s in unique_strings),
+                  default=0)
 
     # allocation_size for the character buffer -- use actual size
     alloc_size = len(char_buf)
@@ -726,8 +737,17 @@ def _encode_idfmeta(
     #   0xABA36 + N = XMRENoSplitCompressionInfo<N> where N is the aligned bit width
     #   0xABA5B = XM123CompressionInfo (for RowNumber)
     buf += _u4(u32_b)
-    # bookmark_bits: 24 for RowNumber, row_count for data columns (PBI ground truth)
-    buf += _u8(24 if is_row_number else row_count)
+    # bookmark_bits: 24 for RowNumber; for data columns Desktop writes a
+    # log-scale width, ceil(log2(5*(rows+1))) — verified against all 22
+    # pure-bitpack segments in the PBI Desktop ground truth (4 rows -> 5,
+    # 9994 rows -> 16). The previous row_count value diverged at scale.
+    # Zero-row segments keep the legacy 0 (Desktop-verified empty shape).
+    if is_row_number:
+        buf += _u8(24)
+    elif row_count == 0:
+        buf += _u8(0)
+    else:
+        buf += _u8(max(1, math.ceil(math.log2(5 * (row_count + 1)))))
 
     # storage_alloc_size: always 32
     buf += _u8(32)
@@ -736,10 +756,12 @@ def _encode_idfmeta(
     buf += _u8(storage_used)
     # segment_needs_resizing
     buf += _u1(0)
-    # compression_info: ALWAYS 3 = XMHybridRLECompressionInfo
-    # The engine auto-detects actual bit width from min/max data IDs.
-    # Valid compression types: 3=hybrid RLE (standard for all column segments)
-    buf += _u4(3)
+    # compression_info: 3 = XMHybridRLECompressionInfo for columns without
+    # nulls, 2 when the column has nulls — PBI Desktop ground truth
+    # (IT_Support: compression_info=2 exactly for the two has_nulls columns,
+    # 3 for the other 21). Writing 3 for a nullable string column makes the
+    # engine's hierarchy materialization (VALUES/SUMMARIZECOLUMNS) fail.
+    buf += _u4(2 if has_nulls else 3)
 
     # --- SS block ---
     buf += TAG_SS_OPEN
@@ -950,19 +972,25 @@ def _encode_h_dollar_data(
         key=lambda x: x if isinstance(x, (int, float)) else (str(type(x)), x),
     )
 
-    # POS_TO_ID: sorted_pos -> data_id (dict_index + 3)
-    pos_to_id = [seen[sk] + 3 for sk in sorted_keys]
+    # POS_TO_ID: sorted_pos -> data_id (dict_index + 3). When the column has
+    # NULLs (conversion also canonicalizes String "" to None), the BLANK
+    # member (reserved data id 2) occupies sorted position 0 — PBI Desktop
+    # ground truth (IT_Support Body/Answer): POS_TO_ID[0]=2, ID_TO_POS[2]=0,
+    # RecordsPerSegment=distinct+1, AHS DistinctDataCount=distinct+1.
+    col_has_nulls = any(v is None for v in converted)
+    pos_to_id = ([2] if col_has_nulls else []) + [seen[sk] + 3 for sk in sorted_keys]
+    h_pos_count = len(pos_to_id)
 
     # ID_TO_POS: full array [0..distinct+2]
     h_record_count = distinct + 3
     id_to_pos_full = [0] * h_record_count
-    id_to_pos_full[1] = distinct  # sentinel
+    id_to_pos_full[1] = h_pos_count  # sentinel = hierarchy position count
     for sorted_pos, did in enumerate(pos_to_id):
-        if did < h_record_count:
+        if did != 2 and did < h_record_count:
             id_to_pos_full[did] = sorted_pos
 
-    # Segment layout
-    h_rec_per_seg = distinct
+    # Segment layout: records per segment = hierarchy position count
+    h_rec_per_seg = h_pos_count
     h_seg_count = math.ceil(h_record_count / h_rec_per_seg)
     h_rps = []
     remaining = h_record_count
@@ -971,8 +999,9 @@ def _encode_h_dollar_data(
         h_rps.append(seg_rec)
         remaining -= seg_rec
 
-    # POS_TO_ID values: sorted data_ids + padding
-    p2id_vals = list(pos_to_id) + [2] + [0] * (h_record_count - distinct - 1)
+    # POS_TO_ID values: hierarchy entries + zero padding to RecordCount.
+    # Desktop ground truth (54/54 H$ files): trailing slots are all zeros.
+    p2id_vals = list(pos_to_id) + [0] * (h_record_count - h_pos_count)
     i2p_vals = list(id_to_pos_full)
 
     return {
@@ -1009,14 +1038,20 @@ def _encode_column(
     """
     row_count = len(values)
 
-    # --- Build dictionary ---
-    # Separate nulls from values
-    has_nulls = nullable and any(v is None for v in values)
-
-    # Convert values to storage format
+    # Convert values to storage format first — conversion canonicalizes
+    # String "" to None, so null detection must run on CONVERTED values.
     converted = []
     for v in values:
         converted.append(_convert_value_for_dict(v, data_type))
+
+    # --- Build dictionary ---
+    # Null presence is derived from CONVERTED values regardless of the declared
+    # nullable flag: conversion canonicalizes String "" to None, and gating on
+    # `nullable` would leave those rows without a null slot — they would alias
+    # to the first dictionary entry (index 0) and silently decode as the wrong
+    # value. Encoding the null state is always consistent; the declared flag
+    # only expresses caller intent.
+    has_nulls = any(v is None for v in converted)
 
     # Build unique values list.
     # GT v2 comparison: String columns use INSERTION order, numeric use SORTED.
@@ -1065,20 +1100,26 @@ def _encode_column(
         min_data_id = _DATA_ID_OFFSET
         max_data_id = _DATA_ID_OFFSET + max(row_count - 1, 0)
     elif has_nulls:
+        # NULL is stored as raw index 0 (not a dictionary entry); values map to
+        # raw 1..N == data_ids 3..N+2. PBI Desktop ground truth (IT_Support
+        # Body/Answer: 11917 dict entries, max_data_id=11919) shows
+        # max_data_id excludes the null state: 3 + N - 1, same as non-null.
         min_data_id = _DATA_ID_OFFSET
-        max_data_id = _DATA_ID_OFFSET + len(unique_sorted)  # null=0, values=1..N
+        max_data_id = _DATA_ID_OFFSET + max(len(unique_sorted) - 1, 0)
     else:
         min_data_id = _DATA_ID_OFFSET
         max_data_id = _DATA_ID_OFFSET + max(len(unique_sorted) - 1, 0)
 
     # Bit width for encoding indices
-    # PBI computes bw from distinct_count (verified by IDFMETA ground truth comparison).
-    # IDF stores 0-based dict indices; max stored value = len(unique_sorted) - 1.
-    _distinct = len(unique_sorted)
-    if _distinct <= 2:
+    # PBI computes bw from the distinct STATE count (verified by IDFMETA ground
+    # truth comparison). IDF stores 0-based dict indices; with nulls present the
+    # null state occupies raw 0 and values shift to 1..N, so the width must
+    # cover N+1 states or the packed values overflow (DBCC corruption).
+    _states = len(unique_sorted) + (1 if has_nulls else 0)
+    if _states <= 2:
         bit_width_raw = 1
     else:
-        bit_width_raw = math.ceil(math.log2(_distinct))
+        bit_width_raw = math.ceil(math.log2(_states))
     bit_width = _align_bit_width(max(1, bit_width_raw))
 
     # --- Encode IDF ---
@@ -1236,13 +1277,26 @@ def encode_table_data(
             # Data columns use XMHybridRLECompressionInfo<XMRENoSplitCompressionInfo<N>>
             # where N = aligned bit width computed from max_data_id
             # The encoder computes bit_width internally, but we need it here for u32_b
-            non_null = [v for v in values if v is not None]
+            converted_vals = [_convert_value_for_dict(v, data_type)
+                              for v in values]
+            non_null = [v for v in converted_vals if v is not None]
             unique_count = len(set(non_null))
-            # bw from distinct_count (matching PBI ground truth IDFMETA)
-            if unique_count <= 2:
+            # Nullable columns store NULL as raw index 0 with values at 1..N,
+            # so the bit width must cover N+1 states (PBI ground truth:
+            # IT_Support Body/Answer columns). Without this, a column with
+            # e.g. 2 distinct values + NULL overflows a 1-bit encoding and
+            # AS rejects the table at load (DBCC string-store corruption).
+            # Conversion also canonicalizes String "" to None, so null
+            # detection must use converted values — and must NOT be gated on
+            # the declared nullable flag (a "" in a nullable=False column
+            # would otherwise alias to the first dictionary entry).
+            col_has_nulls = any(v is None for v in converted_vals)
+            states = unique_count + (1 if col_has_nulls else 0)
+            # bw from distinct state count (matching PBI ground truth IDFMETA)
+            if states <= 2:
                 bw = 1
             else:
-                bw = math.ceil(math.log2(unique_count))
+                bw = math.ceil(math.log2(states))
             bw = _align_bit_width(max(1, bw))
             col_u32_a = _HYBRID_RLE_FAMILY
             col_u32_b = _NOSPLIT_BASE + bw

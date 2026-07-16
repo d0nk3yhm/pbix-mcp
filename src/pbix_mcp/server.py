@@ -1454,7 +1454,10 @@ def pbix_create(
             - "mode": "directquery" — live database queries (default: "import").
               DirectQuery requires source_db and a running database server.
         measures_json: Optional JSON array of measures, e.g.
-            '[{"table": "Sales", "name": "Total", "expression": "SUM(Sales[Amount])"}]'
+            '[{"table": "Sales", "name": "Total", "expression": "SUM(Sales[Amount])",
+              "format_string": "$#,0.00"}]'
+            Optional per-measure fields: "description", "format_string"
+            (display format code, e.g. "$#,0.00", "0.0%", "#,0")
         relationships_json: Optional JSON array of relationships, e.g.
             '[{"from_table": "Sales", "from_column": "ProductID",
               "to_table": "Products", "to_column": "ProductID"}]'
@@ -1483,6 +1486,7 @@ def pbix_create(
                     mdef["name"],
                     mdef["expression"],
                     mdef.get("description", ""),
+                    format_string=mdef.get("format_string"),
                 )
 
         if relationships_json:
@@ -4786,13 +4790,15 @@ def _rebuild_datamodel(
         # Get existing measures
         measures = []
         for mrow in conn.execute(
-            "SELECT t.Name as tbl, m.Name, m.Expression, m.FormatString "
+            "SELECT t.Name as tbl, m.Name, m.Expression, m.FormatString, "
+            "m.Description "
             "FROM Measure m JOIN [Table] t ON m.TableID = t.ID"
         ):
             measures.append({
                 "table": mrow["tbl"], "name": mrow["Name"],
                 "expression": mrow["Expression"],
                 "format_string": mrow["FormatString"] or "",
+                "description": mrow["Description"] or "",
             })
 
         # Get existing relationships
@@ -4888,10 +4894,13 @@ def _rebuild_datamodel(
     # Add all measures (existing + new), skip measures on removed tables
     for m in measures:
         if m["table"] not in remove_tables:
-            builder.add_measure(m["table"], m["name"], m["expression"], m["format_string"])
+            builder.add_measure(m["table"], m["name"], m["expression"],
+                                m.get("description", ""),
+                                format_string=m.get("format_string"))
     for m in extra_measures:
         builder.add_measure(m["table"], m["name"], m["expression"],
-                            m.get("format_string", ""))
+                            m.get("description", ""),
+                            format_string=m.get("format_string"))
 
     # Add all relationships (existing + new), skip removed ones and those referencing removed tables
     remove_rel_set = {(r[0], r[1], r[2], r[3]) for r in remove_relationships}
@@ -5245,13 +5254,15 @@ def _modify_metadata_sqlite(
 
             modified_measures = []
             for mrow in conn.execute(
-                "SELECT t.Name as tbl, m.Name, m.Expression, m.FormatString "
+                "SELECT t.Name as tbl, m.Name, m.Expression, m.FormatString, "
+                "m.Description "
                 "FROM Measure m JOIN [Table] t ON m.TableID = t.ID"
             ):
                 modified_measures.append({
                     "table": mrow["tbl"], "name": mrow["Name"],
                     "expression": mrow["Expression"],
                     "format_string": mrow["FormatString"] or "",
+                    "description": mrow["Description"] or "",
                 })
 
             # Read tables and relationships from modified metadata
@@ -5309,7 +5320,9 @@ def _modify_metadata_sqlite(
             builder.add_table(tname, tinfo["columns"], rows=[])
 
     for m in modified_measures:
-        builder.add_measure(m["table"], m["name"], m["expression"], m["format_string"])
+        builder.add_measure(m["table"], m["name"], m["expression"],
+                            m.get("description", ""),
+                            format_string=m.get("format_string"))
 
     for r in modified_rels:
         builder.add_relationship(

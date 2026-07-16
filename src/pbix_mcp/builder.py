@@ -124,6 +124,16 @@ class PBIXBuilder:
         """
         if mode not in ("import", "directquery"):
             raise ValueError(f"mode must be 'import' or 'directquery', got {mode!r}")
+        # Validate row shape early so callers get a clear error here instead
+        # of a cryptic "'list' object has no attribute 'keys'" deep in save().
+        if rows:
+            for i, row in enumerate(rows):
+                if not isinstance(row, dict):
+                    raise TypeError(
+                        f"Table '{name}' row {i} must be a dict mapping column "
+                        f"names to values, got {type(row).__name__}. "
+                        f'Example: [{{"col1": 100, "col2": "Widget"}}]'
+                    )
         self._tables.append({
             "name": name,
             "columns": columns,
@@ -141,13 +151,28 @@ class PBIXBuilder:
         name: str,
         expression: str,
         description: str = "",
+        *,
+        format_string: str | None = None,
     ) -> "PBIXBuilder":
-        """Add a DAX measure to a table."""
+        """Add a DAX measure to a table.
+
+        Args:
+            table: Table name (must exist via add_table)
+            name: Measure name
+            expression: DAX expression
+            description: Optional measure description
+            format_string: Optional display format code (e.g. "$#,0.00",
+                           "0.0%", "#,0"). Persisted to Measure.FormatString
+                           so PBI Desktop renders the measure formatted.
+                           Keyword-only to prevent positional mix-ups with
+                           description. None or "" means no explicit format.
+        """
         self._measures.append({
             "table": table,
             "name": name,
             "expression": expression,
             "description": description,
+            "format_string": format_string,
         })
         return self
 
@@ -394,7 +419,12 @@ class PBIXBuilder:
             if not t["columns"]:
                 issues.append(f"CRITICAL: Table '{t['name']}' has no columns")
             if not t["rows"]:
-                issues.append(f"WARNING: Table '{t['name']}' has no rows (empty table)")
+                issues.append(
+                    f"WARNING: Table '{t['name']}' has no rows (empty table) — "
+                    f"PBI Desktop cannot open files containing truly empty "
+                    f"embedded tables. Add at least one row, or use "
+                    f"source_csv/source_db so Refresh populates it."
+                )
             # Check row data matches column definitions
             col_names = {c["name"] for c in t["columns"]}
             for i, row in enumerate(t.get("rows", [])):
@@ -1586,7 +1616,7 @@ def _modify_metadata_and_encode(
                     FormatStringDefinitionID, LineageTag, SourceLineageTag
                 ) VALUES (
                     ?, ?, ?, ?, 6,
-                    ?, NULL, 0, 1,
+                    ?, ?, 0, 1,
                     ?, ?,
                     0, 0, NULL, NULL,
                     0, NULL,
@@ -1594,6 +1624,7 @@ def _modify_metadata_and_encode(
                 )""",
                 (m_id, tid, mdef["name"], mdef.get("description", ""),
                  mdef["expression"],
+                 mdef.get("format_string") or None,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP,
                  str(uuid.uuid4())),
             )
@@ -1838,6 +1869,14 @@ def _modify_metadata_and_encode(
             # ============================================================
             for col_def in tdef["columns"]:
                 col_name = col_def["name"]
+                # CRITICAL: re-read the data type per column. This loop
+                # previously reused the stale `data_type` left over from the
+                # encoding loop above (always the LAST column's type), which
+                # sent String columns down the numeric branch: `seen` was then
+                # built from sorted order while the actual dictionary is
+                # insertion-ordered, so H$ POS_TO_ID/ID_TO_POS pointed at the
+                # wrong strings (wrong sort order / hierarchy results).
+                data_type = col_def.get("data_type", "String")
                 info = col_storage_info[tname][col_name]
                 col_id = info["col_id"]
                 ah_id = info["ah_id"]
@@ -1852,11 +1891,16 @@ def _modify_metadata_and_encode(
                 # CRITICAL: String=insertion order, Numeric=sorted (matching GT v2)
                 raw_vals = [row.get(col_name) for row in rows]
                 if data_type == "String":
-                    # Insertion order for strings
+                    # Insertion order for strings. Empty string canonicalizes
+                    # to NULL (matching _convert_value_for_dict), so it never
+                    # becomes a dictionary entry here either.
                     seen_order: dict[object, int] = {}
                     dict_values: list = []
                     for v in raw_vals:
-                        if v is not None and v not in seen_order:
+                        if v is None or str(v) == "":
+                            continue
+                        v = str(v)
+                        if v not in seen_order:
                             seen_order[v] = len(dict_values)
                             dict_values.append(v)
                     seen = seen_order
@@ -1874,21 +1918,35 @@ def _modify_metadata_and_encode(
                     key=lambda x: (str(type(x)), x) if not isinstance(x, (int, float)) else x,
                 )
 
-                # POS_TO_ID: sorted_pos -> data_id (dict_index + 3)
-                # BaseId=0, so data_ids start at 3
-                pos_to_id = []
+                # Null presence must mirror the encoder's converted-value view:
+                # String "" canonicalizes to NULL there, so it counts here too.
+                col_has_nulls = any(
+                    v is None or (data_type == "String" and str(v) == "")
+                    for v in raw_vals
+                ) and row_count > 0
+
+                # POS_TO_ID: sorted_pos -> data_id (dict_index + 3).
+                # When the column has NULLs, the BLANK member (reserved data
+                # id 2) is a real hierarchy entry at sorted position 0 — PBI
+                # Desktop ground truth (IT_Support Body/Answer: DistinctData-
+                # Count=distinct+1, RecordsPerSegment=distinct+1,
+                # POS_TO_ID[0]=2, ID_TO_POS[2]=0). Without it, VALUES()/
+                # SUMMARIZECOLUMNS over the column fail in the live engine.
+                pos_to_id = [2] if col_has_nulls else []
                 for sv in sorted_vals:
                     di = seen[sv]
                     pos_to_id.append(di + 3)
+                h_pos_count = len(pos_to_id)  # distinct (+1 with blank)
 
                 # ID_TO_POS: full array of RecordCount=distinct+3 entries
-                # [0]=0 (unused), [1]=distinct (sentinel), [2]=0 (unused),
+                # [0]=0 (unused), [1]=position count (sentinel),
+                # [2]=blank position (0) when nulls, else unused,
                 # [3..]=sorted_position for each data_id
                 h_record_count_pre = distinct + 3  # 5 for 2 distinct
                 id_to_pos_full = [0] * h_record_count_pre
-                id_to_pos_full[1] = distinct  # sentinel
+                id_to_pos_full[1] = h_pos_count  # sentinel
                 for sorted_pos, did in enumerate(pos_to_id):
-                    if did < h_record_count_pre:
+                    if did != 2 and did < h_record_count_pre:
                         id_to_pos_full[did] = sorted_pos
 
                 # Always create the AttributeHierarchy row (required for ALL columns)
@@ -1903,7 +1961,28 @@ def _modify_metadata_and_encode(
                     (ah_id, col_id, ahs_id, _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
                 )
 
-                # Build H$ table metadata for ALL cardinalities
+                # For empty columns (distinct==0), use MatType=3: the hierarchy
+                # is not materialized, so NO H$ table/partition/storage rows may
+                # exist. (Previously the H$ shells were inserted before this
+                # guard, leaving phantom tables with dangling SegmentMapStorage
+                # references — Desktop rejected such files at load.)
+                if distinct == 0:
+                    c.execute(
+                        """INSERT INTO AttributeHierarchyStorage (
+                            ID, AttributeHierarchyID, SortOrder, OptimizationLevel,
+                            MaterializationType, ColumnPositionToData, ColumnDataToPosition,
+                            DistinctDataCount, DataVersion, StorageFileID,
+                            SystemTableID, HasStatistics, MinValue, MaxValue,
+                            StringValueMaxLength
+                        ) VALUES (?, ?, 0, 0,
+                            3, -1, -1,
+                            0, 1, 0,
+                            0, 1, ?, ?, ?)""",
+                        (ahs_id, ah_id, min_val, max_val, max_strlen),
+                    )
+                    continue
+
+                # Build H$ table metadata for materialized hierarchies
                 h_table_name = f"H${tname} ({table_id})${col_name} ({col_id})"
                 h_table_id = alloc.next()
                 h_ts_id = alloc.next()
@@ -1989,27 +2068,12 @@ def _modify_metadata_and_encode(
                     (h_prt_folder_id, h_ps_id, h_prt_folder_path),
                 )
 
-                # For empty columns (distinct==0), use MatType=3 (no H$ table)
-                if distinct == 0:
-                    c.execute(
-                        """INSERT INTO AttributeHierarchyStorage (
-                            ID, AttributeHierarchyID, SortOrder, OptimizationLevel,
-                            MaterializationType, ColumnPositionToData, ColumnDataToPosition,
-                            DistinctDataCount, DataVersion, StorageFileID,
-                            SystemTableID, HasStatistics, MinValue, MaxValue,
-                            StringValueMaxLength
-                        ) VALUES (?, ?, 0, 0,
-                            3, -1, -1,
-                            0, 1, 0,
-                            0, 1, ?, ?, ?)""",
-                        (ahs_id, ah_id, min_val, max_val, max_strlen),
-                    )
-                    continue
-
                 # --- Build H$ binary data using dynamic NoSplit encoding ---
                 import math as _math_h
                 h_record_count = distinct + 3
-                h_rec_per_seg = distinct
+                # Records per segment = hierarchy position count: distinct,
+                # +1 when the blank member is present (Desktop ground truth).
+                h_rec_per_seg = h_pos_count
                 h_seg_count = _math_h.ceil(h_record_count / h_rec_per_seg)
                 h_rps = []
                 remaining = h_record_count
@@ -2018,9 +2082,12 @@ def _modify_metadata_and_encode(
                     h_rps.append(seg_rec)
                     remaining -= seg_rec
 
-                # POS_TO_ID values: sorted data_ids + padding to RecordCount
+                # POS_TO_ID values: sorted data_ids + zero padding to RecordCount.
+                # Desktop ground truth (54/54 H$ files in basic_measures.pbix):
+                # the trailing RecordCount-distinct slots are ALL zeros — never
+                # the reserved id 2 the builder previously wrote.
                 p2id_vals = list(pos_to_id)  # distinct sorted data_ids
-                p2id_vals.extend([2] + [0] * (h_record_count - distinct - 1))
+                p2id_vals.extend([0] * (h_record_count - distinct))
 
                 # ID_TO_POS values (already computed, length = h_record_count)
                 i2p_vals = list(id_to_pos_full)
@@ -2185,7 +2252,10 @@ def _modify_metadata_and_encode(
                     vertipaq_files[h_abf_idf] = h_idf_map[h_col_name]
                     vertipaq_files[h_abf_meta] = h_meta_map[h_col_name]
 
-                # AHS: MaterializationType=0, SystemTableID=h_table_id
+                # AHS: MaterializationType=0, SystemTableID=h_table_id.
+                # DistinctDataCount counts hierarchy positions, i.e. it
+                # INCLUDES the blank member when the column has nulls
+                # (Desktop GT: Body distinct=11917 -> DistinctDataCount=11918).
                 c.execute(
                     """INSERT INTO AttributeHierarchyStorage (
                         ID, AttributeHierarchyID, SortOrder, OptimizationLevel,
@@ -2194,7 +2264,7 @@ def _modify_metadata_and_encode(
                         SystemTableID, HasStatistics, MinValue, MaxValue,
                         StringValueMaxLength
                     ) VALUES (?, ?, 0, 0, 0, 0, 1, ?, 1, 0, ?, 1, ?, ?, ?)""",
-                    (ahs_id, ah_id, distinct, h_table_id,
+                    (ahs_id, ah_id, h_pos_count, h_table_id,
                      min_val, max_val, max_strlen),
                 )
 
@@ -2332,28 +2402,62 @@ def _modify_metadata_and_encode(
             # PBI uses H$ sorted_pos to index: R$[sorted_pos] → PK row.
             # So for each distinct FK value (sorted), store the matching PK row.
 
+            # Determine the FK column type: string keys must use the SAME
+            # canonicalization as the dictionary/H$ writers ("" -> NULL,
+            # str() coercion), or the R$ slots desync from the dictionary
+            # (off-by-one join misalignment).
+            many_col_def = next(
+                (cd for cd in many_tdef["columns"]
+                 if cd["name"] == many_col_name), {})
+            fk_is_string = many_col_def.get("data_type", "String") == "String"
+
+            def _canon_key(v, is_string):
+                if v is None:
+                    return None
+                if is_string:
+                    s = str(v)
+                    return s if s != "" else None
+                return v
+
             # Map TO table key values to row indices
             to_key_index: dict[object, int] = {}
             for idx, row in enumerate(to_rows):
-                key_val = row.get(one_col_name)
+                key_val = _canon_key(row.get(one_col_name), fk_is_string)
                 if key_val is not None and key_val not in to_key_index:
                     to_key_index[key_val] = idx
 
-            # Get DISTINCT FK values, sorted (matching H$ sorted positions)
-            fk_values = [r.get(many_col_name) for r in from_rows]
-            fk_distinct_sorted = sorted(
-                set(v for v in fk_values if v is not None),
-                key=lambda x: x if isinstance(x, (int, float)) else str(x),
-            )
-            # R$ RecordCount = distinct + DATA_ID_OFFSET (3 padding slots).
-            # Ground truth analysis: R$ is indexed by data_id (position 3 =
-            # first dict entry). Values are 1-based row indices into TO table.
+            # Get DISTINCT FK values in DICTIONARY (data_id) order: insertion
+            # order for strings, sorted for numerics — R$ is indexed by the
+            # FK column's data_id, NOT by sorted/hierarchy position. Verified
+            # against PBI Desktop ground truth (basic_measures fct Orders ->
+            # dim Customer string relationship: 400/400 slots match insertion
+            # order, 0/400 match sorted order). Building R$ in sorted order
+            # silently joined string FKs to the WRONG dimension rows whenever
+            # insertion order differed from sorted order.
+            fk_values = [_canon_key(r.get(many_col_name), fk_is_string)
+                         for r in from_rows]
+            if fk_is_string:
+                _fk_seen: set = set()
+                fk_dict_order: list = []
+                for v in fk_values:
+                    if v is not None and v not in _fk_seen:
+                        _fk_seen.add(v)
+                        fk_dict_order.append(v)
+            else:
+                fk_dict_order = sorted(
+                    set(v for v in fk_values if v is not None),
+                    key=lambda x: x if isinstance(x, (int, float)) else str(x),
+                )
+            # R$ RecordCount = distinct + DATA_ID_OFFSET (3 padding slots);
+            # slot 3+i corresponds to FK data_id 3+i (dictionary entry i).
+            # NULL/blank rows have no dictionary entry and thus no R$ slot.
             DATA_ID_OFFSET = 3
-            from_row_count = len(fk_distinct_sorted) + DATA_ID_OFFSET
+            from_row_count = len(fk_dict_order) + DATA_ID_OFFSET
 
-            # Build R$ INDEX: 3 padding zeros + 1-based TO row per distinct FK
+            # Build R$ INDEX: 3 padding zeros + 1-based TO row per dictionary
+            # entry, in data_id order
             index_values: list[int] = [0] * DATA_ID_OFFSET
-            for fk_val in fk_distinct_sorted:
+            for fk_val in fk_dict_order:
                 matched_idx = to_key_index.get(fk_val, 0)
                 index_values.append(matched_idx + 1)  # 1-based row index
 

@@ -16,7 +16,12 @@ pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
 
 def _load_pbix(path):
-    """Load tables, measures, relationships from a PBIX file."""
+    """Load tables, measures, relationships from a PBIX file.
+
+    Requires the optional ``pbixray`` package (``pip install pbixray``);
+    only exercised when PBIX_TEST_SAMPLES points at the test corpus.
+    """
+    pytest.importorskip("pbixray")
     from pbixray import PBIXRay
     model = PBIXRay(path)
 
