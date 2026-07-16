@@ -246,3 +246,32 @@ class TestLogging:
         set_level("debug")
         assert logger.level == logging.DEBUG
         set_level("normal")  # Reset
+
+
+class TestGenericExceptionErrorPath:
+    """Regression: MCP tools must return a clean ToolResponse when a tool body
+    raises a generic exception (e.g. ValueError for a duplicate measure) — the
+    except-Exception handlers previously crashed on `e.code` (12 sites)."""
+
+    def test_duplicate_measure_returns_clean_error(self, tmp_path):
+        import pbix_mcp.server as srv
+        from pbix_mcp.builder import PBIXBuilder
+
+        p = tmp_path / "dup.pbix"
+        b = PBIXBuilder()
+        b.add_table("T", [{"name": "A", "data_type": "Int64"}], rows=[{"A": 1}])
+        b.add_measure("T", "M", "SUM(T[A])")
+        b.add_page("P1")
+        p.write_bytes(b.build())
+
+        r = json.loads(srv.pbix_open(file_path=str(p), alias="dup_t"))
+        assert r["success"] is True
+        try:
+            out = json.loads(srv.pbix_datamodel_add_measure(
+                alias="dup_t", table_name="T", measure_name="M",
+                expression="1"))
+            # must be a clean tool error, not an AttributeError crash
+            assert out["success"] is False
+            assert "AttributeError" not in json.dumps(out)
+        finally:
+            srv.pbix_close(alias="dup_t")

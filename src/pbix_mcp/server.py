@@ -5398,7 +5398,7 @@ def pbix_datamodel_query_metadata(alias: str, sql_query: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
 @mcp.tool()
@@ -5435,7 +5435,7 @@ def pbix_datamodel_modify_metadata(alias: str, sql_statement: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
 @mcp.tool()
@@ -5491,7 +5491,7 @@ def pbix_datamodel_modify_measure(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
 @mcp.tool()
@@ -5581,7 +5581,7 @@ def pbix_datamodel_add_measure(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
 @mcp.tool()
@@ -5630,7 +5630,7 @@ def pbix_datamodel_remove_measure(alias: str, measure_name: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
 @mcp.tool()
@@ -5815,7 +5815,7 @@ def pbix_datamodel_add_field_parameter(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
 @mcp.tool()
@@ -6009,7 +6009,7 @@ def pbix_datamodel_modify_column(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
 @mcp.tool()
@@ -6469,7 +6469,7 @@ def pbix_evaluate_dax(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
 @mcp.tool()
@@ -6555,7 +6555,7 @@ def pbix_evaluate_dax_per_dimension(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
 def _get_layout_pbir(work_dir: str) -> dict | None:
@@ -9737,7 +9737,7 @@ def pbix_set_incremental_refresh(
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
 @mcp.tool()
@@ -9807,7 +9807,7 @@ def pbix_get_incremental_refresh(alias: str) -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
 @mcp.tool()
@@ -9868,7 +9868,7 @@ def pbix_export_tmdl(alias: str, output_path: str = "") -> str:
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", e.code).to_text()
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
 def _sanitize_pbir_name(name: str) -> str:
