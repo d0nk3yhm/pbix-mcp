@@ -943,5 +943,85 @@ class TestAddTableRowValidation:
         assert b._tables[-1]["rows"] == [{"A": 1}, {"A": 2}]
 
 
+class TestCompressedStringStore:
+    """Huffman-compressed string dictionaries (MS-XLDM §2.7.4): encode above
+    the size threshold, decode via the xmhuffman primitive. Round-trip through
+    the real encoder/decoder code path."""
+
+    @staticmethod
+    def _page_compressed_flag(blob: bytes) -> int:
+        # dict_type(4) + hash(24) + PageLayout(8+1+8+8) + page hdr(8+1+8+8)
+        return blob[4 + 24 + 25 + 25]
+
+    def _roundtrip(self, strings):
+        from pbix_mcp.formats.vertipaq_decoder import decode_dictionary
+        from pbix_mcp.formats.vertipaq_encoder import _encode_string_dictionary
+        blob = _encode_string_dictionary(strings)
+        dt, back = decode_dictionary(blob)
+        return blob, back
+
+    def test_small_dict_stays_uncompressed(self):
+        blob, back = self._roundtrip([f"v{i}" for i in range(20)])
+        assert self._page_compressed_flag(blob) == 0
+        assert back == [f"v{i}" for i in range(20)]
+
+    def test_large_dict_compresses_and_roundtrips(self):
+        strings = [
+            f"Support ticket {i} regarding data analytics tooling and options"
+            for i in range(500)
+        ]
+        blob, back = self._roundtrip(strings)
+        assert self._page_compressed_flag(blob) == 1  # crossed the threshold
+        assert back == strings
+
+    def test_compressed_unicode_roundtrips(self):
+        strings = [
+            f"事件 {i}: データ分析 🔥 déjà café — narrative текст {i}"
+            for i in range(600)
+        ]
+        blob, back = self._roundtrip(strings)
+        assert self._page_compressed_flag(blob) == 1
+        assert back == strings
+
+    def test_compressed_multipage_roundtrips(self):
+        import struct
+
+        # > 2^19 chars forces multiple pages
+        strings = [("detail " * 60).strip() + f" #{i}" for i in range(1500)]
+        blob, back = self._roundtrip(strings)
+        assert self._page_compressed_flag(blob) == 1
+        # store_page_count lives at dict_type(4)+hash(24)+8+1+8
+        page_count = struct.unpack_from("<q", blob, 4 + 24 + 8 + 1 + 8)[0]
+        assert page_count >= 2
+        assert back == strings
+
+    def test_decodes_real_desktop_compressed_dict(self):
+        """The corpus IT_Support.pbix has real Huffman-compressed columns
+        (Body: 11,917 strings across 9 pages). Requires the public test
+        corpus + pbixray."""
+        import os
+        import zipfile
+
+        samples = os.environ.get("PBIX_TEST_SAMPLES", "")
+        path = os.path.join(samples, "IT_Support.pbix") if samples else ""
+        if not path or not os.path.exists(path):
+            pytest.skip("IT_Support.pbix not in PBIX_TEST_SAMPLES")
+        pbixray = pytest.importorskip("pbixray")
+
+        from pbix_mcp.formats.abf_rebuild import list_abf_files, read_abf_file
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        from pbix_mcp.formats.vertipaq_decoder import decode_dictionary
+
+        abf = decompress_datamodel(zipfile.ZipFile(path).read("DataModel"))
+        files = list_abf_files(abf)
+        dfile = [f for f in files
+                 if "Body (2108).dictionary" in str(f.get("Path"))][0]
+        _, mine = decode_dictionary(read_abf_file(abf, dfile))
+        ref = list(dict.fromkeys(
+            pbixray.PBIXRay(path).get_table("fact_IT_Support")["Body"]
+            .dropna().astype(str)))
+        assert set(s for s in mine if s) == set(ref)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

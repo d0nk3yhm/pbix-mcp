@@ -186,10 +186,64 @@ def decode_dictionary(dict_bytes: bytes) -> tuple[int, list]:
         return dict_type, _decode_numeric_dictionary(buf, pos, dict_type)
 
 
+# Compressed string-store character-set identifiers (MS-XLDM §2.7.4.1.4):
+#   0x000aba91 single charset — only the low byte of each UTF-16 char is
+#               Huffman-encoded; CharacterSetUsed is the common high byte.
+#   0x000aba92 general        — every byte of the UTF-16LE stream is encoded.
+_HUFFMAN_SINGLE = 0x000ABA91
+_HUFFMAN_GENERAL = 0x000ABA92
+
+
+def _decode_compressed_page(page: dict) -> list[str]:
+    """Decode one Huffman-compressed dictionary page via the xmhuffman kernel.
+
+    ``page`` carries the parsed compressed-page fields plus ``offsets`` (the
+    per-string start bit offsets from the record-handle vector, ascending).
+    Canonical-Huffman format is Microsoft's MS-XLDM §2.7.4. The heavy lifting
+    (bit walk + charset reinsertion) is delegated to the MIT ``xmhuffman``
+    primitive, mirroring how the ZIP layer delegates XPress9 to
+    ``xpress9-python``.
+    """
+    try:
+        import xmhuffman
+    except ImportError as e:  # pragma: no cover - dependency is declared
+        raise ImportError(
+            "Reading Huffman-compressed string dictionaries requires the "
+            "'xmhuffman' package (pip install xmhuffman)."
+        ) from e
+
+    buf = page["comp_buf"]
+    enc = page["encode_array"]
+    offsets = page["offsets"]
+    total_bits = page["total_bits"]
+    if page["charset_id"] == _HUFFMAN_GENERAL:
+        raw = xmhuffman.decode_page(buf, enc, offsets, total_bits, swap=True)
+        # trailing odd byte (if any) is padding; drop it before UTF-16LE decode
+        return [b[: len(b) & ~1].decode("utf-16-le", errors="ignore") for b in raw]
+    cb = page["charset_used"]
+    if cb == 0:
+        raw = xmhuffman.decode_page(buf, enc, offsets, total_bits, swap=True)
+        return [b.decode("latin-1") for b in raw]
+    raw = xmhuffman.decode_page(
+        buf, enc, offsets, total_bits, swap=True,
+        charset_mode="single", charset_byte=cb,
+    )
+    return [b.decode("utf-16-le") for b in raw]
+
+
 def _decode_string_dictionary(buf: bytes, pos: int) -> list[str]:
-    """Decode a string dictionary from position pos onward."""
+    """Decode a string dictionary from position pos onward.
+
+    Handles both uncompressed and Huffman-compressed pages. The on-disk
+    layout is: PageLayout, then N DictionaryPage blocks, then ONE shared
+    DictionaryRecordHandlesVector (record handles carry `(offset, page_id)`
+    in data-id order — char offset for uncompressed pages, start-bit offset
+    for compressed pages).
+    """
+    from collections import defaultdict
+
     # store_string_count: int64
-    count = struct.unpack_from("<q", buf, pos)[0]
+    struct.unpack_from("<q", buf, pos)[0]
     pos += 8
     # f_store_compressed: int8
     pos += 1
@@ -199,79 +253,87 @@ def _decode_string_dictionary(buf: bytes, pos: int) -> list[str]:
     page_count = struct.unpack_from("<q", buf, pos)[0]
     pos += 8
 
-    strings: list[str] = []
-
+    pages: list[dict] = []
     for _ in range(page_count):
         # DictionaryPage header
-        # page_mask: uint64
-        pos += 8
-        # page_contains_nulls: uint8
-        pos += 1
-        # page_start_index: uint64
-        pos += 8
-        # page_string_count: uint64
-        page_string_count = struct.unpack_from("<Q", buf, pos)[0]
-        pos += 8
-        # page_compressed: uint8
+        pos += 8   # page_mask: uint64
+        pos += 1   # page_contains_nulls: uint8
+        pos += 8   # page_start_index: uint64
+        pos += 8   # page_string_count: uint64
         page_compressed = struct.unpack_from("<B", buf, pos)[0]
         pos += 1
 
-        # string_store_begin_mark: 4 bytes
         mark = buf[pos:pos + 4]
         if mark != STRING_STORE_BEGIN:
             raise ValueError(f"Expected STRING_STORE_BEGIN at {pos}, got {mark!r}")
         pos += 4
 
         if page_compressed == 0:
-            # UncompressedStrings
-            # remaining_store_available: uint64
-            pos += 8
-            # buffer_used_characters: uint64
-            buffer_used_chars = struct.unpack_from("<Q", buf, pos)[0]
-            pos += 8
-            # allocation_size: uint64
+            pos += 8  # remaining_store_available: uint64
+            pos += 8  # buffer_used_characters: uint64
             alloc_size = struct.unpack_from("<Q", buf, pos)[0]
             pos += 8
-            # character buffer (UTF-16LE)
             char_buf = buf[pos:pos + alloc_size]
             pos += alloc_size
+            pages.append({"compressed": False, "char_buf": char_buf})
         else:
-            # Compressed strings -- not common in our generated files,
-            # but we should handle the basic case
-            raise ValueError("Compressed string dictionaries not yet supported")
+            total_bits = struct.unpack_from("<I", buf, pos)[0]
+            pos += 4
+            charset_id = struct.unpack_from("<I", buf, pos)[0]
+            pos += 4
+            len_comp_buf = struct.unpack_from("<Q", buf, pos)[0]
+            pos += 8
+            charset_used = 0
+            if charset_id == _HUFFMAN_SINGLE:
+                charset_used = struct.unpack_from("<B", buf, pos)[0]
+                pos += 1
+            pos += 4  # ui_decode_bits: uint32 (decoder uses a flat table)
+            encode_array = buf[pos:pos + 128]
+            pos += 128
+            pos += 8  # ui64_buffer_size: uint64
+            comp_buf = buf[pos:pos + len_comp_buf]
+            pos += len_comp_buf
+            pages.append({
+                "compressed": True, "total_bits": total_bits,
+                "charset_id": charset_id, "charset_used": charset_used,
+                "encode_array": encode_array, "comp_buf": comp_buf,
+            })
 
-        # string_store_end_mark
         end_mark = buf[pos:pos + 4]
         if end_mark != STRING_STORE_END:
             raise ValueError(f"Expected STRING_STORE_END at {pos}, got {end_mark!r}")
         pos += 4
 
-        # DictionaryRecordHandlesVector
-        # element_count: uint64
-        elem_count = struct.unpack_from("<Q", buf, pos)[0]
-        pos += 8
-        # element_size: uint32
-        elem_size = struct.unpack_from("<I", buf, pos)[0]
+    # ONE shared DictionaryRecordHandlesVector after all pages
+    elem_count = struct.unpack_from("<Q", buf, pos)[0]
+    pos += 8
+    pos += 4  # element_size: uint32 (== 8)
+    offsets_by_page: dict[int, list[int]] = defaultdict(list)
+    for _ in range(elem_count):
+        offset = struct.unpack_from("<I", buf, pos)[0]
         pos += 4
+        page_id = struct.unpack_from("<I", buf, pos)[0]
+        pos += 4
+        offsets_by_page[page_id].append(offset)
 
-        for j in range(elem_count):
-            # StringRecordHandle: char_offset(u32), page_id(u32)
-            char_offset = struct.unpack_from("<I", buf, pos)[0]
-            pos += 4
-            _page_id = struct.unpack_from("<I", buf, pos)[0]
-            pos += 4
-
-            # Read string from char_buf at byte offset = char_offset * 2
-            byte_offset = char_offset * 2
-            # Find null terminator
-            s_end = byte_offset
-            while s_end + 1 < len(char_buf):
-                ch = struct.unpack_from("<H", char_buf, s_end)[0]
-                if ch == 0:
-                    break
-                s_end += 2
-            s = char_buf[byte_offset:s_end].decode("utf-16-le", errors="replace")
-            strings.append(s)
+    strings: list[str] = []
+    for page_id, page in enumerate(pages):
+        offsets = offsets_by_page.get(page_id, [])
+        if page["compressed"]:
+            page["offsets"] = offsets  # start bits, already in data-id (ascending) order
+            strings.extend(_decode_compressed_page(page))
+        else:
+            char_buf = page["char_buf"]
+            for char_offset in offsets:
+                byte_offset = char_offset * 2
+                s_end = byte_offset
+                while s_end + 1 < len(char_buf):
+                    if struct.unpack_from("<H", char_buf, s_end)[0] == 0:
+                        break
+                    s_end += 2
+                strings.append(
+                    char_buf[byte_offset:s_end].decode("utf-16-le", errors="replace")
+                )
 
     return strings
 

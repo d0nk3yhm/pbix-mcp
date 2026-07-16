@@ -265,97 +265,236 @@ def _encode_dict_hash_info(unique_values: list, dict_type: int) -> bytes:
     return struct.pack("<6i", *vals)
 
 
+# --- Huffman-compressed string store (MS-XLDM §2.7.4) ---------------------
+# character_set_type_identifier values:
+_HUFFMAN_SINGLE = 0x000ABA91   # low byte per char; CharacterSetUsed is high byte
+_HUFFMAN_GENERAL = 0x000ABA92  # every UTF-16LE byte is a Huffman symbol
+_MAX_CODE_LEN = 15             # nibble-packed code lengths cap at 15
+# Compress when the uncompressed char store would exceed this (Desktop switches
+# to Huffman above ~16 KB / 8192 UTF-16 code units); smaller dicts stay
+# uncompressed (byte-identical to Desktop).
+_COMPRESS_CHAR_THRESHOLD = 8192
+# Each dictionary page holds at most 2^19 UTF-16 code units (verified against
+# PBI Desktop ground truth: pages split at ~524,288 chars).
+_PAGE_CHAR_CAP = 1 << 19
+
+
+def _length_limited_code_lengths(freq: dict[int, int]) -> dict[int, int]:
+    """Package-merge: optimal prefix-code lengths bounded to _MAX_CODE_LEN.
+
+    freq maps symbol -> positive weight. Returns symbol -> length in [1, 15].
+    """
+    syms = sorted(freq, key=lambda s: (freq[s], s))
+    n = len(syms)
+    if n == 0:
+        return {}
+    if n == 1:
+        return {syms[0]: 1}
+    orig = sorted((freq[s], (s,)) for s in syms)
+    level = list(orig)
+    for _ in range(_MAX_CODE_LEN - 1):
+        packages = [
+            (level[i][0] + level[i + 1][0], level[i][1] + level[i + 1][1])
+            for i in range(0, len(level) - 1, 2)
+        ]
+        level = sorted(orig + packages)
+    from collections import Counter
+    cnt: Counter = Counter()
+    for _w, cover in level[: 2 * n - 2]:
+        for s in cover:
+            cnt[s] += 1
+    return {s: cnt[s] for s in syms}
+
+
+def _canonical_codes(lengths: dict[int, int]) -> dict[int, tuple[int, int]]:
+    """symbol->length  =>  symbol->(code, length), canonical per MS-XLDM
+    §2.7.4.1.5: sort (length, symbol) ascending, increment code with a
+    left-shift on each length increase."""
+    codes: dict[int, tuple[int, int]] = {}
+    code = 0
+    prev_len = None
+    for length, sym in sorted((ln, s) for s, ln in lengths.items()):
+        if prev_len is not None:
+            code = (code + 1) << (length - prev_len)
+        codes[sym] = (code, length)
+        prev_len = length
+    return codes
+
+
+def _swap_pairs(b: bytes) -> bytes:
+    """Swap adjacent byte pairs (2k<->2k+1); trailing odd byte unchanged."""
+    out = bytearray(b)
+    for k in range(0, len(out) - 1, 2):
+        out[k], out[k + 1] = out[k + 1], out[k]
+    return bytes(out)
+
+
+def _encode_compressed_page(page_strings: list[str]) -> tuple[bytes, list[int]]:
+    """Encode one page's strings into a Huffman-compressed string store blob.
+
+    Returns (page_blob, bit_offsets) where page_blob is the DictionaryPage body
+    from page_mask through the STRING_STORE_END mark, and bit_offsets are the
+    per-string start bit offsets (the record-handle values for this page).
+    """
+    # Single-charset mode when every character fits in latin-1 (high byte 0);
+    # otherwise general mode over the raw UTF-16LE byte stream.
+    all_latin1 = all(ord(c) < 256 for s in page_strings for c in s)
+    if all_latin1:
+        charset_id, charset_used = _HUFFMAN_SINGLE, 0
+        byte_seqs = [s.encode("latin-1") for s in page_strings]
+    else:
+        charset_id, charset_used = _HUFFMAN_GENERAL, 0
+        byte_seqs = [s.encode("utf-16-le") for s in page_strings]
+
+    from collections import Counter
+    freq: Counter = Counter()
+    for bs in byte_seqs:
+        freq.update(bs)
+    if not freq:
+        freq[0] = 1
+    lengths = _length_limited_code_lengths(dict(freq))
+    codes = _canonical_codes(lengths)
+
+    bit_list: list[int] = []
+    bit_offsets: list[int] = []
+    for bs in byte_seqs:
+        bit_offsets.append(len(bit_list))
+        for byte in bs:
+            code, length = codes[byte]
+            for i in range(length - 1, -1, -1):
+                bit_list.append((code >> i) & 1)
+    total_bits = len(bit_list)
+
+    nbytes = (total_bits + 7) // 8
+    target = ((nbytes + 1) & ~1) + 2  # even length + 2-byte margin (Desktop rule)
+    raw = bytearray(target)
+    for i, bit in enumerate(bit_list):
+        if bit:
+            raw[i >> 3] |= 1 << (7 - (i & 7))
+    comp_buf = _swap_pairs(bytes(raw))
+
+    max_len = max(lengths.values()) if lengths else 0
+    ui_decode_bits = min(max_len, 11)
+    encode_array = bytearray(128)
+    for s, ln in lengths.items():
+        i, hi = divmod(s, 2)
+        if hi:
+            encode_array[i] |= (ln & 0x0F) << 4
+        else:
+            encode_array[i] |= ln & 0x0F
+
+    body = bytearray()
+    body += STRING_STORE_BEGIN
+    body += _u4(total_bits)
+    body += _u4(charset_id)
+    body += _u8(len(comp_buf))          # len_compressed_string_buffer
+    if charset_id == _HUFFMAN_SINGLE:
+        body += _u1(charset_used)
+    body += _u4(ui_decode_bits)
+    body += bytes(encode_array)
+    body += _u8(len(comp_buf))          # ui64_buffer_size
+    body += comp_buf
+    body += STRING_STORE_END
+    return bytes(body), bit_offsets
+
+
 def _encode_string_dictionary(unique_strings: list[str]) -> bytes:
     """
     Build a complete string dictionary blob (dict_type=2).
 
     Layout:
       - dictionary_type: int32 = 2
-      - hash_information: 6 x int32 (zeros)
+      - hash_information: 6 x int32
       - PageLayout header
-      - DictionaryPage(s)
-      - DictionaryRecordHandlesVector
+      - DictionaryPage(s) — uncompressed, or Huffman-compressed above the
+        size threshold (MS-XLDM §2.7.4), paginated at 2^19 chars per page
+      - DictionaryRecordHandlesVector (shared across pages)
     """
+    count = len(unique_strings)
+    # code units (excl. terminator) per string; +1 accounts for the null.
+    code_units = [len(s.encode("utf-16-le")) // 2 for s in unique_strings]
+    total_chars = sum(cu + 1 for cu in code_units)
+    longest = max(code_units, default=0)
+
     buf = bytearray()
-
-    # dictionary_type
     buf += _s4(DICT_TYPE_STRING)
-
-    # hash_information (Bug #11)
     buf += _encode_dict_hash_info(unique_strings, DICT_TYPE_STRING)
 
-    count = len(unique_strings)
+    compress = total_chars > _COMPRESS_CHAR_THRESHOLD
 
-    # Encode all strings as UTF-16LE null-terminated into a single page
-    char_buf = bytearray()
-    offsets = []  # byte offsets of each string in char_buf
-    for s in unique_strings:
-        offsets.append(len(char_buf))
-        encoded = (s + "\x00").encode("utf-16-le")
-        char_buf += encoded
+    if not compress:
+        # --- Uncompressed single page (byte-identical to PBI Desktop) ---
+        char_buf = bytearray()
+        offsets = []
+        for s in unique_strings:
+            offsets.append(len(char_buf))
+            char_buf += (s + "\x00").encode("utf-16-le")
+        alloc_size = len(char_buf)
 
-    # Find longest string in UTF-16 CODE UNITS, excluding the null terminator
-    # (matching AS format). Python len() counts characters, which under-reports
-    # non-BMP text (emoji/surrogate pairs: 1 char = 2 code units) and makes the
-    # string store fail AS's load-time consistency check.
-    longest = max((len(s.encode("utf-16-le")) // 2 for s in unique_strings),
-                  default=0)
+        buf += _s8(count)          # store_string_count
+        buf += _u1(1)              # f_store_compressed
+        buf += _s8(longest)        # store_longest_string
+        buf += _s8(1)              # store_page_count
 
-    # allocation_size for the character buffer -- use actual size
-    alloc_size = len(char_buf)
-    # buffer_used_characters = number of UTF-16 code units used
-    buffer_used_chars = alloc_size // 2
-    # remaining_store_available = allocated chars - used chars (in chars)
-    remaining = 0
+        buf += _u8(0)              # page_mask
+        buf += _u1(0)              # page_contains_nulls
+        buf += _u8(0)              # page_start_index
+        buf += _u8(count)          # page_string_count
+        buf += _u1(0)              # page_compressed
+        buf += STRING_STORE_BEGIN
+        buf += _u8(0)              # remaining_store_available
+        buf += _u8(alloc_size // 2)  # buffer_used_characters
+        buf += _u8(alloc_size)     # allocation_size
+        buf += bytes(char_buf)
+        buf += STRING_STORE_END
 
-    # --- PageLayout ---
-    # store_string_count: int64
-    buf += _s8(count)
-    # f_store_compressed: int8 = 1 (string store present, uncompressed)
-    buf += _u1(1)
-    # store_longest_string: int64 (in characters)
-    buf += _s8(longest)
-    # store_page_count: int64
-    buf += _s8(1)  # single page
+        buf += _u8(count)          # record handle element_count
+        buf += _u4(8)              # element_size
+        for off in offsets:
+            buf += _u4(off // 2)   # char offset
+            buf += _u4(0)          # page_id
+        return bytes(buf)
 
-    # --- DictionaryPage ---
-    # page_mask: uint64 -- bitmask; for simplicity use 0
-    buf += _u8(0)
-    # page_contains_nulls: uint8
-    buf += _u1(0)
-    # page_start_index: uint64
-    buf += _u8(0)
-    # page_string_count: uint64
-    buf += _u8(count)
-    # page_compressed: uint8 = 0 (uncompressed)
-    buf += _u1(0)
+    # --- Huffman-compressed, paginated at _PAGE_CHAR_CAP chars per page ---
+    pages: list[list[str]] = []
+    cur: list[str] = []
+    cur_chars = 0
+    for s, cu in zip(unique_strings, code_units):
+        add = cu + 1
+        if cur and cur_chars + add > _PAGE_CHAR_CAP:
+            pages.append(cur)
+            cur, cur_chars = [], 0
+        cur.append(s)
+        cur_chars += add
+    if cur:
+        pages.append(cur)
 
-    # string_store_begin_mark
-    buf += STRING_STORE_BEGIN
+    buf += _s8(count)              # store_string_count
+    buf += _u1(1)                  # f_store_compressed
+    buf += _s8(longest)            # store_longest_string
+    buf += _s8(len(pages))         # store_page_count
 
-    # --- UncompressedStrings ---
-    # remaining_store_available: uint64
-    buf += _u8(remaining)
-    # buffer_used_characters: uint64
-    buf += _u8(buffer_used_chars)
-    # allocation_size: uint64 (in bytes)
-    buf += _u8(alloc_size)
-    # uncompressed_character_buffer: alloc_size bytes
-    buf += bytes(char_buf)
+    handles: list[int] = []        # per-string (data-id order) start bit offset
+    handle_pages: list[int] = []
+    start_index = 0
+    for page_id, page_strings in enumerate(pages):
+        body, bit_offsets = _encode_compressed_page(page_strings)
+        buf += _u8(1)              # page_mask (compressed pages use 0x1)
+        buf += _u1(0)              # page_contains_nulls
+        buf += _u8(start_index)    # page_start_index
+        buf += _u8(len(page_strings))  # page_string_count
+        buf += _u1(1)              # page_compressed
+        buf += body
+        for off in bit_offsets:
+            handles.append(off)
+            handle_pages.append(page_id)
+        start_index += len(page_strings)
 
-    # string_store_end_mark
-    buf += STRING_STORE_END
-
-    # --- DictionaryRecordHandlesVector ---
-    # element_count: uint64
-    buf += _u8(count)
-    # element_size: uint32 = 8 (each handle is 8 bytes)
-    buf += _u4(8)
-    # vector of StringRecordHandle { char_offset: u32, page_id: u32 }
-    for i, off in enumerate(offsets):
-        buf += _u4(off // 2)   # character offset (Bug #12: byte_offset / 2)
-        buf += _u4(0)          # page_id = 0 (single page)
-
+    buf += _u8(count)              # record handle element_count
+    buf += _u4(8)                  # element_size
+    for off, pid in zip(handles, handle_pages):
+        buf += _u4(off)            # bit offset within page
+        buf += _u4(pid)            # page_id
     return bytes(buf)
 
 
