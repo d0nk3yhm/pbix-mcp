@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast tests (190 pass, 8 skip, 19 slow/integration deselected)
+# Fast tests (194 pass, 8 skip, 19 slow/integration deselected)
 pytest -m "not slow"
 
 # With coverage
@@ -27,7 +27,7 @@ PBIX_TEST_SAMPLES=/path/to/samples pytest -v
 |------|---------|-------|
 | `test_dax_engine.py` | DAX function unit tests | 55 (6 skip without PBIX) |
 | `test_dax_accuracy.py` | DAX evaluation accuracy | 50 |
-| `test_golden.py` | Round-trip and artifact tests | 31 (2 skip without PBIX) |
+| `test_golden.py` | Round-trip and artifact tests | 36 (3 skip without PBIX) |
 | `test_fixtures.py` | Public fixture verification | 18 |
 | `test_beta_features.py` | RLS, password, doctor tests | 10 |
 | `test_cross_report.py` | 4-file integration tests | 19 (all skip without PBIX) |
