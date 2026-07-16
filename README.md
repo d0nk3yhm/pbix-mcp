@@ -92,9 +92,10 @@ Every layer of the PBIX binary format has been independently reversed and reimpl
 | XMLA Load document (db.xml) | **Reversed** | 28 xmlns namespaces, CompatibilityLevel=1550, TabularMetadata — `generate_db_xml()` |
 | CryptKey.bin | **Constant** | 144-byte RSA key BLOB (Microsoft crypto format; GUID-independent constant) |
 | Metadata SQLite | **Reversed** | 68 system tables matching PBI March 2026 schema — `create_empty_metadata_db()` |
-| VertiPaq column storage | **Reversed** | IDF (bit-packed), IDFMETA (segment stats), dictionary (Long/Real/String), HIDX (hash index) |
+| VertiPaq column storage | **Reversed** | IDF (bit-packed), IDFMETA (segment stats), dictionary (Long/Real/String, uncompressed or Huffman-compressed), HIDX (hash index) |
 | H$ attribute hierarchies | **Reversed** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities |
 | R$ relationship indexes | **Reversed** | NoSplit<N> INDEX encoding with +3 DATA_ID_OFFSET padding and 1-based row indices (verified byte-exact against PBI Desktop ground truth) |
+| Compressed string store | **Reversed** | Canonical-Huffman string pages ([MS-XLDM §2.7.4](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-xldm/)) — read and write; codec via [xmhuffman](https://github.com/Hugoberry/xmhuffman-cython) (MIT) |
 | XPress9 compression | **Reversed** | Custom compress/decompress with reversed chunk framing, headers, and multi-thread format; core algorithm via [xpress9-python](https://github.com/Hugoberry/xpress9-python) (MIT) |
 
 The only non-generated artifact is the 144-byte CryptKey constant. This is a Microsoft RSA key BLOB that requires `rskeymgmt` infrastructure to generate. The key is GUID-independent — any valid key works with any database ID. Random bytes produce `PFE_INVALID_CRYPT_KEY`.
@@ -423,7 +424,7 @@ The AI reads the current connections via `pbix_list_data_sources`, then calls `p
 
 | Type | Status | Dictionary Format |
 |------|--------|-------------------|
-| `String` | Stable | External UTF-16LE with hash table |
+| `String` | Stable | UTF-16LE with hash table; large dictionaries canonical-Huffman-compressed |
 | `Int64` | Stable | External 32-bit entries (IsOperatingOn32=1) |
 | `Double` | Stable | External 64-bit IEEE 754 entries |
 | `DateTime` | Stable | External 64-bit entries (same encoding as Double) |
@@ -436,7 +437,7 @@ Every component of the VertiPaq columnar storage engine is independently impleme
 
 - **IDF** — Bit-packed encoding for data columns (RLE disabled; pure bitpack is slightly less space-efficient but correct)
 - **IDFMETA** — Segment statistics with tagged CP/CS/SS/SDOs blocks
-- **Dictionary** — Type-specific encoding (Long/Real/String) with hash tables
+- **Dictionary** — Type-specific encoding (Long/Real/String) with hash tables; large string dictionaries use canonical-Huffman compression (MS-XLDM §2.7.4, read + write) via [xmhuffman](https://github.com/Hugoberry/xmhuffman-cython) (MIT)
 - **H$ system tables** — Attribute hierarchy POS_TO_ID + ID_TO_POS using NoSplit<32> encoding
 - **R$ system tables** — Relationship join INDEX using NoSplit<N> encoding; +3 DATA_ID_OFFSET padding, 1-based row indices into TO table (derived from PBI Desktop ground truth binary comparison)
 - **Compression class IDs** — Determined through binary format analysis (u32_a/u32_b selectors)
@@ -509,7 +510,7 @@ PBIX_TEST_SAMPLES=test_corpus pytest tests/test_cross_report.py -v
 |-------|-------|--------|-------------|
 | `test_dax_engine.py` | 55 | `unit` | 6 skip without private files |
 | `test_dax_accuracy.py` | 50 | `unit` | No |
-| `test_golden.py` | 36 | `golden` | 2 skip without the public test corpus |
+| `test_golden.py` | 36 | `golden` | 3 skip without the public test corpus |
 | `test_fixtures.py` | 18 | `unit` | No (ships with repo) |
 | `test_beta_features.py` | 10 | `unit` | No |
 | `test_cross_report.py` | 19 | `slow`, `integration` | Yes (4 public PBIX dashboards) |
@@ -615,7 +616,7 @@ For **modifying existing PBIX files** (adding a measure, changing a visual), the
 
 ### No Microsoft Dependencies
 
-This project is **100% Python** with zero Microsoft DLLs or SDKs. Every layer of the PBIX format — from the ZIP shell to the VertiPaq column encoding — is independently reversed and implemented. The XPress9 compression uses [xpress9-python](https://github.com/Hugoberry/xpress9-python) (MIT) as a low-level primitive; the Power BI DataModel container format (chunk framing, headers, multi-thread support, full read/write/modify round-trip) is original work in `datamodel_roundtrip.py`.
+This project is **100% Python** with zero Microsoft DLLs or SDKs. Every layer of the PBIX format — from the ZIP shell to the VertiPaq column encoding — is independently reversed and implemented. The XPress9 compression uses [xpress9-python](https://github.com/Hugoberry/xpress9-python) (MIT) and the canonical-Huffman string store uses [xmhuffman](https://github.com/Hugoberry/xmhuffman-cython) (MIT) as low-level primitives; the Power BI DataModel container format (chunk framing, headers, multi-thread support, full read/write/modify round-trip) is original work in `datamodel_roundtrip.py`.
 
 ## Purpose & Interoperability
 

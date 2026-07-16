@@ -43,7 +43,7 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 
 | Type | Status | Dictionary Format |
 |------|--------|-------------------|
-| String | ✅ Stable | External UTF-16LE with hash table |
+| String | ✅ Stable | UTF-16LE with hash table; large dictionaries canonical-Huffman-compressed (MS-XLDM §2.7.4, read + write) |
 | Int64 | ✅ Stable | External 32-bit entries (IsOperatingOn32=1) |
 | Double | ✅ Stable | External 64-bit IEEE 754 entries |
 | DateTime | ✅ Stable | External 64-bit entries (same encoding as Double) |
