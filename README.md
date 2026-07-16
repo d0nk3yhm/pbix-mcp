@@ -514,7 +514,7 @@ PBIX_TEST_SAMPLES=test_corpus pytest tests/test_cross_report.py -v
 | `test_beta_features.py` | 10 | `unit` | No |
 | `test_cross_report.py` | 19 | `slow`, `integration` | Yes (4 public PBIX dashboards) |
 
-**From a fresh clone: 216 tests collected, 189 passed, 27 skipped, 0 failures.** The skipped tests require the public test corpus or private PBIX files. Download the corpus with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus`.
+**From a fresh clone: 217 tests collected, 190 passed, 27 skipped, 0 failures.** The skipped tests require the public test corpus or private PBIX files. Download the corpus with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus`.
 
 ## Architecture
 
