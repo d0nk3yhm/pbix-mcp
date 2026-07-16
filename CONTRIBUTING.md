@@ -11,10 +11,11 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast unit tests only (173 pass, 27 skip without test corpus/private files)
+# Fast unit tests only (189 pass, 8 skip, 19 slow/integration deselected)
 pytest -m "not slow"
 
 # Download public test corpus, then run integration tests
+# (integration tests also need: pip install pbixray)
 python scripts/download_test_corpus.py
 PBIX_TEST_SAMPLES=test_corpus pytest -v
 
@@ -49,10 +50,11 @@ src/pbix_mcp/
 tests/
   test_dax_engine.py     # Unit tests (55; 6 skip without private files)
   test_dax_accuracy.py   # Accuracy tests (50)
-  test_golden.py         # Golden tests (15; 2 skip without private files)
+  test_golden.py         # Golden tests (31; 2 skip without the public test corpus)
   test_fixtures.py       # Fixture tests (18; ships with repo)
   test_beta_features.py  # Beta feature tests (10; RLS, password, doctor)
-  test_cross_report.py   # Integration tests (19; requires 4 private PBIX files)
+  test_cross_report.py   # Integration tests (19; requires the public test corpus:
+                         #   python scripts/download_test_corpus.py)
 ```
 
 ## Commit Messages
