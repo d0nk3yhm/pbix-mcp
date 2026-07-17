@@ -73,6 +73,25 @@ Every layer of the PBIX is generated from scratch — no templates or skeletons:
 - **H$ POS_TO_ID**: must use same sort order as encoder's dictionary
 - **RLE encoding disabled**: pure bitpack used for IDF segments — slightly less space-efficient but correct
 
+### Empty tables (`rows=[]`)
+
+**Tables created with no rows do not open in PBI Desktop.** A never-processed,
+zero-row Import table is not a representable VertiPaq state — Desktop itself
+never produces one (its "empty" tables are calculated tables, DirectQuery, or
+an Import partition *processed* to zero rows, which still emits valid empty
+segment structures). Files containing one load with the table dropped, after
+which DAX reports "queries only work on databases with at least one table".
+
+`_pre_build_checks()` warns explicitly when a table has no rows. Workarounds:
+
+- Add at least one row, or
+- Use `source_csv` / `source_db` so Refresh populates the table from the source.
+
+Note: the *metadata* for empty columns is correct as of 0.9.3 — such columns use
+`AttributeHierarchyStorage.MaterializationType=3` with no H$ system table (a
+previous bug emitted phantom H$ tables with dangling `SegmentMapStorage`
+references). The remaining limitation is the zero-row partition itself.
+
 ### Other builder notes
 - Fixed RowNumber GUID: 2662979B-1795-4F74-8F37-6A1BA8059B61
 - Relationship direction: auto-detects Many/One sides; From=Many (fact), To=One (dimension)
