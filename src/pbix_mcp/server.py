@@ -6619,14 +6619,33 @@ def pbix_evaluate_dax_per_dimension(
         lines.append(header)
         lines.append("-" * len(header))
 
-        for val in unique_vals[:max_values]:
-            fc = dict(base_fc)
-            fc[dimension] = [val]
-            results = dax_engine.evaluate_measures_batch(
-                measure_names, ctx['tables'], ctx['measure_defs'],
-                fc, ctx['date_table'], ctx['date_column'],
-                ctx.get('relationships')
-            )
+        capped_vals = unique_vals[:max_values]
+
+        # Fast path: group the fact rows by the propagated join key ONCE and
+        # aggregate per bucket, instead of re-filtering the whole fact table for
+        # every dimension value. Only covers simple aggregations (SUM/COUNT/…);
+        # measures it cannot safely bucket are absent from `fast` and are
+        # evaluated the exact per-value way below, so results never change.
+        fast = dax_engine.evaluate_per_dimension(
+            measure_names, ctx['tables'], ctx['measure_defs'], base_fc,
+            dimension, dim_table, dim_col, capped_vals,
+            ctx['date_table'], ctx['date_column'], ctx.get('relationships')
+        )
+        fallback_measures = [m for m in measure_names if m not in fast]
+
+        for val in capped_vals:
+            if fallback_measures:
+                fc = dict(base_fc)
+                fc[dimension] = [val]
+                fb = dax_engine.evaluate_measures_batch(
+                    fallback_measures, ctx['tables'], ctx['measure_defs'],
+                    fc, ctx['date_table'], ctx['date_column'],
+                    ctx.get('relationships')
+                )
+            else:
+                fb = {}
+            results = {m: (fast[m].get(val) if m in fast else fb.get(m))
+                       for m in measure_names}
 
             row_str = f"{str(val):<25s}"
             for m in measure_names:

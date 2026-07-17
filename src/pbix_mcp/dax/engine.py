@@ -43,9 +43,9 @@ from typing import Any, Optional
 class DAXContext:
     """Execution context for DAX evaluation — holds table data and filter state."""
 
-    def __init__(self, tables: dict, measures: dict, date_table: str = None,
-                 date_column: str = None, filter_context: dict = None,
-                 relationships: list = None):
+    def __init__(self, tables: dict, measures: dict, date_table: Optional[str] = None,
+                 date_column: Optional[str] = None, filter_context: Optional[dict] = None,
+                 relationships: Optional[list] = None):
         """
         tables: { 'tableName': { 'columns': [...], 'rows': [[...], ...] } }
         measures: { 'MeasureName': 'DAX expression string' }
@@ -3587,6 +3587,160 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
     for name in measure_names:
         results[name] = _engine.evaluate_measure(name, ctx)
     return results
+
+
+# Simple single-column aggregations that can be bucketed once per fact table
+# instead of re-scanning the fact table once per dimension value.
+_SIMPLE_AGG_RE = re.compile(
+    r"^(SUM|AVERAGE|MIN|MAX|COUNT|DISTINCTCOUNT)\s*\(\s*"
+    r"(?:'([^']+)'|([A-Za-z0-9_ .\-]+?))\s*\[\s*([^\]]+?)\s*\]\s*\)$",
+    re.IGNORECASE,
+)
+_COUNTROWS_RE = re.compile(
+    r"^COUNTROWS\s*\(\s*(?:'([^']+)'|([A-Za-z0-9_ .\-]+?))\s*\)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_simple_agg(expr: str):
+    """Parse a measure expression that is a single simple aggregation.
+
+    Returns (func_upper, table_name, column_name_or_None) or None if the
+    expression is anything more complex (arithmetic, CALCULATE, nested calls,
+    iterators, multiple columns, …) — those are NOT eligible for bucketing.
+    """
+    if expr is None:
+        return None
+    e = expr.strip()
+    m = _SIMPLE_AGG_RE.match(e)
+    if m:
+        func = m.group(1).upper()
+        table = (m.group(2) or m.group(3) or "").strip()
+        col = m.group(4).strip()
+        return (func, table, col)
+    m = _COUNTROWS_RE.match(e)
+    if m:
+        table = (m.group(1) or m.group(2) or "").strip()
+        return ("COUNTROWS", table, None)
+    return None
+
+
+def evaluate_per_dimension(measure_names: list, tables: dict, measures: dict,
+                           base_fc: Optional[dict], dimension: str, dim_table: str,
+                           dim_col: str, unique_vals: list,
+                           date_table: Optional[str] = None,
+                           date_column: Optional[str] = None,
+                           relationships: Optional[list] = None) -> dict:
+    """Fast per-dimension evaluation for simple aggregation measures.
+
+    Instead of re-filtering the whole fact table once per dimension value
+    (O(values × fact_rows)), the fact rows are grouped by the propagated join
+    key ONCE and each bucket is aggregated with the real engine (O(fact_rows +
+    values)). The dimension->fact mapping reuses the engine's own relationship
+    propagation (``_get_cross_table_filters`` / multi-hop ``_find_rel_path``),
+    so results are identical to the per-value path.
+
+    Returns ``{measure_name: {dim_value: result}}`` covering ONLY the measures
+    it could safely bucket. Measures that are not simple aggregations, or whose
+    join key maps a fact row to more than one dimension value (ambiguous), are
+    omitted so the caller can evaluate them the slow-but-exact way.
+    """
+    # Which requested measures are eligible? name -> (func, table, col)
+    specs = {}
+    for name in measure_names:
+        parsed = _parse_simple_agg(measures.get(name, ""))
+        if parsed is None:
+            continue
+        _func, tname, _cname = parsed
+        if tname not in tables:
+            continue
+        specs[name] = tname
+    if not specs:
+        return {}
+
+    # base filter context WITHOUT the iterated dimension (the per-value path
+    # overwrites fc[dimension] per value, so the dimension must not be part of
+    # the constant base filter).
+    base_fc_no_dim = {k: v for k, v in (base_fc or {}).items() if k != dimension}
+
+    # group eligible measures by their fact table (shared bucketing)
+    by_table: dict = {}
+    for name, tname in specs.items():
+        by_table.setdefault(tname, []).append(name)
+
+    col_helper = DAXContext(tables, measures, date_table, date_column, {}, relationships)
+    fast: dict = {}
+
+    for ftbl_name, ms in by_table.items():
+        ftbl = tables[ftbl_name]
+
+        # --- filter the fact table by the base context ONCE ---
+        base_ctx = DAXContext(tables, measures, date_table, date_column,
+                              base_fc_no_dim, relationships)
+        base_rows = base_ctx.get_filtered_rows(ftbl_name)
+
+        # --- bucket base-filtered rows by dimension value ---
+        # buckets are keyed by str(val) for the direct case (dimension column on
+        # the aggregated table) and by the value object for the cross-table
+        # case; `key_is_str` records which so the aggregation loop resolves the
+        # right key.
+        buckets: dict = {}
+        if ftbl_name == dim_table:
+            dcol_idx = col_helper._find_col_idx(ftbl["columns"], dim_col)
+            if dcol_idx < 0:
+                continue
+            wanted = set(str(v) for v in unique_vals)
+            for row in base_rows:
+                key = str(row[dcol_idx])
+                if key in wanted:
+                    buckets.setdefault(key, []).append(row)
+            key_is_str = True
+        else:
+            # cross-table: reuse the engine's propagation to map each fact join
+            # key to a single dimension value (fall back on ambiguity).
+            fact_col_idx = None
+            key_to_value: dict = {}
+            ok = True
+            for val in unique_vals:
+                probe = DAXContext(tables, measures, date_table, date_column,
+                                   {dimension: [val]}, relationships)
+                cross = probe._get_cross_table_filters(ftbl_name)
+                if len(cross) != 1:
+                    ok = False
+                    break
+                allowed, idx = cross[0]
+                if fact_col_idx is None:
+                    fact_col_idx = idx
+                elif fact_col_idx != idx:
+                    ok = False
+                    break
+                for k in allowed:
+                    if k in key_to_value and key_to_value[k] != val:
+                        ok = False  # one fact key maps to two dimension values
+                        break
+                    key_to_value[k] = val
+                if not ok:
+                    break
+            if not ok or fact_col_idx is None:
+                continue
+            for row in base_rows:
+                v = key_to_value.get(str(row[fact_col_idx]))
+                if v is not None:
+                    buckets.setdefault(v, []).append(row)
+            key_is_str = False
+
+        # --- aggregate each bucket with the real engine (empty filter) ---
+        for val in unique_vals:
+            bkey = str(val) if key_is_str else val
+            brows = buckets.get(bkey, [])
+            tables_copy = dict(tables)
+            tables_copy[ftbl_name] = {**ftbl, "rows": brows}
+            res = evaluate_measures_batch(list(ms), tables_copy, measures, {},
+                                          date_table, date_column, relationships)
+            for name in ms:
+                fast.setdefault(name, {})[val] = res.get(name)
+
+    return fast
 
 
 def _find_selectedvalue_targets(expr: str) -> list:
