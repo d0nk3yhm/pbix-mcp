@@ -48,7 +48,7 @@ src/pbix_mcp/
     requests.py          # Tool input models (FilterContext, DimensionRef)
     responses.py         # Tool output models (ToolResponse, DAXEvalResponse)
 tests/
-  test_dax_engine.py     # Unit tests (55; 6 skip without private files)
+  test_dax_engine.py     # Unit tests (55; 6 skip without the public test corpus)
   test_dax_accuracy.py   # Accuracy tests (50)
   test_golden.py         # Golden tests (48; 3 skip without the public test corpus)
   test_fixtures.py       # Fixture tests (18; ships with repo)

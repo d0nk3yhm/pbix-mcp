@@ -103,7 +103,7 @@ Add cultures, translate table/column/measure names, list/remove cultures.
 List/remove M partitions. `pbix_add_partition` blocked for PBIX (needs PartitionStorage), works for PBIP/TMDL export.
 
 ### Incremental Refresh (2)
-Get/set incremental refresh policies. `pbix_set_incremental_refresh` blocked — requires DataMashup with RangeStart/RangeEnd M parameters.
+Get/set incremental refresh policies. `pbix_set_incremental_refresh` works for files with a data source (source_csv/source_db); embedded-only files return a clear error (same as PBI Desktop).
 
 ### Diagnostics & Security (5)
 17-point diagnostic (`pbix_doctor`), report documentation (`pbix_document`), file diff (`pbix_diff`), performance analysis (`pbix_performance`), password extraction (`pbix_get_password`).
