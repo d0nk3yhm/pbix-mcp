@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Live PBI Desktop (March 2026) via ADOMD: an empty table with a String column now loads and queries (`EVALUATE VALUES(T[S])` returns an empty set, `SUMMARIZECOLUMNS`/`TOPN` succeed, storage DMVs report the real columns instead of the empty-fallback database); an empty **and** a populated table coexist in one model (`INFO.TABLES()` returns both; the populated table still reports its 20 rows and its measure evaluates correctly).
 - Zero-row structure matches Desktop ground truth: `SegmentMapStorage` RecordCount=0 / SegmentCount=1 / RecordsPerSegment=0, Partition Type=4 / Mode=0 / DataView=3, no phantom H$ system tables.
 - Regression tests pin all three conventions (no page for an empty string store, MatType=2 + DDC=0 on empty tables, MatType=3 retained on populated RowNumber).
-- Full test suite: 227 collected, 199 passed, 28 skipped (corpus-dependent), 0 failures; ruff clean; mypy 169 (CI baseline 175).
+- Full test suite: 234 collected, 206 passed, 28 skipped (corpus-dependent), 0 failures; ruff clean; mypy 169 (CI baseline 175).
 
 ## [0.9.4] - 2026-07-16
 

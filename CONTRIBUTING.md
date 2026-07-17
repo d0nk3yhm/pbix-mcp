@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast unit tests only (199 pass, 9 skip, 19 slow/integration deselected)
+# Fast unit tests only (206 pass, 9 skip, 19 slow/integration deselected)
 pytest -m "not slow"
 
 # Download public test corpus, then run integration tests
@@ -50,7 +50,7 @@ src/pbix_mcp/
 tests/
   test_dax_engine.py     # Unit tests (55; 6 skip without private files)
   test_dax_accuracy.py   # Accuracy tests (50)
-  test_golden.py         # Golden tests (41; 3 skip without the public test corpus)
+  test_golden.py         # Golden tests (48; 3 skip without the public test corpus)
   test_fixtures.py       # Fixture tests (18; ships with repo)
   test_beta_features.py  # Beta feature tests (10; RLS, password, doctor)
   test_cross_report.py   # Integration tests (19; requires the public test corpus:
