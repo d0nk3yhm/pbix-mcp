@@ -75,22 +75,19 @@ Every layer of the PBIX is generated from scratch — no templates or skeletons:
 
 ### Empty tables (`rows=[]`)
 
-**Tables created with no rows do not open in PBI Desktop.** A never-processed,
-zero-row Import table is not a representable VertiPaq state — Desktop itself
-never produces one (its "empty" tables are calculated tables, DirectQuery, or
-an Import partition *processed* to zero rows, which still emits valid empty
-segment structures). Files containing one load with the table dropped, after
-which DAX reports "queries only work on databases with at least one table".
+Supported as of 0.9.5 — a table with columns but no rows opens and queries in
+PBI Desktop (`COUNTROWS` returns blank, `VALUES` returns an empty set). The
+zero-row representation mirrors Desktop's own empty-table convention:
 
-`_pre_build_checks()` warns explicitly when a table has no rows. Workarounds:
-
-- Add at least one row, or
-- Use `source_csv` / `source_db` so Refresh populates the table from the source.
-
-Note: the *metadata* for empty columns is correct as of 0.9.3 — such columns use
-`AttributeHierarchyStorage.MaterializationType=3` with no H$ system table (a
-previous bug emitted phantom H$ tables with dangling `SegmentMapStorage`
-references). The remaining limitation is the zero-row partition itself.
+- Zero-row partition: `SegmentMapStorage` RecordCount=0, SegmentCount=1,
+  RecordsPerSegment=0 (Type=3), Partition Type=4 / Mode=0 / DataView=3
+- `AttributeHierarchyStorage.MaterializationType=2` with `DistinctDataCount=0`
+  and no H$ system table (Desktop uses MatType=2 for its own zero-row table;
+  MatType=3 is reserved for the RowNumber of a *populated* table)
+- Empty **string** stores carry **no dictionary page** (`store_page_count=0`).
+  A page with `allocation_size=0` has a null character buffer, which Analysis
+  Services' string-store consistency check rejects
+  (`PFE_XM_DBCC_STRINGSTORE_CORRUPT`) — a store with no strings has no page.
 
 ### Other builder notes
 - Fixed RowNumber GUID: 2662979B-1795-4F74-8F37-6A1BA8059B61
