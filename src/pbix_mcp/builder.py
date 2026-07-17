@@ -419,12 +419,7 @@ class PBIXBuilder:
             if not t["columns"]:
                 issues.append(f"CRITICAL: Table '{t['name']}' has no columns")
             if not t["rows"]:
-                issues.append(
-                    f"WARNING: Table '{t['name']}' has no rows (empty table) — "
-                    f"PBI Desktop cannot open files containing truly empty "
-                    f"embedded tables. Add at least one row, or use "
-                    f"source_csv/source_db so Refresh populates it."
-                )
+                issues.append(f"WARNING: Table '{t['name']}' has no rows (empty table)")
             # Check row data matches column definitions
             col_names = {c["name"] for c in t["columns"]}
             for i, row in enumerate(t.get("rows", [])):
@@ -1347,6 +1342,11 @@ def _modify_metadata_and_encode(
                 (rn_ah_id, rn_col_id, rn_ahs_id,
                  _FIXED_TIMESTAMP),
             )
+            # RowNumber MaterializationType: PBI Desktop ground truth uses 3 for
+            # tables that have rows, and 2 for a zero-row table (its own
+            # '# Measures' holder table: MatType=2, DistinctDataCount=0, while
+            # every populated table's RowNumber is MatType=3).
+            _rn_rows = len(tdef.get("rows", []))
             c.execute(
                 """INSERT INTO AttributeHierarchyStorage (
                     ID, AttributeHierarchyID, SortOrder, OptimizationLevel,
@@ -1354,10 +1354,10 @@ def _modify_metadata_and_encode(
                     DistinctDataCount, DataVersion, StorageFileID,
                     SystemTableID, HasStatistics
                 ) VALUES (?, ?, 0, 0,
-                    3, -1, -1,
+                    ?, -1, -1,
                     ?, 1, 0,
                     0, 1)""",
-                (rn_ahs_id, rn_ah_id, len(tdef.get("rows", []))),
+                (rn_ahs_id, rn_ah_id, 3 if _rn_rows else 2, _rn_rows),
             )
 
             # ============================================================
@@ -1961,11 +1961,14 @@ def _modify_metadata_and_encode(
                     (ah_id, col_id, ahs_id, _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
                 )
 
-                # For empty columns (distinct==0), use MatType=3: the hierarchy
-                # is not materialized, so NO H$ table/partition/storage rows may
-                # exist. (Previously the H$ shells were inserted before this
-                # guard, leaving phantom tables with dangling SegmentMapStorage
+                # For empty columns (distinct==0) the hierarchy is not
+                # materialized, so NO H$ table/partition/storage rows may exist.
+                # (Previously the H$ shells were inserted before this guard,
+                # leaving phantom tables with dangling SegmentMapStorage
                 # references — Desktop rejected such files at load.)
+                # MaterializationType=2 is Desktop's "empty" convention: its own
+                # zero-row table uses MatType=2/DistinctDataCount=0, and Desktop
+                # never uses MatType=3 on a user column (3 is RowNumber-only).
                 if distinct == 0:
                     c.execute(
                         """INSERT INTO AttributeHierarchyStorage (
@@ -1975,7 +1978,7 @@ def _modify_metadata_and_encode(
                             SystemTableID, HasStatistics, MinValue, MaxValue,
                             StringValueMaxLength
                         ) VALUES (?, ?, 0, 0,
-                            3, -1, -1,
+                            2, -1, -1,
                             0, 1, 0,
                             0, 1, ?, ?, ?)""",
                         (ahs_id, ah_id, min_val, max_val, max_strlen),

@@ -420,6 +420,22 @@ def _encode_string_dictionary(unique_strings: list[str]) -> bytes:
     buf += _s4(DICT_TYPE_STRING)
     buf += _encode_dict_hash_info(unique_strings, DICT_TYPE_STRING)
 
+    if count == 0:
+        # --- Empty store: NO pages ---
+        # A page whose allocation_size is 0 has a zero-size/NULL character
+        # buffer, which trips Analysis Services' string-store consistency
+        # checks (XMStringStorePage::CheckInternalConsistency rejects
+        # m_cbAllocSize <= 0 / m_rgBufferForStrings == nullptr) and the file
+        # fails to open with PFE_XM_DBCC_STRINGSTORE_CORRUPT. A store with no
+        # strings therefore carries no page at all — there is nothing to check.
+        buf += _s8(0)   # store_string_count
+        buf += _u1(1)   # f_store_compressed
+        buf += _s8(0)   # store_longest_string
+        buf += _s8(0)   # store_page_count — no pages
+        buf += _u8(0)   # record handle element_count
+        buf += _u4(8)   # element_size
+        return bytes(buf)
+
     compress = total_chars > _COMPRESS_CHAR_THRESHOLD
 
     if not compress:

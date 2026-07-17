@@ -943,6 +943,146 @@ class TestAddTableRowValidation:
         assert b._tables[-1]["rows"] == [{"A": 1}, {"A": 2}]
 
 
+class TestEmptyTable:
+    """Zero-row tables (`rows=[]`) must open in PBI Desktop.
+
+    Conventions verified against Desktop ground truth (its own zero-row
+    '# Measures' holder table) and against the live engine.
+    """
+
+    def _empty_meta(self):
+        import io
+        import tempfile
+        import zipfile
+
+        from pbix_mcp.builder import PBIXBuilder
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        b = PBIXBuilder()
+        b.add_table("E", [{"name": "S", "data_type": "String"},
+                          {"name": "N", "data_type": "Int64"}], rows=[])
+        b.add_page("P1")
+        with pytest.warns(UserWarning):
+            pbix = b.build()
+        abf = decompress_datamodel(zipfile.ZipFile(io.BytesIO(pbix)).read("DataModel"))
+        meta = read_metadata_sqlite(abf)
+        tmp = tempfile.mktemp(suffix=".db")
+        with open(tmp, "wb") as f:
+            f.write(meta)
+        return tmp
+
+    def test_empty_string_store_has_no_page(self):
+        """A page with allocation_size=0 has a null char buffer, which AS's
+        string-store consistency check rejects (PFE_XM_DBCC_STRINGSTORE_CORRUPT).
+        A store with zero strings must carry no page at all."""
+        import struct
+
+        from pbix_mcp.formats.vertipaq_encoder import _encode_string_dictionary
+
+        blob = _encode_string_dictionary([])
+        # dict_type(4) + hash(24) + count(8) + f_compressed(1) + longest(8)
+        page_count = struct.unpack_from("<q", blob, 4 + 24 + 8 + 1 + 8)[0]
+        assert page_count == 0, "empty string store must emit no dictionary page"
+
+    def test_empty_string_dict_roundtrips(self):
+        from pbix_mcp.formats.vertipaq_decoder import decode_dictionary
+        from pbix_mcp.formats.vertipaq_encoder import _encode_string_dictionary
+
+        dt, vals = decode_dictionary(_encode_string_dictionary([]))
+        assert vals == []
+
+    def test_empty_table_rownumber_materialization_type_is_2(self):
+        """Desktop: RowNumber MatType=3 when the table has rows, 2 when empty
+        (its own zero-row '# Measures' table uses 2 / DistinctDataCount=0)."""
+        import os
+        import sqlite3
+
+        tmp = self._empty_meta()
+        try:
+            conn = sqlite3.connect(tmp)
+            rows = conn.execute("""
+                SELECT c.Type, ahs.MaterializationType, ahs.DistinctDataCount
+                FROM Column c
+                JOIN [Table] t ON c.TableID = t.ID
+                JOIN AttributeHierarchy ah ON ah.ColumnID = c.ID
+                JOIN AttributeHierarchyStorage ahs
+                  ON ah.AttributeHierarchyStorageID = ahs.ID
+                WHERE t.Name = 'E'
+            """).fetchall()
+            conn.close()
+        finally:
+            os.unlink(tmp)
+        assert rows
+        for _col_type, mat_type, ddc in rows:
+            assert mat_type == 2, "empty table columns use MaterializationType=2"
+            assert ddc == 0
+
+    def test_empty_table_zero_row_partition(self):
+        """SegmentMapStorage for a zero-row partition: RecordCount=0,
+        SegmentCount=1, RecordsPerSegment=0 (Desktop ground truth)."""
+        import os
+        import sqlite3
+
+        tmp = self._empty_meta()
+        try:
+            conn = sqlite3.connect(tmp)
+            sms = conn.execute("""
+                SELECT sms.RecordCount, sms.SegmentCount, sms.RecordsPerSegment
+                FROM SegmentMapStorage sms
+                JOIN PartitionStorage ps ON ps.SegmentMapStorageID = sms.ID
+                JOIN [Partition] p ON p.PartitionStorageID = ps.ID
+                JOIN [Table] t ON p.TableID = t.ID
+                WHERE t.Name = 'E'
+            """).fetchone()
+            # and no phantom H$ tables for the empty columns
+            hs = conn.execute(
+                "SELECT Name FROM [Table] WHERE Name LIKE 'H$E%'").fetchall()
+            conn.close()
+        finally:
+            os.unlink(tmp)
+        assert sms == (0, 1, 0)
+        assert hs == []
+
+    def test_populated_table_rownumber_still_mattype_3(self):
+        """Regression guard: populated tables must keep RowNumber MatType=3."""
+        import io
+        import os
+        import sqlite3
+        import tempfile
+        import zipfile
+
+        from pbix_mcp.builder import PBIXBuilder
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        b = PBIXBuilder()
+        b.add_table("D", [{"name": "S", "data_type": "String"}],
+                    rows=[{"S": "a"}, {"S": "b"}])
+        b.add_page("P1")
+        pbix = b.build()
+        abf = decompress_datamodel(zipfile.ZipFile(io.BytesIO(pbix)).read("DataModel"))
+        meta = read_metadata_sqlite(abf)
+        tmp = tempfile.mktemp(suffix=".db")
+        with open(tmp, "wb") as f:
+            f.write(meta)
+        try:
+            conn = sqlite3.connect(tmp)
+            rn = conn.execute("""
+                SELECT ahs.MaterializationType, ahs.DistinctDataCount
+                FROM Column c
+                JOIN [Table] t ON c.TableID = t.ID
+                JOIN AttributeHierarchy ah ON ah.ColumnID = c.ID
+                JOIN AttributeHierarchyStorage ahs
+                  ON ah.AttributeHierarchyStorageID = ahs.ID
+                WHERE t.Name = 'D' AND c.Type = 3
+            """).fetchone()
+            conn.close()
+        finally:
+            os.unlink(tmp)
+        assert rn == (3, 2), "populated RowNumber stays MatType=3, DDC=rowcount"
+
+
 class TestCompressedStringStore:
     """Huffman-compressed string dictionaries (MS-XLDM §2.7.4): encode above
     the size threshold, decode via the xmhuffman primitive. Round-trip through
