@@ -510,12 +510,12 @@ PBIX_TEST_SAMPLES=test_corpus pytest tests/test_cross_report.py -v
 |-------|-------|--------|-------------|
 | `test_dax_engine.py` | 55 | `unit` | 6 skip without private files |
 | `test_dax_accuracy.py` | 50 | `unit` | No |
-| `test_golden.py` | 41 | `golden` | 3 skip without the public test corpus |
+| `test_golden.py` | 48 | `golden` | 3 skip without the public test corpus |
 | `test_fixtures.py` | 18 | `unit` | No (ships with repo) |
 | `test_beta_features.py` | 10 | `unit` | No |
 | `test_cross_report.py` | 19 | `slow`, `integration` | Yes (4 public PBIX dashboards) |
 
-**From a fresh clone: 227 tests collected, 199 passed, 28 skipped, 0 failures.** The skipped tests require the public test corpus or private PBIX files. Download the corpus with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus`.
+**From a fresh clone: 234 tests collected, 206 passed, 28 skipped, 0 failures.** The skipped tests require the public test corpus or private PBIX files. Download the corpus with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus`.
 
 ## Architecture
 

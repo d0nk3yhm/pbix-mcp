@@ -950,7 +950,11 @@ class TestEmptyTable:
     '# Measures' holder table) and against the live engine.
     """
 
-    def _empty_meta(self):
+    ALL_TYPES = ["String", "Int64", "Double", "DateTime", "Decimal", "Boolean"]
+
+    @staticmethod
+    def _meta_for(columns, table="E", rows=None):
+        """Build a PBIX and return a temp path to its metadata SQLite."""
         import io
         import tempfile
         import zipfile
@@ -960,10 +964,12 @@ class TestEmptyTable:
         from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
 
         b = PBIXBuilder()
-        b.add_table("E", [{"name": "S", "data_type": "String"},
-                          {"name": "N", "data_type": "Int64"}], rows=[])
+        b.add_table(table, columns, rows=rows if rows is not None else [])
         b.add_page("P1")
-        with pytest.warns(UserWarning):
+        if not rows:
+            with pytest.warns(UserWarning):
+                pbix = b.build()
+        else:
             pbix = b.build()
         abf = decompress_datamodel(zipfile.ZipFile(io.BytesIO(pbix)).read("DataModel"))
         meta = read_metadata_sqlite(abf)
@@ -971,6 +977,76 @@ class TestEmptyTable:
         with open(tmp, "wb") as f:
             f.write(meta)
         return tmp
+
+    def _empty_meta(self):
+        return self._meta_for([{"name": "S", "data_type": "String"},
+                               {"name": "N", "data_type": "Int64"}])
+
+    @pytest.mark.parametrize("data_type", ALL_TYPES)
+    def test_empty_table_every_data_type(self, data_type):
+        """Every one of the 6 data types must produce a valid zero-row table:
+        SegmentMapStorage 0/1/0, AHS MatType=2 / DDC=0, and no phantom H$."""
+        import os
+        import sqlite3
+
+        tmp = self._meta_for([{"name": "C", "data_type": data_type}])
+        try:
+            conn = sqlite3.connect(tmp)
+            sms = conn.execute("""
+                SELECT sms.RecordCount, sms.SegmentCount, sms.RecordsPerSegment
+                FROM SegmentMapStorage sms
+                JOIN PartitionStorage ps ON ps.SegmentMapStorageID = sms.ID
+                JOIN [Partition] p ON p.PartitionStorageID = ps.ID
+                JOIN [Table] t ON p.TableID = t.ID
+                WHERE t.Name = 'E'
+            """).fetchone()
+            ahs = conn.execute("""
+                SELECT DISTINCT ahs.MaterializationType, ahs.DistinctDataCount
+                FROM Column c
+                JOIN [Table] t ON c.TableID = t.ID
+                JOIN AttributeHierarchy ah ON ah.ColumnID = c.ID
+                JOIN AttributeHierarchyStorage ahs
+                  ON ah.AttributeHierarchyStorageID = ahs.ID
+                WHERE t.Name = 'E'
+            """).fetchall()
+            hs = conn.execute(
+                "SELECT Name FROM [Table] WHERE Name LIKE 'H$E%'").fetchall()
+            dangling = conn.execute("""
+                SELECT ps.ID FROM PartitionStorage ps
+                LEFT JOIN SegmentMapStorage sms ON ps.SegmentMapStorageID = sms.ID
+                WHERE ps.SegmentMapStorageID != 0 AND sms.ID IS NULL
+            """).fetchall()
+            conn.close()
+        finally:
+            os.unlink(tmp)
+        assert sms == (0, 1, 0), f"{data_type}: zero-row SegmentMapStorage"
+        assert ahs == [(2, 0)], f"{data_type}: empty columns use MatType=2/DDC=0"
+        assert hs == [], f"{data_type}: no phantom H$ tables"
+        assert dangling == [], f"{data_type}: no dangling storage refs"
+
+    def test_empty_table_all_six_types_together(self):
+        import os
+        import sqlite3
+
+        tmp = self._meta_for([{"name": f"C_{t}", "data_type": t}
+                              for t in self.ALL_TYPES])
+        try:
+            conn = sqlite3.connect(tmp)
+            n = conn.execute("""
+                SELECT COUNT(*) FROM Column c JOIN [Table] t ON c.TableID = t.ID
+                WHERE t.Name = 'E'""").fetchone()[0]
+            ahs = conn.execute("""
+                SELECT DISTINCT ahs.MaterializationType
+                FROM Column c JOIN [Table] t ON c.TableID = t.ID
+                JOIN AttributeHierarchy ah ON ah.ColumnID = c.ID
+                JOIN AttributeHierarchyStorage ahs
+                  ON ah.AttributeHierarchyStorageID = ahs.ID
+                WHERE t.Name = 'E'""").fetchall()
+            conn.close()
+        finally:
+            os.unlink(tmp)
+        assert n == len(self.ALL_TYPES) + 1  # + RowNumber
+        assert ahs == [(2,)]
 
     def test_empty_string_store_has_no_page(self):
         """A page with allocation_size=0 has a null char buffer, which AS's
