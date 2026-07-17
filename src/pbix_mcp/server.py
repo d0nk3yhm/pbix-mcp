@@ -67,6 +67,75 @@ _open_files: dict[str, dict] = {}
 # }
 
 
+# ---------------------------------------------------------------------------
+# ZIP extraction safety limits (guard against decompression bombs and
+# path-traversal in untrusted .pbix / .pbit / .pbiviz archives).
+#   - Python's own extractall() already strips leading "/" and ".." components
+#     and never materialises symlink entries, so classic Zip-Slip is mitigated;
+#     these limits add the missing size caps and a defence-in-depth containment
+#     check so a small crafted archive cannot fill the disk or escape work_dir.
+# ---------------------------------------------------------------------------
+_ZIP_MAX_TOTAL_UNCOMPRESSED = 4 * 1024**3   # 4 GiB across all members
+_ZIP_MAX_FILE_UNCOMPRESSED = 2 * 1024**3    # 2 GiB for any single member
+_ZIP_MAX_MEMBERS = 20000                    # PBIX has ~dozens; this is headroom
+_ZIP_MAX_RATIO = 100                        # uncompressed:compressed per member
+_ZIP_RATIO_MIN_SIZE = 1 << 16               # only ratio-check members >= 64 KiB
+
+
+def _validate_zip_members(zf: "zipfile.ZipFile", dest: str) -> None:
+    """Reject decompression bombs and path-traversal before extracting.
+
+    Raises InvalidPBIXError on any violation. Validates the whole archive up
+    front so a malicious file is refused before a single byte is written.
+    """
+    infos = zf.infolist()
+    if len(infos) > _ZIP_MAX_MEMBERS:
+        raise InvalidPBIXError(
+            f"Archive has too many entries ({len(infos)} > {_ZIP_MAX_MEMBERS}); "
+            "refusing to extract (possible zip bomb)."
+        )
+    dest_real = os.path.realpath(dest)
+    total = 0
+    for zi in infos:
+        # --- size / decompression-bomb caps ---
+        total += zi.file_size
+        if zi.file_size > _ZIP_MAX_FILE_UNCOMPRESSED:
+            raise InvalidPBIXError(
+                f"Archive member '{zi.filename}' is too large "
+                f"({zi.file_size} bytes > {_ZIP_MAX_FILE_UNCOMPRESSED}); "
+                "refusing to extract (possible zip bomb)."
+            )
+        if total > _ZIP_MAX_TOTAL_UNCOMPRESSED:
+            raise InvalidPBIXError(
+                f"Archive expands to more than {_ZIP_MAX_TOTAL_UNCOMPRESSED} "
+                "bytes uncompressed; refusing to extract (possible zip bomb)."
+            )
+        if (
+            zi.file_size >= _ZIP_RATIO_MIN_SIZE
+            and zi.compress_size > 0
+            and zi.file_size / zi.compress_size > _ZIP_MAX_RATIO
+        ):
+            raise InvalidPBIXError(
+                f"Archive member '{zi.filename}' has a suspicious compression "
+                f"ratio ({zi.file_size // max(zi.compress_size, 1)}:1); "
+                "refusing to extract (possible zip bomb)."
+            )
+        # --- path containment (defence in depth over extractall's own sanitising) ---
+        target = os.path.realpath(os.path.join(dest, zi.filename))
+        if target != dest_real and not target.startswith(dest_real + os.sep):
+            raise InvalidPBIXError(
+                f"Archive member '{zi.filename}' resolves outside the "
+                "extraction directory; refusing to extract (path traversal)."
+            )
+        # --- reject symlink entries (belt-and-suspenders: CPython never
+        #     creates them, but do not even consider such an archive valid) ---
+        if (zi.external_attr >> 16) & 0o170000 == 0o120000:
+            raise InvalidPBIXError(
+                f"Archive member '{zi.filename}' is a symlink; "
+                "refusing to extract."
+            )
+
+
 # ============================= HELPERS =====================================
 
 def _ensure_open(alias: str) -> dict:
@@ -79,8 +148,9 @@ def _ensure_open(alias: str) -> dict:
 
 
 def _extract_pbix(pbix_path: str, work_dir: str) -> None:
-    """Extract a PBIX/PBIT ZIP to work_dir."""
+    """Extract a PBIX/PBIT ZIP to work_dir (with bomb / traversal guards)."""
     with zipfile.ZipFile(pbix_path, "r") as zf:
+        _validate_zip_members(zf, work_dir)
         zf.extractall(work_dir)
 
 
@@ -1083,7 +1153,12 @@ def pbix_save(alias: str, output_path: str = "", overwrite: bool = False, backup
             shutil.copy2(target, backup_path)
 
         _repack_pbix(work_dir, target, strip_sensitivity_label=strip_sensitivity_label)
-        info["modified"] = False
+        # Only mark the session clean when we wrote back to the ORIGINAL file.
+        # Exporting a copy elsewhere must leave it dirty, otherwise a later
+        # pbix_close (without force) would silently discard the work-dir edits
+        # and the original on disk would never receive them.
+        if target == info["path"]:
+            info["modified"] = False
         # Clear DAX cache since data may have changed
         _dax_cache.pop(alias, None)
         size = os.path.getsize(target)
@@ -1663,14 +1738,32 @@ def pbix_add_visual(
                 if not any(i.get("name") == item_name for i in items):
                     items.append({"type": 100, "path": item_name, "name": item_name})
 
-        # Clamp position to stay within page bounds.
         page = sections[page_index]
-        page_w = page.get("width", 1280)
-        page_h = page.get("height", 720)
-        x = min(float(x), page_w - width)
-        y = min(float(y), page_h - height)
-        x = max(0.0, x)
-        y = max(0.0, y)
+        # If this visual belongs to a singleVisualGroup, its container x/y are
+        # stored RELATIVE to the group origin — pbix_get_visual_positions adds
+        # the group origin back on read. Convert the caller's ABSOLUTE coords to
+        # group-relative so a grouped child is not corrupted; only top-level
+        # visuals are page-clamped.
+        group_origin = None
+        parent_group = config.get("parentGroupName")
+        if parent_group:
+            for _vc in page.get("visualContainers", []):
+                _cfg = _parse_visual_config(_vc)
+                if _cfg.get("name") == parent_group and _cfg.get("singleVisualGroup"):
+                    group_origin = (float(_vc.get("x", 0)), float(_vc.get("y", 0)))
+                    break
+
+        if group_origin is not None:
+            x = float(x) - group_origin[0]
+            y = float(y) - group_origin[1]
+        else:
+            # Clamp position to stay within page bounds.
+            page_w = page.get("width", 1280)
+            page_h = page.get("height", 720)
+            x = min(float(x), page_w - width)
+            y = min(float(y), page_h - height)
+            x = max(0.0, x)
+            y = max(0.0, y)
 
         # Update layouts position if present (image visuals)
         if "layouts" in config:
@@ -6776,14 +6869,20 @@ def pbix_get_default_filters(alias: str, page_index: int = 0) -> str:
         filters = _extract_default_filters_dict(info["work_dir"], page_index)
 
         if not filters:
-            return "No default slicer filters found on this page."
+            return ToolResponse.ok(
+                "No default slicer filters found on this page.",
+                data={"filters": {}},
+            ).to_text()
 
         lines = ["Default slicer filters:\n"]
         for key, vals in filters.items():
             lines.append(f"  {key}: {vals}")
         lines.append("\nUse as filter_context in pbix_evaluate_dax:")
         lines.append(f"  {json.dumps(filters)}")
-        return "\n".join(lines)
+        # Wrap in the standard envelope like every other tool, and expose the
+        # parsed filters as structured data so programmatic consumers do not
+        # have to scrape the rendered message.
+        return ToolResponse.ok("\n".join(lines), data={"filters": filters}).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:

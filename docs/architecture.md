@@ -30,7 +30,7 @@ src/pbix_mcp/
 
 ### Reading a PBIX
 
-1. `pbix_open` extracts the ZIP to a temp directory
+1. `pbix_open` extracts the ZIP to a temp directory (members are validated first — decompression-bomb size/ratio caps and path-traversal/symlink rejection)
 2. Report/Layout is parsed as JSON for visual/page operations
 3. DataModel is XPress9-compressed; decompress to get ABF archive
 4. ABF contains SQLite metadata + VertiPaq column data
