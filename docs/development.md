@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast tests (223 pass, 9 skip, 19 slow/integration deselected)
+# Fast tests (229 pass, 9 skip, 19 slow/integration deselected)
 pytest -m "not slow"
 
 # With coverage
@@ -36,6 +36,7 @@ PBIX_TEST_SAMPLES=test_corpus pytest -v
 | `test_dax_multihop.py` | Multi-hop (snowflake) DAX filter propagation | 6 |
 | `test_found_issues.py` | OpenBI-found regressions (save flag, envelope, group coords, MAXID) | 6 |
 | `test_zip_safety.py` | PBIX/ZIP extraction hardening (bomb + traversal) | 5 |
+| `test_perf_per_dimension.py` | Bucketed per-dimension eval (correctness + perf) | 6 |
 
 ## Public Test Corpus
 
@@ -57,7 +58,7 @@ ruff check src/ tests/
 python -m mypy src/pbix_mcp/ --ignore-missing-imports
 ```
 
-mypy has 172 errors (CI baseline is 175 — see `.github/workflows/ci.yml`). CI fails if error count exceeds 175. Tracked for gradual cleanup.
+mypy has 162 errors (CI baseline is 175 — see `.github/workflows/ci.yml`). CI fails if error count exceeds 175. Tracked for gradual cleanup.
 
 ## Adding a New DAX Function
 

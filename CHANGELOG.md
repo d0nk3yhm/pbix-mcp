@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.7] - 2026-07-18
+
+### Performance
+- **`pbix_evaluate_dax_per_dimension` no longer re-scans the fact table per dimension value.** It previously re-filtered the entire fact table once for every dimension value (O(values × fact_rows)) — fine at demo scale, slow on large models with many categories. For simple aggregation measures (`SUM`/`AVERAGE`/`MIN`/`MAX`/`COUNT`/`DISTINCTCOUNT` of a column, or `COUNTROWS` of a table) the fact rows are now grouped by the propagated join key **once** and each bucket is aggregated with the real engine (O(fact_rows + values)). The dimension→fact mapping reuses the engine's own relationship propagation, including the 0.9.6 multi-hop (snowflake) path, so results are byte-for-byte identical to the per-value path. Any measure that is not a simple aggregation — or whose join key maps a fact row to more than one dimension value — transparently falls back to the exact per-value evaluation, so **no returned value changes**.
+
+### Verified
+- Optimized output equals an independent group-by over a 200,000-row / 50-value model and equals the previous per-value engine path exactly; multi-hop snowflake bucketing verified; complex measures confirmed to fall back.
+- Perf guard test asserts total fact-row scans stay O(fact_rows), independent of `max_values` (the old path scaled ~`max_values × fact_rows`).
+- Full test suite: 257 collected, 229 passed, 28 skipped (corpus-dependent), 0 failures; ruff clean; mypy 162 (CI baseline 175 — improved via `Optional` annotations on `DAXContext`).
+
 ## [0.9.6] - 2026-07-17
 
 ### Fixed
