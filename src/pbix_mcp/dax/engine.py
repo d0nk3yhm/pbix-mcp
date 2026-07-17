@@ -78,6 +78,30 @@ class DAXContext:
                 if ft and tt and fc and tc:
                     self._rel_index[(ft, tt)] = {'from_col': fc, 'to_col': tc}
                     self._rel_index[(tt, ft)] = {'from_col': tc, 'to_col': fc}
+        # Directed adjacency for MULTI-HOP (snowflake) filter propagation.
+        # A filter propagates along the default cross-filter direction: from the
+        # "one" side (ToTable) to the "many" side (FromTable). Each edge carries
+        # the join columns on both endpoints so a filter can be chained hop by
+        # hop. Bidirectional relationships (CrossFilteringBehavior == 2) also add
+        # the reverse edge. Only used when no DIRECT relationship exists, so the
+        # existing single-hop behaviour is untouched.
+        #   _rel_adj[a] = [ (b, col_on_a, col_on_b), ... ]
+        #   -> allowed values of a[col_on_a] restrict b[col_on_b]
+        self._rel_adj: dict = {}
+        for rel in self.relationships:
+            if not rel.get('IsActive'):
+                continue
+            ft = rel.get('FromTable', '')
+            tt = rel.get('ToTable', '')
+            fc = rel.get('FromColumn', '')
+            tc = rel.get('ToColumn', '')
+            if not (ft and tt and fc and tc):
+                continue
+            # one -> many (dim -> fact): ToTable -> FromTable
+            self._rel_adj.setdefault(tt, []).append((ft, tc, fc))
+            if rel.get('CrossFilteringBehavior') == 2:
+                # bidirectional: also many -> one
+                self._rel_adj.setdefault(ft, []).append((tt, fc, tc))
 
     @staticmethod
     def _auto_detect_date_table(tables: dict) -> str:
@@ -149,6 +173,18 @@ class DAXContext:
                 # Try via date table special handling (for Year/Month filters on date dim)
                 if src_table == self.date_table:
                     result_filters.extend(self._get_date_cross_filter(table_name, src_tbl, col_filters))
+                    continue
+                # No direct relationship: try a multi-hop (snowflake) path so a
+                # filter on a dimension 2+ hops from the fact is not silently
+                # dropped (e.g. Regions -> Customers -> Orders).
+                path = self._find_rel_path(src_table, table_name)
+                if path:
+                    res = self._propagate_filter_path(src_tbl, col_filters, path, table_name)
+                    # res is None only on a structural error; an (empty) set is a
+                    # real result and MUST be applied so the fact filters to zero
+                    # rows rather than falling back to the grand total.
+                    if res is not None:
+                        result_filters.append(res)
                 continue
 
             # Direct relationship exists: filter source dim table, get join key values
@@ -174,6 +210,66 @@ class DAXContext:
                 result_filters.append((allowed_keys, fact_join_idx))
 
         return result_filters
+
+    def _find_rel_path(self, src_table: str, target_table: str) -> Optional[list]:
+        """BFS the directed relationship graph for a filter-propagation path.
+
+        Returns the shortest list of hops [(cur, nxt, col_on_cur, col_on_nxt), ...]
+        from src_table to target_table, or None if none exists. Direction is
+        enforced by _rel_adj (one->many by default), so a filter cannot leak
+        across a shared fact to a sibling dimension.
+        """
+        if src_table == target_table:
+            return None
+        visited = {src_table}
+        # queue of (table, path_so_far); small graphs, list-as-queue is fine
+        queue: list = [(src_table, [])]
+        while queue:
+            cur, path = queue.pop(0)
+            for (nxt, col_cur, col_nxt) in self._rel_adj.get(cur, []):
+                if nxt in visited:
+                    continue
+                new_path = path + [(cur, nxt, col_cur, col_nxt)]
+                if nxt == target_table:
+                    return new_path
+                visited.add(nxt)
+                queue.append((nxt, new_path))
+        return None
+
+    def _propagate_filter_path(self, src_tbl, col_filters, path, target_table):
+        """Propagate a dimension filter along a multi-hop path to the fact table.
+
+        Returns (allowed_key_set, target_col_idx) to apply to target_table, or
+        None on a structural error (missing column/table). The returned set may
+        be empty — that is a legitimate result (no matching rows) and the caller
+        must apply it rather than dropping the filter.
+        """
+        # Start from the source dimension rows filtered by its own column filters.
+        frontier_rows = src_tbl['rows']
+        for src_col, values in col_filters:
+            idx = self._find_col_idx(src_tbl['columns'], src_col)
+            if idx >= 0:
+                allowed = set(str(v) for v in values)
+                frontier_rows = [r for r in frontier_rows if str(r[idx]) in allowed]
+        frontier_tbl = src_tbl
+        for (cur_name, nxt_name, col_cur, col_nxt) in path:
+            cur_idx = self._find_col_idx(frontier_tbl['columns'], col_cur)
+            if cur_idx < 0:
+                return None
+            allowed_keys = set(str(r[cur_idx]) for r in frontier_rows)
+            nxt_tbl = self.tables.get(nxt_name)
+            if not nxt_tbl:
+                return None
+            nxt_idx = self._find_col_idx(nxt_tbl['columns'], col_nxt)
+            if nxt_idx < 0:
+                return None
+            if nxt_name == target_table:
+                # Final hop: emit the filter for the fact table (empty set is OK).
+                return (allowed_keys, nxt_idx)
+            # Intermediate hop: restrict the next table's rows and continue.
+            frontier_rows = [r for r in nxt_tbl['rows'] if str(r[nxt_idx]) in allowed_keys]
+            frontier_tbl = nxt_tbl
+        return None
 
     def _get_date_cross_filter(self, table_name, date_tbl, col_filters):
         """Handle date dimension filters (Year, Month etc.) that need Date column resolution."""
