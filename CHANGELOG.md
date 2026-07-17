@@ -14,9 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - This removes the 0.9.3 Known Limitation. `_pre_build_checks()` still notes an empty table, but only as information — it is no longer a defect.
 
 ### Verified
-- Live PBI Desktop (March 2026) via ADOMD: an empty table with a String column now loads and queries (`EVALUATE VALUES(T[S])` returns an empty set, `SUMMARIZECOLUMNS`/`TOPN` succeed, storage DMVs report the real columns instead of the empty-fallback database); an empty **and** a populated table coexist in one model (`INFO.TABLES()` returns both; the populated table still reports its 20 rows and its measure evaluates correctly).
-- Zero-row structure matches Desktop ground truth: `SegmentMapStorage` RecordCount=0 / SegmentCount=1 / RecordsPerSegment=0, Partition Type=4 / Mode=0 / DataView=3, no phantom H$ system tables.
-- Regression tests pin all three conventions (no page for an empty string store, MatType=2 + DDC=0 on empty tables, MatType=3 retained on populated RowNumber).
+- **Full empty-table sweep in live PBI Desktop (March 2026) via ADOMD — 13/13 pass.** Each file is checked for the real model loading (not Desktop's empty-fallback database), every expected table present via `INFO.TABLES()`, and exact row counts:
+  - Empty table for **every data type** — String, Int64, Double, DateTime, Decimal, Boolean — individually, and all six together.
+  - **Populated** all-six-types control (regression guard): loads with correct rows and columns.
+  - Empty **+ populated** tables in one model: both present, populated rows and measure evaluate correctly.
+  - Three empty tables in one model; empty table carrying measures (which evaluate); empty table with `nullable: false` columns.
+  - **Relationship pointing at an empty dimension**: loads and the fact-side aggregation evaluates correctly across the join to a zero-row table.
+- Zero-row structure matches Desktop ground truth: `SegmentMapStorage` RecordCount=0 / SegmentCount=1 / RecordsPerSegment=0, Partition Type=4 / Mode=0 / DataView=3, no phantom H$ system tables, no dangling storage references.
+- Regression tests pin the conventions for all six data types (no page for an empty string store, MatType=2 + DDC=0 on empty tables, MatType=3 retained on populated RowNumber).
 - Full test suite: 234 collected, 206 passed, 28 skipped (corpus-dependent), 0 failures; ruff clean; mypy 169 (CI baseline 175).
 
 ## [0.9.4] - 2026-07-16
