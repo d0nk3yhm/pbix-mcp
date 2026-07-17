@@ -7,7 +7,7 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 | Behavior | What happens | Impact |
 |----------|-------------|--------|
 | Unsupported function | Returns `None`, tracked in `unsupported_functions` | Measure result is `None` with status "unsupported" |
-| Circular reference | Returns 0 | Incorrect result, no error raised |
+| Circular reference | Raises `DAXEvaluationError`, caught by graceful degradation | Measure result is `None`; no infinite loop |
 | Date-table detection | Heuristic: looks for column named "Date" | May pick wrong table in ambiguous models |
 | SUMX with infix arithmetic | `SUMX(T, Col1 * Col2)` returns 0 | Row-level arithmetic parsing is limited |
 | Large tables | In-memory Python, no VertiPaq compression | Performance degrades at millions of rows |

@@ -13,7 +13,7 @@
 ## Feature Stability
 
 ### Stable
-- PBIX creation from scratch (with actual row data)
+- PBIX creation from scratch (populated and zero-row tables)
 - File open/close/save/repack (auto-backup, force flags)
 - Report layout read/write (pages, visuals, filters, positions)
 - Visual add/remove (cards, charts, shapes, images, textboxes, slicers)
@@ -26,10 +26,10 @@
 - DataMashup (M code) read/write
 - XPress9 DataModel decompress/recompress (byte-exact round-trip)
 - Huffman-compressed string dictionaries read/write (MS-XLDM §2.7.4, via `xmhuffman`)
+- Row-Level Security read/write/evaluate (binary-splice persistence; roles survive save/reopen, verified on PBI Desktop files)
 
 ### Beta
 - Calculated column evaluation (per-row DAX; tested with synthetic data only)
-- Row-Level Security read/write/evaluate (implemented, limited test coverage)
 - Password extraction from protected dashboards (regex-based, limited test coverage)
 - Diagnostic health check (`pbix_doctor`) (implemented, limited test coverage)
 

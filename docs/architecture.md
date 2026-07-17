@@ -174,7 +174,7 @@ The engine is a best-effort evaluator, not a strict Analysis Services runtime.
 It handles 156 functions across 10 categories. Key design decisions:
 
 - Returns `None` for unsupported functions (tracked in `unsupported_functions`)
-- Returns 0 for circular references
+- Raises `DAXEvaluationError` for circular references (caught by graceful degradation → `None`)
 - Uses heuristics for date-table detection (column named "Date" in a table)
 - Auto-applies default slicer filters from report layout
 - Smart SELECTEDVALUE fallback for parameter-driven measures

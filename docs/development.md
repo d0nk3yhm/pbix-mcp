@@ -17,29 +17,35 @@ pytest -m "not slow"
 # With coverage
 pytest -m "not slow" --cov=src/pbix_mcp --cov-report=term-missing
 
-# All tests (requires private PBIX test corpus)
-PBIX_TEST_SAMPLES=/path/to/samples pytest -v
+# Download the public test corpus, then run all tests
+# (integration tests also need: pip install pbixray)
+python scripts/download_test_corpus.py
+PBIX_TEST_SAMPLES=test_corpus pytest -v
 ```
 
 ## Test Architecture
 
 | File | Purpose | Count |
 |------|---------|-------|
-| `test_dax_engine.py` | DAX function unit tests | 55 (6 skip without PBIX) |
+| `test_dax_engine.py` | DAX function unit tests | 55 (6 skip without the corpus) |
 | `test_dax_accuracy.py` | DAX evaluation accuracy | 50 |
-| `test_golden.py` | Round-trip and artifact tests | 48 (3 skip without PBIX) |
+| `test_golden.py` | Round-trip and artifact tests | 48 (3 skip without the corpus) |
 | `test_fixtures.py` | Public fixture verification | 18 |
 | `test_beta_features.py` | RLS, password, doctor tests | 10 |
-| `test_cross_report.py` | 4-file integration tests | 19 (all skip without PBIX) |
+| `test_cross_report.py` | 4-file integration tests | 19 (all skip without the corpus) |
 
-## Private Test Corpus
+## Public Test Corpus
 
-Set `PBIX_TEST_SAMPLES` environment variable to point to your PBIX test files.
-The integration tests expect:
+`python scripts/download_test_corpus.py` fetches four dashboards from the
+MIT-licensed [Power-BI-Design-Files](https://github.com/Dashboard-Design/Power-BI-Design-Files)
+repository (Copyright (c) 2024 Sajjad Ahmadi) into `test_corpus/`. Point
+`PBIX_TEST_SAMPLES` at that directory to run the integration tests.
+
+The tests resolve these exact filenames:
 - `GeoSales_Dashboard.pbix` (71 measures)
-- `Agents Performance - Dashboard.pbix` (42 measures)
-- `Ecommerce Conversion Dashboard.pbix` (70 measures)
-- `IT_Support_Ticket_Desk.pbix` (21 measures)
+- `Agents_Performance.pbix` (42 measures)
+- `Ecommerce_Conversion.pbix` (70 measures)
+- `IT_Support.pbix` (21 measures)
 
 ## Linting & Type Checking
 

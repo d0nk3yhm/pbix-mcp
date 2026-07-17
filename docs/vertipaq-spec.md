@@ -310,6 +310,29 @@ This layer delegates the canonical-Huffman codec to the MIT
 [`xmhuffman`](https://github.com/Hugoberry/xmhuffman-cython) primitive, the
 same way the ZIP layer delegates XPress9 to `xpress9-python`.
 
+## Zero-Row Tables
+
+A table with columns but no rows is a valid VertiPaq state — Power BI Desktop
+produces one itself (the conventional `# Measures` holder table). Its
+representation differs from a populated table in three specific ways:
+
+| Structure | Zero-row value | Populated value |
+|-----------|---------------|-----------------|
+| `SegmentMapStorage` | RecordCount=0, SegmentCount=1, RecordsPerSegment=0 | RecordCount=rows, RecordsPerSegment=rows |
+| `AttributeHierarchyStorage.MaterializationType` | 2 (DistinctDataCount=0), no H$ table | 0 for user columns (H$ materialized); 3 for RowNumber |
+| String dictionary | **no page** (`store_page_count=0`) | one or more pages |
+
+The partition itself is unchanged: Type=4 (M/Power Query), Mode=0 (Import),
+State=1, DataView=3.
+
+**The string store is the critical case.** Emitting a page with
+`allocation_size = 0` produces a zero-size (NULL) character buffer, which the
+engine's string-store consistency check rejects — the file then fails to open
+with `PFE_XM_DBCC_STRINGSTORE_CORRUPT` and Desktop silently falls back to
+creating an empty database. A store containing no strings must carry **no page
+at all**. Numeric dictionaries are unaffected: an empty numeric dictionary is
+simply a `VectorOfVectors` with count 0 and has no page/allocation concept.
+
 ## H$ System Tables (Attribute Hierarchies)
 
 Each user column with MaterializationType=0 has an H$ system table:
