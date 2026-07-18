@@ -9,7 +9,9 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 | Unsupported function | Returns `None`, tracked in `unsupported_functions` | Measure result is `None` with status "unsupported" |
 | Circular reference | Raises `DAXEvaluationError`, caught by graceful degradation | Measure result is `None`; no infinite loop |
 | Date-table detection | Heuristic: looks for column named "Date" | May pick wrong table in ambiguous models |
-| SUMX with infix arithmetic | `SUMX(T, Col1 * Col2)` returns 0 | Row-level arithmetic parsing is limited |
+| Operator spacing | Binary/comparison/logical operators need surrounding spaces — `a * b`, `a = b`, `a && b` evaluate correctly; the unspaced forms `a*b`, `a=b`, `a&&b` do not | Write DAX with spaces around operators (as Power BI's formatter does). A proper tokenizer is planned |
+| Bare-table iterators | `AVERAGEX`/`MINX`/`COUNTX`/`TOPN`/`RANKX` over a bare table can return BLANK | `SUMX`/`MAXX` are correct; iterate over `VALUES()`/`ALL()` where possible |
+| Pathological measures | A few complex/self-referential measures can evaluate extremely slowly (effectively hang) — pre-existing, no evaluation depth/time guard | Rare; an evaluator guard is planned for a future release |
 | Large tables | In-memory Python, no VertiPaq compression | Performance degrades at millions of rows |
 | RANKX visual row context | Returns BLANK | 1 out of 204 tested measures affected |
 

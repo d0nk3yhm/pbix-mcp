@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast tests (242 pass, 9 skip, 19 slow/integration deselected)
+# Fast tests (256 pass, 9 skip, 19 slow/integration deselected)
 pytest -m "not slow"
 
 # With coverage
@@ -28,12 +28,12 @@ PBIX_TEST_SAMPLES=test_corpus pytest -v
 | File | Purpose | Count |
 |------|---------|-------|
 | `test_dax_engine.py` | DAX function unit tests | 55 (6 skip without the corpus) |
-| `test_dax_accuracy.py` | DAX evaluation accuracy | 50 |
-| `test_golden.py` | Round-trip and artifact tests | 48 (3 skip without the corpus) |
+| `test_dax_accuracy.py` | DAX evaluation accuracy | 61 |
+| `test_golden.py` | Round-trip and artifact tests | 49 (3 skip without the corpus) |
 | `test_fixtures.py` | Public fixture verification | 18 |
 | `test_beta_features.py` | RLS, password, doctor tests | 10 |
 | `test_cross_report.py` | 4-file integration tests | 19 (all skip without the corpus) |
-| `test_dax_multihop.py` | Multi-hop (snowflake) DAX filter propagation | 6 |
+| `test_dax_multihop.py` | Multi-hop DAX + empty-selection BLANK | 8 |
 | `test_found_issues.py` | OpenBI-found regressions (save flag, envelope, group coords, MAXID) | 6 |
 | `test_zip_safety.py` | ZIP + path-traversal hardening (bomb, Zip-Slip, `_safe_join`, `set_theme`) | 10 |
 | `test_perf_per_dimension.py` | Bucketed per-dimension eval (correctness, adversarial, fuzz, perf) | 14 |

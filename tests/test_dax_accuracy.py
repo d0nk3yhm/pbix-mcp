@@ -105,6 +105,27 @@ class TestBlankHandling:
         result = engine.evaluate_measure('M', c)
         assert result == "yes"
 
+    def test_divide_by_zero_is_blank(self, engine, tables, rels):
+        """DIVIDE(x, 0) with no alternate returns BLANK (None), not 0."""
+        c = ctx(tables, rels, {'M': 'DIVIDE(10, 0)'})
+        assert engine.evaluate_measure('M', c) is None
+
+    def test_divide_by_zero_alternate(self, engine, tables, rels):
+        """DIVIDE(x, 0, alt) returns the alternate."""
+        c = ctx(tables, rels, {'M': 'DIVIDE(10, 0, -1)'})
+        assert engine.evaluate_measure('M', c) == -1
+
+    def test_divide_normal(self, engine, tables, rels):
+        c = ctx(tables, rels, {'M': 'DIVIDE(10, 2)'})
+        assert engine.evaluate_measure('M', c) == 5.0
+
+    def test_binary_divide_by_zero_is_blank_not_numerator(self, engine, tables, rels):
+        """Spaced `a / b` with b==0 returns BLANK, not the numerator (regression)."""
+        c = ctx(tables, rels, {'M': '10 / 0'})
+        assert engine.evaluate_measure('M', c) is None
+        c2 = ctx(tables, rels, {'M': '10 / 2'})
+        assert engine.evaluate_measure('M', c2) == 5.0
+
 
 # ===========================================================================
 # 2. Nested CALCULATE — multiple filter modifiers
@@ -127,9 +148,22 @@ class TestNestedCalculate:
             'Pct': "DIVIDE([Total], CALCULATE([Total], REMOVEFILTERS(Products[Category])))"
         }, {'Products.Category': ['Hardware']})
         result = engine.evaluate_measure('Pct', c)
-        # REMOVEFILTERS should remove the Category filter for the denominator
+        # REMOVEFILTERS removes the Category filter for the denominator, so this
+        # is Hardware's share of the grand total: Hardware = P1(380)+P3(790)=1170,
+        # total across all categories = 1740 -> 0.6724.
+        # (Pre-0.9.8 this wrongly returned 1.0 because REMOVEFILTERS on an
+        # UNQUOTED Products[Category] was silently a no-op.)
         assert isinstance(result, float)
-        assert result == pytest.approx(1.0, abs=0.01)  # Hardware/Total with filter propagation
+        assert result == pytest.approx(1170 / 1740, abs=1e-4)
+
+    def test_pct_of_total_unquoted_all(self, engine, tables, rels):
+        """% of total with UNQUOTED ALL(Table[Col]) — regression for 0.9.8 #1."""
+        c = ctx(tables, rels, {
+            'Total': 'SUM(Sales[Amount])',
+            'Pct': 'DIVIDE(SUM(Sales[Amount]), CALCULATE(SUM(Sales[Amount]), ALL(Products[Category])))',
+        }, {'Products.Category': ['Electronics']})
+        # Electronics = P2 = 570; grand total = 1740 -> 0.3276 (NOT 1.0 no-op).
+        assert engine.evaluate_measure('Pct', c) == pytest.approx(570 / 1740, abs=1e-4)
 
     def test_calculate_all_table(self, engine, tables, rels):
         """CALCULATE with ALL('Table') removes all filters on that table."""
@@ -492,3 +526,50 @@ class TestStringConcat:
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+class TestLogicalOperators:
+    """0.9.8 #5: && / || must be logical AND/OR, not string concatenation.
+
+    Uses spaced operators (as DAX / RLS FilterExpressions are written); the
+    RLS-substitution cases mirror exactly what pbix_evaluate_rls feeds _eval_expr.
+    """
+
+    def test_and(self, engine, tables, rels):
+        c = ctx(tables, rels, {'M': '5 > 3 && 2 < 10'})
+        assert engine.evaluate_measure('M', c) is True
+        c2 = ctx(tables, rels, {'M': '5 > 3 && 2 > 10'})
+        assert engine.evaluate_measure('M', c2) is False
+
+    def test_or(self, engine, tables, rels):
+        c = ctx(tables, rels, {'M': '5 < 3 || 2 < 10'})
+        assert engine.evaluate_measure('M', c) is True
+        c2 = ctx(tables, rels, {'M': '5 < 3 || 2 > 10'})
+        assert engine.evaluate_measure('M', c2) is False
+
+    def test_if_with_and(self, engine, tables, rels):
+        c = ctx(tables, rels, {'M': 'IF(1 = 1 && 2 = 2, "yes", "no")'})
+        assert engine.evaluate_measure('M', c) == "yes"
+
+    def test_precedence_and_binds_tighter_than_or(self, engine, tables, rels):
+        # (5 < 3 && anything) || (2 < 10) -> True
+        c = ctx(tables, rels, {'M': '5 < 3 && 9 < 1 || 2 < 10'})
+        assert engine.evaluate_measure('M', c) is True
+
+    def test_string_concat_still_works(self, engine, tables, rels):
+        c = ctx(tables, rels, {'M': '"a" & "b" & "c"'})
+        assert engine.evaluate_measure('M', c) == "abc"
+
+    def test_rls_substituted_multi_condition(self, engine, tables, rels):
+        """Exactly what pbix_evaluate_rls evaluates per row after substitution.
+
+        Pre-0.9.8 these were string-concatenated (not True) so a multi-condition
+        RLS rule reported 0 visible rows.
+        """
+        def visible(expr):
+            r = engine.evaluate_measure('M', ctx(tables, rels, {'M': expr}))
+            return r is True or r == 1
+        assert visible('"East" = "East" && "yes" = "yes"') is True
+        assert visible('"West" = "East" && "yes" = "yes"') is False
+        assert visible('"East" = "East" && "no" = "yes"') is False
+        assert visible('"East" = "East" || "West" = "East"') is True

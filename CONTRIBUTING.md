@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast unit tests only (242 pass, 9 skip, 19 slow/integration deselected)
+# Fast unit tests only (256 pass, 9 skip, 19 slow/integration deselected)
 pytest -m "not slow"
 
 # Download public test corpus, then run integration tests
@@ -49,11 +49,11 @@ src/pbix_mcp/
     responses.py         # Tool output models (ToolResponse, DAXEvalResponse)
 tests/
   test_dax_engine.py     # Unit tests (55; 6 skip without the public test corpus)
-  test_dax_accuracy.py   # Accuracy tests (50)
-  test_golden.py         # Golden tests (48; 3 skip without the public test corpus)
+  test_dax_accuracy.py   # Accuracy tests (61)
+  test_golden.py         # Golden tests (49; 3 skip without the public test corpus)
   test_fixtures.py       # Fixture tests (18; ships with repo)
   test_beta_features.py  # Beta feature tests (10; RLS, password, doctor)
-  test_dax_multihop.py   # Multi-hop (snowflake) DAX filter propagation (6)
+  test_dax_multihop.py   # Multi-hop DAX + empty-selection BLANK (8)
   test_found_issues.py   # OpenBI-found regressions: save flag, envelope, group coords, MAXID (6)
   test_zip_safety.py     # ZIP + path-traversal hardening: bomb, Zip-Slip, _safe_join, set_theme (10)
   test_perf_per_dimension.py  # Bucketed per-dimension eval: correctness, adversarial, fuzz, perf (14)

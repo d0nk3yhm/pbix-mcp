@@ -205,10 +205,13 @@ def _convert_value_for_dict(value, data_type: str):
             epoch = _dt.datetime(1899, 12, 30)
             return (dt - epoch).total_seconds() / 86400.0
     elif data_type == "Decimal":
+        from decimal import ROUND_HALF_UP
         from decimal import Decimal as D
-        if isinstance(value, D):
-            return int(value * 10000)
-        return int(float(value) * 10000)
+        # Currency/Decimal is fixed-point scaled by 10000. Convert via
+        # Decimal(str(v)) and round half-up so e.g. 19.99 stores as 199900,
+        # not 199899 (float truncation: 19.99*10000 == 199899.99999999997).
+        dec = value if isinstance(value, D) else D(str(value))
+        return int((dec * 10000).to_integral_value(rounding=ROUND_HALF_UP))
     else:
         return value
 
