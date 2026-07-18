@@ -4990,10 +4990,8 @@ def _rebuild_datamodel(
 
         # Get existing relationships — preserve the semantic columns (IsActive,
         # CrossFilteringBehavior, cardinality, ...) so an unrelated datamodel
-        # edit doesn't silently reset bidirectional / inactive / many-to-many
-        # relationships back to active many-to-one (OpenBI #3). Exception: a
-        # one-to-one is rebuilt as a bidirectional many-to-one (the builder
-        # can't yet emit the reverse index) — see PBIXBuilder.add_relationship.
+        # edit doesn't silently reset bidirectional / inactive / many-to-many /
+        # one-to-one relationships back to active many-to-one (OpenBI #3).
         rels = []
         for rrow in conn.execute(
             "SELECT ft.Name as ft, fc.ExplicitName as fc, "
@@ -5945,12 +5943,9 @@ def pbix_datamodel_add_relationship(
         info["modified"] = True
         _note = ""
         if (from_card, to_card) == (1, 1):
-            # The builder downgrades 1:1 to a bidirectional many-to-one (a 1:1
-            # needs a reverse R$ index the builder doesn't yet emit).
-            _card_label, cross_filter, _note = "*:1", 2, (
-                "\n  note: one-to-one is stored as a bidirectional many-to-one "
-                "(full 1:1 with a reverse index is a known limitation); "
-                "cross-filtering still works in both directions.")
+            # A 1:1 is stored as a genuine one-to-one: Power BI forces
+            # cross-filter Both and the builder emits the reverse R$ index.
+            _card_label, cross_filter = "1:1", 2
         else:
             _card_label = {(2, 1): "*:1", (1, 2): "1:*", (2, 2): "*:*"}[
                 (from_card, to_card)]
