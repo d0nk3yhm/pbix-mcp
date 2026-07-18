@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.11] - 2026-07-18
+
+Clears the remaining OpenBI-reported issues (#2, #5b, and the #1 coverage gap),
+hardens the DAX engine, and makes DataModel edits fail safely on models the
+rebuild can't reproduce.
+
+### Fixed
+- **Bookmarks no longer write `display.mode = "visible"`** (OpenBI #2). Power BI's `display.mode` enum is `hidden` | `maximize` | `spotlight` | `elevation` — there is no `"visible"`; a visible visual is expressed by *omitting* mode. A hide-some-visuals bookmark previously stamped `mode:"visible"` on the untouched visuals, which could make Desktop ignore the block or mishandle Selection-pane state. Hidden visuals now get `{"display":{"mode":"hidden"}}` and visible ones a bare `{"singleVisual":{}}`.
+- **`CALCULATE` now consumes `USERELATIONSHIP` and `CROSSFILTER`** (OpenBI #5b). They previously parsed to marker tuples that `CALCULATE` never applied, so both were silent no-ops. `USERELATIONSHIP(col1, col2)` now activates that relationship for the wrapped expression (deactivating the sibling active one on the same table pair — role-playing date tables work), and `CROSSFILTER(col1, col2, None|OneWay|Both)` overrides the cross-filter direction.
+- **`TOPN` / `RANKX` (and `ADDCOLUMNS`, `SELECTCOLUMNS`, `GENERATE`, `GENERATEALL`, `CONCATENATEX`) over a bare table no longer return BLANK.** They built the per-row context with a direct `__column__` lookup that `KeyError`-ed on a bare-table (multi-column `__row__`) iterator; they now use `_make_row_context` like `SUMX`/`AVERAGEX`. This clears the last "bare-table iterators" limitation.
+- **`pbix_format_visual` maps the `labels` object** (OpenBI #1 coverage gap). `{"labels": {"color": ..., "fontSize": ...}}` — a Card's "Callout value" colour/size (`objects.labels.*`) — was silently dropped because only the friendly alias `dataLabels` was recognized; both now route to `objects.labels`.
+
+### Changed
+- **Date-table auto-detection is relationship-aware.** It now prefers a date dimension that sits on the one-side of a relationship over a fact table that merely has a `Date` column, disambiguating models where both do. Name heuristics remain as the fallback. (No change to any public-corpus result.)
+
+### Added
+- **A datamodel edit that requires a full rebuild now fails safely on models it can't reproduce.** The rebuild path can't recompute **calculated tables** (`DATATABLE`/`GENERATESERIES`), **calculated columns**, or **measure-only container tables** (their VertiPaq data comes from a DAX expression), so a rebuild would reopen them empty. The rebuild tools (`add_relationship`, `remove_relationship`, `remove_table`, `set_table_data`, …) now raise a clear `MODEL_EDIT_UNSUPPORTED` error naming the offending tables and pointing at the surgical tools (`add_measure` / `modify_measure` / `remove_measure` / `modify_column`) that work on all models — instead of a cryptic builder crash or a corrupt file. Full support for editing such models is a tracked follow-up.
+
+### Verified
+- New tests: bookmark display-mode, `USERELATIONSHIP`/`CROSSFILTER`, `TOPN`/`RANKX` bare-table, `labels` mapping, relationship-aware date detection, and the rebuild guard. Public-corpus DAX + cross-report re-run with no drift. Full fast suite: 292 passed, 10 skipped, 0 failures; ruff clean; mypy 164.
+
 ## [0.9.10] - 2026-07-18
 
 Resolves the relationship-semantics data loss that 0.9.9 deferred (OpenBI #3/#4).

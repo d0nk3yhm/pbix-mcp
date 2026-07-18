@@ -52,6 +52,14 @@ class MetadataSQLError(PBIXMCPError):
     code = "METADATA_SQL_FAILED"
 
 
+class UnsupportedModelEditError(PBIXMCPError):
+    """A DataModel edit that requires a full rebuild can't run because the model
+    contains tables the rebuild path can't faithfully reproduce (calculated
+    tables, calculated columns, or measure-only containers). Surgical tools
+    (add/modify/remove measure, modify column) still work on such models."""
+    code = "MODEL_EDIT_UNSUPPORTED"
+
+
 # ---------------------------------------------------------------------------
 # DAX errors
 # ---------------------------------------------------------------------------

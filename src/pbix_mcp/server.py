@@ -42,6 +42,7 @@ from pbix_mcp.errors import (
     SessionError,
     UnsafeWriteError,
     UnsupportedFormatError,
+    UnsupportedModelEditError,
 )
 from pbix_mcp.logging_config import logger
 from pbix_mcp.models.requests import DimensionRef, FilterContext
@@ -701,14 +702,21 @@ def _build_format_objects(fmt: dict) -> dict:
             props["position"] = {"expr": {"Literal": {"Value": raw}}}
         _add("legend", props)
 
-    # --- dataLabels (labels) ---
-    if "dataLabels" in fmt:
-        dl = fmt["dataLabels"]
+    # --- dataLabels / labels (both -> the PBI `labels` object) ---
+    # "dataLabels" is the friendly name for a chart's data labels; "labels" is
+    # the raw PBI object name and is what a Card's "Callout value" (the big
+    # number's colour/size/units) lives under (objects.labels.*). Accept either
+    # so `{"labels": {"color": "#.."}}` isn't silently dropped (OpenBI #1 gap).
+    _dl = fmt.get("dataLabels", fmt.get("labels"))
+    if _dl is not None:
+        dl = _dl
         props = {}
         if "show" in dl: props["show"] = _pbi_lit(dl["show"])
         if "fontSize" in dl: props["fontSize"] = _pbi_lit(float(dl["fontSize"]))
         if "color" in dl: props["color"] = _solid_color(dl["color"])
         if "fontFamily" in dl: props["fontFamily"] = _pbi_lit(dl["fontFamily"])
+        if "bold" in dl: props["bold"] = _pbi_lit(dl["bold"])
+        if "italic" in dl: props["italic"] = _pbi_lit(dl["italic"])
         if "displayUnits" in dl:
             raw = _DISPLAY_UNITS.get(dl["displayUnits"], f"{dl['displayUnits']}D")
             props["labelDisplayUnits"] = {"expr": {"Literal": {"Value": raw}}}
@@ -2323,7 +2331,7 @@ def pbix_add_bookmark(
             if vname:
                 visual_states[vname] = {
                     "visualType": vc_config.get("singleVisual", {}).get("visualType", "unknown"),
-                    "display": {"mode": "hidden" if vname in hidden_set else "visible"},
+                    "hidden": vname in hidden_set,
                 }
 
         # Build bookmark object
@@ -2344,12 +2352,22 @@ def pbix_add_bookmark(
             },
         }
 
-        # Add visual display states if any visuals hidden
+        # Add visual display states if any visuals hidden.
+        # Power BI's display.mode enum is "hidden"|"maximize"|"spotlight"|
+        # "elevation" — there is NO "visible". A visible visual is expressed by
+        # OMITTING mode (applying the bookmark with no display override shows
+        # it). Writing mode:"visible" made Desktop ignore the block / mishandle
+        # Selection-pane state, so hidden visuals get {"display":{"mode":
+        # "hidden"}} and visible ones get a bare {"singleVisual":{}} (no mode).
         if hidden_set:
             bookmark["explorationState"]["sections"] = {
                 section_name: {
                     "visualContainers": {
-                        vname: {"singleVisual": {"display": state["display"]}}
+                        vname: (
+                            {"singleVisual": {"display": {"mode": "hidden"}}}
+                            if state["hidden"]
+                            else {"singleVisual": {}}
+                        )
                         for vname, state in visual_states.items()
                     }
                 }
@@ -4906,6 +4924,7 @@ def _rebuild_datamodel(
 
         # Get all existing user tables
         tables = []
+        special_tables: list[tuple[str, str]] = []
         for trow in conn.execute(
             "SELECT ID, Name FROM [Table] WHERE ModelID = 1 "
             "AND Name NOT LIKE 'H$%' AND Name NOT LIKE 'R$%' ORDER BY ID"
@@ -4918,7 +4937,42 @@ def _rebuild_datamodel(
             ):
                 dt = _AMO_TO_TYPE.get(crow["ExplicitDataType"], "String")
                 cols.append({"name": crow["ExplicitName"], "data_type": dt})
+
+            # Detect tables the from-scratch rebuild can't faithfully reproduce.
+            # A calculated table (Partition.Type=2, e.g. DATATABLE/GENERATESERIES)
+            # or a table with calculated columns (Column.Type=4) has VertiPaq data
+            # that Desktop computes from a DAX expression — the builder can't
+            # recompute it, so rebuilding would silently open the table EMPTY. A
+            # measure-only container has no data columns at all. Reproducing the
+            # whole model for an unrelated edit (add relationship, set table data)
+            # would corrupt these, so fail loudly with an actionable message.
+            prow = conn.execute(
+                "SELECT Type FROM [Partition] WHERE TableID = ? LIMIT 1", (tid,)
+            ).fetchone()
+            n_calc_cols = conn.execute(
+                "SELECT COUNT(*) FROM [Column] WHERE TableID = ? AND Type = 4",
+                (tid,),
+            ).fetchone()[0]
+            if (prow is not None and prow["Type"] == 2) or n_calc_cols > 0:
+                special_tables.append((tname, "calculated table"))
+            elif not cols:
+                special_tables.append((tname, "measure-only container"))
             tables.append({"name": tname, "columns": cols})
+
+        if special_tables:
+            conn.close()
+            listing = ", ".join(f"'{n}' ({k})" for n, k in special_tables)
+            raise UnsupportedModelEditError(
+                "This edit rebuilds the whole DataModel, but the model contains "
+                f"tables the rebuild can't preserve: {listing}. Calculated tables "
+                "would reopen empty (Power BI computes their rows from DAX, which "
+                "the rebuild can't recompute), and measure-only containers have no "
+                "data columns. To avoid corrupting the file the edit was refused. "
+                "The surgical DataModel tools do NOT rebuild and work on these "
+                "models: pbix_datamodel_add_measure / modify_measure / "
+                "remove_measure / modify_column. Editing models that contain "
+                "calculated tables via the rebuild path is a known limitation."
+            )
 
         # Get existing measures
         measures = []

@@ -157,3 +157,66 @@ class TestBidirectionalCrossFilter:
              'ToColumn': 'K', 'IsActive': True, 'CrossFilteringBehavior': 2}])
         assert 'Fact' not in single._rel_adj          # one-direction: Dim->Fact only
         assert 'Fact' in bidir._rel_adj               # bidirectional: reverse edge added
+
+
+class TestUserelationshipAndCrossfilter:
+    """OpenBI #5b: CALCULATE must consume USERELATIONSHIP / CROSSFILTER instead
+    of treating them as silent no-op markers."""
+
+    def _roleplay(self, fc, measure):
+        # Sales has two keys into Dim; OrderK relationship active, ShipK inactive.
+        tables = {
+            "Sales": {"columns": ["OrderK", "ShipK", "Amount"],
+                      "rows": [["K1", "K2", 100.0], ["K2", "K1", 50.0]]},
+            "Dim": {"columns": ["K"], "rows": [["K1"], ["K2"]]},
+        }
+        measures = {
+            "ByOrder": "SUM(Sales[Amount])",
+            "ByShip": "CALCULATE(SUM(Sales[Amount]), USERELATIONSHIP(Sales[ShipK], Dim[K]))",
+            "NoFilter": "CALCULATE(SUM(Sales[Amount]), CROSSFILTER(Sales[OrderK], Dim[K], None))",
+        }
+        rels = [
+            {"FromTable": "Sales", "FromColumn": "OrderK", "ToTable": "Dim",
+             "ToColumn": "K", "IsActive": True},
+            {"FromTable": "Sales", "FromColumn": "ShipK", "ToTable": "Dim",
+             "ToColumn": "K", "IsActive": False},
+        ]
+        res = dax_engine.evaluate_measures_batch(
+            [measure], tables, measures, fc, None, None, rels)
+        return res[measure]
+
+    def test_active_relationship_filters_by_order(self):
+        # filter Dim=K1 via the active OrderK relationship -> row with OrderK=K1 (100)
+        assert self._roleplay({"Dim.K": ["K1"]}, "ByOrder") == 100.0
+
+    def test_userelationship_switches_to_ship(self):
+        # USERELATIONSHIP activates ShipK -> filter Dim=K1 selects row with ShipK=K1 (50)
+        assert self._roleplay({"Dim.K": ["K1"]}, "ByShip") == 50.0
+
+    def test_userelationship_differs_from_active(self):
+        assert self._roleplay({"Dim.K": ["K1"]}, "ByOrder") != \
+               self._roleplay({"Dim.K": ["K1"]}, "ByShip")
+
+    def test_crossfilter_none_removes_propagation(self):
+        # CROSSFILTER(..., None) stops the relationship filtering -> grand total (150)
+        assert self._roleplay({"Dim.K": ["K1"]}, "NoFilter") == 150.0
+
+
+class TestDateTableDetection:
+    """0.9.11: date-table auto-detection prefers the date dimension on the
+    one-side of a relationship over a fact that merely has a Date column."""
+
+    def test_relationship_disambiguates_date_table(self):
+        # Fact 'Sales' also has Date+Year (would trip the name-only heuristic);
+        # the real date dim 'Calendar' is the ToTable of the relationship.
+        tables = {
+            "Sales": {"columns": ["Date", "Year", "Amount"], "rows": [["2024-01-01", 2024, 5.0]]},
+            "Calendar": {"columns": ["Date", "Year", "Month"], "rows": [["2024-01-01", 2024, 1]]},
+        }
+        rels = [{"FromTable": "Sales", "FromColumn": "Date",
+                 "ToTable": "Calendar", "ToColumn": "Date", "IsActive": True}]
+        assert dax_engine.DAXContext._auto_detect_date_table(tables, rels) == "Calendar"
+
+    def test_name_heuristic_still_works_without_relationships(self):
+        tables = {"dimDate": {"columns": ["Date", "Year"], "rows": [["2024-01-01", 2024]]}}
+        assert dax_engine.DAXContext._auto_detect_date_table(tables, []) == "dimDate"

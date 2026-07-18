@@ -637,3 +637,14 @@ class TestBareTableIterators:
         assert ev('MINX(ALL(T), T[a])') == 10
         assert ev('COUNTX(ALL(T), T[a])') == 3
         assert ev('SUMX(ALL(T), T[a])') == 60   # control (was already correct)
+
+    def test_topn_rankx_over_bare_table(self, engine, tables, rels):
+        # 0.9.11: TOPN's order scoring and RANKX's ranking over a bare table
+        # (multi-column __row__ dicts) previously KeyError'd on __column__.
+        t = {'T': {'columns': ['a', 'b'], 'rows': [[10, 1], [20, 2], [30, 3]]}}
+        def ev(x):
+            return engine.evaluate_measure('m', DAXContext(t, {'m': x}, None, None, None, []))
+        # TOPN(2, ..., DESC) picks a=30 and a=20 -> SUMX(a) = 50
+        assert ev('SUMX(TOPN(2, ALL(T), T[a], 0), T[a])') == 50
+        # each row ranked by a among {10,20,30} -> ranks 3+2+1 = 6
+        assert ev('SUMX(ALL(T), RANKX(ALL(T), T[a]))') == 6

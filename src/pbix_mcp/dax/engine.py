@@ -64,13 +64,13 @@ class DAXContext:
         self.tables = tables
         self.measures = measures
         self.date_column = date_column or 'Date'
-        # Auto-detect date table if not provided
+        self.filter_context = filter_context or {}
+        self.relationships = relationships or []
+        # Auto-detect date table if not provided (relationship-aware).
         if date_table:
             self.date_table = date_table
         else:
-            self.date_table = self._auto_detect_date_table(tables)
-        self.filter_context = filter_context or {}
-        self.relationships = relationships or []
+            self.date_table = self._auto_detect_date_table(tables, self.relationships)
         self._current_row = None  # Set during row iteration (SUMX, AVERAGEX, etc.)
         self._measure_cache = {}
         self._eval_stack = set()  # Prevent circular refs
@@ -116,8 +116,37 @@ class DAXContext:
                 self._rel_adj.setdefault(ft, []).append((tt, fc, tc))
 
     @staticmethod
-    def _auto_detect_date_table(tables: dict) -> str:
-        """Auto-detect the date/calendar dimension table from available tables."""
+    def _auto_detect_date_table(tables: dict, relationships: list = None) -> str:
+        """Auto-detect the date/calendar dimension table from available tables.
+
+        A relationship-aware pass runs first: a table that is the ONE side
+        (ToTable) of a relationship AND carries a Date column plus calendar
+        columns (Year/Month) — or a date-y name — is almost certainly the date
+        dimension, which is more reliable than matching on the table name alone
+        (a fact table can also have a "Date" column). Name heuristics follow as
+        a fallback for models without an explicit relationship.
+        """
+        relationships = relationships or []
+
+        # Pass 0 (relationship-aware): prefer a date dimension on the one-side of
+        # a relationship.
+        one_side = [r.get('ToTable') for r in relationships if r.get('ToTable')]
+        # de-dup preserving order
+        seen: set = set()
+        for tname in one_side:
+            if tname in seen:
+                continue
+            seen.add(tname)
+            tdata = tables.get(tname)
+            if not tdata:
+                continue
+            cols_lower = [c.lower() for c in tdata.get('columns', [])]
+            if 'date' in cols_lower and (
+                'year' in cols_lower or 'month' in cols_lower
+                or 'date' in tname.lower() or 'calendar' in tname.lower()
+            ):
+                return tname
+
         # Pass 1: table name contains 'date' and has a 'Date' column
         for tname, tdata in tables.items():
             if 'date' in tname.lower() and 'Date' in tdata.get('columns', []):
@@ -1287,6 +1316,20 @@ class DAXEngine:
                     f"DATEADD({filter_arg[19:-1].strip()}, -1, YEAR)", new_ctx)
                 continue
 
+            # USERELATIONSHIP(col1, col2) — activate a specific (usually inactive)
+            # relationship for the wrapped expression, overriding the active one
+            # on the same table pair. Rebuilds the propagation graph.
+            if filter_arg.upper().startswith('USERELATIONSHIP'):
+                new_ctx = self._apply_userelationship(filter_arg, new_ctx)
+                continue
+
+            # CROSSFILTER(col1, col2, direction) — override a relationship's
+            # cross-filter direction (None / OneWay / Both) for the wrapped
+            # expression.
+            if filter_arg.upper().startswith('CROSSFILTER'):
+                new_ctx = self._apply_crossfilter(filter_arg, new_ctx)
+                continue
+
             # TREATAS
             if filter_arg.upper().startswith('TREATAS'):
                 result = self._eval_expr(filter_arg, new_ctx)
@@ -1367,6 +1410,73 @@ class DAXEngine:
                 continue
 
         return self._eval_expr(base_expr, new_ctx)
+
+    @staticmethod
+    def _two_col_refs(filter_arg: str) -> list:
+        """Extract the (table, column) pairs from a function's argument list,
+        e.g. USERELATIONSHIP('Sales'[Ship Date], 'Date'[Date])."""
+        pairs = re.findall(r"'?([^'\[\],(]+)'?\s*\[([^\]]+)\]", filter_arg)
+        return [(t.strip(), c.strip()) for t, c in pairs]
+
+    def _apply_userelationship(self, filter_arg: str, ctx: DAXContext) -> DAXContext:
+        """USERELATIONSHIP(col1, col2): make the relationship joining col1 and
+        col2 active for the wrapped expression, deactivating any other active
+        relationship between the same two tables (only one may be active per
+        pair). No-op (graceful) if no matching relationship exists."""
+        refs = self._two_col_refs(filter_arg)
+        if len(refs) < 2:
+            return ctx
+        (t1, c1), (t2, c2) = refs[0], refs[1]
+        target = {(t1, c1), (t2, c2)}
+        pair = {t1, t2}
+        new_rels, changed = [], False
+        for rel in ctx.relationships:
+            r = dict(rel)
+            rk = {(r.get('FromTable'), r.get('FromColumn')),
+                  (r.get('ToTable'), r.get('ToColumn'))}
+            rpair = {r.get('FromTable'), r.get('ToTable')}
+            if rk == target:
+                r['IsActive'] = 1
+                changed = True
+            elif rpair == pair and r.get('IsActive'):
+                r['IsActive'] = 0  # deactivate the sibling active relationship
+            new_rels.append(r)
+        if not changed:
+            return ctx
+        return DAXContext(ctx.tables, ctx.measures, ctx.date_table,
+                          ctx.date_column, ctx.filter_context, new_rels)
+
+    def _apply_crossfilter(self, filter_arg: str, ctx: DAXContext) -> DAXContext:
+        """CROSSFILTER(col1, col2, direction): override the cross-filter
+        direction of the col1<->col2 relationship for the wrapped expression.
+        direction: None -> inactive-for-filtering (0), OneWay -> single (1),
+        Both -> bidirectional (2)."""
+        refs = self._two_col_refs(filter_arg)
+        if len(refs) < 2:
+            return ctx
+        (t1, c1), (t2, c2) = refs[0], refs[1]
+        # third argument = direction keyword
+        inner = filter_arg[filter_arg.find('(') + 1:filter_arg.rfind(')')]
+        args = self._split_args(inner)
+        direction = args[2].strip().upper().strip("'\"") if len(args) >= 3 else 'BOTH'
+        xf = {'NONE': 0, 'ONEWAY': 1, 'BOTH': 2}.get(direction, 2)
+        target = {(t1, c1), (t2, c2)}
+        new_rels, changed = [], False
+        for rel in ctx.relationships:
+            r = dict(rel)
+            rk = {(r.get('FromTable'), r.get('FromColumn')),
+                  (r.get('ToTable'), r.get('ToColumn'))}
+            if rk == target:
+                r['CrossFilteringBehavior'] = xf
+                # direction None makes the relationship stop propagating filters
+                if xf == 0:
+                    r['IsActive'] = 0
+                changed = True
+            new_rels.append(r)
+        if not changed:
+            return ctx
+        return DAXContext(ctx.tables, ctx.measures, ctx.date_table,
+                          ctx.date_column, ctx.filter_context, new_rels)
 
     def _apply_dateadd_filter(self, expr: str, ctx: DAXContext) -> DAXContext:
         """Apply DATEADD as a filter context modification."""
@@ -1771,7 +1881,10 @@ class DAXEngine:
             scored = []
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+                    # _make_row_context handles BOTH single-column
+                    # (__column__/__value__) and bare-table (__row__) iterators;
+                    # the old direct __column__ lookup KeyError'd on a bare table.
+                    row_ctx = self._make_row_context(row_item, ctx)
                     score = self._eval_expr(order_expr, row_ctx)
                 else:
                     score = self._eval_expr(order_expr, ctx)
@@ -1795,7 +1908,7 @@ class DAXEngine:
         for row_item in table_ref:
             new_item = dict(row_item) if isinstance(row_item, dict) else row_item
             if isinstance(row_item, dict) and '__table__' in row_item:
-                row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+                row_ctx = self._make_row_context(row_item, ctx)
             else:
                 row_ctx = ctx
             # Process name/expression pairs
@@ -1880,7 +1993,7 @@ class DAXEngine:
         result = []
         for row_item in table_ref:
             if isinstance(row_item, dict) and '__table__' in row_item:
-                row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+                row_ctx = self._make_row_context(row_item, ctx)
             else:
                 row_ctx = ctx
             new_row = {}
@@ -2128,7 +2241,7 @@ class DAXEngine:
         result = []
         for row_item in table_ref:
             if isinstance(row_item, dict) and '__table__' in row_item:
-                row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+                row_ctx = self._make_row_context(row_item, ctx)
             else:
                 row_ctx = ctx
             inner = self._eval_expr(args[1].strip(), row_ctx)
@@ -2153,7 +2266,7 @@ class DAXEngine:
         result = []
         for row_item in table_ref:
             if isinstance(row_item, dict) and '__table__' in row_item:
-                row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+                row_ctx = self._make_row_context(row_item, ctx)
             else:
                 row_ctx = ctx
             inner = self._eval_expr(args[1].strip(), row_ctx)
@@ -2734,7 +2847,7 @@ class DAXEngine:
         if isinstance(table_ref, list):
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+                    row_ctx = self._make_row_context(row_item, ctx)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
                     if result is not None:
@@ -2771,7 +2884,9 @@ class DAXEngine:
         if isinstance(table_ref, list):
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+                    # _make_row_context handles bare-table (__row__) iterators
+                    # too; the old direct __column__ lookup KeyError'd on them.
+                    row_ctx = self._make_row_context(row_item, ctx)
                     result = self._eval_expr(rank_expr, row_ctx)
                     if isinstance(result, (int, float)):
                         all_vals.append(result)

@@ -250,6 +250,48 @@ def _zip_dir_to_pbix_bytes(work_dir):
 # --------------------------------------------------------------------------- #
 # #4 — the public tool parses the friendly cardinality / direction values
 # --------------------------------------------------------------------------- #
+class TestRebuildGuardsSpecialTables:
+    """A datamodel edit that rebuilds must refuse (clearly) on models with
+    calculated / measure-only tables rather than crash or corrupt the file."""
+
+    _SAMPLES = os.environ.get("PBIX_TEST_SAMPLES", "")
+
+    @pytest.mark.skipif(not _SAMPLES, reason="needs PBIX_TEST_SAMPLES corpus")
+    def test_rebuild_refuses_calc_table_model(self, tmp_path):
+        from pbix_mcp.errors import UnsupportedModelEditError
+        src = os.path.join(self._SAMPLES, "GeoSales_Dashboard.pbix")
+        if not os.path.exists(src):
+            pytest.skip("GeoSales_Dashboard.pbix not in corpus")
+        work = tmp_path / "w"
+        work.mkdir()
+        with zipfile.ZipFile(src) as z:
+            dm = next(n for n in z.namelist() if n.lower() == "datamodel")
+            (work / "DataModel").write_bytes(z.read(dm))
+        with pytest.raises(UnsupportedModelEditError) as ei:
+            server._rebuild_datamodel(
+                {"work_dir": str(work)},
+                extra_measures=[{"table": "fct_Orders", "name": "_probe",
+                                 "expression": "1", "format_string": None}])
+        assert ei.value.code == "MODEL_EDIT_UNSUPPORTED"
+        # names the offending table(s) and points at the surgical tools
+        assert "# Measures" in ei.value.message or "calculated table" in ei.value.message
+        assert "pbix_datamodel_add_measure" in ei.value.message
+
+    def test_normal_model_still_rebuilds(self, tmp_path):
+        # a plain built model (no calc/measure-only tables) must NOT trip the guard
+        b = _star_builder()
+        b.add_relationship("Sales", "CustID", "Customer", "CustID")
+        work = tmp_path / "w"
+        work.mkdir()
+        with zipfile.ZipFile(io.BytesIO(b.build())) as z:
+            (work / "DataModel").write_bytes(z.read("DataModel"))
+        old, new = server._rebuild_datamodel(
+            {"work_dir": str(work)},
+            extra_measures=[{"table": "Sales", "name": "_p2",
+                             "expression": "1", "format_string": None}])
+        assert new > 0
+
+
 class TestAddRelationshipToolParsing:
     @pytest.mark.parametrize("value", ["nonsense", "1:2:3", "one"])
     def test_invalid_cardinality_rejected(self, value):
