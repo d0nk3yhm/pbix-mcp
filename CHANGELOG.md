@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.9] - 2026-07-18
+
+Works through several documented DAX-engine limitations plus two OpenBI-reported
+issues. Each fix is verified for zero drift against the public corpus.
+
+### Fixed
+- **Operators no longer require surrounding spaces.** A real tokenizer replaces the space-delimited operator splitting, so unspaced DAX — `SUM(a)/SUM(b)`, `T[Qty]*T[Price]`, `x=y`, `a&&b` — now evaluates identically to the spaced form. This removes the "operator spacing" limitation and, with it, the old "`SUMX` with infix arithmetic returns 0" limitation (`SUMX(T, T[Qty]*T[Price])` is now correct). The tokenizer respects `()`/`[]`/quotes, treats a leading `-`/`+` as a unary sign, and keeps `--` line comments intact. Verified equivalence across 9,000 randomized spaced-vs-unspaced expressions (0 mismatches) and the public corpus (no drift).
+- **Bare-table iterators `AVERAGEX`/`MINX`/`COUNTX` no longer return BLANK.** They now build the per-row context the same way `SUMX`/`MAXX` do, so iterating a bare table (`AVERAGEX(ALL(T), T[a])`) computes correctly instead of `KeyError`-ing on the multi-column row and degrading to BLANK. (`TOPN`/`RANKX` use different paths and remain noted.)
+- **`pbix_format_visual` now deep-merges nested object properties** (reported by OpenBI). A partial update — e.g. changing only a border colour — previously replaced the whole object entry and dropped the unspecified siblings (`width`, `radius`). Entries are now merged by `selector`, updating only the specified properties.
+- **The DAX engine carries cross-filter direction** (reported by OpenBI). `CrossFilteringBehavior` is now loaded into the evaluation context, so a bidirectional (`=2`) relationship adds the reverse multi-hop propagation edge instead of being silently treated as single-direction.
+
+### Added
+- **Evaluation budget guard**: each top-level measure is bounded to a fixed number of sub-expression evaluations, so a non-terminating / runaway-expansion measure degrades to BLANK instead of hanging the tool (defense-in-depth). A single pathologically-slow (e.g. O(n²)) measure can still be slow but no longer hangs indefinitely on runaway expansion.
+
+### Verified
+- 9,000-expression spaced-vs-unspaced tokenizer fuzz (0 mismatches); public corpus DAX + cross-report re-evaluated with no result drift.
+- New regression tests for operator spacing, bare-table iterators, format deep-merge, bidirectional edge, and the eval guard.
+- Full test suite: 294 collected, 266 passed, 28 skipped (corpus-dependent), 0 failures; ruff clean; mypy 162.
+
+### Deferred (documented; not shipped here)
+- **Relationship-semantics preservation on rebuild + a relationship editor** (OpenBI #3/#4): the builder still hardcodes `IsActive`/`CrossFilteringBehavior`/cardinality, so a datamodel edit resets bidirectional/inactive relationships. Held because generating correct relationship *storage* for those semantics needs live Power BI Desktop verification (risk of producing a file Desktop rejects). Highest-priority next item.
+- Date-table detection via the model relationship (not a name heuristic); `USERELATIONSHIP`/`CROSSFILTER` consumption in `CALCULATE`; the bookmark `display.mode` value (needs a Desktop-authored bookmark to confirm the valid enum).
+
 ## [0.9.8] - 2026-07-18
 
 A correctness release: five DAX/encoder bugs that silently produced wrong

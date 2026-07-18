@@ -1972,15 +1972,30 @@ def pbix_format_visual(
         new_objects = result.get("_objects", {})
         new_vc_objects = result.get("_vcObjects", {})
 
+        # Deep-merge so a partial update keeps the unspecified sibling properties
+        # of an existing object entry (matched by selector). Replacing the whole
+        # category array used to silently drop e.g. border width/radius when only
+        # the colour was sent.
+        def _merge_obj_entries(existing_list, entries):
+            out = list(existing_list or [])
+            for ne in entries:
+                sel = ne.get("selector")
+                match = next((e for e in out if e.get("selector") == sel), None)
+                if match is not None:
+                    match.setdefault("properties", {}).update(ne.get("properties", {}))
+                else:
+                    out.append(ne)
+            return out
+
         # Merge data formatting into singleVisual.objects
         for category, entries in new_objects.items():
-            existing_objects[category] = entries
+            existing_objects[category] = _merge_obj_entries(existing_objects.get(category), entries)
 
         # Merge container formatting into singleVisual.vcObjects
         if new_vc_objects:
             existing_vc_objects = sv.setdefault("vcObjects", {})
             for category, entries in new_vc_objects.items():
-                existing_vc_objects[category] = entries
+                existing_vc_objects[category] = _merge_obj_entries(existing_vc_objects.get(category), entries)
 
         vc["config"] = json.dumps(config, ensure_ascii=False)
         _set_layout(info["work_dir"], layout)
@@ -6415,6 +6430,9 @@ def _get_dax_context(alias: str) -> dict:
             'ToTable': r.get('ToTableName', ''),
             'ToColumn': r.get('ToColumnName', ''),
             'IsActive': r.get('IsActive', 1),
+            # Carry cross-filter direction so the engine honors bidirectional
+            # (CrossFilteringBehavior=2) relationships. 1 = single (default).
+            'CrossFilteringBehavior': r.get('CrossFilteringBehavior', 1),
         })
 
     # Load all user-facing tables
