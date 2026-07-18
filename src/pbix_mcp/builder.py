@@ -1711,26 +1711,16 @@ def _modify_metadata_and_encode(
                 ft, fc, tt, tc = tt, tc, ft, fc
                 from_card, to_card = 2, 1
 
-            # One-to-one requires a SECOND (reverse) R$ join index: Desktop
-            # stores RelationshipStorage2ID plus a mirror R$ table, and a 1:1
-            # written with only a single index fails to load
-            # (TMProxyRelationship::GetStorage2ID, "parallel loading Vertipaq
-            # data objects"). The builder does not yet emit that reverse index,
-            # so downgrade a requested 1:1 to a bidirectional many-to-one: it
-            # loads cleanly and preserves both-direction filtering — only the
-            # exact 1:1 cardinality hint is lost. (Desktop ground truth for full
-            # 1:1 support is documented for a future release.)
-            if from_card == 1 and to_card == 1:
-                warnings.warn(
-                    "Relationship %s[%s]->%s[%s]: one-to-one is stored as a "
-                    "bidirectional many-to-one (full 1:1 with a reverse index "
-                    "is not yet supported)." % (
-                        rdef.get("from_table"), rdef.get("from_column"),
-                        rdef.get("to_table"), rdef.get("to_column")),
-                    stacklevel=2)
-                from_card, to_card = 2, 1
-                if cross_filter == 1:
-                    cross_filter = 2
+            # One-to-one: Power BI stores a 1:1 with cross-filter forced to Both
+            # (the UI offers no single-direction 1:1) AND a SECOND, reverse R$
+            # join index — RelationshipStorage2ID + a mirror R$ table. A 1:1
+            # written with only the single forward index fails to load
+            # (TMProxyRelationship::GetStorage2ID). Both indexes are emitted
+            # below (storage allocation + the reverse _build_r_index call).
+            # Verified byte-for-byte against a Desktop-authored 1:1.
+            is_one_to_one = (from_card == 1 and to_card == 1)
+            if is_one_to_one:
+                cross_filter = 2
 
             is_m2m = (from_card == 2 and to_card == 2)
 
@@ -1773,12 +1763,16 @@ def _modify_metadata_and_encode(
             # RelationshipStorage / RelationshipIndexStorage / R$ rows. The
             # engine joins m2m via the column dictionaries at query time.
             if is_m2m:
-                rs_id = 0
-                ris_id = 0
+                rs_id = ris_id = rs2_id = ris2_id = 0
             else:
                 # Full storage entries (same for Import and DirectQuery)
-                rs_id = alloc.next()   # RelationshipStorage
-                ris_id = alloc.next()  # RelationshipIndexStorage
+                rs_id = alloc.next()   # RelationshipStorage (forward)
+                ris_id = alloc.next()  # RelationshipIndexStorage (forward)
+                if is_one_to_one:
+                    rs2_id = alloc.next()   # RelationshipStorage (reverse)
+                    ris2_id = alloc.next()  # RelationshipIndexStorage (reverse)
+                else:
+                    rs2_id = ris2_id = 0
 
             c.execute(
                 """INSERT INTO [Relationship] (
@@ -1795,7 +1789,7 @@ def _modify_metadata_and_encode(
                     ?,
                     ?, ?, ?,
                     ?, ?, ?,
-                    1, ?, 0,
+                    1, ?, ?,
                     ?, ?, ?
                 )""",
                 (rel_id, rel_name, 1 if is_active else 0, rel_type,
@@ -1803,7 +1797,7 @@ def _modify_metadata_and_encode(
                  1 if rely_ri else 0,
                  from_tid, from_col_id, from_card,
                  to_tid, to_col_id, to_card,
-                 rs_id,
+                 rs_id, rs2_id,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP, sec_filter),
             )
 
@@ -1830,6 +1824,27 @@ def _modify_metadata_and_encode(
                     (ris_id, rs_id),
                 )
 
+                if is_one_to_one:
+                    # Reverse-index twin. Desktop stores TWO RelationshipStorage
+                    # rows for a 1:1 sharing the SAME Name (rs_name), each with
+                    # its own RelationshipIndexStorage / R$ table.
+                    c.execute(
+                        """INSERT INTO RelationshipStorage (
+                            ID, RelationshipID, Name, DefinitionType,
+                            Cardinality, Flags, RelationshipIndexStorageID
+                        ) VALUES (?, ?, ?, 0, 0, 0, ?)""",
+                        (rs2_id, rel_id, rs_name, ris2_id),
+                    )
+                    c.execute(
+                        """INSERT INTO RelationshipIndexStorage (
+                            ID, RelationshipStorageID, IndexType, Flags,
+                            RecordCount, SecondaryRecordCount,
+                            StorageFolderID, StorageFileID,
+                            SystemTableID, SecondarySystemTableID
+                        ) VALUES (?, ?, 1, 0, 0, 0, 0, 0, 0, 0)""",
+                        (ris2_id, rs2_id),
+                    )
+
             # Mark relationship as "from source" so PBI Desktop recognizes
             # it during Refresh and doesn't try to re-import it (which
             # causes TMCCollectionObject::Add errors)
@@ -1846,6 +1861,10 @@ def _modify_metadata_and_encode(
             rdef["_rs_id"] = rs_id
             rdef["_ris_id"] = ris_id
             rdef["_is_m2m"] = is_m2m
+            # For a 1:1, _rs2_id/_ris2_id are non-zero and trigger the reverse
+            # R$ index in the build loop; 0 for every other relationship.
+            rdef["_rs2_id"] = rs2_id
+            rdef["_ris2_id"] = ris2_id
 
         # ============================================================
         # Model-level annotations (ObjectType=1, ObjectID=1)
@@ -2485,28 +2504,15 @@ def _modify_metadata_and_encode(
         # ============================================================
         # Create R$ system tables for each relationship
         # ============================================================
-        for rdef in relationships:
-            # Skip relationships that weren't fully resolved
-            if "_rel_id" not in rdef:
-                continue
-
-            # Many-to-many relationships have no R$ join index (Desktop stores
-            # none — see the INSERT phase); skip R$ table creation for them.
-            if rdef.get("_is_m2m"):
-                continue
-
-            # Use resolved Many/One from relationship INSERT phase
-            many_tname = rdef["_many_table"]
-            one_tname = rdef["_one_table"]
-
-            rel_id = rdef["_rel_id"]
-            rel_name = rdef["_rel_name"]
-            rs_id = rdef["_rs_id"]
-            ris_id = rdef["_ris_id"]
-            from_tid = table_id_map[many_tname]   # PBI From = Many
-            to_tid = table_id_map[one_tname]      # PBI To = One
-            many_col_name = rdef["_many_column"]
-            one_col_name = rdef["_one_column"]
+        # R$ index construction, factored into a closure so a one-to-one
+        # relationship can build BOTH a forward and a reverse index (Desktop
+        # stores two R$ tables for a 1:1). It closes over c / alloc /
+        # table_id_map / tables / vertipaq_files. `many_*` is the INDEXED table
+        # and `one_*` the target; for the reverse index the caller swaps them.
+        def _build_r_index(many_tname, one_tname, many_col_name, one_col_name,
+                           rel_id, rel_name, rs_id, ris_id):
+            from_tid = table_id_map[many_tname]   # PBI From = Many (indexed side)
+            to_tid = table_id_map[one_tname]      # PBI To = One (target side)
 
             # R$ table indexes the Many (fact) side
             from_tname = many_tname
@@ -2857,6 +2863,25 @@ def _modify_metadata_and_encode(
                 WHERE ID = ?""",
                 (r_cs_id,),
             )
+
+        # Build the forward R$ index for every non-m2m relationship. A 1:1 also
+        # gets a REVERSE index — the INSERT phase allocated rs2/ris2 and set
+        # RelationshipStorage2ID; the reverse call swaps the indexed/target
+        # sides so it indexes the One/To table by the Many/From key.
+        for rdef in relationships:
+            if "_rel_id" not in rdef or rdef.get("_is_m2m"):
+                continue
+            _build_r_index(
+                rdef["_many_table"], rdef["_one_table"],
+                rdef["_many_column"], rdef["_one_column"],
+                rdef["_rel_id"], rdef["_rel_name"],
+                rdef["_rs_id"], rdef["_ris_id"])
+            if rdef.get("_rs2_id"):
+                _build_r_index(
+                    rdef["_one_table"], rdef["_many_table"],
+                    rdef["_one_column"], rdef["_many_column"],
+                    rdef["_rel_id"], rdef["_rel_name"],
+                    rdef["_rs2_id"], rdef["_ris2_id"])
 
         # Clean up any pre-existing system tables — make them inert
         # so they don't interfere with Refresh.

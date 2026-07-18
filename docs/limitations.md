@@ -103,7 +103,7 @@ Manage relationships):
 | Many-to-one (default) | `2→1`, single R$ index | ✅ |
 | One-to-many | `1→2`, single R$ index | ✅ author + preserve |
 | Many-to-many | `2→2`, **no** storage (`StorageID=0`, no R$ table) | ✅ author + preserve |
-| One-to-one | needs a reverse index (`RelationshipStorage2ID` + a mirror R$ table) | ⚠️ stored as a **bidirectional many-to-one** (loads clean, filters both ways; the exact 1:1 uniqueness hint is dropped and a warning is emitted). Full 1:1 with the reverse index is a documented follow-up. |
+| One-to-one | `1→1`, cross-filter forced Both, **two** R$ indexes (`RelationshipStorageID` + `RelationshipStorage2ID`, a forward + reverse mirror R$ table) | ✅ author + preserve (verified byte-for-byte against Desktop; a 1:1 with only the single forward index fails to load) |
 
 Before 0.9.10 any datamodel edit (add measure, modify column, …) silently reset
 every relationship to active / single-direction / many-to-one; that data loss is

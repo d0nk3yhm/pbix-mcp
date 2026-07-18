@@ -20,7 +20,6 @@ import io
 import os
 import sqlite3
 import tempfile
-import warnings
 import zipfile
 
 import pytest
@@ -176,27 +175,30 @@ class TestBuilderRelationshipSemantics:
         assert "A[K]->B[AK]" not in rels
         assert rels["B[AK]->A[K]"]["FromCardinality"] == 2
 
-    def test_one_to_one_downgrades_to_bidirectional_many_to_one(self):
+    def test_one_to_one_builds_forward_and_reverse_index(self):
+        # Full 1:1 (verified byte-for-byte against a Desktop-authored file and
+        # round-tripped: opens in Desktop with no repair). A 1:1 keeps
+        # FromCardinality=ToCardinality=1, forces CrossFilteringBehavior=2, and
+        # emits TWO R$ join indexes (RelationshipStorageID + Storage2ID) — a 1:1
+        # with only the single forward index fails to load.
         b = PBIXBuilder("O")
         b.add_table("A", [{"name": "K", "data_type": "String"}, {"name": "V", "data_type": "String"}],
                     rows=[{"K": "1", "V": "a"}, {"K": "2", "V": "b"}])
         b.add_table("B", [{"name": "K", "data_type": "String"}, {"name": "W", "data_type": "String"}],
                     rows=[{"K": "1", "W": "x"}, {"K": "2", "W": "y"}])
         b.add_measure("A", "Cnt", "COUNTROWS(A)")
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            b.add_relationship("A", "K", "B", "K",
-                               from_cardinality=1, to_cardinality=1,
-                               cross_filter_behavior=2, auto_orient=False)
-            pbix = b.build()
-        assert any("one-to-one" in str(w.message).lower() for w in caught)
-        rels, _, _, _ = _dump(pbix)
+        b.add_relationship("A", "K", "B", "K",
+                           from_cardinality=1, to_cardinality=1,
+                           cross_filter_behavior=2, auto_orient=False)
+        rels, nrs, nris, nrt = _dump(b.build())
         r = rels["A[K]->B[K]"]
-        # downgraded to bidirectional many-to-one (loads in Desktop)
-        assert r["FromCardinality"] == 2 and r["ToCardinality"] == 1
-        assert r["CrossFilteringBehavior"] == 2
+        assert r["FromCardinality"] == 1 and r["ToCardinality"] == 1   # true 1:1
+        assert r["CrossFilteringBehavior"] == 2                        # Both
         assert r["RelationshipStorageID"] != 0
-        assert r["RelationshipStorage2ID"] == 0
+        assert r["RelationshipStorage2ID"] != 0                        # reverse index
+        assert r["RelationshipStorageID"] != r["RelationshipStorage2ID"]
+        # two RelationshipStorage / IndexStorage rows and two R$ tables for the 1:1
+        assert nrs == 2 and nris == 2 and nrt == 2
 
 
 # --------------------------------------------------------------------------- #

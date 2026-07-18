@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.13] - 2026-07-18
+
+Completes relationship fidelity: genuine one-to-one relationships (the last item
+0.9.10 downgraded).
+
+### Added
+- **Full one-to-one relationships.** A 1:1 is now stored exactly as Power BI Desktop does — `FromCardinality=ToCardinality=1`, cross-filter forced to Both, and **two** R$ join indexes: a forward index on the From table and a reverse index on the To table (`RelationshipStorageID` + `RelationshipStorage2ID`, two `RelationshipStorage` rows sharing one GUID name, two R$ system tables). 0.9.10 could only downgrade a 1:1 to a bidirectional many-to-one because a 1:1 written with a single index fails to load (`TMProxyRelationship::GetStorage2ID`); the reverse index fixes that. Authoring (`cardinality="OneToOne"`) and preservation-through-rebuild both produce the true 1:1.
+
+### Changed
+- The R$ index construction was factored into a reusable closure so the forward and reverse indexes share one code path. The refactor was proven **byte-identical** for every non-1:1 relationship (a canonical logical hash of the metadata is unchanged), so nothing about existing relationships moved.
+
+### Verified
+- Ground truth re-confirmed against a Desktop-authored 1:1 (two R$ tables; the reverse is a faithful mirror of the forward with From/To swapped). The built 1:1 structure matches it field-for-field.
+- Round-trip: a pure-1:1 model and an all-five-relationship-types model both open in Power BI Desktop with **no repair** (verified via process/window inspection). A 1:1 survives a datamodel rebuild with both indexes intact.
+- Two independent adversarial code reviews of the builder diff found no correctness defects. Full fast suite: 304 passed; corpus (non-Agents): 135 passed; 0 failures; ruff clean; mypy 163.
+
 ## [0.9.12] - 2026-07-18
 
 ### Added
