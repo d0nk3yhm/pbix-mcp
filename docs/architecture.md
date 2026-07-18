@@ -40,7 +40,7 @@ src/pbix_mcp/
 
 ### Writing a PBIX
 
-1. Modifications are applied to files in the temp directory
+1. Modifications are applied to files in the temp directory (writes that incorporate caller-supplied names — e.g. a theme `filename`, `.pbiviz` members — are contained to the work dir via `_safe_join`, so they cannot escape via path traversal)
 2. `pbix_save` repacks the temp directory into a ZIP
 3. SecurityBindings are auto-removed to prevent corruption
 4. DataModel is stored uncompressed (it's already XPress9)
