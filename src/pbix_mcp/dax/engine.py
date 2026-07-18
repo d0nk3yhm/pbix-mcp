@@ -32,9 +32,11 @@ Supports 150+ DAX functions:
 """
 
 import math
+import os
 import random
 import re
 import statistics
+import time
 from calendar import monthrange
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
@@ -430,6 +432,19 @@ class DAXEngine:
     def __init__(self):
         self._current_var_scope = None  # Active variable scope during VAR/RETURN eval
         self.unsupported_functions: set[str] = set()  # Track unsupported DAX functions hit
+        # Wall-clock budget per outermost measure, enforced on the ENGINE (not
+        # the context) because iterators spawn a fresh sub-context per row —
+        # a context-local timer/counter would reset every row and never fire.
+        # _eval_depth tracks true measure nesting so the deadline is set once at
+        # the top and shared across every sub-context; _time_counter is a global
+        # throttle so the time check runs regardless of which context is active.
+        try:
+            self._max_eval_seconds = float(os.environ.get("PBIX_DAX_MAX_SECONDS", "20"))
+        except (TypeError, ValueError):
+            self._max_eval_seconds = 20.0
+        self._deadline = None
+        self._eval_depth = 0
+        self._time_counter = 0
         self._func_map = {
             # --- Aggregation ---
             'SUM': self._fn_sum,
@@ -623,6 +638,11 @@ class DAXEngine:
             ctx._eval_stack.discard(measure_name)
             return None
 
+        # Engine-level wall-clock deadline, set once at the true outermost
+        # measure and shared across every sub-context iterators create.
+        self._eval_depth += 1
+        if self._eval_depth == 1:
+            self._deadline = time.monotonic() + self._max_eval_seconds
         try:
             result = self._eval_expr(expr.strip(), ctx)
             if cache_key:
@@ -633,6 +653,9 @@ class DAXEngine:
             return None
         finally:
             ctx._eval_stack.discard(measure_name)
+            self._eval_depth -= 1
+            if self._eval_depth == 0:
+                self._deadline = None
 
     def _eval_expr(self, expr: str, ctx: DAXContext, var_scope: dict = None) -> Any:
         """Evaluate a DAX expression string.
@@ -646,6 +669,18 @@ class DAXEngine:
             from pbix_mcp.errors import DAXEvaluationError
             raise DAXEvaluationError(
                 "DAX evaluation budget exceeded (possible non-terminating measure)"
+            )
+        # Wall-clock guard (engine-level so it survives the per-row sub-contexts
+        # iterators create; throttled to keep time.monotonic() off the hot path).
+        # Catches O(dim x fact) measures that scan a large fact per iteration —
+        # low call count, huge wall-clock — which the eval-CALL guard misses.
+        self._time_counter += 1
+        if (self._deadline is not None and (self._time_counter & 0x3F) == 0
+                and time.monotonic() > self._deadline):
+            from pbix_mcp.errors import DAXEvaluationError
+            raise DAXEvaluationError(
+                "DAX evaluation time budget exceeded (measure too slow to "
+                "evaluate — e.g. a rank/iterator scanning a large fact table)"
             )
 
         # Merge explicit var_scope with instance-level scope (from VAR/RETURN blocks).
