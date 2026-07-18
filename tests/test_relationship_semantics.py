@@ -293,6 +293,46 @@ class TestRebuildGuardsSpecialTables:
                              "expression": "1", "format_string": None}])
         assert new > 0
 
+    def test_measure_only_container_preserved_through_rebuild(self, tmp_path):
+        # A model whose only special table is a MEASURE-ONLY container (no data
+        # columns, e.g. a "_Measures" table) must NOT be guarded — the container
+        # and its measures survive a rebuild-based edit.
+        b = _star_builder()
+        b.add_table("_Measures", [], rows=[])            # measure-only container
+        b.add_measure("_Measures", "GrandTotal", "SUM(Sales[Amount])")
+        b.add_measure("_Measures", "RowCnt", "COUNTROWS(Sales)")
+        work = tmp_path / "w"
+        work.mkdir()
+        with zipfile.ZipFile(io.BytesIO(b.build())) as z:
+            (work / "DataModel").write_bytes(z.read("DataModel"))
+        # rebuild-based edit (add a relationship) must succeed, not raise the guard
+        server._rebuild_datamodel(
+            {"work_dir": str(work)},
+            extra_relationships=[{"from_table": "Sales", "from_column": "CustID",
+                                  "to_table": "Customer", "to_column": "CustID"}])
+        # verify the container + its measures survived
+        import sqlite3
+        import tempfile
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        meta = read_metadata_sqlite(decompress_datamodel(
+            (work / "DataModel").read_bytes()))
+        fd, t = tempfile.mkstemp(suffix=".db")
+        os.write(fd, meta)
+        os.close(fd)
+        try:
+            c = sqlite3.connect(t)
+            tabs = [r[0] for r in c.execute("SELECT Name FROM [Table] WHERE ModelID=1")]
+            meas = {r[0] for r in c.execute("SELECT Name FROM Measure")}
+            nrel = c.execute("SELECT COUNT(*) FROM [Relationship]").fetchone()[0]
+            c.close()
+        finally:
+            os.unlink(t)
+        assert "_Measures" in tabs
+        assert {"GrandTotal", "RowCnt"} <= meas
+        assert nrel == 1
+
 
 class TestAddRelationshipToolParsing:
     @pytest.mark.parametrize("value", ["nonsense", "1:2:3", "one"])

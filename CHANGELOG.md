@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.14] - 2026-07-18
+
+Extends datamodel editing to models with a measures table, and closes a guard gap.
+
+### Added
+- **Measure-only container tables are preserved through a rebuild.** A table that holds only measures (no data columns — e.g. a `_Measures` table) is now re-emitted as a RowNumber-only empty table + its measures, so the rebuild-based tools (`add_relationship`, `remove_relationship`, `set_table_data`, …) work on the very common "a measures table + import tables" model shape instead of being refused. Verified: a measures-table model rebuilds (adding a relationship) with the container + measures intact and opens in Power BI Desktop with no repair.
+
+### Fixed
+- **The rebuild guard now also catches DAX calculated columns** (`Column.Type=2` on a normal table), not just calculated tables and calc-table columns. Previously a model with a calculated column but no calculated table slipped past the guard, and a rebuild would silently **drop the column** (breaking any relationship on it). Such models are now correctly refused with `MODEL_EDIT_UNSUPPORTED` naming the table.
+
+### Note
+- Full support for editing models with **calculated tables** (`DATATABLE`/`GENERATESERIES`) or **calculated columns** still needs verbatim VertiPaq preservation (copying the computed column bytes through untouched — decode-and-re-encode is not lossless for value-encoded columns); those models remain guarded. The surgical tools (`add_measure`/`modify_measure`/`remove_measure`/`modify_column`) continue to work on all models.
+
 ## [0.9.13] - 2026-07-18
 
 Completes relationship fidelity: genuine one-to-one relationships (the last item
