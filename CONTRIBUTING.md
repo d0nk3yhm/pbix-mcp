@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast unit tests only (237 pass, 9 skip, 19 slow/integration deselected)
+# Fast unit tests only (242 pass, 9 skip, 19 slow/integration deselected)
 pytest -m "not slow"
 
 # Download public test corpus, then run integration tests
@@ -55,7 +55,7 @@ tests/
   test_beta_features.py  # Beta feature tests (10; RLS, password, doctor)
   test_dax_multihop.py   # Multi-hop (snowflake) DAX filter propagation (6)
   test_found_issues.py   # OpenBI-found regressions: save flag, envelope, group coords, MAXID (6)
-  test_zip_safety.py     # PBIX/ZIP extraction hardening: bomb + traversal guards (5)
+  test_zip_safety.py     # ZIP + path-traversal hardening: bomb, Zip-Slip, _safe_join, set_theme (10)
   test_perf_per_dimension.py  # Bucketed per-dimension eval: correctness, adversarial, fuzz, perf (14)
   test_cross_report.py   # Integration tests (19; requires the public test corpus:
                          #   python scripts/download_test_corpus.py)

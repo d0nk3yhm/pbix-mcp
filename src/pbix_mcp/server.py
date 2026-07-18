@@ -82,6 +82,25 @@ _ZIP_MAX_RATIO = 100                        # uncompressed:compressed per member
 _ZIP_RATIO_MIN_SIZE = 1 << 16               # only ratio-check members >= 64 KiB
 
 
+def _safe_join(base_dir: str, *parts: str) -> str:
+    """Join *parts onto base_dir, guaranteeing the result stays inside base_dir.
+
+    Prevents path traversal / arbitrary file write when any part is influenced by
+    untrusted input — tool arguments (e.g. a theme ``filename``), ZIP member
+    names, or manifest fields. Raises UnsafeWriteError if the resolved path would
+    escape base_dir via ``..`` components, an absolute path, or (on Windows) a
+    drive/UNC prefix.
+    """
+    base_real = os.path.realpath(base_dir)
+    target = os.path.realpath(os.path.join(base_dir, *parts))
+    if target != base_real and not target.startswith(base_real + os.sep):
+        raise UnsafeWriteError(
+            "Refusing to write outside the working directory (path traversal): "
+            f"{os.path.join(*parts)!r}"
+        )
+    return target
+
+
 def _validate_zip_members(zf: "zipfile.ZipFile", dest: str) -> None:
     """Reject decompression bombs and path-traversal before extracting.
 
@@ -1695,10 +1714,11 @@ def pbix_add_visual(
                 ext = os.path.splitext(src_path)[1].lower()
                 # Generate unique filename
                 item_name = f"{visual_name}{ext}"
-                # Copy to RegisteredResources
+                # Copy to RegisteredResources (item_name derives from the
+                # visual name; contain it to work_dir against traversal).
                 res_dir = os.path.join(info["work_dir"], "Report", "StaticResources", "RegisteredResources")
                 os.makedirs(res_dir, exist_ok=True)
-                _shutil.copy2(src_path, os.path.join(res_dir, item_name))
+                _shutil.copy2(src_path, _safe_join(res_dir, item_name))
 
                 # Set imageUrl to ResourcePackageItem
                 sv.setdefault("objects", {})["general"] = [{"properties": {
@@ -2542,8 +2562,11 @@ def pbix_add_custom_visual(alias: str, pbiviz_path: str) -> str:
                 import uuid as _uuid
                 visual_guid = visual_name + _uuid.uuid4().hex[:32].upper()
 
-            # Create CustomVisuals directory in the PBIX work dir
-            cv_dir = os.path.join(work_dir, "Report", "CustomVisuals", visual_name)
+            # Create CustomVisuals directory in the PBIX work dir. Both
+            # `visual_name` (from the .pbiviz manifest) and the member `name`s
+            # below are untrusted, so contain every path to work_dir to prevent
+            # Zip-Slip / arbitrary file write (CWE-22).
+            cv_dir = _safe_join(work_dir, "Report", "CustomVisuals", visual_name)
             os.makedirs(cv_dir, exist_ok=True)
 
             # Extract all files into the custom visual directory
@@ -2555,7 +2578,7 @@ def pbix_add_custom_visual(alias: str, pbiviz_path: str) -> str:
 
                 # Determine target path inside cv_dir
                 # .pbiviz files may have files at root or in resources/
-                target = os.path.join(cv_dir, name)
+                target = _safe_join(cv_dir, name)
                 os.makedirs(os.path.dirname(target), exist_ok=True)
 
                 with zf.open(name) as src:
@@ -2742,16 +2765,18 @@ def pbix_set_theme(alias: str, theme_json: str, filename: str = "CY24SU11.json")
 
         written_to = []
 
+        # `filename` is caller-controlled; contain it to work_dir to prevent
+        # path traversal / arbitrary file write (CWE-22/CWE-73).
         # Write to BaseThemes
         base_dir = os.path.join(work_dir, "Report", "StaticResources", "SharedResources", "BaseThemes")
         os.makedirs(base_dir, exist_ok=True)
-        with open(os.path.join(base_dir, filename), "w", encoding="utf-8") as fh:
+        with open(_safe_join(base_dir, filename), "w", encoding="utf-8") as fh:
             json.dump(theme, fh, indent=2, ensure_ascii=False)
         written_to.append("BaseThemes")
 
         # Also write to RegisteredResources if the file exists there
         reg_dir = os.path.join(work_dir, "Report", "StaticResources", "RegisteredResources")
-        reg_path = os.path.join(reg_dir, filename)
+        reg_path = _safe_join(reg_dir, filename)
         if os.path.exists(reg_path):
             with open(reg_path, "w", encoding="utf-8") as fh:
                 json.dump(theme, fh, indent=2, ensure_ascii=False)

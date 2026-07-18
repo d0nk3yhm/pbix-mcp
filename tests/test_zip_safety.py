@@ -3,6 +3,7 @@
 Guards _extract_pbix / _validate_zip_members against decompression bombs and
 path traversal in untrusted archives. See server._validate_zip_members.
 """
+import json
 import os
 import tempfile
 import zipfile
@@ -10,7 +11,8 @@ import zipfile
 import pytest
 
 from pbix_mcp import server
-from pbix_mcp.errors import InvalidPBIXError
+from pbix_mcp.builder import PBIXBuilder
+from pbix_mcp.errors import InvalidPBIXError, UnsafeWriteError
 
 
 def _write_zip(path, members):
@@ -91,3 +93,69 @@ class TestZipSafety:
             os.makedirs(dest)
             with pytest.raises(InvalidPBIXError, match="(?i)symlink"):
                 server._extract_pbix(zpath, dest)
+
+
+def _minimal_pbix(path):
+    b = PBIXBuilder("T")
+    b.add_table("Items", [{"name": "ID", "data_type": "Int64"}], rows=[{"ID": 1}])
+    b.save(path)
+
+
+class TestSafeJoin:
+    def test_rejects_parent_traversal(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = os.path.join(td, "work")
+            os.makedirs(base)
+            with pytest.raises(UnsafeWriteError):
+                server._safe_join(base, "../../evil.json")
+
+    def test_rejects_absolute_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = os.path.join(td, "work")
+            os.makedirs(base)
+            outside = os.path.join(td, "evil.json")
+            with pytest.raises(UnsafeWriteError):
+                server._safe_join(base, outside)
+
+    def test_allows_contained_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = os.path.join(td, "work")
+            os.makedirs(base)
+            got = server._safe_join(base, "sub", "ok.json")
+            assert got == os.path.realpath(os.path.join(base, "sub", "ok.json"))
+
+
+class TestSetThemeTraversal:
+    """CWE-22/CWE-73: pbix_set_theme filename must not escape work_dir."""
+
+    def test_traversal_filename_refused_no_file_written(self, tmp_path):
+        p = str(tmp_path / "t.pbix")
+        _minimal_pbix(p)
+        alias = "sec1"
+        try:
+            server.pbix_open(p, alias)
+            wd = server._open_files[alias]["work_dir"]
+            base = os.path.join(wd, "Report", "StaticResources",
+                                "SharedResources", "BaseThemes")
+            target_outside = tmp_path / "PWNED.json"
+            trav = os.path.relpath(str(target_outside), base)
+            res = json.loads(server.pbix_set_theme(alias, '{"name":"x"}', filename=trav))
+            assert res["success"] is False
+            assert not target_outside.exists(), "arbitrary file write escaped work_dir!"
+        finally:
+            server._open_files.pop(alias, None)
+
+    def test_legitimate_filename_still_works(self, tmp_path):
+        p = str(tmp_path / "t.pbix")
+        _minimal_pbix(p)
+        alias = "sec2"
+        try:
+            server.pbix_open(p, alias)
+            wd = server._open_files[alias]["work_dir"]
+            res = json.loads(server.pbix_set_theme(alias, '{"name":"Ok"}', filename="Ok.json"))
+            assert res["success"] is True
+            written = os.path.join(wd, "Report", "StaticResources",
+                                   "SharedResources", "BaseThemes", "Ok.json")
+            assert os.path.exists(written)
+        finally:
+            server._open_files.pop(alias, None)
