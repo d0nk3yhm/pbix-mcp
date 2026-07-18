@@ -74,6 +74,11 @@ class DAXContext:
         self._current_row = None  # Set during row iteration (SUMX, AVERAGEX, etc.)
         self._measure_cache = {}
         self._eval_stack = set()  # Prevent circular refs
+        # Bound total sub-expression evaluations per top-level measure so a
+        # pathological/non-terminating measure degrades to BLANK instead of
+        # hanging the whole tool. Reset per outermost measure in evaluate_measure.
+        self._eval_calls = 0
+        self._max_eval_calls = 3_000_000
         # Build relationship index: { (fromTable, toTable): { fromCol, toCol } }
         self._rel_index = {}
         for rel in self.relationships:
@@ -580,6 +585,8 @@ class DAXEngine:
         if measure_name in ctx._eval_stack:
             from pbix_mcp.errors import DAXEvaluationError
             raise DAXEvaluationError(f"Circular reference detected: '{measure_name}' references itself")
+        if not ctx._eval_stack:
+            ctx._eval_calls = 0   # reset budget for each outermost measure
         ctx._eval_stack.add(measure_name)
 
         expr = ctx.measures.get(measure_name)
@@ -604,6 +611,14 @@ class DAXEngine:
         var_scope: dict of variable names (e.g. '_max') to their evaluated values.
         Used internally for VAR/RETURN support.
         """
+        # Bound runaway/non-terminating evaluation -> BLANK instead of a hang.
+        ctx._eval_calls += 1
+        if ctx._eval_calls > ctx._max_eval_calls:
+            from pbix_mcp.errors import DAXEvaluationError
+            raise DAXEvaluationError(
+                "DAX evaluation budget exceeded (possible non-terminating measure)"
+            )
+
         # Merge explicit var_scope with instance-level scope (from VAR/RETURN blocks).
         # Explicit var_scope takes priority; instance scope provides fallback so
         # that function handlers calling _eval_expr without var_scope still see vars.
@@ -741,7 +756,7 @@ class DAXEngine:
         # dropping conditions — e.g. multi-condition RLS reporting 0 rows).
         # `||` binds looser than `&&`, so try `||` first.
         for _lop in ('||', '&&'):
-            _lparts = self._split_top_level(expr, _lop)
+            _lparts = self._split_operators(expr, _lop)
             if len(_lparts) > 1:
                 _vals = [self._dax_truthy(self._eval_expr(p.strip(), ctx, var_scope))
                          for p in _lparts]
@@ -926,6 +941,62 @@ class DAXEngine:
         parts.append(''.join(current))
         return parts
 
+    def _split_operators(self, expr: str, op: str) -> list:
+        """Split expr at top-level `op`, WITHOUT requiring surrounding spaces.
+
+        Superset of _split_top_level for a single operator: respects (), [],
+        and '...'/"..." nesting; for `+`/`-` it skips a unary sign and a
+        scientific-notation exponent (1e-5); for `=`/`<`/`>` it skips the char
+        when it is part of a two-char operator (`<=`, `>=`, `<>`). Spaced
+        expressions split exactly as before (the space just lands in the part
+        and is stripped by the caller); the new behaviour is that UNSPACED
+        operators (`a*b`, `a=b`) now split too.
+        """
+        parts: list = []
+        cur: list = []
+        dp = db = 0
+        insq = indq = False
+        i, n = 0, len(expr)
+        while i < n:
+            ch = expr[i]
+            if insq:
+                cur.append(ch); insq = (ch != "'"); i += 1; continue
+            if indq:
+                cur.append(ch); indq = (ch != '"'); i += 1; continue
+            if ch == "'":
+                insq = True; cur.append(ch); i += 1; continue
+            if ch == '"':
+                indq = True; cur.append(ch); i += 1; continue
+            if ch == '(':
+                dp += 1; cur.append(ch); i += 1; continue
+            if ch == ')':
+                dp -= 1; cur.append(ch); i += 1; continue
+            if ch == '[':
+                db += 1; cur.append(ch); i += 1; continue
+            if ch == ']':
+                db -= 1; cur.append(ch); i += 1; continue
+            if dp == 0 and db == 0 and expr[i:i + len(op)] == op:
+                prev = ''.join(cur)
+                nxt = expr[i + len(op):i + len(op) + 1]
+                skip = False
+                if op in ('+', '-'):
+                    p = prev.rstrip()
+                    if p == '' or p[-1] in '+-*/(<>=&|,':
+                        skip = True                       # unary sign
+                    elif len(p) >= 2 and p[-1] in 'eE' and p[-2].isdigit():
+                        skip = True                       # exponent 1e-5
+                elif op == '=' and prev[-1:] in ('<', '>'):
+                    skip = True                           # part of <= / >=
+                elif op == '<' and nxt in ('=', '>'):
+                    skip = True                           # part of <= / <>
+                elif op == '>' and nxt == '=':
+                    skip = True                           # part of >=
+                if not skip:
+                    parts.append(prev); cur = []; i += len(op); continue
+            cur.append(ch); i += 1
+        parts.append(''.join(cur))
+        return parts
+
     def _make_row_context(self, row_item: dict, ctx: 'DAXContext') -> 'DAXContext':
         """Create a filter context from a row dict, filtering on ALL columns of the row.
         This implements the row context → filter context transition."""
@@ -978,10 +1049,10 @@ class DAXEngine:
         In DAX, BLANK is treated as 0 in arithmetic operations."""
         # Split at lowest precedence first (+ and -)
         for op in ['+', '-']:
-            parts = self._split_top_level(expr, f' {op} ')
+            parts = self._split_operators(expr, op)
             if len(parts) > 1:
                 left = self._eval_expr(parts[0].strip(), ctx, var_scope)
-                right = self._eval_expr((' ' + op + ' ').join(parts[1:]).strip(), ctx, var_scope)
+                right = self._eval_expr(op.join(parts[1:]).strip(), ctx, var_scope)
                 # DAX: BLANK treated as 0 in arithmetic
                 if left is None: left = 0
                 if right is None: right = 0
@@ -991,10 +1062,10 @@ class DAXEngine:
 
         # Then * and /
         for op in ['*', '/']:
-            parts = self._split_top_level(expr, f' {op} ')
+            parts = self._split_operators(expr, op)
             if len(parts) > 1:
                 left = self._eval_expr(parts[0].strip(), ctx, var_scope)
-                right = self._eval_expr((' ' + op + ' ').join(parts[1:]).strip(), ctx, var_scope)
+                right = self._eval_expr(op.join(parts[1:]).strip(), ctx, var_scope)
                 # DAX: BLANK treated as 0 in arithmetic
                 if left is None: left = 0
                 if right is None: right = 0
@@ -1014,7 +1085,7 @@ class DAXEngine:
         for op_str, op_fn in [('<>', lambda a, b: a != b), ('>=', lambda a, b: a >= b),
                                ('<=', lambda a, b: a <= b), ('>', lambda a, b: a > b),
                                ('<', lambda a, b: a < b), ('=', lambda a, b: a == b)]:
-            parts = self._split_top_level(expr, f' {op_str} ')
+            parts = self._split_operators(expr, op_str)
             if len(parts) == 2:
                 left = self._eval_expr(parts[0].strip(), ctx, var_scope)
                 right = self._eval_expr(parts[1].strip(), ctx, var_scope)
@@ -1538,10 +1609,10 @@ class DAXEngine:
             min_val = None
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    table_name = row_item['__table__']
-                    col_name = row_item['__column__']
-                    val = row_item['__value__']
-                    row_ctx = ctx.with_filters({f"{table_name}.{col_name}": [val]})
+                    # _make_row_context handles both single-column (ALL(T[c]))
+                    # and multi-column (bare-table ALL(T)/FILTER(T)) row dicts;
+                    # the old __column__/__value__ access KeyError'd on the latter.
+                    row_ctx = self._make_row_context(row_item, ctx)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
                     if isinstance(result, (int, float)):
@@ -1569,10 +1640,7 @@ class DAXEngine:
         if isinstance(table_ref, list):
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    table_name = row_item['__table__']
-                    col_name = row_item['__column__']
-                    val = row_item['__value__']
-                    row_ctx = ctx.with_filters({f"{table_name}.{col_name}": [val]})
+                    row_ctx = self._make_row_context(row_item, ctx)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
                     if isinstance(result, (int, float)):
@@ -1594,7 +1662,7 @@ class DAXEngine:
         if isinstance(table_ref, list):
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    row_ctx = ctx.with_filters({f"{row_item['__table__']}.{row_item['__column__']}": [row_item['__value__']]})
+                    row_ctx = self._make_row_context(row_item, ctx)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
                 else:

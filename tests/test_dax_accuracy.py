@@ -573,3 +573,67 @@ class TestLogicalOperators:
         assert visible('"West" = "East" && "yes" = "yes"') is False
         assert visible('"East" = "East" && "no" = "yes"') is False
         assert visible('"East" = "East" || "West" = "East"') is True
+
+
+class TestOperatorSpacing:
+    """0.9.9: operators no longer require surrounding spaces (tokenizer).
+
+    Spaced and unspaced forms must give identical results.
+    """
+
+    def test_unspaced_arithmetic(self, engine, tables, rels):
+        for spaced, unspaced in [
+            ('10 / 2', '10/2'), ('2 * 3 - 1', '2*3-1'),
+            ('SUM(Sales[Amount]) / 2', 'SUM(Sales[Amount])/2'),
+        ]:
+            a = engine.evaluate_measure('M', ctx(tables, rels, {'M': spaced}))
+            b = engine.evaluate_measure('M', ctx(tables, rels, {'M': unspaced}))
+            assert a == b, (spaced, unspaced, a, b)
+
+    def test_unspaced_division_result(self, engine, tables, rels):
+        assert engine.evaluate_measure('M', ctx(tables, rels, {'M': '10/4'})) == 2.5
+
+    def test_sumx_infix_unspaced(self, engine, tables, rels):
+        # The old "SUMX infix returns 0" limitation — now correct.
+        c = ctx(tables, rels, {'M': 'SUMX(Sales, Sales[Qty]*Sales[Amount])'})
+        spaced = engine.evaluate_measure('M', ctx(tables, rels, {'M': 'SUMX(Sales, Sales[Qty] * Sales[Amount])'}))
+        assert engine.evaluate_measure('M', c) == spaced
+        assert spaced != 0
+
+    def test_unspaced_comparison(self, engine, tables, rels):
+        assert engine.evaluate_measure('M', ctx(tables, rels, {'M': 'SUM(Sales[Amount])>=100'})) is True
+        assert engine.evaluate_measure('M', ctx(tables, rels, {'M': 'IF(1=1&&2=2, "y", "n")'})) == "y"
+
+    def test_unary_minus_not_split(self, engine, tables, rels):
+        # A `-` used as a unary sign must not be treated as a binary operator.
+        assert engine.evaluate_measure('M', ctx(tables, rels, {'M': '10*-2'})) == -20
+        assert engine.evaluate_measure('M', ctx(tables, rels, {'M': '10 * -2'})) == -20
+        # (`5--3` is NOT tested: `--` is a DAX line comment, so `5--3` == 5.)
+
+
+class TestEvalBudgetGuard:
+    """0.9.9: a non-terminating / runaway measure degrades to BLANK instead of
+    hanging the tool (defense-in-depth; bounds total sub-expression evals)."""
+
+    def test_over_budget_degrades_to_blank(self, engine, tables, rels):
+        c = ctx(tables, rels, {'M': 'SUM(Sales[Amount])'})
+        c._max_eval_calls = 1     # forces the budget to trip
+        assert engine.evaluate_measure('M', c) is None
+
+    def test_normal_measure_unaffected(self, engine, tables, rels):
+        c = ctx(tables, rels, {'M': 'SUM(Sales[Amount])'})
+        assert engine.evaluate_measure('M', c) == 1740
+
+
+class TestBareTableIterators:
+    """0.9.9: AVERAGEX/MINX/COUNTX over a bare table (multi-column __row__ dicts)
+    now compute correctly instead of returning BLANK (KeyError on __column__)."""
+
+    def test_iterators_over_bare_table(self, engine, tables, rels):
+        t = {'T': {'columns': ['a', 'b'], 'rows': [[10, 1], [20, 2], [30, 3]]}}
+        def ev(x):
+            return engine.evaluate_measure('m', DAXContext(t, {'m': x}, None, None, None, []))
+        assert ev('AVERAGEX(ALL(T), T[a])') == 20.0
+        assert ev('MINX(ALL(T), T[a])') == 10
+        assert ev('COUNTX(ALL(T), T[a])') == 3
+        assert ev('SUMX(ALL(T), T[a])') == 60   # control (was already correct)

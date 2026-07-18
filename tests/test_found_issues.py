@@ -192,3 +192,29 @@ class TestDefaultFiltersEnvelope:
             assert "filters" in parsed["data"]
         finally:
             server._open_files.pop(alias, None)
+
+
+class TestFormatVisualDeepMerge:
+    """OpenBI #1: pbix_format_visual must deep-merge nested object properties,
+    not replace the whole object (which dropped unspecified siblings)."""
+
+    def test_partial_border_update_keeps_siblings(self, tmp_path):
+        p = str(tmp_path / "fmt.pbix")
+        _build_minimal_pbix(p)
+        alias = "fmtmerge"
+        try:
+            server.pbix_open(p, alias)
+            server.pbix_add_page(alias, "P1")
+            server.pbix_add_visual(alias, 0, "card", x=10, y=10, width=100, height=80)
+            server.pbix_format_visual(alias, 0, 0, json.dumps(
+                {"border": {"color": "#E55A2B", "width": 2, "radius": 12}}))
+            # partial update: only the colour
+            server.pbix_format_visual(alias, 0, 0, json.dumps({"border": {"color": "#00AA00"}}))
+            layout = server._get_layout(server._open_files[alias]["work_dir"])
+            page = (layout.get("sections") or layout.get("pages"))[0]
+            cfg = json.loads(page["visualContainers"][0]["config"])
+            props = cfg["singleVisual"]["vcObjects"]["border"][0]["properties"]
+            assert "width" in props and "radius" in props, "sibling props dropped!"
+            assert "color" in props
+        finally:
+            server._open_files.pop(alias, None)

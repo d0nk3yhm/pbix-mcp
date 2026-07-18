@@ -140,3 +140,20 @@ class TestEmptySelectionNoGrandTotalLeak:
         r = dax_engine.evaluate_measures_batch(
             ['S'], tables, measures, {'Dim.Region': ['N']}, None, None, rels)
         assert r['S'] == 10
+
+
+class TestBidirectionalCrossFilter:
+    """OpenBI #5a: CrossFilteringBehavior is now carried into the engine, so a
+    bidirectional (=2) relationship adds the reverse multi-hop edge."""
+
+    def test_bidirectional_adds_reverse_edge(self):
+        tables = {'Dim': {'columns': ['K', 'V'], 'rows': [[1, 'x']]},
+                  'Fact': {'columns': ['FK', 'Amt'], 'rows': [[1, 10]]}}
+        single = dax_engine.DAXContext(tables, {}, None, None, None, [
+            {'FromTable': 'Fact', 'FromColumn': 'FK', 'ToTable': 'Dim',
+             'ToColumn': 'K', 'IsActive': True, 'CrossFilteringBehavior': 1}])
+        bidir = dax_engine.DAXContext(tables, {}, None, None, None, [
+            {'FromTable': 'Fact', 'FromColumn': 'FK', 'ToTable': 'Dim',
+             'ToColumn': 'K', 'IsActive': True, 'CrossFilteringBehavior': 2}])
+        assert 'Fact' not in single._rel_adj          # one-direction: Dim->Fact only
+        assert 'Fact' in bidir._rel_adj               # bidirectional: reverse edge added
