@@ -458,8 +458,14 @@ class PBIXBuilder:
 
         for t in self._tables:
             if not t["columns"]:
-                issues.append(f"CRITICAL: Table '{t['name']}' has no columns")
-            if not t["rows"]:
+                # A table with no data columns is a MEASURE-ONLY container (e.g.
+                # a "_Measures" table): just the auto RowNumber column + an empty
+                # partition + measures. Valid as long as it carries no rows.
+                if t["rows"]:
+                    issues.append(
+                        f"CRITICAL: Table '{t['name']}' has no columns but has "
+                        f"{len(t['rows'])} rows")
+            elif not t["rows"]:
                 issues.append(f"WARNING: Table '{t['name']}' has no rows (empty table)")
             # Check row data matches column definitions
             col_names = {c["name"] for c in t["columns"]}

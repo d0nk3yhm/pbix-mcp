@@ -4939,24 +4939,26 @@ def _rebuild_datamodel(
                 cols.append({"name": crow["ExplicitName"], "data_type": dt})
 
             # Detect tables the from-scratch rebuild can't faithfully reproduce.
-            # A calculated table (Partition.Type=2, e.g. DATATABLE/GENERATESERIES)
-            # or a table with calculated columns (Column.Type=4) has VertiPaq data
-            # that Desktop computes from a DAX expression — the builder can't
-            # recompute it, so rebuilding would silently open the table EMPTY. A
-            # measure-only container has no data columns at all. Reproducing the
-            # whole model for an unrelated edit (add relationship, set table data)
-            # would corrupt these, so fail loudly with an actionable message.
+            # A CALCULATED table (Partition.Type=2, e.g. DATATABLE/GENERATESERIES),
+            # a table carrying CALCULATED COLUMNS (Column.Type=4 = calc-table
+            # column, or Column.Type=2 = DAX column on a normal table), or a
+            # DirectQuery/dual partition all have data Power BI derives from a DAX
+            # expression / live source — the builder can't reproduce it, so a
+            # rebuild would silently open those tables EMPTY or drop the column.
+            # These are refused. A MEASURE-ONLY container (no data columns — a
+            # "_Measures" table) IS preserved: it re-emits as a RowNumber-only
+            # empty table, which the builder now supports.
             prow = conn.execute(
                 "SELECT Type FROM [Partition] WHERE TableID = ? LIMIT 1", (tid,)
             ).fetchone()
             n_calc_cols = conn.execute(
-                "SELECT COUNT(*) FROM [Column] WHERE TableID = ? AND Type = 4",
+                "SELECT COUNT(*) FROM [Column] WHERE TableID = ? AND Type IN (2, 4)",
                 (tid,),
             ).fetchone()[0]
             if (prow is not None and prow["Type"] == 2) or n_calc_cols > 0:
-                special_tables.append((tname, "calculated table"))
-            elif not cols:
-                special_tables.append((tname, "measure-only container"))
+                kind = ("calculated table" if (prow is not None and prow["Type"] == 2)
+                        else "table with calculated columns")
+                special_tables.append((tname, kind))
             tables.append({"name": tname, "columns": cols})
 
         if special_tables:
@@ -4964,14 +4966,16 @@ def _rebuild_datamodel(
             listing = ", ".join(f"'{n}' ({k})" for n, k in special_tables)
             raise UnsupportedModelEditError(
                 "This edit rebuilds the whole DataModel, but the model contains "
-                f"tables the rebuild can't preserve: {listing}. Calculated tables "
-                "would reopen empty (Power BI computes their rows from DAX, which "
-                "the rebuild can't recompute), and measure-only containers have no "
-                "data columns. To avoid corrupting the file the edit was refused. "
-                "The surgical DataModel tools do NOT rebuild and work on these "
-                "models: pbix_datamodel_add_measure / modify_measure / "
+                f"tables the rebuild can't preserve: {listing}. Power BI computes "
+                "their rows/values from a DAX expression, which the rebuild can't "
+                "recompute — rebuilding would reopen them empty or drop the "
+                "calculated column. To avoid corrupting the file the edit was "
+                "refused. The surgical DataModel tools do NOT rebuild and work on "
+                "these models: pbix_datamodel_add_measure / modify_measure / "
                 "remove_measure / modify_column. Editing models that contain "
-                "calculated tables via the rebuild path is a known limitation."
+                "calculated tables/columns via the rebuild path is a known "
+                "limitation. (Models whose only special table is a measure-only "
+                "container ARE supported.)"
             )
 
         # Get existing measures

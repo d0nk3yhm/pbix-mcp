@@ -119,18 +119,22 @@ DataModel-edit tools come in two flavors:
   `remove_relationship`, `remove_table`, `add_field_parameter`,
   `add_calculation_group`, `set_table_data`, `update_table_rows`, `replace_value`.
 
-The rebuild tools can't reproduce **calculated tables** (a `DATATABLE` /
-`GENERATESERIES` / DAX-defined table), **calculated columns**, or **measure-only
-container tables** (a table that holds only measures, e.g. a `_Measures` table):
-Power BI computes their VertiPaq data from a DAX expression, and the builder can't
-recompute it — a rebuild would reopen those tables **empty**. Rather than corrupt
-the file, a rebuild tool now **refuses with a clear error** (`MODEL_EDIT_UNSUPPORTED`)
-that names the offending tables and points at the surgical tools. Since most
-real-world models include at least a measures table, the rebuild tools are in
-practice usable on pbix-mcp-generated models and simple models without these
-tables; full support for editing models with calculated/measure-only tables
-(surgical relationship ops + calculated-table reconstruction) is a tracked
-follow-up.
+**Measure-only container tables** (a table that holds only measures, e.g. a
+`_Measures` table — no data columns) **are preserved** through a rebuild, so the
+rebuild tools work on the very common "measures table + import tables" model
+shape.
+
+The rebuild tools still can't reproduce **calculated tables** (a `DATATABLE` /
+`GENERATESERIES` / DAX-defined table) or **calculated columns** (`Column.Type`
+2 or 4 — a DAX column on a normal table, or a calc-table column): Power BI
+computes their VertiPaq data from a DAX expression, and the builder can't
+recompute it — a rebuild would reopen those tables empty or drop the calculated
+column. Rather than corrupt the file, a rebuild tool **refuses with a clear
+error** (`MODEL_EDIT_UNSUPPORTED`) that names the offending tables and points at
+the surgical tools (which work on all models). Full support for editing models
+with **calculated** tables/columns needs verbatim VertiPaq preservation (copying
+the computed column bytes through untouched, rather than re-encoding them) and is
+a tracked follow-up.
 
 ### Other builder notes
 - Fixed RowNumber GUID: 2662979B-1795-4F74-8F37-6A1BA8059B61
