@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast tests (229 pass, 9 skip, 19 slow/integration deselected)
+# Fast tests (237 pass, 9 skip, 19 slow/integration deselected)
 pytest -m "not slow"
 
 # With coverage
@@ -36,7 +36,7 @@ PBIX_TEST_SAMPLES=test_corpus pytest -v
 | `test_dax_multihop.py` | Multi-hop (snowflake) DAX filter propagation | 6 |
 | `test_found_issues.py` | OpenBI-found regressions (save flag, envelope, group coords, MAXID) | 6 |
 | `test_zip_safety.py` | PBIX/ZIP extraction hardening (bomb + traversal) | 5 |
-| `test_perf_per_dimension.py` | Bucketed per-dimension eval (correctness + perf) | 6 |
+| `test_perf_per_dimension.py` | Bucketed per-dimension eval (correctness, adversarial, fuzz, perf) | 14 |
 
 ## Public Test Corpus
 

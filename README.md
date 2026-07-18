@@ -517,9 +517,9 @@ PBIX_TEST_SAMPLES=test_corpus pytest tests/test_cross_report.py -v
 | `test_dax_multihop.py` | 6 | `unit` | No |
 | `test_found_issues.py` | 6 | `unit` | No |
 | `test_zip_safety.py` | 5 | `unit` | No |
-| `test_perf_per_dimension.py` | 6 | `unit` | No |
+| `test_perf_per_dimension.py` | 14 | `unit` | No |
 
-**From a fresh clone: 257 tests collected, 229 passed, 28 skipped, 0 failures.** All 28 skipped tests are gated on the public test corpus (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
+**From a fresh clone: 265 tests collected, 237 passed, 28 skipped, 0 failures.** All 28 skipped tests are gated on the public test corpus (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
 
 ## Architecture
 

@@ -3658,6 +3658,13 @@ def evaluate_per_dimension(measure_names: list, tables: dict, measures: dict,
     if not specs:
         return {}
 
+    # Buckets and results are keyed by the dimension value object, so values
+    # that are == and hash-equal must not appear twice (1 vs 1.0 vs True would
+    # collapse into one key and cross-contaminate). The production caller already
+    # dedups via set(); collapse here too so the function is self-consistent for
+    # any caller (keeps first occurrence, matching set()/str() comparison).
+    unique_vals = list(dict.fromkeys(unique_vals))
+
     # base filter context WITHOUT the iterated dimension (the per-value path
     # overwrites fc[dimension] per value, so the dimension must not be part of
     # the constant base filter).
@@ -3696,6 +3703,25 @@ def evaluate_per_dimension(measure_names: list, tables: dict, measures: dict,
                     buckets.setdefault(key, []).append(row)
             key_is_str = True
         else:
+            # The cross-table bucketing applies base_fc (via base_rows) and the
+            # dimension filter (via key_to_value) INDEPENDENTLY, then intersects
+            # at the fact-key level. That is only valid when no base filter sits
+            # on the dimension's own join path: a base filter on the dimension
+            # table (or an intermediate on the path to the fact) must be combined
+            # CONJUNCTIVELY per dim ROW — which this fast path does not do, and
+            # which misattributes rows when the join key is non-unique/NULL. So
+            # fall back (skip → caller evaluates per-value) whenever a base filter
+            # targets a table on that path. Base filters on the fact itself or on
+            # an unrelated dimension are orthogonal and stay on the fast path.
+            path_tables = {dim_table}
+            _p = col_helper._find_rel_path(dim_table, ftbl_name)
+            if _p:
+                for _hop in _p:
+                    path_tables.add(_hop[0])
+                    path_tables.add(_hop[1])
+            path_tables.discard(ftbl_name)
+            if any(k.split(".", 1)[0] in path_tables for k in base_fc_no_dim):
+                continue
             # cross-table: reuse the engine's propagation to map each fact join
             # key to a single dimension value (fall back on ambiguity).
             fact_col_idx = None
