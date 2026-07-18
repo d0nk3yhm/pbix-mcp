@@ -182,13 +182,54 @@ class PBIXBuilder:
         from_column: str,
         to_table: str,
         to_column: str,
+        *,
+        is_active: bool = True,
+        cross_filter_behavior: int = 1,
+        from_cardinality: int = 2,
+        to_cardinality: int = 1,
+        rely_on_referential_integrity: bool = False,
+        join_on_date_behavior: int = 1,
+        security_filtering_behavior: int = 1,
+        relationship_type: int = 1,
+        auto_orient: bool = True,
     ) -> "PBIXBuilder":
-        """Add a relationship between two tables."""
+        """Add a relationship between two tables.
+
+        The extra keyword args mirror the TOM/[Relationship] columns so that
+        non-default relationship semantics survive a rebuild (see
+        ``_rebuild_datamodel``) and can be authored directly:
+
+        - ``is_active``: False writes ``IsActive=0`` (inactive relationship,
+          e.g. a role-playing date table). Storage is unchanged — Desktop
+          encodes inactive purely by this column.
+        - ``cross_filter_behavior``: 1=single (default star-schema), 2=both
+          (bidirectional). Storage is unchanged — encoded purely by this column.
+        - ``from_cardinality`` / ``to_cardinality``: 2=many, 1=one. The pair
+          gives many-to-one (2,1 default), one-to-many (1,2), one-to-one (1,1)
+          and many-to-many (2,2). **Many-to-many is special**: Desktop stores no
+          physical join index for it (``RelationshipStorageID=0``, no
+          RelationshipStorage / RelationshipIndexStorage / R$ table), so the
+          builder omits all of those — verified against a Desktop-authored file.
+        - ``auto_orient``: when True (default) and the relationship is a plain
+          many-to-one, the From/To may be swapped so From=Many (the historical
+          convenience for callers who pass either order). Any non-default
+          cardinality, or ``auto_orient=False`` (used by the preservation path),
+          keeps the caller's orientation verbatim.
+        """
         self._relationships.append({
             "from_table": from_table,
             "from_column": from_column,
             "to_table": to_table,
             "to_column": to_column,
+            "is_active": bool(is_active),
+            "cross_filter_behavior": int(cross_filter_behavior),
+            "from_cardinality": int(from_cardinality),
+            "to_cardinality": int(to_cardinality),
+            "rely_on_referential_integrity": bool(rely_on_referential_integrity),
+            "join_on_date_behavior": int(join_on_date_behavior),
+            "security_filtering_behavior": int(security_filtering_behavior),
+            "relationship_type": int(relationship_type),
+            "auto_orient": bool(auto_orient),
         })
         return self
 
@@ -1639,17 +1680,76 @@ def _modify_metadata_and_encode(
             # has unique values (PK → One side) vs duplicates (FK → Many side).
             ft, fc = rdef["from_table"], rdef["from_column"]
             tt, tc = rdef["to_table"], rdef["to_column"]
-            # Check if from_table's column has all unique values (= PK = One side)
-            from_tdef = next((t for t in tables if t["name"] == ft), None)
-            to_tdef = next((t for t in tables if t["name"] == tt), None)
-            if from_tdef and to_tdef:
-                from_vals = [r.get(fc) for r in from_tdef.get("rows", [])]
-                to_vals = [r.get(tc) for r in to_tdef.get("rows", [])]
-                from_is_unique = len(set(from_vals)) == len(from_vals)
-                to_is_unique = len(set(to_vals)) == len(to_vals)
-                # If from has unique values and to doesn't (or has more rows), swap
-                if from_is_unique and (not to_is_unique or len(to_vals) > len(from_vals)):
-                    ft, fc, tt, tc = tt, tc, ft, fc
+
+            # Relationship semantics. Defaults reproduce the historical behavior
+            # (active, single cross-filter, many-to-one). The preservation path
+            # in _rebuild_datamodel passes the values read from the existing
+            # [Relationship] row so non-default semantics survive a rebuild.
+            is_active = rdef.get("is_active", True)
+            cross_filter = rdef.get("cross_filter_behavior", 1)
+            from_card = rdef.get("from_cardinality", 2)
+            to_card = rdef.get("to_cardinality", 1)
+            rely_ri = rdef.get("rely_on_referential_integrity", False)
+            join_on_date = rdef.get("join_on_date_behavior", 1)
+            sec_filter = rdef.get("security_filtering_behavior", 1)
+            rel_type = rdef.get("relationship_type", 1)
+            auto_orient = rdef.get("auto_orient", True)
+
+            # Did the caller leave the orientation unspecified (a plain
+            # many-to-one)? Captured BEFORE the 1:* / 1:1 rewrites below, which
+            # also land on (2,1) — only a genuinely-default 2:1 may have its
+            # From/To auto-corrected by the uniqueness heuristic. An explicit
+            # 1:*, 1:1 or *:* asserts orientation and must not be re-swapped.
+            orientation_unspecified = (from_card == 2 and to_card == 1)
+
+            # Normalize one-to-many (1:*) to the canonical many-to-one (*:1) by
+            # swapping From/To. Power BI stores relationships many->one; a 1:*
+            # authored with From=one is the same relationship seen from the other
+            # table, and swapping keeps the single R$ index on the true many side
+            # (the R$ builder always indexes the From/Many table).
+            if from_card == 1 and to_card == 2:
+                ft, fc, tt, tc = tt, tc, ft, fc
+                from_card, to_card = 2, 1
+
+            # One-to-one requires a SECOND (reverse) R$ join index: Desktop
+            # stores RelationshipStorage2ID plus a mirror R$ table, and a 1:1
+            # written with only a single index fails to load
+            # (TMProxyRelationship::GetStorage2ID, "parallel loading Vertipaq
+            # data objects"). The builder does not yet emit that reverse index,
+            # so downgrade a requested 1:1 to a bidirectional many-to-one: it
+            # loads cleanly and preserves both-direction filtering — only the
+            # exact 1:1 cardinality hint is lost. (Desktop ground truth for full
+            # 1:1 support is documented for a future release.)
+            if from_card == 1 and to_card == 1:
+                warnings.warn(
+                    "Relationship %s[%s]->%s[%s]: one-to-one is stored as a "
+                    "bidirectional many-to-one (full 1:1 with a reverse index "
+                    "is not yet supported)." % (
+                        rdef.get("from_table"), rdef.get("from_column"),
+                        rdef.get("to_table"), rdef.get("to_column")),
+                    stacklevel=2)
+                from_card, to_card = 2, 1
+                if cross_filter == 1:
+                    cross_filter = 2
+
+            is_m2m = (from_card == 2 and to_card == 2)
+
+            # The uniqueness-based From/To swap is only meaningful for a plain
+            # many-to-one relationship whose orientation the caller didn't
+            # assert. Any explicit non-default cardinality (1:*, 1:1, *:*) or
+            # auto_orient=False (the preservation path) keeps the given order.
+            if auto_orient and orientation_unspecified:
+                # Check if from_table's column has all unique values (= PK = One side)
+                from_tdef = next((t for t in tables if t["name"] == ft), None)
+                to_tdef = next((t for t in tables if t["name"] == tt), None)
+                if from_tdef and to_tdef:
+                    from_vals = [r.get(fc) for r in from_tdef.get("rows", [])]
+                    to_vals = [r.get(tc) for r in to_tdef.get("rows", [])]
+                    from_is_unique = len(set(from_vals)) == len(from_vals)
+                    to_is_unique = len(set(to_vals)) == len(to_vals)
+                    # If from has unique values and to doesn't (or has more rows), swap
+                    if from_is_unique and (not to_is_unique or len(to_vals) > len(from_vals)):
+                        ft, fc, tt, tc = tt, tc, ft, fc
             from_tid = table_id_map.get(ft)
             to_tid = table_id_map.get(tt)
             from_col_id = column_id_map.get(ft, {}).get(fc)
@@ -1658,7 +1758,8 @@ def _modify_metadata_and_encode(
             if not all([from_tid, to_tid, from_col_id, to_col_id]):
                 continue  # Skip if any reference is missing
 
-            # Store resolved Many/One for R$ section
+            # Store resolved Many/One for R$ section (unused for many-to-many,
+            # which builds no R$ table — see _is_m2m below).
             rdef["_many_table"] = ft
             rdef["_many_column"] = fc
             rdef["_one_table"] = tt
@@ -1667,11 +1768,17 @@ def _modify_metadata_and_encode(
             rel_id = alloc.next()
             rel_name = str(uuid.uuid4())
 
-            # Full storage entries (same for Import and DirectQuery)
-            # RelationshipStorage
-            rs_id = alloc.next()
-            # RelationshipIndexStorage
-            ris_id = alloc.next()
+            # Many-to-many has NO physical join index — verified against a
+            # Desktop-authored file: RelationshipStorageID=0 and no
+            # RelationshipStorage / RelationshipIndexStorage / R$ rows. The
+            # engine joins m2m via the column dictionaries at query time.
+            if is_m2m:
+                rs_id = 0
+                ris_id = 0
+            else:
+                # Full storage entries (same for Import and DirectQuery)
+                rs_id = alloc.next()   # RelationshipStorage
+                ris_id = alloc.next()  # RelationshipIndexStorage
 
             c.execute(
                 """INSERT INTO [Relationship] (
@@ -1683,42 +1790,45 @@ def _modify_metadata_and_encode(
                     State, RelationshipStorageID, RelationshipStorage2ID,
                     ModifiedTime, RefreshedTime, SecurityFilteringBehavior
                 ) VALUES (
-                    ?, 1, ?, 1, 1,
-                    1, 1,
-                    0,
-                    ?, ?, 2,
-                    ?, ?, 1,
+                    ?, 1, ?, ?, ?,
+                    ?, ?,
+                    ?,
+                    ?, ?, ?,
+                    ?, ?, ?,
                     1, ?, 0,
-                    ?, ?, 1
+                    ?, ?, ?
                 )""",
-                (rel_id, rel_name,
-                 from_tid, from_col_id,
-                 to_tid, to_col_id,
+                (rel_id, rel_name, 1 if is_active else 0, rel_type,
+                 cross_filter, join_on_date,
+                 1 if rely_ri else 0,
+                 from_tid, from_col_id, from_card,
+                 to_tid, to_col_id, to_card,
                  rs_id,
-                 _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
+                 _FIXED_TIMESTAMP, _FIXED_TIMESTAMP, sec_filter),
             )
 
-            # RelationshipStorage
-            rs_name = f"{rel_name.replace('-', ' ')} ({rel_id})"
-            c.execute(
-                """INSERT INTO RelationshipStorage (
-                    ID, RelationshipID, Name, DefinitionType,
-                    Cardinality, Flags, RelationshipIndexStorageID
-                ) VALUES (?, ?, ?, 0, 0, 0, ?)""",
-                (rs_id, rel_id, rs_name, ris_id),
-            )
+            if not is_m2m:
+                # RelationshipStorage
+                rs_name = f"{rel_name.replace('-', ' ')} ({rel_id})"
+                c.execute(
+                    """INSERT INTO RelationshipStorage (
+                        ID, RelationshipID, Name, DefinitionType,
+                        Cardinality, Flags, RelationshipIndexStorageID
+                    ) VALUES (?, ?, ?, 0, 0, 0, ?)""",
+                    (rs_id, rel_id, rs_name, ris_id),
+                )
 
-            # RelationshipIndexStorage (SystemTableID and RecordCount updated later
-            # when R$ table is created)
-            c.execute(
-                """INSERT INTO RelationshipIndexStorage (
-                    ID, RelationshipStorageID, IndexType, Flags,
-                    RecordCount, SecondaryRecordCount,
-                    StorageFolderID, StorageFileID,
-                    SystemTableID, SecondarySystemTableID
-                ) VALUES (?, ?, 1, 0, 0, 0, 0, 0, 0, 0)""",
-                (ris_id, rs_id),
-            )
+                # RelationshipIndexStorage (SystemTableID and RecordCount updated
+                # later when R$ table is created)
+                c.execute(
+                    """INSERT INTO RelationshipIndexStorage (
+                        ID, RelationshipStorageID, IndexType, Flags,
+                        RecordCount, SecondaryRecordCount,
+                        StorageFolderID, StorageFileID,
+                        SystemTableID, SecondarySystemTableID
+                    ) VALUES (?, ?, 1, 0, 0, 0, 0, 0, 0, 0)""",
+                    (ris_id, rs_id),
+                )
 
             # Mark relationship as "from source" so PBI Desktop recognizes
             # it during Refresh and doesn't try to re-import it (which
@@ -1735,6 +1845,7 @@ def _modify_metadata_and_encode(
             rdef["_rel_name"] = rel_name
             rdef["_rs_id"] = rs_id
             rdef["_ris_id"] = ris_id
+            rdef["_is_m2m"] = is_m2m
 
         # ============================================================
         # Model-level annotations (ObjectType=1, ObjectID=1)
@@ -2377,6 +2488,11 @@ def _modify_metadata_and_encode(
         for rdef in relationships:
             # Skip relationships that weren't fully resolved
             if "_rel_id" not in rdef:
+                continue
+
+            # Many-to-many relationships have no R$ join index (Desktop stores
+            # none — see the INSERT phase); skip R$ table creation for them.
+            if rdef.get("_is_m2m"):
                 continue
 
             # Use resolved Many/One from relationship INSERT phase

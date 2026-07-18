@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.10] - 2026-07-18
+
+Resolves the relationship-semantics data loss that 0.9.9 deferred (OpenBI #3/#4).
+Every relationship trait was reverse-engineered from Power BI Desktop-authored
+files and round-tripped: files written by pbix-mcp open in Desktop with **no
+repair prompt** and show the correct cardinality / cross-filter / active state in
+Manage relationships.
+
+### Fixed
+- **A datamodel edit no longer resets relationship semantics** (OpenBI #3, data loss). Every mutating tool (add/remove measure, modify column, add table, …) routes through `_rebuild_datamodel`, which re-read relationships as bare 4-tuples and re-created them as active / single-direction / many-to-one — so the first unrelated edit silently rewrote any **bidirectional** or **inactive** relationship (role-playing date tables, bridge tables). The rebuild now reads and preserves `IsActive`, `CrossFilteringBehavior`, `FromCardinality`, `ToCardinality`, `RelyOnReferentialIntegrity`, `SecurityFilteringBehavior` and keeps the source file's Many/One orientation verbatim.
+
+### Added
+- **`pbix_datamodel_add_relationship` can set cardinality, cross-filter direction, and active state** (OpenBI #4). New optional params: `cardinality` (`ManyToOne` default, `OneToMany`, `OneToOne`, `ManyToMany`; also accepts `*:1`/`1:*`/`1:1`/`*:*`), `cross_filter_direction` (`single`/`both`), `is_active`. Previously every relationship was hardcoded to active / single / many-to-one.
+- **The builder writes the exact storage Desktop produces for each relationship type**, verified byte-for-byte against Desktop-authored files:
+  - *inactive* → `IsActive=0` (storage unchanged);
+  - *bidirectional* → `CrossFilteringBehavior=2` (single storage, `Storage2ID=0`);
+  - *many-to-many* → `2→2` with **no** physical join index at all (`RelationshipStorageID=0`, no RelationshipStorage / RelationshipIndexStorage / R$ table — Desktop joins m2m via the column dictionaries).
+
+### Known limitation
+- **One-to-one** relationships need a *second* (reverse) R$ index — Desktop stores `RelationshipStorage2ID` plus a mirror R$ table. A 1:1 written with only a single index fails to load (`TMProxyRelationship::GetStorage2ID`). Until the reverse index is emitted, a requested/preserved 1:1 is stored as a **bidirectional many-to-one**: it loads cleanly and cross-filters both ways; only the exact 1:1 uniqueness hint is dropped, and a warning is emitted. The Desktop ground truth for full 1:1 support is captured for a follow-up.
+
+### Verified
+- Ground truth captured live from Power BI Desktop 2.152.882.0 (bidirectional, inactive, many-to-many, one-to-one authored and diffed).
+- Round-trip: a from-scratch model carrying all five relationship types opens in Desktop with no repair prompt; Manage relationships shows the correct glyph for each (`*──◄►──1` bidirectional, `*──►──*` many-to-many, inactive flagged).
+- Preservation verified end-to-end: after adding a measure, bidirectional / inactive / many-to-many all survive the rebuild.
+- New `tests/test_relationship_semantics.py` (12 tests). Public corpus DAX + cross-report re-run with no drift. Full fast suite: 278 passed, 9 skipped, 0 failures; ruff clean; mypy 162.
+
 ## [0.9.9] - 2026-07-18
 
 Works through several documented DAX-engine limitations plus two OpenBI-reported
