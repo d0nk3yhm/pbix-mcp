@@ -625,6 +625,49 @@ class TestEvalBudgetGuard:
         assert engine.evaluate_measure('M', c) == 1740
 
 
+class TestWallClockGuard:
+    """0.9.12: an O(dim x fact) measure (few eval calls, each scanning a large
+    fact) is bounded by a WALL-CLOCK budget on the engine — the eval-call guard
+    misses it, and a context-local timer would reset on every per-row sub-context
+    an iterator creates. Degrades to BLANK instead of hanging."""
+
+    def _model(self):
+        import random
+        random.seed(0)
+        fact = [[i % 300, 1.0] for i in range(50000)]
+        dim = [[k, "D%d" % k] for k in range(300)]
+        tables = {"Fact": {"columns": ["K", "v"], "rows": fact},
+                  "Dim": {"columns": ["K", "n"], "rows": dim}}
+        rels = [{"FromTable": "Fact", "FromColumn": "K", "ToTable": "Dim",
+                 "ToColumn": "K", "IsActive": True}]
+        measures = {"slow": "SUMX(ALL(Dim), CALCULATE(SUM(Fact[v])))",
+                    "fast": "SUM(Fact[v])"}
+        return tables, measures, rels
+
+    def test_slow_measure_bounded_to_blank(self):
+        import time as _t
+
+        from pbix_mcp.dax.engine import DAXContext, DAXEngine
+        tables, measures, rels = self._model()
+        eng = DAXEngine()
+        eng._max_eval_seconds = 0.3   # tiny budget forces the guard
+        c = DAXContext(tables, measures, None, None, None, rels)
+        t0 = _t.monotonic()
+        result = eng.evaluate_measure("slow", c)
+        elapsed = _t.monotonic() - t0
+        assert result is None                    # degraded, not hung
+        assert elapsed < 3.0                     # wall-clock actually bounded
+        # a fast measure on the same engine is unaffected
+        assert eng.evaluate_measure("fast", c) == 50000.0
+
+    def test_enough_budget_computes_correctly(self):
+        from pbix_mcp.dax.engine import DAXContext, DAXEngine
+        tables, measures, rels = self._model()
+        eng = DAXEngine()   # default budget (generous)
+        c = DAXContext(tables, measures, None, None, None, rels)
+        assert eng.evaluate_measure("slow", c) == 50000.0
+
+
 class TestBareTableIterators:
     """0.9.9: AVERAGEX/MINX/COUNTX over a bare table (multi-column __row__ dicts)
     now compute correctly instead of returning BLANK (KeyError on __column__)."""

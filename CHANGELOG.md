@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.12] - 2026-07-18
+
+### Added
+- **Wall-clock guard for the DAX engine.** The existing eval-*call* budget bounds runaway/expansion measures, but it misses an O(dimension × fact) measure — e.g. `RANKX(ALL(DimEmployee), …)` where each of hundreds of dimension rows filter-scans a 200K-row fact: few eval calls, but enormous wall-clock. Such a measure previously hung the tool (and the Agents cross-report test). Each outermost measure is now bounded by a wall-clock deadline (default 20s, override with `PBIX_DAX_MAX_SECONDS`); on exceed it degrades to BLANK instead of hanging. The guard lives on the engine (not the context) so it survives the per-row sub-contexts iterators create, and it is throttled to keep the clock read off the hot path. Ordinary measures are unaffected; a slow measure computes correctly when given enough budget. (No change to any public-corpus result.)
+
 ## [0.9.11] - 2026-07-18
 
 Clears the remaining OpenBI-reported issues (#2, #5b, and the #1 coverage gap),
