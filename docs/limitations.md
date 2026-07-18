@@ -109,6 +109,29 @@ Before 0.9.10 any datamodel edit (add measure, modify column, …) silently rese
 every relationship to active / single-direction / many-to-one; that data loss is
 fixed — existing semantics now survive the rebuild.
 
+### Editing models with calculated or measure-only tables
+DataModel-edit tools come in two flavors:
+
+- **Surgical** (edit the metadata in place, no rebuild) — work on **all** models:
+  `pbix_datamodel_add_measure`, `modify_measure`, `remove_measure`,
+  `modify_column`, `set_rls_role`, `modify_metadata`.
+- **Rebuild** (regenerate the whole DataModel from scratch) — `add_relationship`,
+  `remove_relationship`, `remove_table`, `add_field_parameter`,
+  `add_calculation_group`, `set_table_data`, `update_table_rows`, `replace_value`.
+
+The rebuild tools can't reproduce **calculated tables** (a `DATATABLE` /
+`GENERATESERIES` / DAX-defined table), **calculated columns**, or **measure-only
+container tables** (a table that holds only measures, e.g. a `_Measures` table):
+Power BI computes their VertiPaq data from a DAX expression, and the builder can't
+recompute it — a rebuild would reopen those tables **empty**. Rather than corrupt
+the file, a rebuild tool now **refuses with a clear error** (`MODEL_EDIT_UNSUPPORTED`)
+that names the offending tables and points at the surgical tools. Since most
+real-world models include at least a measures table, the rebuild tools are in
+practice usable on pbix-mcp-generated models and simple models without these
+tables; full support for editing models with calculated/measure-only tables
+(surgical relationship ops + calculated-table reconstruction) is a tracked
+follow-up.
+
 ### Other builder notes
 - Fixed RowNumber GUID: 2662979B-1795-4F74-8F37-6A1BA8059B61
 - Relationship direction: default many-to-one auto-detects Many/One sides

@@ -218,3 +218,70 @@ class TestFormatVisualDeepMerge:
             assert "color" in props
         finally:
             server._open_files.pop(alias, None)
+
+
+class TestBookmarkDisplayMode:
+    """OpenBI #2: a visibility bookmark must never write display.mode='visible'
+    (not a valid Power BI enum). Visible visuals omit mode; only hidden ones get
+    display.mode='hidden'."""
+
+    def test_visible_visual_has_no_mode(self, tmp_path):
+        p = str(tmp_path / "bm.pbix")
+        _build_minimal_pbix(p)
+        alias = "bmtest"
+        try:
+            server.pbix_open(p, alias)
+            server.pbix_add_page(alias, "P1")
+            server.pbix_add_visual(alias, 0, "card", x=10, y=10, width=100, height=80)
+            server.pbix_add_visual(alias, 0, "card", x=120, y=10, width=100, height=80)
+            work = server._open_files[alias]["work_dir"]
+            layout = server._get_layout(work)
+            page = (layout.get("sections") or layout.get("pages"))[0]
+            names = [json.loads(vc["config"])["name"] for vc in page["visualContainers"]]
+            assert len(names) >= 2
+            hide, keep = names[0], names[1]
+
+            server.pbix_add_bookmark(alias, "HideFirst", hidden_visuals=hide)
+
+            layout = server._get_layout(work)
+            cfg = json.loads(layout["config"])
+            bm = cfg["bookmarks"][-1]
+            vcs = bm["explorationState"]["sections"]
+            # dig out the visualContainers map for the (only) section
+            section = next(iter(vcs.values()))
+            containers = section["visualContainers"]
+
+            # the whole bookmark must contain no "visible"
+            assert '"visible"' not in json.dumps(bm)
+            # hidden visual -> display.mode == "hidden"
+            assert containers[hide]["singleVisual"]["display"]["mode"] == "hidden"
+            # visible visual -> no display / no mode
+            assert "display" not in containers[keep].get("singleVisual", {})
+        finally:
+            server._open_files.pop(alias, None)
+
+
+class TestFormatObjectCoverage:
+    """OpenBI #1 gap: the friendly formatter must map `labels` (a Card's Callout
+    value colour/size) and `categoryLabels`, not silently drop them."""
+
+    def test_labels_maps_to_objects_labels(self):
+        objs = server._build_format_objects({"labels": {"color": "#00AA00", "fontSize": 24}})
+        assert "labels" in objs["_objects"] if "_objects" in objs else "labels" in objs
+        # _build_format_objects returns {"_objects":..,"_vcObjects":..}
+        got = objs.get("_objects", objs)
+        assert "labels" in got
+        props = got["labels"][0]["properties"]
+        assert "color" in props and "fontSize" in props
+
+    def test_datalabels_still_works(self):
+        objs = server._build_format_objects({"dataLabels": {"color": "#112233"}})
+        got = objs.get("_objects", objs)
+        assert "labels" in got
+
+    def test_category_labels_still_mapped(self):
+        # categoryLabels was already covered (pie/donut); confirm it still works.
+        objs = server._build_format_objects({"categoryLabels": {"color": "#334455", "fontSize": 10}})
+        got = objs.get("_objects", objs)
+        assert "categoryLabels" in got
+        assert "categoryLabelFontColor" in got["categoryLabels"][0]["properties"]
