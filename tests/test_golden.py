@@ -1241,3 +1241,51 @@ class TestCompressedStringStore:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestNonStringRoundTrip:
+    """Build -> decode value round-trip for every non-String data type.
+
+    Guards against silent write-path corruption (regression guard for the
+    0.9.8 Decimal rounding fix). Uses the same read_table_from_abf path that
+    serves both reads and _rebuild_datamodel edits.
+    """
+
+    def test_all_numeric_types_round_trip(self, tmp_path):
+        import zipfile
+
+        from pbix_mcp.builder import PBIXBuilder
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
+
+        p = str(tmp_path / "rt.pbix")
+        b = PBIXBuilder("T")
+        rows_in = [
+            {"I": -42, "D": 3.14159, "Dec": 19.99, "B": True},
+            {"I": 1000000, "D": -2.5, "Dec": 1234.5678, "B": False},
+            {"I": 0, "D": 0.0, "Dec": 0.10, "B": True},
+        ]
+        b.add_table("M", [
+            {"name": "I", "data_type": "Int64"},
+            {"name": "D", "data_type": "Double"},
+            {"name": "Dec", "data_type": "Decimal"},
+            {"name": "B", "data_type": "Boolean"},
+        ], rows=rows_in)
+        b.save(p)
+
+        with zipfile.ZipFile(p) as zf:
+            abf = decompress_datamodel(zf.read("DataModel"))
+        meta = read_metadata_sqlite(abf)
+        t = read_table_from_abf(abf, "M", meta)
+        cols = t["columns"]
+        got = [dict(zip(cols, r)) for r in t["rows"]]
+        got_by_i = {r["I"]: r for r in got}
+
+        for exp in rows_in:
+            r = got_by_i[exp["I"]]
+            assert r["I"] == exp["I"]
+            assert abs(r["D"] - exp["D"]) < 1e-9, (r["D"], exp["D"])
+            # Decimal must round-trip EXACTLY (the 0.9.8 fix): 19.99 not 19.9899
+            assert abs(r["Dec"] - exp["Dec"]) < 1e-9, (r["Dec"], exp["Dec"])
+            assert bool(r["B"]) == exp["B"]

@@ -39,6 +39,13 @@ from calendar import monthrange
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
+# Sentinel returned by _eval_binary to mean "this expression is NOT a binary
+# expression" — distinct from a genuine BLANK (None) result of an operation such
+# as x / 0. It lets _eval_expr return BLANK for a real division-by-zero instead
+# of falling through and mis-parsing the expression as a bare function call
+# (which would return just the numerator).
+_NOT_APPLICABLE = object()
+
 
 class DAXContext:
     """Execution context for DAX evaluation — holds table data and filter state."""
@@ -204,10 +211,12 @@ class DAXContext:
                     allowed = set(str(v) for v in values)
                     filtered_dim_rows = [r for r in filtered_dim_rows if str(r[col_idx]) in allowed]
 
-            # Get allowed join key values
+            # Get allowed join key values. Append even an EMPTY set: an empty
+            # dimension selection must filter the fact to zero rows (BLANK), not
+            # be dropped (which would leave the fact unfiltered -> grand total).
+            # Mirrors the multi-hop path's empty-set handling.
             allowed_keys = set(str(r[dim_join_idx]) for r in filtered_dim_rows)
-            if allowed_keys:
-                result_filters.append((allowed_keys, fact_join_idx))
+            result_filters.append((allowed_keys, fact_join_idx))
 
         return result_filters
 
@@ -286,9 +295,10 @@ class DAXContext:
                 allowed = set(str(v) for v in values)
                 filtered_rows = [r for r in filtered_rows if str(r[col_idx]) in allowed]
 
+        # An empty allowed_dates set is a legitimate empty selection (filter the
+        # fact to zero rows -> BLANK), NOT a reason to drop the filter and leak
+        # the grand total; it flows through to the returns below unchanged.
         allowed_dates = set(str(r[date_col_idx]) for r in filtered_rows)
-        if not allowed_dates:
-            return []
 
         # Find date column in fact table via relationship or heuristic
         tbl = self.tables.get(table_name)
@@ -724,10 +734,25 @@ class DAXEngine:
                 return True
             return False
 
+        # Logical AND / OR. Split at top level BEFORE binary/comparison so
+        # precedence is right ((a=1) && (b>2), not a = (1 && b) > 2) AND so that
+        # `&&` / `||` are not swallowed by the single-`&` string-concat branch
+        # further down (which would silently turn `A && B` into str(A)+str(B),
+        # dropping conditions — e.g. multi-condition RLS reporting 0 rows).
+        # `||` binds looser than `&&`, so try `||` first.
+        for _lop in ('||', '&&'):
+            _lparts = self._split_top_level(expr, _lop)
+            if len(_lparts) > 1:
+                _vals = [self._dax_truthy(self._eval_expr(p.strip(), ctx, var_scope))
+                         for p in _lparts]
+                return any(_vals) if _lop == '||' else all(_vals)
+
         # Binary operations: +, -, *, / — check BEFORE function calls
         # so that FUNC() + expr is parsed as binary, not just FUNC()
         result = self._eval_binary(expr, ctx, var_scope)
-        if result is not None:
+        if result is not _NOT_APPLICABLE:
+            # A binary op matched — return its result even when that result is
+            # BLANK (None), e.g. x / 0. Only _NOT_APPLICABLE means "not binary".
             return result
 
         # Comparison: <, >, <=, >=, =, <>
@@ -943,6 +968,11 @@ class DAXEngine:
             return None
         return result
 
+    @staticmethod
+    def _dax_truthy(val: Any) -> bool:
+        """DAX truthiness: BLANK / 0 / '' / False are falsy; anything else truthy."""
+        return not (val is None or val == 0 or val == '' or val is False)
+
     def _eval_binary(self, expr: str, ctx: DAXContext, var_scope: dict = None) -> Any:
         """Evaluate binary arithmetic: +, -, *, /
         In DAX, BLANK is treated as 0 in arithmetic operations."""
@@ -977,7 +1007,7 @@ class DAXEngine:
                         return None
                 return None
 
-        return None
+        return _NOT_APPLICABLE
 
     def _eval_comparison(self, expr: str, ctx: DAXContext, var_scope: dict = None) -> Any:
         """Evaluate comparison operators."""
@@ -1073,11 +1103,15 @@ class DAXEngine:
             return None
         numerator = self._eval_expr(args[0].strip(), ctx)
         denominator = self._eval_expr(args[1].strip(), ctx)
-        alt = self._eval_expr(args[2].strip(), ctx) if len(args) > 2 else 0
-
+        # DAX: the alternate result defaults to BLANK (None), not 0.
+        alt = self._eval_expr(args[2].strip(), ctx) if len(args) > 2 else None
+        # DAX treats a BLANK numerator as 0; a BLANK/zero denominator yields the
+        # alternate (BLANK by default) — NOT the numerator.
+        if numerator is None:
+            numerator = 0
         if isinstance(numerator, (int, float)) and isinstance(denominator, (int, float)):
             if denominator == 0:
-                return alt if alt is not None else 0
+                return alt
             return numerator / denominator
         return alt
 
@@ -1155,8 +1189,11 @@ class DAXEngine:
 
             # REMOVEFILTERS / ALL
             if filter_arg.upper().startswith('REMOVEFILTERS') or filter_arg.upper().startswith('ALL'):
-                # Extract the column/table reference
-                inner_match = re.search(r"\(\s*'?([^'\)]+)'?\s*(?:\[([^\]]+)\])?\s*\)", filter_arg)
+                # Extract the column/table reference. Exclude [ ] from the table
+                # capture so an UNQUOTED Sales[Region] splits into table=Sales +
+                # col=Region (else the whole "Sales[Region]" was captured as a
+                # table name and ALL/REMOVEFILTERS silently did nothing).
+                inner_match = re.search(r"\(\s*'?([^'\)\[\]]+)'?\s*(?:\[([^\]]+)\])?\s*\)", filter_arg)
                 if inner_match:
                     table = inner_match.group(1).strip()
                     col = inner_match.group(2)

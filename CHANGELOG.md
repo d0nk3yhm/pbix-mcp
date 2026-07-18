@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.8] - 2026-07-18
+
+A correctness release: five DAX/encoder bugs that silently produced wrong
+numbers. Every fix is repro-first and verified against the public corpus (real
+measures) for zero result drift.
+
+### Fixed
+- **Decimal/Currency columns truncated on write.** `int(float(v)*10000)` truncated (`19.99*10000 == 199899.99999999997`), so `19.99` round-tripped as `19.9899` — silent data corruption. Now uses `Decimal(str(v))` with half-up rounding.
+- **`CALCULATE(m, ALL(Table[Col]))` / `REMOVEFILTERS(Table[Col])` was a silent no-op for UNQUOTED table names.** The column-reference regex captured the whole `Sales[Region]` as a table name, so the filter modifier did nothing and "% of total" returned **100% for every row**. Now `Sales[Region]` splits into table + column correctly (quoted `'Sales'[Region]` already worked).
+- **Empty cross-filter selection leaked the grand total** (single-hop and date-table paths). When a filter combination selected zero dimension rows, the empty key-set was dropped and the fact table was left unfiltered, so the measure returned the grand total instead of BLANK. Now an empty selection filters the fact to zero rows (mirrors the multi-hop fix shipped in 0.9.6).
+- **`&&` / `||` were evaluated as string concatenation.** `A && B` became `str(A)+str(B)`, so multi-condition `FILTER`/`IF` predicates — and standard multi-condition **RLS rules** — silently dropped conditions (a multi-condition RLS rule could report 0 visible rows). They are now proper logical AND/OR with correct precedence (`||` looser than `&&`). Single-`&` string concatenation is unchanged.
+- **`DIVIDE(x, 0)` and `x / 0` returned the wrong value.** `DIVIDE(x, 0)` returned `0` instead of BLANK (breaking `ISBLANK`/visual blanking), and a spaced binary `SUM(a) / SUM(b)` with a zero denominator returned the **numerator** instead of BLANK. Both now return BLANK (or the supplied alternate). A BLANK *numerator* is still treated as 0, per DAX.
+
+### Verified
+- New repro-first regression tests for every fix, incl. a build→decode round-trip for all non-String data types, "% of total" with unquoted `ALL`, empty-selection BLANK, RLS-substituted multi-condition predicates, and DIVIDE/`/` BLANK semantics.
+- Public corpus (real measures across 4 dashboards) re-evaluated with no result drift.
+- Full test suite: 284 collected, 256 passed, 28 skipped (corpus-dependent), 0 failures; ruff clean; mypy 162 (CI baseline 175).
+
+### Known limitations (unchanged; documented for the next release)
+- The DAX evaluator requires **spaces around binary and comparison operators** (`a / b`, `a = b`, `a && b`), not the unspaced forms (`a/b`, `a=b`). This underlies the "SUMX with infix arithmetic" note in `docs/limitations.md`. A proper operator tokenizer is the top candidate for a future release.
+- Table iterators (`AVERAGEX`/`MINX`/`COUNTX`/`TOPN`/`RANKX`) over a *bare* table can return BLANK; `SUMX`/`MAXX` are correct.
+
 ## [0.9.7] - 2026-07-18
 
 ### Security

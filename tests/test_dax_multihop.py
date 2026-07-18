@@ -107,3 +107,36 @@ class TestDirectionSafety:
         )
         # All 3 customers remain — the Products filter must not cross the fact.
         assert res["Cust Count"] == 3
+
+
+class TestEmptySelectionNoGrandTotalLeak:
+    """0.9.8 #3: an empty cross-filter selection must return BLANK/0, not the
+    grand total (single-hop + date paths; mirrors the multi-hop fix)."""
+
+    def test_single_hop_empty_selection_is_blank(self):
+        tables = {
+            'Dim': {'columns': ['K', 'Name', 'Region'],
+                    'rows': [[1, 'Alpha', 'N'], [2, 'Beta', 'S']]},
+            'Fact': {'columns': ['FK', 'Amt'], 'rows': [[1, 10], [2, 20]]},
+        }
+        measures = {'S': 'SUM(Fact[Amt])'}
+        rels = [{'FromTable': 'Fact', 'FromColumn': 'FK',
+                 'ToTable': 'Dim', 'ToColumn': 'K', 'IsActive': True}]
+        # Beta is Region 'S'; filtering Region='N' AND Name='Beta' selects zero
+        # Dim rows -> the fact must filter to zero -> 0, not the grand total 30.
+        r = dax_engine.evaluate_measures_batch(
+            ['S'], tables, measures, {'Dim.Region': ['N'], 'Dim.Name': ['Beta']},
+            None, None, rels)
+        assert r['S'] in (0, 0.0)
+
+    def test_nonempty_selection_still_correct(self):
+        tables = {
+            'Dim': {'columns': ['K', 'Region'], 'rows': [[1, 'N'], [2, 'S']]},
+            'Fact': {'columns': ['FK', 'Amt'], 'rows': [[1, 10], [2, 20]]},
+        }
+        measures = {'S': 'SUM(Fact[Amt])'}
+        rels = [{'FromTable': 'Fact', 'FromColumn': 'FK',
+                 'ToTable': 'Dim', 'ToColumn': 'K', 'IsActive': True}]
+        r = dax_engine.evaluate_measures_batch(
+            ['S'], tables, measures, {'Dim.Region': ['N']}, None, None, rels)
+        assert r['S'] == 10

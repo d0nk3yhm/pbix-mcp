@@ -509,17 +509,17 @@ PBIX_TEST_SAMPLES=test_corpus pytest tests/test_cross_report.py -v
 | Suite | Tests | Marker | Needs PBIX? |
 |-------|-------|--------|-------------|
 | `test_dax_engine.py` | 55 | `unit` | 6 skip without the public test corpus |
-| `test_dax_accuracy.py` | 50 | `unit` | No |
-| `test_golden.py` | 48 | `golden` | 3 skip without the public test corpus |
+| `test_dax_accuracy.py` | 61 | `unit` | No |
+| `test_golden.py` | 49 | `golden` | 3 skip without the public test corpus |
 | `test_fixtures.py` | 18 | `unit` | No (ships with repo) |
 | `test_beta_features.py` | 10 | `unit` | No |
 | `test_cross_report.py` | 19 | `slow`, `integration` | Yes (4 public PBIX dashboards) |
-| `test_dax_multihop.py` | 6 | `unit` | No |
+| `test_dax_multihop.py` | 8 | `unit` | No |
 | `test_found_issues.py` | 6 | `unit` | No |
 | `test_zip_safety.py` | 10 | `unit` | No |
 | `test_perf_per_dimension.py` | 14 | `unit` | No |
 
-**From a fresh clone: 270 tests collected, 242 passed, 28 skipped, 0 failures.** All 28 skipped tests are gated on the public test corpus (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
+**From a fresh clone: 284 tests collected, 256 passed, 28 skipped, 0 failures.** All 28 skipped tests are gated on the public test corpus (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
 
 ## Architecture
 

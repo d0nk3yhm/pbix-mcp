@@ -304,13 +304,21 @@ class TestITSupport:
             except Exception as e:
                 pytest.fail(f'Measure "{name}" crashed: {e}')
 
-    def test_success_rate_100_with_defaults(self, data):
-        """IT Support should hit 100% with default filters."""
+    def test_success_rate_with_defaults(self, data):
+        """Most IT Support measures evaluate to a value under default filters.
+
+        Not 100%: BLANK is a legitimate DAX result. As of 0.9.8, four measures
+        correctly evaluate to BLANK rather than a spurious non-blank value —
+        e.g. `IF([Avg Res] >= 2.9 && [Tickets] >= 100, 1)` returns BLANK when the
+        alert condition is not met (before the 0.9.8 `&&` fix it wrongly returned
+        1), and two `DIVIDE(...)` ratios with a zero denominator now return BLANK
+        instead of 0. Non-blank rate is ~85%.
+        """
         tables, measures, rels, dt, dc, df = data
         success = sum(1 for name in measures
                       if evaluate_measures_smart([name], tables, measures, df or None, dt, dc, rels).get(name) is not None)
         rate = success / len(measures)
-        assert rate >= 1.0, f'Success rate {rate:.0%} < 100%'
+        assert rate >= 0.8, f'Non-blank rate {rate:.0%} < 80% (possible regression)'
 
 
 if __name__ == '__main__':
