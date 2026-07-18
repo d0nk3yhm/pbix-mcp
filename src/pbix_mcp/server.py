@@ -4934,11 +4934,20 @@ def _rebuild_datamodel(
                 "description": mrow["Description"] or "",
             })
 
-        # Get existing relationships
+        # Get existing relationships — preserve the semantic columns (IsActive,
+        # CrossFilteringBehavior, cardinality, ...) so an unrelated datamodel
+        # edit doesn't silently reset bidirectional / inactive / many-to-many
+        # relationships back to active many-to-one (OpenBI #3). Exception: a
+        # one-to-one is rebuilt as a bidirectional many-to-one (the builder
+        # can't yet emit the reverse index) — see PBIXBuilder.add_relationship.
         rels = []
         for rrow in conn.execute(
             "SELECT ft.Name as ft, fc.ExplicitName as fc, "
-            "tt.Name as tt, tc.ExplicitName as tc "
+            "tt.Name as tt, tc.ExplicitName as tc, "
+            "r.IsActive, r.CrossFilteringBehavior, "
+            "r.FromCardinality, r.ToCardinality, "
+            "r.RelyOnReferentialIntegrity, r.JoinOnDateBehavior, "
+            "r.SecurityFilteringBehavior, r.Type "
             "FROM Relationship r "
             "JOIN [Table] ft ON r.FromTableID = ft.ID "
             "JOIN [Column] fc ON r.FromColumnID = fc.ID "
@@ -4948,6 +4957,19 @@ def _rebuild_datamodel(
             rels.append({
                 "from_table": rrow["ft"], "from_column": rrow["fc"],
                 "to_table": rrow["tt"], "to_column": rrow["tc"],
+                # NULL IsActive (shouldn't occur in Desktop files) defaults to
+                # active — 0 is a valid value, so `bool(None)` must not silently
+                # deactivate a relationship.
+                "is_active": (True if rrow["IsActive"] is None
+                              else bool(rrow["IsActive"])),
+                "cross_filter_behavior": rrow["CrossFilteringBehavior"] or 1,
+                "from_cardinality": rrow["FromCardinality"] or 2,
+                "to_cardinality": rrow["ToCardinality"] or 1,
+                "rely_on_referential_integrity": bool(
+                    rrow["RelyOnReferentialIntegrity"]),
+                "join_on_date_behavior": rrow["JoinOnDateBehavior"] or 1,
+                "security_filtering_behavior": rrow["SecurityFilteringBehavior"] or 1,
+                "relationship_type": rrow["Type"] or 1,
             })
 
         # Get existing user hierarchies
@@ -5043,12 +5065,40 @@ def _rebuild_datamodel(
             continue
         if r["from_table"] in remove_tables or r["to_table"] in remove_tables:
             continue
+        # Preserve the existing relationship's full semantics verbatim; keep
+        # Desktop's From/To (Many/One) orientation rather than re-deriving it.
         builder.add_relationship(
-            r["from_table"], r["from_column"], r["to_table"], r["to_column"]
+            r["from_table"], r["from_column"], r["to_table"], r["to_column"],
+            is_active=r.get("is_active", True),
+            cross_filter_behavior=r.get("cross_filter_behavior", 1),
+            from_cardinality=r.get("from_cardinality", 2),
+            to_cardinality=r.get("to_cardinality", 1),
+            rely_on_referential_integrity=r.get(
+                "rely_on_referential_integrity", False),
+            join_on_date_behavior=r.get("join_on_date_behavior", 1),
+            security_filtering_behavior=r.get("security_filtering_behavior", 1),
+            relationship_type=r.get("relationship_type", 1),
+            auto_orient=False,
         )
     for r in extra_relationships:
+        # Newly-added relationships may carry explicit semantics (from
+        # pbix_datamodel_add_relationship); fall back to the historical
+        # active/single/many-to-one defaults when they don't. auto_orient stays
+        # True: the builder only auto-detects Many/One when the cardinality was
+        # left at the default many-to-one, so an explicit 1:*/1:1/*:* keeps the
+        # caller's orientation while a plain add still gets the old auto-correct.
         builder.add_relationship(
-            r["from_table"], r["from_column"], r["to_table"], r["to_column"]
+            r["from_table"], r["from_column"], r["to_table"], r["to_column"],
+            is_active=r.get("is_active", True),
+            cross_filter_behavior=r.get("cross_filter_behavior", 1),
+            from_cardinality=r.get("from_cardinality", 2),
+            to_cardinality=r.get("to_cardinality", 1),
+            rely_on_referential_integrity=r.get(
+                "rely_on_referential_integrity", False),
+            join_on_date_behavior=r.get("join_on_date_behavior", 1),
+            security_filtering_behavior=r.get("security_filtering_behavior", 1),
+            relationship_type=r.get("relationship_type", 1),
+            auto_orient=True,
         )
 
     # Add all user hierarchies (existing, preserved across rebuild)
@@ -5773,19 +5823,54 @@ def pbix_datamodel_add_relationship(
     from_column: str,
     to_table: str,
     to_column: str,
+    cardinality: str = "ManyToOne",
+    cross_filter_direction: str = "single",
+    is_active: bool = True,
 ) -> str:
     """Add a relationship between two tables. Rebuilds the DataModel.
 
-    Creates a cross-table relationship with R$ index tables in VertiPaq.
-    The from side is many (fact), the to side is one (dimension).
+    Creates a cross-table relationship with R$ index tables in VertiPaq
+    (except many-to-many, which by design has no join index).
 
     Args:
         alias: The alias of the open file
-        from_table: Fact table name (many side)
-        from_column: Foreign key column in fact table
-        to_table: Dimension table name (one side)
-        to_column: Primary key column in dimension table
+        from_table: "From" table name — the many side for the default ManyToOne
+        from_column: Join column in the from table
+        to_table: "To" table name — the one side for the default ManyToOne
+        to_column: Join column in the to table
+        cardinality: One of "ManyToOne" (default), "OneToMany", "OneToOne",
+            "ManyToMany". Accepts the glyph forms "*:1", "1:*", "1:1", "*:*".
+            For OneToOne/ManyToMany both join columns should be unique / both
+            non-unique respectively, matching Power BI Desktop's rules.
+        cross_filter_direction: "single" (default, filters flow one way) or
+            "both" (bidirectional). Accepts 1/2.
+        is_active: False creates an inactive relationship (activate it from DAX
+            with USERELATIONSHIP). Only one active relationship may exist per
+            table pair+path, exactly as in Desktop.
     """
+    _CARD = {
+        "manytoone": (2, 1), "*:1": (2, 1), "m:1": (2, 1),
+        "onetomany": (1, 2), "1:*": (1, 2), "1:m": (1, 2),
+        "onetoone": (1, 1), "1:1": (1, 1),
+        "manytomany": (2, 2), "*:*": (2, 2), "m:m": (2, 2),
+    }
+    key = str(cardinality).strip().lower().replace(" ", "").replace("-", "")
+    if key not in _CARD:
+        return ToolResponse.error(
+            f"Invalid cardinality {cardinality!r}. Use one of: ManyToOne, "
+            "OneToMany, OneToOne, ManyToMany.", "INVALID_ARGUMENT").to_text()
+    from_card, to_card = _CARD[key]
+
+    xf = str(cross_filter_direction).strip().lower()
+    if xf in ("single", "onedirection", "one", "1"):
+        cross_filter = 1
+    elif xf in ("both", "bothdirections", "bidirectional", "2"):
+        cross_filter = 2
+    else:
+        return ToolResponse.error(
+            f"Invalid cross_filter_direction {cross_filter_direction!r}. "
+            "Use 'single' or 'both'.", "INVALID_ARGUMENT").to_text()
+
     try:
         info = _ensure_open(alias)
         dm_path = os.path.join(info["work_dir"], "DataModel")
@@ -5797,11 +5882,30 @@ def pbix_datamodel_add_relationship(
             extra_relationships=[{
                 "from_table": from_table, "from_column": from_column,
                 "to_table": to_table, "to_column": to_column,
+                "is_active": bool(is_active),
+                "cross_filter_behavior": cross_filter,
+                "from_cardinality": from_card,
+                "to_cardinality": to_card,
             }],
         )
         info["modified"] = True
+        _note = ""
+        if (from_card, to_card) == (1, 1):
+            # The builder downgrades 1:1 to a bidirectional many-to-one (a 1:1
+            # needs a reverse R$ index the builder doesn't yet emit).
+            _card_label, cross_filter, _note = "*:1", 2, (
+                "\n  note: one-to-one is stored as a bidirectional many-to-one "
+                "(full 1:1 with a reverse index is a known limitation); "
+                "cross-filtering still works in both directions.")
+        else:
+            _card_label = {(2, 1): "*:1", (1, 2): "1:*", (2, 2): "*:*"}[
+                (from_card, to_card)]
+        _dir_label = "both" if cross_filter == 2 else "single"
+        _act_label = "active" if is_active else "inactive"
         return ToolResponse.ok(
             f"Relationship added: {from_table}.{from_column} → {to_table}.{to_column}\n"
+            f"  cardinality={_card_label}, cross-filter={_dir_label}, {_act_label}"
+            f"{_note}\n"
             f"  DataModel: {old_size:,} → {new_size:,} bytes"
         ).to_text()
     except PBIXMCPError as e:

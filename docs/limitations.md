@@ -90,9 +90,30 @@ zero-row representation mirrors Desktop's own empty-table convention:
   Services' string-store consistency check rejects
   (`PFE_XM_DBCC_STRINGSTORE_CORRUPT`) — a store with no strings has no page.
 
+### Relationship semantics
+The builder and every datamodel-edit path preserve and can author non-default
+relationship traits (verified byte-for-byte against Power BI Desktop-authored
+files, and round-tripped: files open with no repair prompt, correct glyphs in
+Manage relationships):
+
+| Trait | Encoding | Support |
+|-------|----------|---------|
+| Active / inactive | `IsActive` 1/0 (storage unchanged) | ✅ author + preserve |
+| Cross-filter single / both | `CrossFilteringBehavior` 1/2 (storage unchanged) | ✅ author + preserve |
+| Many-to-one (default) | `2→1`, single R$ index | ✅ |
+| One-to-many | `1→2`, single R$ index | ✅ author + preserve |
+| Many-to-many | `2→2`, **no** storage (`StorageID=0`, no R$ table) | ✅ author + preserve |
+| One-to-one | needs a reverse index (`RelationshipStorage2ID` + a mirror R$ table) | ⚠️ stored as a **bidirectional many-to-one** (loads clean, filters both ways; the exact 1:1 uniqueness hint is dropped and a warning is emitted). Full 1:1 with the reverse index is a documented follow-up. |
+
+Before 0.9.10 any datamodel edit (add measure, modify column, …) silently reset
+every relationship to active / single-direction / many-to-one; that data loss is
+fixed — existing semantics now survive the rebuild.
+
 ### Other builder notes
 - Fixed RowNumber GUID: 2662979B-1795-4F74-8F37-6A1BA8059B61
-- Relationship direction: auto-detects Many/One sides; From=Many (fact), To=One (dimension)
+- Relationship direction: default many-to-one auto-detects Many/One sides
+  (From=Many/fact, To=One/dimension); explicit cardinality or the preservation
+  path keeps the caller's / source file's orientation verbatim
 - Key annotations: PBI_IsFromSource (ObjectType=7), PBI_ResultType, SummarizationSetBy, PBI_QueryOrder, __PBI_TimeIntelligenceEnabled
 - M expression navigation uses `Item` key (not `Name`) for MySQL/PostgreSQL
 
