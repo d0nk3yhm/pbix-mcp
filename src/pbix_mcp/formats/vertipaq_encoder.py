@@ -1254,6 +1254,18 @@ def _encode_column(
         # Zero rows: use min=max=2 (template convention for empty segments)
         min_data_id = 2
         max_data_id = 2
+    elif has_nulls and len(unique_sorted) == 0:
+        # All-NULL column (rows exist but every value is blank). There are ZERO
+        # real dictionary entries, so the only data_id physically stored in the
+        # segment is the blank id 2 (raw index 0 + BaseId 2). Declaring the
+        # normal has_nulls range [3, 3] would claim a real value at data_id 3
+        # that neither the dictionary nor any row provides — Power BI's DBCC
+        # dictionary/hierarchy consistency check then rejects the model on open
+        # ("off-by-one", PFE_XM_DBCC_COLUMN_DICTIONARY_FAILED). Mirror the
+        # row_count==0 empty convention: min=max=2 (matching the sole stored
+        # data_id and driving DictionaryStorage.LastId=2 for the empty dict).
+        min_data_id = 2
+        max_data_id = 2
     elif is_row_number:
         min_data_id = _DATA_ID_OFFSET
         max_data_id = _DATA_ID_OFFSET + max(row_count - 1, 0)
@@ -1502,6 +1514,16 @@ def update_table_in_abf(
       4. Replaces all matched column files in the ABF.
       5. Returns the rebuilt ABF bytes.
 
+    NOTE: this surgical in-place path has no current callers — the shipped tools
+    (pbix_set_table_data / pbix_update_table_rows) rebuild the whole DataModel via
+    PBIXBuilder, which regenerates every column's hierarchy from scratch. It does
+    NOT demote a column that transitions from having real values to ALL-NULL:
+    the segment is re-encoded correctly (min=max=2, empty dict) but the previously
+    materialized H$ attribute hierarchy / AttributeHierarchyStorage is left stale,
+    which would fail Power BI's DBCC check. Route all-null transitions through the
+    builder rebuild (or extend this function to demote the hierarchy) before using
+    it in production.
+
     Parameters
     ----------
     abf_bytes : bytes
@@ -1708,7 +1730,15 @@ def update_table_in_abf(
 
         h_data = _encode_h_dollar_data(col_name, col_def["data_type"], rows)
         if h_data is None:
-            continue  # distinct==0, H$ stays as-is (MaterializationType=3)
+            # distinct==0 (all-null): no new H$ data to write. WARNING: if the
+            # column previously had real values, its materialized H$ hierarchy and
+            # AttributeHierarchyStorage are left STALE here (pointing at data_ids
+            # the now-empty dictionary no longer holds) — a DBCC inconsistency.
+            # This surgical path has no live callers; the builder rebuild used by
+            # the shipped tools regenerates the hierarchy and avoids this. See the
+            # function docstring. A proper fix would demote the AHS to
+            # MaterializationType=2/DistinctDataCount=0 and drop the H$ table.
+            continue
 
         # Map H$ encoded bytes to ABF file_log entries by matching Path pattern
         h_file_map = {
