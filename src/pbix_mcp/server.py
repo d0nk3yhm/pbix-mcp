@@ -5087,16 +5087,25 @@ def _rebuild_datamodel(
             upd = table_updates[tname]
             builder.add_table(tname, upd["columns"], rows=upd["rows"])
         else:
-            # Read existing row data from VertiPaq
+            # Read existing row data from VertiPaq. If a column cannot be
+            # decoded we must NOT fall back to rebuilding the table with no
+            # rows — that would silently turn an unrelated metadata edit
+            # (add_measure, add_relationship, …) into whole-table data loss.
+            # Abort loudly instead; the DataModel on disk is only rewritten at
+            # the very end of the rebuild, so the original file stays intact.
             try:
                 td = read_table_from_abf(abf, tname, meta_bytes)
-                existing_rows = [
-                    dict(zip(td["columns"], row_vals))
-                    for row_vals in td.get("rows", [])
-                ]
-                builder.add_table(tname, tinfo["columns"], rows=existing_rows)
-            except Exception:
-                builder.add_table(tname, tinfo["columns"], rows=[])
+            except Exception as e:
+                raise InvalidPBIXError(
+                    f"Cannot preserve the rows of table '{tname}' during this "
+                    f"edit: {e}. Aborting rather than silently rebuilding the "
+                    f"table with no data (the file on disk is left unchanged)."
+                ) from e
+            existing_rows = [
+                dict(zip(td["columns"], row_vals))
+                for row_vals in td.get("rows", [])
+            ]
+            builder.add_table(tname, tinfo["columns"], rows=existing_rows)
 
     # Add new tables
     for et in extra_tables:
@@ -5550,13 +5559,20 @@ def _modify_metadata_sqlite(
     builder = PBIXBuilder()
     for tinfo in modified_tables:
         tname = tinfo["name"]
+        # See _rebuild_datamodel: never silently substitute rows=[] on a read
+        # failure — that would destroy the table's data during an unrelated
+        # metadata edit. Abort loudly and leave the file unchanged.
         try:
             td = read_table_from_abf(abf, tname, meta_bytes)
-            existing_rows = [dict(zip(td["columns"], rv))
-                             for rv in td.get("rows", [])]
-            builder.add_table(tname, tinfo["columns"], rows=existing_rows)
-        except Exception:
-            builder.add_table(tname, tinfo["columns"], rows=[])
+        except Exception as e:
+            raise InvalidPBIXError(
+                f"Cannot preserve the rows of table '{tname}' during this "
+                f"edit: {e}. Aborting rather than silently rebuilding the "
+                f"table with no data (the file on disk is left unchanged)."
+            ) from e
+        existing_rows = [dict(zip(td["columns"], rv))
+                         for rv in td.get("rows", [])]
+        builder.add_table(tname, tinfo["columns"], rows=existing_rows)
 
     for m in modified_measures:
         builder.add_measure(m["table"], m["name"], m["expression"],
@@ -9554,18 +9570,20 @@ def pbix_doctor(alias: str) -> str:
             return f"{count} roles" if count else "None"
         _check("Row-Level Security (RLS)", check_rls)
 
-        # 12. Calculated tables (detected via partition type or expression)
+        # 12. Calculated tables — a calculated (DAX) table is Partition.Type=2
+        # (DATATABLE / GENERATESERIES / CALENDAR / etc.). Partition.Type=4 is a
+        # plain M/import partition and must NOT be counted here — doing so
+        # mislabels every imported table as "calculated". Calculation-group
+        # source tables (Type=7) are reported separately and excluded too.
         def check_calc():
             _init_datamodel()
             c = db_conn.cursor()
             c.execute("""SELECT t.Name FROM [Table] t
                          JOIN Partition p ON p.TableID = t.ID
                          WHERE t.Name NOT LIKE 'H$%' AND t.Name NOT LIKE 'R$%'
-                         AND (p.Type = 4 OR (p.QueryDefinition IS NOT NULL
-                              AND p.QueryDefinition NOT LIKE '%#table(%'))
-                         AND p.QueryDefinition LIKE '%=%'""")
+                         AND p.Type = 2""")
             calc = [r[0] for r in c.fetchall()]
-            return f"{len(calc)} calculated tables" if calc else "None"
+            return f"{len(calc)} calculated tables ({', '.join(calc)})" if calc else "None"
         _check("Calculated tables", check_calc)
 
         # 13. Default slicer filters

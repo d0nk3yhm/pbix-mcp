@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.16] - 2026-07-19
+
+Hardens the reader against silent data loss on high-cardinality String columns, and fixes a `pbix_doctor` mislabel.
+
+### Fixed
+- **Reading a large/compressed String column can no longer silently vanish (data-integrity).** When a String column's character store crosses the 8192-char threshold it is stored as a Huffman-compressed dictionary (the format Power BI Desktop itself uses). The reader (`read_table_from_abf`) previously wrapped every per-column decode in a bare `except … → None`, so if a column's VertiPaq files *existed* but could not be decoded (e.g. the `xmhuffman` dependency missing, or a corrupt store), the column was silently returned blank and then dropped from the result entirely — indistinguishable from "no data". The reader now **fails loud**: it collects such columns and raises `InvalidPBIXError` naming each column, the decode stage, and the underlying reason (with an install hint when `xmhuffman` is the cause), instead of returning partial data. Legitimately data-less columns (calculated columns, RowNumber) are still excluded quietly as before. Verified that the D: compressed encoder itself is correct and Power BI Desktop reads it: a model with an 891-distinct Titanic-style `Name` column (commas/parens, latin-1) opens clean, and encode↔decode round-trips exactly across the boundary and at high cardinality (uncompressed, single-page, and multi-page compressed; ASCII, latin-1 accents, CJK, and emoji). New `tests/test_large_string_roundtrip.py` locks in the round-trip and the fail-loud behaviour.
+- **A metadata edit can no longer silently rebuild a table with no rows (data-integrity).** The rebuild path (`_rebuild_datamodel`, `_modify_metadata_sqlite`) re-reads every table's VertiPaq data to carry it through a rebuild. It previously wrapped that read in `except Exception: … rows=[]`, so if any column failed to decode the *entire table* was rebuilt empty and written to disk — turning an unrelated edit (`add_relationship`, `set_table_data`, …) into whole-table data loss. It now aborts loudly (raises `InvalidPBIXError` naming the table) and leaves the file on disk unchanged, so no data is destroyed. (Found by adversarial review of the reader fix above.)
+- **`pbix_doctor` no longer mislabels imported tables as calculated.** The "Calculated tables" check keyed on `Partition.Type = 4`, which is a plain M/import partition — so every imported table was counted as calculated (e.g. a 3-table import model reported "3 calculated tables"). It now keys on `Partition.Type = 2` (the actual DAX calculated-table marker, `DATATABLE`/`GENERATESERIES`/`CALENDAR`/…) and lists the table names.
+
 ## [0.9.15] - 2026-07-19
 
 Fixes a critical DBCC failure on all-NULL columns, and a stale default-slicer-filter cache in DAX evaluation.
