@@ -369,7 +369,9 @@ def _decode_numeric_dictionary(buf: bytes, pos: int, dict_type: int) -> list:
 # IDF decoder (RLE + bit-packed hybrid)
 # ---------------------------------------------------------------------------
 
-def decode_idf(idf_bytes: bytes, bit_width: int, row_count: int) -> list[int]:
+def decode_idf(
+    idf_bytes: bytes, bit_width: int, row_count: int, rle_base: int = 0
+) -> list[int]:
     """
     Decode an IDF blob and return per-row dictionary indices.
 
@@ -380,6 +382,15 @@ def decode_idf(idf_bytes: bytes, bit_width: int, row_count: int) -> list[int]:
         - Otherwise, repeat data_value exactly repeat_value times
       sub_segment_size: uint64  (count of uint64 words)
       sub_segment[]: array of uint64 (bit-packed values)
+
+    ``rle_base``: value subtracted from every RLE ``data_value``. In Power BI
+    Desktop segments the bit-packed sub-segment stores indices RELATIVE to the
+    segment minimum (``data_id - min_data_id``), but an RLE run stores the
+    ABSOLUTE ``data_id``. Passing ``rle_base = min_data_id - null_offset``
+    re-bases RLE runs onto the same relative scale as the bit-packed values, so
+    a column that mixes both (or is pure-RLE, e.g. a single-value column)
+    decodes consistently. The default 0 preserves the legacy behaviour for
+    callers that don't need the adjustment (our own encoder never emits RLE).
     """
     buf = idf_bytes
     pos = 0
@@ -413,29 +424,34 @@ def decode_idf(idf_bytes: bytes, bit_width: int, row_count: int) -> list[int]:
         sub_words.append(w)
         pos += 8
 
-    # Decode primary entries to produce index list
-    indices = []
-    sub_pos = 0  # index into sub_words
-
+    # Pre-decode the ENTIRE bit-packed sub-segment into one flat array. The
+    # values for every bit-packed primary entry are stored contiguously here
+    # (values_per_word per u64 word, low bits first), so a bit-packed entry
+    # consumes the next `rv` of them by value-offset — NOT by whole words. The
+    # earlier word-at-a-time approach discarded the unused tail of the last
+    # word of each group, which misaligned every later group in a mixed segment.
     values_per_word = 64 // bit_width if bit_width > 0 else 0
     mask = (1 << bit_width) - 1 if bit_width > 0 else 0
+    bitpacked_values: list[int] = []
+    if values_per_word:
+        for word in sub_words:
+            for j in range(values_per_word):
+                bitpacked_values.append((word >> (j * bit_width)) & mask)
 
+    # Decode primary entries. A primary entry is a bit-packed marker when
+    # `data_value + bit_packed_offset == 0xFFFFFFFF` (Power BI stores each
+    # successive marker as 0xFFFFFFFF minus the number of bit-packed values
+    # already consumed), otherwise it is an RLE run of `data_value`.
+    indices = []
+    bit_packed_offset = 0
     for dv, rv in primary_entries:
-        if dv == 0xFFFFFFFF:
-            # Bit-packed: read rv values from sub-segment
-            remaining = rv
-            while remaining > 0 and sub_pos < len(sub_words):
-                word = sub_words[sub_pos]
-                sub_pos += 1
-                for j in range(values_per_word):
-                    if remaining <= 0:
-                        break
-                    val = (word >> (j * bit_width)) & mask
-                    indices.append(val)
-                    remaining -= 1
+        if (dv + bit_packed_offset) & 0xFFFFFFFF == 0xFFFFFFFF:
+            indices.extend(bitpacked_values[bit_packed_offset:bit_packed_offset + rv])
+            bit_packed_offset += rv
         else:
-            # RLE: repeat dv exactly rv times
-            indices.extend([dv] * rv)
+            # RLE: repeat dv exactly rv times. Re-base absolute data_ids onto
+            # the same relative scale as the bit-packed sub-segment values.
+            indices.extend([dv - rle_base] * rv)
 
     # Truncate to exact row count (sub-segment may have padding)
     return indices[:row_count]
@@ -453,6 +469,28 @@ def _oa_date_to_python(oa_days: float):
         return epoch + _dt.timedelta(days=oa_days)
     except (OverflowError, ValueError):
         return oa_days  # Return raw value if conversion fails
+
+
+def _reconstruct_value_encoded(n, data_type: str):
+    """Convert a VALUE-encoded numeric ``n`` to a Python-friendly value.
+
+    Value encoding (DictionaryStorage.Type=2, no external dictionary) stores the
+    scaled integer directly in the segment; the real value is
+    ``n = (data_id + BaseId) / Magnitude`` (already applied by the caller). This
+    then maps ``n`` to the column's declared type. Verified byte-for-byte against
+    pbixray over the whole corpus (Int64 keys/counts, DateTime) — e.g. an OLE
+    serial 45748 -> 2025-04-01. Magnitude carries the decimal/currency scale, so
+    ``n`` is the final numeric value for Float64/Decimal (do NOT divide again).
+    """
+    if data_type == "DateTime":
+        return _oa_date_to_python(n)
+    if data_type == "Boolean":
+        return bool(int(round(n)))
+    if data_type == "Int64":
+        return int(round(n))
+    if data_type in ("Float64", "Decimal"):
+        return float(n)
+    return n
 
 
 def _reconstruct_value(dict_value, data_type: str, is_null: bool):
@@ -521,11 +559,18 @@ def read_table_from_abf(
             raise ValueError(f"Table '{table_name}' not found in metadata")
         table_id = table_row["ID"]
 
-        # Get columns (Type=1 is data, Type=3 is calculated; Type=2 is RowNumber)
+        # Get columns (Type=1 is data, Type=3 is calculated; Type=2 is RowNumber).
+        # Also pull the DictionaryStorage encoding so we can decode VALUE-encoded
+        # columns (DictionaryStorage.Type=2, no external .dictionary file):
+        # BaseId + Magnitude reconstruct value = (data_id + BaseId) / Magnitude.
         columns = conn.execute(
             """SELECT c.ID, c.ExplicitName, c.ExplicitDataType, c.IsHidden,
-                      c.ColumnStorageID, c.Type
+                      c.ColumnStorageID, c.Type,
+                      ds.Type AS DSType, ds.BaseId AS DSBaseId,
+                      ds.Magnitude AS DSMagnitude
                FROM [Column] c
+               LEFT JOIN ColumnStorage cs ON cs.ID = c.ColumnStorageID
+               LEFT JOIN DictionaryStorage ds ON ds.ID = cs.DictionaryStorageID
                WHERE c.TableID = ? AND c.Type IN (1, 3)
                ORDER BY c.ID""",
             (table_id,),
@@ -570,6 +615,11 @@ def read_table_from_abf(
         col_id = col["ID"]
         amo_type = col["ExplicitDataType"]
         data_type = _AMO_TO_TYPE_NAME.get(amo_type, "String")
+        # DictionaryStorage.Type=2 => VALUE encoding (no external .dictionary):
+        # values reconstruct from raw index + BaseId + Magnitude.
+        ds_type = col["DSType"] if "DSType" in col.keys() else None
+        ds_base_id = col["DSBaseId"] if "DSBaseId" in col.keys() else None
+        ds_magnitude = col["DSMagnitude"] if "DSMagnitude" in col.keys() else None
 
         # Find column files in ABF using multiple matching strategies
         idf_entry = None
@@ -590,14 +640,19 @@ def read_table_from_abf(
             if path.startswith("H$") or path.startswith("R$"):
                 continue
 
-            # Check if this file belongs to the right table
-            # Real PBIX: "TableName (TableID).tbl"
-            # Our encoder: "TableName.tbl"
-            is_table_file = False
-            if f"{table_name} ({table_id})" in path:
-                is_table_file = True
-            elif path.startswith(f"{table_name}.tbl"):
-                is_table_file = True
+            # Check if this file belongs to the right table.
+            #   Real PBIX:  "<sanitized name> (TableID).tbl\..."
+            #   Our encoder: "TableName.tbl\..."
+            # Match on the TableID token "(TableID).tbl" rather than the name:
+            # Power BI sanitizes '_', '-', '#', etc. to spaces in ABF paths (so
+            # 'fct_Orders' -> 'fct Orders (14).tbl'), and calc / field-parameter
+            # tables get a generic 'Table (id)' / 'Parameter (id)' folder — a
+            # name match misses all of these and silently returns 0 columns.
+            # The numeric TableID is stable across every one of those cases.
+            is_table_file = (
+                f"({table_id}).tbl" in path
+                or path.startswith(f"{table_name}.tbl")
+            )
 
             if not is_table_file:
                 continue
@@ -667,14 +722,42 @@ def read_table_from_abf(
                 else:
                     bit_width = 1
 
+            # Re-base RLE runs (absolute data_ids) onto the same relative scale
+            # as bit-packed values, so single-value / low-cardinality columns
+            # (RLE-encoded by Power BI Desktop) decode correctly.
+            _null_offset = 1 if meta_info["has_nulls"] else 0
+            _rle_base = meta_info["min_data_id"] - _null_offset
             try:
-                indices = decode_idf(idf_bytes_raw, bit_width, row_count)
+                indices = decode_idf(idf_bytes_raw, bit_width, row_count, rle_base=_rle_base)
             except Exception as e:
                 decode_errors.append((col_name, "idf", f"{type(e).__name__}: {e}"))
                 col_data.append((col_name, data_type, None))
                 continue
 
-            # Map indices to values
+            # VALUE-encoded column (no external dictionary, DictionaryStorage.
+            # Type=2): reconstruct value = (data_id + BaseId) / Magnitude.
+            # `indices` are on the re-based scale (data_id - min_data_id +
+            # null_offset), so data_id = idx + _rle_base and the real value is
+            # (idx + _rle_base + BaseId) / Magnitude — using _rle_base (not the
+            # raw min_data_id) keeps bit-packed and RLE runs consistent for a
+            # nullable column. Verified byte-for-byte against pbixray across the
+            # corpus (Int64 keys/counts, DateTime OLE dates, currency mag=10000,
+            # score mag=1e9).
+            if dict_entry is None and ds_type == 2:
+                base = ds_base_id if ds_base_id is not None else 0
+                mag = ds_magnitude if ds_magnitude else 1.0
+                values = []
+                for idx in indices:
+                    if _null_offset and idx == 0:
+                        values.append(None)  # the reserved blank/NULL slot
+                    else:
+                        values.append(
+                            _reconstruct_value_encoded((idx + _rle_base + base) / mag, data_type)
+                        )
+                col_data.append((col_name, data_type, values))
+                continue
+
+            # Map indices to values (hash / dictionary encoding)
             has_nulls = meta_info["has_nulls"]
             null_offset = 1 if has_nulls else 0
             values = []
