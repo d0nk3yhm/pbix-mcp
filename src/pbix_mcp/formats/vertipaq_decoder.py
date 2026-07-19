@@ -27,6 +27,7 @@ import sqlite3
 import struct
 import tempfile
 
+from pbix_mcp.errors import InvalidPBIXError
 from pbix_mcp.formats.vertipaq_encoder import (
     AMO_BOOLEAN,
     AMO_DATETIME,
@@ -557,6 +558,12 @@ def read_table_from_abf(
 
     # Read each column's data
     col_data = []  # list of (col_name, data_type, values_list)
+    # Columns whose VertiPaq files EXIST but fail to decode. These are genuine
+    # data-loss situations (corrupt store, or a missing decoder dependency such
+    # as xmhuffman for Huffman-compressed string dictionaries). We collect them
+    # and raise AFTER the loop rather than silently returning a blank/dropped
+    # column — silent data loss is the worst possible failure for this tool.
+    decode_errors: list[tuple[str, str, str]] = []  # (col_name, stage, message)
 
     for col in columns:
         col_name = col["ExplicitName"]
@@ -623,7 +630,8 @@ def read_table_from_abf(
         meta_bytes = read_abf_file(abf_bytes, meta_entry)
         try:
             meta_info = decode_idfmeta(meta_bytes)
-        except Exception:
+        except Exception as e:
+            decode_errors.append((col_name, "idfmeta", f"{type(e).__name__}: {e}"))
             col_data.append((col_name, data_type, None))
             continue
 
@@ -640,7 +648,8 @@ def read_table_from_abf(
             dict_bytes_raw = read_abf_file(abf_bytes, dict_entry)
             try:
                 _, dict_values = decode_dictionary(dict_bytes_raw)
-            except Exception:
+            except Exception as e:
+                decode_errors.append((col_name, "dictionary", f"{type(e).__name__}: {e}"))
                 col_data.append((col_name, data_type, None))
                 continue
 
@@ -660,7 +669,8 @@ def read_table_from_abf(
 
             try:
                 indices = decode_idf(idf_bytes_raw, bit_width, row_count)
-            except Exception:
+            except Exception as e:
+                decode_errors.append((col_name, "idf", f"{type(e).__name__}: {e}"))
                 col_data.append((col_name, data_type, None))
                 continue
 
@@ -684,6 +694,22 @@ def read_table_from_abf(
             col_data.append((col_name, data_type, []))
         else:
             col_data.append((col_name, data_type, None))
+
+    # Fail LOUD if any column's VertiPaq files existed but could not be decoded.
+    # Returning here would silently drop those columns (they read back blank),
+    # which is exactly the "large String column silently vanished" data-loss
+    # class. Surface it instead so the caller sees which columns failed and why.
+    if decode_errors:
+        details = "; ".join(f"'{n}' ({stage} — {msg})" for n, stage, msg in decode_errors)
+        hint = ""
+        if any("xmhuffman" in msg.lower() for _, _, msg in decode_errors):
+            hint = (" Reading Huffman-compressed string dictionaries requires the "
+                    "'xmhuffman' package — install it with `pip install xmhuffman`.")
+        raise InvalidPBIXError(
+            f"Failed to decode {len(decode_errors)} column(s) in table "
+            f"'{table_name}': {details}. Refusing to return partial data because "
+            f"the affected column(s) would silently read as blank.{hint}"
+        )
 
     # Filter out columns with no data (None means we couldn't read it)
     valid_cols = [(name, dt, vals) for name, dt, vals in col_data if vals is not None]
