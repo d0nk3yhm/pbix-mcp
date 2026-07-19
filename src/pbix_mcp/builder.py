@@ -281,6 +281,19 @@ class PBIXBuilder:
         for mdef in self._measures:
             measure_to_table[mdef["name"]] = mdef["table"]
 
+        # (entity, property) -> data_type, for the report-binding type codes.
+        col_types: dict[tuple[str, str], str] = {}
+        for tdef in self._tables:
+            for c in tdef.get("columns", []):
+                col_types[(tdef["name"], c["name"])] = c.get("data_type", "String")
+
+        def _resolve_type(entity, prop, is_measure):
+            if is_measure:
+                return None
+            return col_types.get((entity, prop))
+
+        from pbix_mcp.report_binding import compile_visual_binding
+
         sections = []
         for i, page in enumerate(pages):
             containers = []
@@ -297,16 +310,28 @@ class PBIXBuilder:
                     single_visual["projections"] = bindings["projections"]
                     single_visual["prototypeQuery"] = bindings["prototypeQuery"]
 
-                containers.append({
+                container = {
                     "x": vis.get("x", 20 + j * 320),
                     "y": vis.get("y", 20),
+                    "z": vis.get("z", 0),
                     "width": vis.get("width", 300),
                     "height": vis.get("height", 200),
                     "config": json.dumps({
                         "name": vis.get("name", f"visual_{j}"),
                         "singleVisual": single_visual,
                     }),
-                })
+                }
+                # Compile the data binding (query + dataTransforms) that Power BI
+                # Desktop's report loader requires on data visuals — without it a
+                # report carrying report-level config / visual objects fails to
+                # load ("Failed to load the report"), though the model opens fine.
+                if bindings:
+                    q, dt = compile_visual_binding(single_visual, _resolve_type)
+                    if q is not None:
+                        container["query"] = json.dumps(q, ensure_ascii=False)
+                        container["dataTransforms"] = json.dumps(dt, ensure_ascii=False)
+                        container["filters"] = "[]"
+                containers.append(container)
             sections.append({
                 "displayName": page["name"],
                 "name": f"ReportSection{i + 1}",

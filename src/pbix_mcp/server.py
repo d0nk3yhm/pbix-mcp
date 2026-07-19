@@ -1615,6 +1615,51 @@ def pbix_create(
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
+def _report_type_resolver(info: dict):
+    """Build ``resolve_type(entity, prop, is_measure) -> data_type`` from the
+    open model's metadata, for report-binding type codes (best-effort).
+
+    Plain internal helper — NOT an MCP tool (must stay above pbix_add_visual's
+    ``@mcp.tool()`` without displacing it)."""
+    col_types: dict = {}
+    try:
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        with open(dm_path, "rb") as f:
+            abf = decompress_datamodel(f.read())
+        meta_bytes = read_metadata_sqlite(abf)
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(meta_bytes)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            conn.row_factory = sqlite3.Row
+            _AMO = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime",
+                    10: "Decimal", 11: "Boolean"}
+            for r in conn.execute(
+                "SELECT t.Name tn, c.ExplicitName cn, c.ExplicitDataType edt "
+                "FROM [Column] c JOIN [Table] t ON t.ID = c.TableID "
+                "WHERE c.Type IN (1, 2, 4)"
+            ):
+                col_types[(r["tn"], r["cn"])] = _AMO.get(r["edt"], "String")
+            conn.close()
+        finally:
+            os.unlink(tmp.name)
+    except Exception:
+        col_types = {}
+
+    def resolve(entity, prop, is_measure):
+        # Measures: Measure.DataType is unreliable (currency measures are stored
+        # as Int64), so fall through to the compiler's numeric/decimal default
+        # (259/1) — matching Desktop for the common case.
+        if is_measure:
+            return None
+        return col_types.get((entity, prop))
+
+    return resolve
+
+
 @mcp.tool()
 def pbix_add_visual(
     alias: str,
@@ -1810,6 +1855,23 @@ def pbix_add_visual(
         }
         if visual_type == "image":
             container["filters"] = "[]"
+
+        # Compile the data binding (query + dataTransforms) Power BI Desktop's
+        # report loader requires on data visuals. Without it a report carrying
+        # report-level config / visual objects fails to load with "Failed to
+        # load the report", even though the model opens fine. Non-data visuals
+        # (textbox / shape / image / button) have no projections and are skipped.
+        sv_final = config.get("singleVisual", {})
+        if sv_final.get("prototypeQuery") and sv_final.get("projections"):
+            try:
+                from pbix_mcp.report_binding import compile_visual_binding
+                q, dt = compile_visual_binding(sv_final, _report_type_resolver(info))
+                if q is not None:
+                    container["query"] = json.dumps(q, ensure_ascii=False)
+                    container["dataTransforms"] = json.dumps(dt, ensure_ascii=False)
+                    container.setdefault("filters", "[]")
+            except Exception:
+                pass  # best-effort: never block visual creation on binding
 
         page.setdefault("visualContainers", []).append(container)
         _set_layout(info["work_dir"], layout)
