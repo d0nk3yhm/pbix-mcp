@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.19] - 2026-07-20
+
+Reports built by pbix-mcp now load in Power BI Desktop (critical report-layer fix).
+
+### Fixed
+- **Reports no longer fail Power BI Desktop's report loader ("Failed to load the report").** Every data visual in the legacy `Report/Layout` was written with only `config` (projections + prototypeQuery) and no compiled data binding. As soon as a report carried report-level `config` / visual `objects` (as OpenBI/pbix-mcp reports do), Desktop's report loader rejected the whole report — no pages, no visuals — even though the data model opened cleanly and `pbix_doctor` was all-green (it never runs the report loader). Both visual-creation paths — the from-scratch builder (`add_page`) and `pbix_add_visual` — now compile the `projections` + `prototypeQuery` into the `query` (a `SemanticQueryDataShapeCommand` with its `Binding`) and `dataTransforms` (projectionOrdering / queryMetadata / visualElements / selects) that the loader requires, plus `filters` and `z`. Textboxes, shapes, images, and buttons (no data binding) are left untouched. Verified against real Power BI Desktop: an OpenBI Titanic report that failed to load now loads once the compiled bindings are present; the binding structure matches Desktop-authored reports (sales_demo / GeoSales) field-for-field. New `src/pbix_mcp/report_binding.py` + `tests/test_report_binding.py`.
+
 ## [0.9.18] - 2026-07-19
 
 Decodes multi-segment columns — large import tables no longer read back truncated.
