@@ -4037,7 +4037,7 @@ def _find_selectedvalue_targets(expr: str) -> list:
 
 
 def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
-                            filter_context: dict = None,
+                            filter_context: dict | None = None,
                             date_table: str = None, date_column: str = None,
                             relationships: list = None) -> dict:
     """Evaluate measures with smart fallback for SELECTEDVALUE-dependent measures.

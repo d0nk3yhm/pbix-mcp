@@ -6715,11 +6715,20 @@ def pbix_evaluate_dax(
         measure_names = [m.strip() for m in measures.split(',') if m.strip()]
 
         parsed_fc = FilterContext.from_json_str(filter_context)
+        fc: dict | None
         if parsed_fc.filters:
             fc = parsed_fc.filters
         else:
-            # Auto-apply default slicer filters from the report layout
-            fc = ctx.get('default_filters') or None
+            # Auto-apply default slicer filters from the report layout, re-derived
+            # from the current layout (not the open-time snapshot) so a slicer/
+            # filter edit is honored on the next evaluate (OpenBI #7). The
+            # derivation is mtime-cached, so the steady state is one stat(), not a
+            # full layout re-parse. On error, fail CLOSED (apply no defaults)
+            # rather than reuse a possibly-stale snapshot.
+            try:
+                fc = _get_default_filters_current(ctx) or None
+            except Exception:
+                fc = None
 
         # Reset unsupported tracker before evaluation
         dax_engine._engine.unsupported_functions.clear()
@@ -6939,16 +6948,20 @@ def _get_layout_pbir(work_dir: str) -> dict | None:
     return {"sections": sections} if sections else None
 
 
-def _extract_default_filters_dict(work_dir: str, page_index: int = 0) -> dict:
+def _extract_default_filters_dict(work_dir: str, page_index: int = 0, layout: dict | None = None) -> dict:
     """Internal: extract default slicer filters as a dict for programmatic use.
 
     Handles both In-type (value list) and Comparison-type (equality/range) filters.
     Returns { 'Entity.Property': [values] } suitable for use as filter_context.
+
+    ``layout`` may be a pre-parsed layout dict to avoid re-reading/re-parsing the
+    (potentially multi-MB) report layout once per page.
     """
-    layout = _get_layout(work_dir)
-    if not layout:
-        # Try PBIR format
-        layout = _get_layout_pbir(work_dir)
+    if layout is None:
+        layout = _get_layout(work_dir)
+        if not layout:
+            # Try PBIR format
+            layout = _get_layout_pbir(work_dir)
     if not layout:
         return {}
 
@@ -7063,12 +7076,59 @@ def _get_all_default_filters(work_dir: str) -> dict:
     all_filters = {}
     sections = layout.get("sections", [])
     for i in range(len(sections)):
-        page_filters = _extract_default_filters_dict(work_dir, i)
+        # Pass the already-parsed layout so each page doesn't re-open/re-parse it.
+        page_filters = _extract_default_filters_dict(work_dir, i, layout=layout)
         # Merge — later pages don't overwrite earlier ones
         for k, v in page_filters.items():
             if k not in all_filters:
                 all_filters[k] = v
     return all_filters
+
+
+def _layout_stamp(work_dir: str | None):
+    """Return a cheap change-stamp for the report layout files: a tuple of
+    (mtime, size) per candidate layout file, or None if none can be stat'd.
+    Used to detect layout/slicer edits without a full re-parse. Including size
+    alongside mtime guards against two same-size edits landing in one mtime tick.
+    """
+    if not work_dir:
+        return None
+    parts = []
+    for rel in (
+        os.path.join("Report", "Layout"),
+        os.path.join("Report", "definition.pbir"),
+        os.path.join("definition", "report.json"),
+    ):
+        try:
+            st = os.stat(os.path.join(work_dir, rel))
+        except OSError:
+            continue
+        parts.append((rel, st.st_mtime_ns, st.st_size))
+    return tuple(parts) if parts else None
+
+
+def _get_default_filters_current(ctx: dict) -> dict:
+    """Return the report's current default slicer filters, re-deriving from the
+    layout only when it has changed on disk since the last derivation.
+
+    The DAX context caches an open-time snapshot, but slicer/filter edits
+    (pbix_set_filters, set_layout_raw, …) rewrite the layout without rebuilding
+    the context, which would otherwise leak a stale selection (OpenBI #7). We key
+    a cached derivation on a cheap layout change-stamp so the steady state is a
+    single stat() instead of a full multi-MB layout re-parse on every evaluation.
+    """
+    work_dir = ctx.get("work_dir")
+    stamp = _layout_stamp(work_dir)
+    if (
+        stamp is not None
+        and ctx.get("_default_filters_stamp") == stamp
+        and "default_filters" in ctx
+    ):
+        return ctx["default_filters"] or {}
+    df = _get_all_default_filters(work_dir) if work_dir else {}
+    ctx["default_filters"] = df
+    ctx["_default_filters_stamp"] = stamp
+    return df
 
 
 @mcp.tool()

@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.15] - 2026-07-19
+
+Fixes a critical DBCC failure on all-NULL columns, and a stale default-slicer-filter cache in DAX evaluation.
+
+### Fixed
+- **All-NULL columns no longer break the model on open (CRITICAL).** A column whose rows all exist but are every one blank (zero real dictionary entries — e.g. an imported column that is entirely empty) produced a segment that declared its real-value data-id range as `[3,3]`, i.e. it claimed a real value at data_id 3 that the empty dictionary never provides. Power BI Desktop's DBCC consistency check rejected such a model on open (`PFE_XM_DBCC_COLUMN_DICTIONARY_FAILED` → "Something went wrong", model won't load). The encoder now recognizes the all-NULL case and declares `min_data_id = max_data_id = 2` — the sole data-id physically stored is the blank id 2 (= dictionary `BaseId`), which also drives `DictionaryStorage.LastId = 2` to match the empty dictionary. Ordinary nullable columns (some values + some NULLs) were already consistent and are byte-for-byte unchanged. Verified end-to-end against Power BI Desktop: the pre-fix model fails to open, the fixed model loads clean, and the data round-trips (all-NULL → all blank, partial-NULL preserved). New `tests/test_nullable_hierarchy.py` locks in the segment/dictionary/attribute-hierarchy consistency invariants and fails if the fix is reverted.
+- **DAX evaluation no longer applies a stale default slicer selection.** `pbix_evaluate_dax` auto-applies the report's default slicer filters when no explicit `filter_context` is given. Those come from the report layout, which can change (`pbix_set_filters`, slicer edits, `pbix_set_layout_raw`, …) without the cached DAX context being rebuilt — so a previous selection kept leaking into later evaluations. The default filters are now re-derived fresh from the current layout at evaluation time, so a slicer change is reflected on the very next evaluate. New `tests/test_default_filters_cache.py` covers both directions (stale filter ignored, fresh filter applied).
+
 ## [0.9.14] - 2026-07-18
 
 Extends datamodel editing to models with a measures table, and closes a guard gap.
