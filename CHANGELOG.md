@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.17] - 2026-07-19
+
+Correctly reads Power BI Desktop-authored column data — value encoding, RLE, and multi-group bit-packed segments — instead of returning blanks.
+
+### Fixed
+- **Value-encoded numeric columns now decode to their real values (data-integrity).** Columns Power BI stores with VALUE encoding (`DictionaryStorage.Type=2`, no external dictionary — common for integer keys/counts and dates) have no dictionary to look up, so the reader previously returned them entirely blank. They are now reconstructed as `value = (data_id + BaseId) / Magnitude`, with OLE-date semantics for DateTime (e.g. serial `45748` → `2025-04-01`). Verified byte-for-byte against `pbixray` across the whole test corpus (including a 199,999-row fact table).
+- **RLE-compressed segments decode correctly.** An RLE run stores the ABSOLUTE `data_id`, whereas the bit-packed sub-segment stores values relative to the segment minimum. The reader now re-bases RLE runs onto the same scale, so single-value / low-cardinality columns (e.g. a `Returned = "Yes"` flag) no longer read as all-blank.
+- **Segments with multiple bit-packed groups decode correctly.** Each successive bit-packed marker is `0xFFFFFFFF` minus the number of bit-packed values already consumed (not a fixed `0xFFFFFFFF`), and all bit-packed values are stored contiguously in the sub-segment. The reader now tracks the running offset and slices the flat bit-packed array by value (not by whole words), fixing columns that previously decoded correctly for the first ~N rows and then turned to garbage/blank.
+
+- **Tables whose name contains `_`, `-`, or `#` no longer read back as zero columns (data-integrity).** Power BI sanitizes those characters to spaces in the internal ABF file paths (`fct_Orders` → `fct Orders (14).tbl`), but the reader matched files by the raw table name, so every column of such a table failed to match and the table silently returned no columns and no rows — and, worse, was rebuilt empty on any metadata edit. File matching now keys on the numeric `(TableID).tbl` token, which is stable across name sanitization and the generic `Table (id)` / `Parameter (id)` folders that calc / field-parameter tables use. (This also unblocked verification of the currency/scale value-encoded columns, `Magnitude` 10000 and 1e9, which live in such tables.)
+- **Nullable value-encoded columns with RLE runs decode consistently.** The value-encoding reconstruction now uses the same re-based scale (`min_data_id − null_offset`) that the segment decode used, so an RLE run in a nullable value-encoded column no longer comes out off by `1/Magnitude`, and the reserved blank slot decodes to NULL.
+
+Net effect: reading Desktop-authored models (`pbix_get_table_data`, `pbix_query_table`, CSV/PBIP export, and the data-preserving rebuild path) now returns the true values for every column encoding present in the corpus — hash (bit-packed / RLE / mixed) and value, across all 162 data columns of the 19-table test corpus — where a quarter of columns (and whole tables) previously came back blank or wrong. New `tests/test_vertipaq_decode.py` locks in the segment-decode format with crafted-byte unit tests plus a `pbixray` corpus cross-check that also fails if any table decodes to zero columns.
+
+Known limitation (pre-existing, tracked): a column whose data spans more than one VertiPaq segment (import tables beyond ~1M rows) still decodes only its first segment. Not present in the test corpus; addressed separately.
+
 ## [0.9.16] - 2026-07-19
 
 Hardens the reader against silent data loss on high-cardinality String columns, and fixes a `pbix_doctor` mislabel.
