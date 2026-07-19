@@ -159,6 +159,50 @@ def decode_idfmeta(meta_bytes: bytes) -> dict:
     }
 
 
+def decode_idfmeta_segments(meta_bytes: bytes) -> list[dict]:
+    """Parse the per-segment metadata of an IDFMETA.
+
+    A column split across several VertiPaq segments carries one CS/SS block per
+    segment inside a single CP; each segment has its OWN records / bit width /
+    min_data_id (the value domain shifts between segments). Returns a list of
+    ``{records, bit_width, min_data_id, has_nulls}`` in storage order (length 1
+    for the common single-segment column). Used to decode multi-segment columns
+    (import tables beyond ~1,048,576 rows) instead of reading only segment 0.
+    """
+    buf = meta_bytes
+    _BW_BASE = 0xABA36
+    segs: list[dict] = []
+    scan = 0
+    while True:
+        ss = buf.find(_TAG_SS_OPEN, scan)
+        if ss < 0:
+            break
+        # The CS0 that opened this segment is the CS_OPEN immediately before SS
+        # (CS1 comes after SS_CLOSE). Its bit width is the 4th field.
+        cs = buf.rfind(_TAG_CS_OPEN, 0, ss)
+        bit_width = 0
+        if cs >= 0:
+            cp = cs + len(_TAG_CS_OPEN) + 8 + 8 + 4  # records(u64), one(u64), u32_a(u32)
+            if cp + 4 <= len(buf):
+                u32_b = struct.unpack_from("<I", buf, cp)[0]
+                if _BW_BASE <= u32_b < _BW_BASE + 64:
+                    bit_width = u32_b - _BW_BASE
+        sp = ss + len(_TAG_SS_OPEN) + 8  # skip distinct_states(u64)
+        min_data_id = struct.unpack_from("<I", buf, sp)[0]
+        sp += 4 + 4 + 4 + 8  # min(4) already read -> skip max(4), orig(4), rle_sort(8)
+        records = struct.unpack_from("<Q", buf, sp)[0]
+        sp += 8
+        has_nulls = struct.unpack_from("<B", buf, sp)[0] != 0
+        segs.append({
+            "records": records,
+            "bit_width": bit_width,
+            "min_data_id": min_data_id,
+            "has_nulls": has_nulls,
+        })
+        scan = ss + len(_TAG_SS_OPEN)
+    return segs
+
+
 # ---------------------------------------------------------------------------
 # Dictionary decoder
 # ---------------------------------------------------------------------------
@@ -370,7 +414,8 @@ def _decode_numeric_dictionary(buf: bytes, pos: int, dict_type: int) -> list:
 # ---------------------------------------------------------------------------
 
 def decode_idf(
-    idf_bytes: bytes, bit_width: int, row_count: int, rle_base: int = 0
+    idf_bytes: bytes, bit_width: int, row_count: int, rle_base: int = 0,
+    segments: "list[tuple[int, int]] | None" = None,
 ) -> list[int]:
     """
     Decode an IDF blob and return per-row dictionary indices.
@@ -393,36 +438,76 @@ def decode_idf(
     callers that don't need the adjustment (our own encoder never emits RLE).
     """
     buf = idf_bytes
+    indices: list[int] = []
     pos = 0
+    seg_idx = 0
+    # An .idf concatenates one block per VertiPaq segment (Power BI splits an
+    # import table into ~1,048,576-row segments). Walk EVERY segment and
+    # concatenate — stopping after the first one silently truncated tables past
+    # one segment. Each segment can have its own bit width / re-base scale
+    # (different value domain), so `segments` carries per-segment (bit_width,
+    # rle_base); when it is None the single bit_width/rle_base applies to all.
+    while pos < len(buf):
+        if segments is not None:
+            if seg_idx >= len(segments):
+                break
+            seg_bw, seg_rle_base, seg_bp_add = segments[seg_idx]
+        else:
+            seg_bw, seg_rle_base, seg_bp_add = bit_width, rle_base, 0
+        seg_indices, pos = _decode_idf_segment_at(
+            buf, pos, seg_bw, seg_rle_base, seg_bp_add
+        )
+        indices.extend(seg_indices)
+        seg_idx += 1
+        if row_count and len(indices) >= row_count and segments is None:
+            # Single-param callers pass one segment's row_count; don't over-read
+            # trailing segments they didn't ask about.
+            break
 
+    # Truncate to exact row count (sub-segment may have padding)
+    return indices[:row_count] if row_count else indices
+
+
+def _decode_idf_segment_at(
+    buf: bytes, pos: int, bit_width: int, rle_base: int, bitpacked_add: int = 0
+):
+    """Decode ONE segment of an .idf starting at ``pos``.
+
+    Returns ``(indices, next_pos)`` — the segment's per-row indices and the byte
+    offset immediately after this segment (start of the next segment, if any).
+
+    ``bitpacked_add`` shifts this segment's bit-packed values onto a shared
+    scale. Across the segments of one column the dictionary is GLOBAL but each
+    segment stores bit-packed values relative to its OWN ``min_data_id``; adding
+    ``segment.min_data_id - global_min`` lines every segment up with the shared
+    dictionary. It is 0 for single-segment columns (the common case).
+    """
     # primary_segment_size: uint64 (should be 16)
     ps_count = struct.unpack_from("<Q", buf, pos)[0]
-    pos += 8
 
     # Read primary segment entries
     primary_entries = []
+    p = pos + 8
     for _ in range(ps_count):
-        dv = struct.unpack_from("<I", buf, pos)[0]
-        rv = struct.unpack_from("<I", buf, pos + 4)[0]
-        pos += 8
+        dv = struct.unpack_from("<I", buf, p)[0]
+        rv = struct.unpack_from("<I", buf, p + 4)[0]
+        p += 8
         if dv == 0 and rv == 0:
-            # Zero entry -- skip (padding)
-            continue
+            continue  # zero entry -- padding
         primary_entries.append((dv, rv))
 
     # Advance past full primary segment (skip any remaining padding)
-    pos = 8 + ps_count * 8
+    p = pos + 8 + ps_count * 8
 
     # sub_segment_size: uint64 (word count)
-    ss_word_count = struct.unpack_from("<Q", buf, pos)[0]
-    pos += 8
+    ss_word_count = struct.unpack_from("<Q", buf, p)[0]
+    p += 8
 
     # Read sub-segment uint64 words
     sub_words = []
     for _ in range(ss_word_count):
-        w = struct.unpack_from("<Q", buf, pos)[0]
-        sub_words.append(w)
-        pos += 8
+        sub_words.append(struct.unpack_from("<Q", buf, p)[0])
+        p += 8
 
     # Pre-decode the ENTIRE bit-packed sub-segment into one flat array. The
     # values for every bit-packed primary entry are stored contiguously here
@@ -436,7 +521,7 @@ def decode_idf(
     if values_per_word:
         for word in sub_words:
             for j in range(values_per_word):
-                bitpacked_values.append((word >> (j * bit_width)) & mask)
+                bitpacked_values.append(((word >> (j * bit_width)) & mask) + bitpacked_add)
 
     # Decode primary entries. A primary entry is a bit-packed marker when
     # `data_value + bit_packed_offset == 0xFFFFFFFF` (Power BI stores each
@@ -453,8 +538,7 @@ def decode_idf(
             # the same relative scale as the bit-packed sub-segment values.
             indices.extend([dv - rle_base] * rv)
 
-    # Truncate to exact row count (sub-segment may have padding)
-    return indices[:row_count]
+    return indices, p
 
 
 # ---------------------------------------------------------------------------
@@ -692,6 +776,16 @@ def read_table_from_abf(
 
         row_count = meta_info["row_count"]
 
+        # Multi-segment columns (import tables beyond one VertiPaq segment,
+        # ~1,048,576 rows) carry one CS/SS block per segment. decode_idfmeta
+        # returns only the first; parse them all so we can decode every segment.
+        try:
+            seg_meta_list = decode_idfmeta_segments(meta_bytes)
+        except Exception:
+            seg_meta_list = []
+        if len(seg_meta_list) > 1:
+            row_count = sum(s["records"] for s in seg_meta_list)
+
         if meta_info["is_row_number"]:
             # RowNumber column -- skip
             col_data.append((col_name, data_type, None))
@@ -727,8 +821,23 @@ def read_table_from_abf(
             # (RLE-encoded by Power BI Desktop) decode correctly.
             _null_offset = 1 if meta_info["has_nulls"] else 0
             _rle_base = meta_info["min_data_id"] - _null_offset
+            # For a multi-segment column the dictionary is shared but each
+            # segment stores values relative to its own min_data_id; build
+            # per-segment (bit_width, rle_base, bitpacked_add) so every segment
+            # lands on the same global scale as segment 0 (= meta_info min).
+            _seg_params = None
+            if len(seg_meta_list) > 1:
+                _gmin = seg_meta_list[0]["min_data_id"]
+                _seg_params = [
+                    (s["bit_width"] or bit_width, _gmin - _null_offset,
+                     s["min_data_id"] - _gmin)
+                    for s in seg_meta_list
+                ]
             try:
-                indices = decode_idf(idf_bytes_raw, bit_width, row_count, rle_base=_rle_base)
+                indices = decode_idf(
+                    idf_bytes_raw, bit_width, row_count,
+                    rle_base=_rle_base, segments=_seg_params,
+                )
             except Exception as e:
                 decode_errors.append((col_name, "idf", f"{type(e).__name__}: {e}"))
                 col_data.append((col_name, data_type, None))

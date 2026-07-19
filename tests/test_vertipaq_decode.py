@@ -102,6 +102,85 @@ class TestDecodeIdf:
         assert decode_idf(idf, 9, 13, rle_base=3) == [1, 2, 3, 4, 5, 97, 6, 7, 8, 9, 10, 11, 12]
 
 
+class TestMultiSegment:
+    """A .idf concatenates one block per VertiPaq segment; all must be decoded."""
+
+    def _two_segment_idf(self):
+        # Segment A: one bit-packed group of 4 values [10,11,12,13].
+        # Segment B: one bit-packed group of 3 values [20,21,22].
+        # (bit_width 8 so the values fit; the decoder masks to bit_width bits.)
+        a = _build_idf([(0xFFFFFFFF, 4)], [10, 11, 12, 13], bit_width=8)
+        b = _build_idf([(0xFFFFFFFF, 3)], [20, 21, 22], bit_width=8)
+        return a + b
+
+    def test_walks_all_segments_single_params(self):
+        idf = self._two_segment_idf()
+        # row_count = total across both segments -> both are decoded & concatenated
+        assert decode_idf(idf, 8, 7, rle_base=0) == [10, 11, 12, 13, 20, 21, 22]
+
+    def test_stops_at_row_count_single_params(self):
+        # Legacy single-segment callers pass one segment's row_count and must not
+        # over-read into trailing segments they didn't ask about.
+        idf = self._two_segment_idf()
+        assert decode_idf(idf, 8, 4, rle_base=0) == [10, 11, 12, 13]
+
+    def test_per_segment_bitpacked_add(self):
+        # segments carries (bit_width, rle_base, bitpacked_add) per segment; the
+        # second segment's bit-packed values are shifted onto the global scale.
+        idf = self._two_segment_idf()
+        out = decode_idf(idf, 8, 7, segments=[(8, 0, 0), (8, 0, 100)])
+        assert out == [10, 11, 12, 13, 120, 121, 122]
+
+    def test_per_segment_bit_width(self):
+        # Different bit width per segment (value domain shifts between segments).
+        a = _build_idf([(0xFFFFFFFF, 2)], [3, 5], bit_width=4)
+        b = _build_idf([(0xFFFFFFFF, 2)], [200, 201], bit_width=9)
+        out = decode_idf(a + b, 4, 4, segments=[(4, 0, 0), (9, 0, 0)])
+        assert out == [3, 5, 200, 201]
+
+
+@pytest.mark.integration
+def test_multi_segment_corpus_full_length():
+    """If PBIX_TEST_SAMPLES holds a file whose biggest table exceeds one VertiPaq
+    segment (~1,048,576 rows), assert we decode every row (not just segment 0)
+    and match pbixray. Skips unless such a file + pbixray are available."""
+    samples = os.environ.get("PBIX_TEST_SAMPLES", "")
+    if not samples or not os.path.isdir(samples):
+        pytest.skip("PBIX_TEST_SAMPLES not set")
+    pbixray = pytest.importorskip("pbixray")
+    import glob
+    import zipfile
+
+    from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+    from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+    from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
+
+    for path in glob.glob(os.path.join(samples, "*.pbix")):
+        px = pbixray.PBIXRay(path)
+        big = None
+        for t in list(px.tables):
+            try:
+                n = px.get_table(t).shape[0]
+            except Exception:
+                continue
+            if n > 1_048_576:
+                big = (t, n)
+                break
+        if not big:
+            continue
+        tname, nrows = big
+        with zipfile.ZipFile(path) as z:
+            abf = decompress_datamodel(z.read("DataModel"))
+        meta = read_metadata_sqlite(abf)
+        td = read_table_from_abf(abf, tname, meta)
+        assert len(td["rows"]) == nrows, (
+            f"{tname}: decoded {len(td['rows'])} rows, expected {nrows} "
+            f"(multi-segment truncation)"
+        )
+        return
+    pytest.skip("no multi-segment (>1,048,576-row) table in PBIX_TEST_SAMPLES")
+
+
 class TestValueEncodedReconstruction:
     def test_int64(self):
         assert _reconstruct_value_encoded(42.0, "Int64") == 42
