@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.18] - 2026-07-19
+
+Decodes multi-segment columns — large import tables no longer read back truncated.
+
+### Fixed
+- **Columns spanning more than one VertiPaq segment now decode in full (data-integrity).** Power BI splits an import table into ~1,048,576-row segments; the `.idf` concatenates one block per segment and the `.idfmeta` carries one CS/SS block per segment, each with its OWN bit width and `min_data_id`. The reader decoded only the first segment, so any table beyond ~1M rows silently read back truncated to its first ~1,048,576 rows (and would be rebuilt truncated on a metadata edit). `decode_idf` now walks every segment, and a new `decode_idfmeta_segments` supplies the per-segment `(bit_width, rle_base, bitpacked_add)` so each segment is shifted onto the shared dictionary's global scale. Verified against `pbixray` on a real 12,627,608-row / 13-segment fact table: every column (dates, keys, quantities, currency) matches exactly across all segments. Single-segment columns and our own encoder's output are unaffected. New multi-segment unit tests plus a `PBIX_TEST_SAMPLES`-gated full-length corpus check.
+
 ## [0.9.17] - 2026-07-19
 
 Correctly reads Power BI Desktop-authored column data — value encoding, RLE, and multi-group bit-packed segments — instead of returning blanks.
