@@ -8,7 +8,7 @@
 
 An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python — no templates, no skeletons, no Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026.
 
-Exposes 101 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
+Exposes 105 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
@@ -148,7 +148,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Partition Management | **Partial** | List/remove partitions via `pbix_get_partitions`, `pbix_remove_partition`. `pbix_add_partition` blocked for PBIX (needs PartitionStorage in VertiPaq), works for PBIP/TMDL export |
 | Sensitivity Labels | **Stable** | Strip MSIP sensitivity labels via `pbix_save(strip_sensitivity_label=True)` |
 | Custom Visuals | **Beta** | Import any `.pbiviz` via `pbix_add_custom_visual` (embeds by GUID + `publicCustomVisuals`), place with `pbix_add_visual` |
-| HTML / CSS / SVG Visuals | **Beta** | Render custom HTML/CSS/SVG (and inline JS) from a DAX measure via the bundled `PBIX HTML` visual — `pbix_add_html_visual` (turnkey create), `pbix_get_html_visual`, `pbix_set_html_visual`, plus escaping-safe `pbix_html_template` builders (KPI cards, SVG charts/gauges/maps, tables). Desktop-verified |
+| HTML / CSS / SVG Visuals | **Beta** | Render custom HTML/CSS/SVG (and inline JS) from a DAX measure via the bundled `PBIX HTML` visual — `pbix_add_html_visual` (turnkey create), `pbix_get_html_visual`, `pbix_set_html_visual`, plus escaping-safe `pbix_html_template` builders (KPI cards, SVG charts/gauges/maps, tables). Clickable elements can **cross-filter the report** like a native visual (`category_field` + `data-pbix-select`). Desktop-verified. See **[docs/html-visuals.md](docs/html-visuals.md)** |
 | Incremental Refresh | **Stable** | `pbix_set_incremental_refresh` / `pbix_get_incremental_refresh` — configure archive/refresh windows with change detection. Requires data source (source_csv/source_db); embedded-only files cannot use incremental refresh (same as PBI Desktop) |
 | Report diff (`pbix_diff`) | **Stable** | Compare two PBIX files — tables, columns, measures, relationships, pages/visuals, data sources, theme colors. Shows added/removed/changed |
 | Report documentation (`pbix_document`) | **Stable** | Auto-generate full report documentation (markdown + .docx) — tables, columns, measures, relationships, data sources, pages/visuals, RLS roles, theme colors |
@@ -520,7 +520,7 @@ PBIX_TEST_SAMPLES=test_corpus pytest tests/test_cross_report.py -v
 | `test_zip_safety.py` | 10 | `unit` | No |
 | `test_perf_per_dimension.py` | 14 | `unit` | No |
 
-**From a fresh clone: 294 tests collected, 266 passed, 28 skipped, 0 failures.** All 28 skipped tests are gated on the public test corpus (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
+**From a fresh clone: 390 tests collected, 359 passed, 31 skipped, 0 failures.** All 31 skipped tests are gated on the public test corpus (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
 
 ## Architecture
 
@@ -552,9 +552,11 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (101 tools)
+  server.py              # MCP server (105 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX builder (metadata, VertiPaq, layout, relationships)
+  html_templates.py      # HTML/SVG template builders (kpi_card, bar_chart, gauge, table, …)
+  assets/pbix_html_visual/  # bundled "PBIX HTML" custom visual (.pbiviz) + source
   builder_v2.py          # Template-free ABF + ZIP generation
   errors.py              # Typed exceptions with stable error codes
   logging_config.py      # Diagnostic logging (normal/debug/trace)

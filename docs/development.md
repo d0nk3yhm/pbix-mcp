@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast tests (266 pass, 9 skip, 19 slow/integration deselected)
+# Fast tests (359 pass, 10 skip, 21 slow/integration deselected)
 pytest -m "not slow"
 
 # With coverage
@@ -73,4 +73,4 @@ mypy has 162 errors (CI baseline is 175 — see `.github/workflows/ci.yml`). CI 
 2. Return `ToolResponse.ok(...)` or `ToolResponse.error(...)`
 3. Catch `PBIXMCPError` before `Exception`
 4. Add `logger.info(...)` at entry point
-5. Update tool count in README, CHANGELOG, CONTRIBUTING
+5. Update tool count in README, CHANGELOG, CONTRIBUTING, docs/architecture.md, docs/tool-contracts.md

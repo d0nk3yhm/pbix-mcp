@@ -1,10 +1,19 @@
 {
   "privileges": [],
   "dataRoles": [
-    { "name": "content", "kind": "GroupingOrMeasure", "displayName": "Content (HTML/CSS/SVG)" }
+    { "name": "content", "kind": "GroupingOrMeasure", "displayName": "Content (HTML/CSS/SVG)" },
+    { "name": "category", "kind": "Grouping", "displayName": "Cross-filter by" }
   ],
   "dataViewMappings": [
-    { "table": { "rows": { "select": [ { "for": { "in": "content" } } ], "dataReductionAlgorithm": { "top": {} } } } }
+    {
+      "conditions": [ { "content": { "max": 1 }, "category": { "max": 1 } } ],
+      "table": {
+        "rows": {
+          "select": [ { "for": { "in": "category" } }, { "for": { "in": "content" } } ],
+          "dataReductionAlgorithm": { "top": { "count": 30000 } }
+        }
+      }
+    }
   ],
   "objects": {},
   "supportsLandingPage": true,
