@@ -2582,185 +2582,170 @@ def pbix_list_resources(alias: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
+# --- Custom visual (.pbiviz) embedding -------------------------------------
+#
+# A Power BI custom visual is registered in a legacy Report/Layout by three
+# byte-identical touchpoints, all equal to the visual's GUID (verified against
+# Desktop-authored reports and our own toolchain-built visual):
+#   1. the folder    Report/CustomVisuals/<guid>/ (holding the .pbiviz verbatim)
+#   2. the top-level  Layout["publicCustomVisuals"] array (a list of guid strings)
+#   3. each visualContainer's singleVisual.visualType == <guid>
+# The GUID MUST come from the .pbiviz manifest — never fabricated — or the three
+# touchpoints diverge and Desktop silently drops the visual. `resourcePackages`
+# is NOT used for custom visuals (that is for images/themes); the earlier
+# type-7 registration here was non-canonical and Desktop ignored it.
+
+# Our own bundled HTML-rendering custom visual (source in
+# assets/pbix_html_visual/visual_src). Renders a `content` data role — an
+# HTML/CSS/SVG string produced by a DAX measure — inside Power BI's sandboxed
+# visual iframe. Built with the powerbi-visuals-tools toolchain; Desktop-verified.
+_HTML_VISUAL_GUID = "pbixHtml5C3A2F1E9B7D46A8C0E1D2F3A4B5C6D7"
+_HTML_VISUAL_ROLE = "content"
+# AnalysisServices silently truncates a text cell past this; keep authored HTML
+# comfortably under it and warn the caller before we cross the line.
+_DAX_STRING_MAX = 32000
+
+
+def _bundled_html_pbiviz() -> str:
+    """Absolute path to the bundled PBIX HTML custom visual (.pbiviz)."""
+    asset_dir = os.path.join(os.path.dirname(__file__), "assets", "pbix_html_visual")
+    if os.path.isdir(asset_dir):
+        for fn in sorted(os.listdir(asset_dir)):
+            if fn.endswith(".pbiviz"):
+                return os.path.join(asset_dir, fn)
+    raise LayoutParseError(
+        "Bundled PBIX HTML visual not found under assets/pbix_html_visual/. "
+        "Pass pbiviz_path=... with your own .pbiviz instead."
+    )
+
+
+def _read_pbiviz_manifest(pbiviz_path: str) -> dict:
+    """Read visual metadata (guid/name/displayName/version/apiVersion) from a
+    .pbiviz archive. The GUID is authoritative — read from the package manifest,
+    never generated."""
+    import zipfile as _zf
+
+    if not os.path.exists(pbiviz_path):
+        raise LayoutParseError(f"File not found: {pbiviz_path}")
+    if not _zf.is_zipfile(pbiviz_path):
+        raise LayoutParseError("Not a valid .pbiviz file (not a ZIP archive)")
+
+    with _zf.ZipFile(pbiviz_path, "r") as zf:
+        names = zf.namelist()
+        manifest = None
+        # package.json carries the canonical visual{} block in a toolchain build;
+        # fall back to the resources/<guid>.pbiviz.json bundle if absent.
+        for cand in ["package.json"] + [n for n in names if n.endswith("pbiviz.json")]:
+            if cand in names:
+                try:
+                    m = json.loads(zf.read(cand))
+                except (json.JSONDecodeError, KeyError):
+                    continue
+                if isinstance(m, dict) and isinstance(m.get("visual"), dict) and m["visual"].get("guid"):
+                    manifest = m
+                    break
+        if not manifest:
+            raise LayoutParseError(
+                "No visual.guid found in the .pbiviz manifest "
+                f"(package.json / *.pbiviz.json). Contents: {names[:10]}"
+            )
+
+    v = manifest["visual"]
+    guid = v["guid"]
+    if not guid or not guid.replace("_", "").isalnum():
+        raise LayoutParseError(f"Invalid custom visual GUID in manifest: {guid!r}")
+    return {
+        "guid": guid,
+        "name": v.get("name", guid),
+        "display_name": v.get("displayName", v.get("name", guid)),
+        "version": v.get("version", manifest.get("version", "1.0.0.0")),
+        "api_version": manifest.get("apiVersion", "5.11.0"),
+    }
+
+
+def _embed_custom_visual(work_dir: str, layout: dict, pbiviz_path: str) -> dict:
+    """Embed a .pbiviz verbatim into a legacy Report/Layout PBIX and register it.
+
+    Extracts the archive into ``Report/CustomVisuals/<guid>/`` and appends
+    ``<guid>`` to top-level ``layout["publicCustomVisuals"]`` (deduped). Returns
+    the manifest metadata dict (incl. ``guid``). Mutates ``layout`` in place;
+    the caller persists it with ``_set_layout``.
+    """
+    import shutil
+    import zipfile as _zf
+
+    meta = _read_pbiviz_manifest(pbiviz_path)
+    guid = meta["guid"]
+
+    # Folder == guid. `guid` is validated alnum above, but contain every write
+    # to work_dir anyway (Zip-Slip / CWE-22 defence on untrusted archives).
+    cv_dir = _safe_join(work_dir, "Report", "CustomVisuals", guid)
+    if os.path.isdir(cv_dir):
+        shutil.rmtree(cv_dir)          # replace on re-import (idempotent)
+    os.makedirs(cv_dir, exist_ok=True)
+
+    with _zf.ZipFile(pbiviz_path, "r") as zf:
+        n_files = 0
+        for name in zf.namelist():
+            if name.endswith("/"):
+                continue
+            target = _safe_join(cv_dir, name)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with zf.open(name) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            n_files += 1
+
+    # Register the guid — the linchpin. Top-level array of guid strings.
+    pcv = layout.get("publicCustomVisuals")
+    if not isinstance(pcv, list):
+        pcv = []
+    if guid not in pcv:
+        pcv.append(guid)
+    layout["publicCustomVisuals"] = pcv
+
+    meta["files"] = n_files
+    return meta
+
+
 @mcp.tool()
 def pbix_add_custom_visual(alias: str, pbiviz_path: str) -> str:
     """Import a custom visual (.pbiviz) into the report.
 
-    Extracts the .pbiviz package, embeds the visual files into the PBIX,
-    and registers it in the layout's resourcePackages. After importing,
-    use pbix_add_visual with the returned visual_type to place it on a page.
+    Extracts the .pbiviz package verbatim into ``Report/CustomVisuals/<guid>/``
+    and registers its GUID in the layout's ``publicCustomVisuals`` — exactly how
+    Power BI Desktop embeds a custom visual. The GUID is read from the .pbiviz
+    manifest (never fabricated). After importing, place it with pbix_add_visual
+    using the returned GUID as ``visual_type`` (or use pbix_add_html_visual for
+    the bundled PBIX HTML visual, which does everything in one call).
 
     Args:
         alias: The alias of the open file
         pbiviz_path: Absolute path to the .pbiviz file
     """
-    import shutil
-    import zipfile as _zf
-
     try:
         info = _ensure_open(alias)
         work_dir = info["work_dir"]
 
-        if not os.path.exists(pbiviz_path):
-            raise LayoutParseError(f"File not found: {pbiviz_path}")
-
-        # .pbiviz is a ZIP — extract and parse manifest
-        if not _zf.is_zipfile(pbiviz_path):
-            raise LayoutParseError("Not a valid .pbiviz file (not a ZIP archive)")
-
-        with _zf.ZipFile(pbiviz_path, "r") as zf:
-            names = zf.namelist()
-
-            # Find pbiviz.json or package.json for metadata
-            manifest = None
-            manifest_name = None
-            for candidate in ["pbiviz.json", "package.json"]:
-                if candidate in names:
-                    manifest_name = candidate
-                    raw = zf.read(candidate)
-                    manifest = json.loads(raw)
-                    break
-
-            if not manifest and manifest_name != "package.json":
-                # Try to find it in a subdirectory
-                for n in names:
-                    if n.endswith("pbiviz.json"):
-                        manifest_name = n
-                        raw = zf.read(n)
-                        manifest = json.loads(raw)
-                        break
-
-            if not manifest:
-                raise LayoutParseError(
-                    "No pbiviz.json or package.json found in .pbiviz file. "
-                    f"Contents: {names[:10]}"
-                )
-
-            # Extract visual metadata
-            if manifest_name and "pbiviz" in manifest_name:
-                visual_info = manifest.get("visual", {})
-                visual_guid = visual_info.get("guid", "")
-                visual_name = visual_info.get("name", "CustomVisual")
-                display_name = visual_info.get("displayName", visual_name)
-                version = visual_info.get("version", "1.0.0.0")
-                api_version = manifest.get("apiVersion", "2.6.0")
-            else:
-                # package.json fallback
-                visual_name = manifest.get("name", "CustomVisual")
-                display_name = manifest.get("displayName", visual_name)
-                visual_guid = manifest.get("guid", "")
-                version = manifest.get("version", "1.0.0.0")
-                api_version = manifest.get("apiVersion", "2.6.0")
-
-            if not visual_guid:
-                # Generate a GUID if not present
-                import uuid as _uuid
-                visual_guid = visual_name + _uuid.uuid4().hex[:32].upper()
-
-            # Create CustomVisuals directory in the PBIX work dir. Both
-            # `visual_name` (from the .pbiviz manifest) and the member `name`s
-            # below are untrusted, so contain every path to work_dir to prevent
-            # Zip-Slip / arbitrary file write (CWE-22).
-            cv_dir = _safe_join(work_dir, "Report", "CustomVisuals", visual_name)
-            os.makedirs(cv_dir, exist_ok=True)
-
-            # Extract all files into the custom visual directory
-            resource_files = []
-            for name in names:
-                # Skip directories and manifest files at root
-                if name.endswith("/"):
-                    continue
-
-                # Determine target path inside cv_dir
-                # .pbiviz files may have files at root or in resources/
-                target = _safe_join(cv_dir, name)
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-
-                with zf.open(name) as src:
-                    with open(target, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-
-                resource_files.append(name)
-
-        # Find the main JS file for registration
-        main_js = None
-        for rf in resource_files:
-            if rf.endswith(".js") and ("visual" in rf.lower() or "prod" in rf.lower()):
-                main_js = rf
-                break
-        if not main_js:
-            # Fallback: first JS file
-            for rf in resource_files:
-                if rf.endswith(".js"):
-                    main_js = rf
-                    break
-
-        # Register in layout's resourcePackages
         layout = _get_layout(work_dir)
         if not layout:
-            raise LayoutParseError("No layout found")
+            raise LayoutParseError(
+                "No legacy Report/Layout found. Custom-visual embedding for the "
+                "PBIR (Report/definition) format is not yet supported."
+            )
 
-        # Parse existing resourcePackages
-        resource_packages = layout.get("resourcePackages", [])
-
-        # Build resource items list
-        items = []
-        for rf in resource_files:
-            # Determine type code
-            if rf.endswith(".js"):
-                item_type = 5  # JavaScript
-            elif rf.endswith(".css"):
-                item_type = 6  # CSS
-            elif rf.endswith(".png") or rf.endswith(".svg") or rf.endswith(".jpg"):
-                item_type = 3  # Image
-            elif rf.endswith(".json"):
-                item_type = 4  # JSON config
-            else:
-                item_type = 0  # Other
-
-            items.append({
-                "type": item_type,
-                "path": f"{visual_name}/{rf}",
-                "name": os.path.splitext(os.path.basename(rf))[0],
-            })
-
-        # Check if this visual is already registered
-        existing_idx = None
-        for i, rp in enumerate(resource_packages):
-            pkg = rp.get("resourcePackage", rp)
-            if pkg.get("name") == visual_name:
-                existing_idx = i
-                break
-
-        new_package = {
-            "resourcePackage": {
-                "name": visual_name,
-                "type": 7,  # Custom visual type
-                "items": items,
-                "disabled": False,
-            }
-        }
-
-        if existing_idx is not None:
-            resource_packages[existing_idx] = new_package
-        else:
-            resource_packages.append(new_package)
-
-        layout["resourcePackages"] = resource_packages
+        meta = _embed_custom_visual(work_dir, layout, pbiviz_path)
         _set_layout(work_dir, layout)
         info["modified"] = True
 
-        # The visual type used in pbix_add_visual
-        visual_type = visual_guid
-
+        guid = meta["guid"]
         return ToolResponse.ok(
-            f"Custom visual '{display_name}' imported successfully!\n"
-            f"  GUID: {visual_guid}\n"
-            f"  Version: {version}\n"
-            f"  Files: {len(resource_files)} extracted to Report/CustomVisuals/{visual_name}/\n"
-            f"  Main JS: {main_js or 'N/A'}\n\n"
+            f"Custom visual '{meta['display_name']}' imported successfully!\n"
+            f"  GUID: {guid}\n"
+            f"  Version: {meta['version']}  (apiVersion {meta['api_version']})\n"
+            f"  Files: {meta['files']} extracted to Report/CustomVisuals/{guid}/\n"
+            f"  Registered in publicCustomVisuals.\n\n"
             f"To place on a page, use:\n"
-            f"  pbix_add_visual(alias, page_index, visual_type=\"{visual_type}\", ...)"
+            f"  pbix_add_visual(alias, page_index, visual_type=\"{guid}\", ...)"
         ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
@@ -2782,29 +2767,501 @@ def pbix_remove_custom_visual(alias: str, visual_name: str) -> str:
         info = _ensure_open(alias)
         work_dir = info["work_dir"]
 
-        # Remove files
+        # `visual_name` is the GUID (folder name / publicCustomVisuals entry).
+        # Remove the embedded files.
         cv_dir = os.path.join(work_dir, "Report", "CustomVisuals", visual_name)
         if os.path.isdir(cv_dir):
             shutil.rmtree(cv_dir)
 
-        # Remove from resourcePackages
         layout = _get_layout(work_dir)
         if layout:
+            # De-register from publicCustomVisuals (the canonical registration).
+            pcv = layout.get("publicCustomVisuals")
+            if isinstance(pcv, list):
+                layout["publicCustomVisuals"] = [g for g in pcv if g != visual_name]
+            # Also strip any legacy non-canonical resourcePackages entry keyed on
+            # the name (older embeds registered a type-7 package).
             resource_packages = layout.get("resourcePackages", [])
-            layout["resourcePackages"] = [
-                rp for rp in resource_packages
-                if rp.get("resourcePackage", rp).get("name") != visual_name
-            ]
+            if resource_packages:
+                layout["resourcePackages"] = [
+                    rp for rp in resource_packages
+                    if rp.get("resourcePackage", rp).get("name") != visual_name
+                ]
             _set_layout(work_dir, layout)
 
         info["modified"] = True
         return ToolResponse.ok(
-            f"Custom visual '{visual_name}' removed from report."
+            f"Custom visual '{visual_name}' removed from report "
+            f"(files + publicCustomVisuals registration)."
         ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         raise LayoutParseError(str(e))
+
+
+# --- HTML custom-visual authoring (turnkey create / view / edit) -----------
+#
+# The bundled PBIX HTML visual renders a `content` data-role string as HTML in
+# Power BI's sandboxed visual iframe. The string is produced by a DAX measure —
+# either a static HTML literal or a data-driven expression (FORMAT()/& concat).
+# These tools embed the visual, author/edit the measure, and place a fully
+# String-bound container in one call.
+
+
+def _html_to_dax_literal(html: str) -> str:
+    """Wrap a raw HTML string as a DAX string-literal expression.
+
+    DAX string literals are double-quoted; an embedded ``"`` is escaped by
+    doubling it. The caller's HTML can therefore use normal double-quoted
+    attributes (``class="x"``) with no manual escaping.
+    """
+    return '"' + html.replace('"', '""') + '"'
+
+
+def _decode_html_dax_literal(expr: str) -> str | None:
+    """Inverse of :func:`_html_to_dax_literal`. Returns the HTML for a pure
+    string-literal measure, or ``None`` if the expression is data-driven DAX
+    (not a single quoted literal) and can't be losslessly decoded to plain HTML.
+    """
+    s = (expr or "").strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        inner = s[1:-1]
+        # A lone (un-doubled) quote would mean the literal ended early -> not a
+        # single literal, so treat as data-driven.
+        if '"' in inner.replace('""', ""):
+            return None
+        return inner.replace('""', '"')
+    return None
+
+
+def _first_model_table(info: dict) -> str:
+    """First data-model table name (home for an auto-created HTML measure)."""
+    from pbix_mcp.formats.model_reader import ModelReader
+    model = ModelReader(info["path"], work_dir=info.get("work_dir"))
+    stats = model.statistics or []
+    if not stats:
+        raise LayoutParseError("Model has no tables to attach the HTML measure to.")
+    return stats[0]["TableName"]
+
+
+def _iter_html_visuals(layout: dict):
+    """Yield (page_index, visual_index, container, single_visual) for every
+    embedded PBIX HTML visual in a legacy Report/Layout."""
+    for pi, sec in enumerate(layout.get("sections", [])):
+        for vi, vc in enumerate(sec.get("visualContainers", [])):
+            try:
+                cfg = json.loads(vc.get("config", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                continue
+            sv = cfg.get("singleVisual", {})
+            if sv.get("visualType") == _HTML_VISUAL_GUID:
+                yield pi, vi, vc, sv
+
+
+def _html_measure_ref(single_visual: dict) -> tuple[str | None, str | None]:
+    """Extract (table, measure_name) bound to the content role of an HTML visual."""
+    proto = single_visual.get("prototypeQuery", {})
+    from_map = {f.get("Name"): f.get("Entity") for f in proto.get("From", [])}
+    for sel in proto.get("Select", []):
+        m = sel.get("Measure")
+        if m:
+            src = m.get("Expression", {}).get("SourceRef", {})
+            entity = from_map.get(src.get("Source"), src.get("Entity"))
+            return entity, m.get("Property")
+    return None, None
+
+
+@mcp.tool()
+def pbix_add_html_visual(
+    alias: str,
+    page_index: int = 0,
+    html: str = "",
+    dax: str = "",
+    x: float = 40,
+    y: float = 40,
+    width: float = 480,
+    height: float = 320,
+    measure_name: str = "",
+    measure_table: str = "",
+    css: str = "",
+    pbiviz_path: str = "",
+    template: str = "",
+    template_spec_json: str = "",
+) -> str:
+    """Create a custom HTML / CSS / SVG visual on a report page (turnkey).
+
+    The one-call path to a fully-rendered custom visual: it (1) embeds the
+    bundled "PBIX HTML" custom visual (or your own ``pbiviz_path``), (2) authors a
+    DAX measure whose string value IS the HTML, and (3) places a fully data-bound
+    visual container that renders it. Power BI Desktop renders arbitrary HTML +
+    inline ``<style>`` CSS + inline ``<svg>`` + inline ``<script>`` inside its
+    sandboxed visual iframe — build KPI cards, SVG charts / gauges / maps, badges,
+    custom tables, etc. External URLs are blocked by the sandbox; embed images as
+    base64 ``data:`` URIs.
+
+    Provide EITHER ``html`` (a raw HTML string — double-quotes are escaped for
+    you) OR ``dax`` (a full DAX string expression, for data-driven HTML via
+    ``FORMAT()`` / ``&`` concatenation and ``SELECTEDVALUE`` context). ``css``,
+    when given with ``html``, is inlined as a leading ``<style>`` block.
+
+    Args:
+        alias: The alias of the open file
+        page_index: Zero-based page index to place the visual on
+        html: Raw HTML/CSS/SVG string to render (mutually exclusive with ``dax``)
+        dax: Full DAX string expression producing the HTML (for data injection)
+        x: X position in report px
+        y: Y position in report px
+        width: Width in report px
+        height: Height in report px
+        measure_name: Name for the created content measure (auto-named if empty)
+        measure_table: Table to hold the measure (first model table if empty)
+        css: Optional CSS inlined as a leading ``<style>`` block (used with ``html``)
+        pbiviz_path: Optional path to your own HTML-rendering .pbiviz to embed
+        template: Optional built-in template name (kpi_card / bar_chart / gauge /
+            table / progress / badge) — rendered into ``html`` for you. List them
+            with pbix_html_template().
+        template_spec_json: JSON spec for ``template`` (e.g.
+            ``{"title":"Sales","value":"1.2M","spark":[3,5,4,8]}``)
+    """
+    try:
+        info = _ensure_open(alias)
+        work_dir = info["work_dir"]
+
+        # A named template renders into `html` (escaping-safe, professional).
+        if template:
+            from pbix_mcp import html_templates
+            try:
+                spec = json.loads(template_spec_json) if template_spec_json else {}
+            except json.JSONDecodeError as e:
+                raise LayoutParseError(f"Invalid template_spec_json: {e}")
+            if not isinstance(spec, dict):
+                raise LayoutParseError("template_spec_json must be a JSON object.")
+            try:
+                html = html_templates.render(template, spec)
+            except ValueError as e:
+                raise LayoutParseError(str(e))
+
+        if bool(html) == bool(dax):
+            raise LayoutParseError(
+                "Provide exactly one content source: `html` (or `template`) or `dax`.")
+
+        # Validate the target page up front — authoring a measure is an
+        # expensive ABF rebuild, so never orphan one on a bad page index. The
+        # measure-add below touches only the DataModel, not Report/Layout, so
+        # this `layout` object stays valid across it.
+        layout = _get_layout(work_dir)
+        if not layout:
+            raise LayoutParseError(
+                "No legacy Report/Layout found (PBIR format not yet supported).")
+        sections = layout.get("sections", [])
+        if page_index < 0 or page_index >= len(sections):
+            raise LayoutParseError(
+                f"Page index {page_index} out of range (report has "
+                f"{len(sections)} page(s))")
+
+        # 1. DAX expression for the content measure.
+        if dax:
+            expr = dax
+        else:
+            full_html = (f"<style>{css}</style>" if css else "") + html
+            if len(full_html) > _DAX_STRING_MAX:
+                raise LayoutParseError(
+                    f"HTML is {len(full_html)} chars; Power BI silently truncates a "
+                    f"text cell past ~{_DAX_STRING_MAX}. Trim it or split the content."
+                )
+            expr = _html_to_dax_literal(full_html)
+
+        table = measure_table or _first_model_table(info)
+
+        # Auto-name the measure uniquely if not supplied.
+        if not measure_name:
+            n_existing = sum(1 for _ in _iter_html_visuals(layout))
+            measure_name = f"HTML Visual {n_existing + 1}"
+
+        # 2. Author the measure (full ABF rebuild -> any length supported).
+        add_res = json.loads(pbix_datamodel_add_measure(
+            alias, table, measure_name, expr,
+            description="HTML content for a PBIX HTML custom visual"))
+        if not add_res.get("success", False):
+            return ToolResponse.error(
+                f"Failed to author HTML measure '{measure_name}' on table '{table}': "
+                f"{add_res.get('message') or add_res.get('error')}",
+                "MEASURE_ADD_FAILED").to_text()
+
+        # 3. Embed the custom visual + place the bound container.
+        meta = _embed_custom_visual(
+            work_dir, layout, pbiviz_path or _bundled_html_pbiviz())
+        guid = meta["guid"]
+
+        page = sections[page_index]
+        page_w = page.get("width", 1280)
+        page_h = page.get("height", 720)
+        xf = max(0.0, min(float(x), page_w - float(width)))
+        yf = max(0.0, min(float(y), page_h - float(height)))
+
+        import uuid as _uuid
+        single_visual = {
+            "visualType": guid,
+            "projections": {_HTML_VISUAL_ROLE: [{"queryRef": "C"}]},
+            "prototypeQuery": {
+                "Version": 2,
+                "From": [{"Name": "t", "Entity": table, "Type": 0}],
+                "Select": [{
+                    "Measure": {
+                        "Expression": {"SourceRef": {"Source": "t"}},
+                        "Property": measure_name,
+                    },
+                    "Name": "C",
+                }],
+            },
+            "drillFilterOtherVisuals": True,
+        }
+        # Carry the position in config.layouts too — modern Power BI Desktop reads
+        # the visual position from here for custom visuals; a container without it
+        # can fault the whole report load. (Matches Desktop-authored custom visuals.)
+        config = {
+            "name": _uuid.uuid4().hex[:16],
+            "layouts": [{"id": 0, "position": {
+                "x": xf, "y": yf, "z": 0.0,
+                "width": float(width), "height": float(height),
+            }}],
+            "singleVisual": single_visual,
+        }
+
+        # The content measure MUST bind as String (underlyingType 1 /
+        # queryMetadata.Type 2048) — Desktop-verified. Override just this measure;
+        # defer everything else to the model resolver.
+        base_resolver = _report_type_resolver(info)
+
+        def _res(entity, prop, is_measure):
+            if is_measure and prop == measure_name:
+                return "String"
+            return base_resolver(entity, prop, is_measure)
+
+        from pbix_mcp.report_binding import compile_visual_binding
+        q, dt = compile_visual_binding(single_visual, _res)
+
+        container = {
+            "x": xf, "y": yf, "z": 0.0,
+            "width": float(width), "height": float(height),
+            "config": json.dumps(config, ensure_ascii=False),
+            "filters": "[]",
+        }
+        if q is not None:
+            container["query"] = json.dumps(q, ensure_ascii=False)
+            container["dataTransforms"] = json.dumps(dt, ensure_ascii=False)
+
+        page.setdefault("visualContainers", []).append(container)
+        _set_layout(work_dir, layout)
+        info["modified"] = True
+
+        idx = len(page["visualContainers"]) - 1
+        page_name = page.get("displayName", f"Page {page_index}")
+        return ToolResponse.ok(
+            f"HTML visual placed on '{page_name}' (visual index {idx}).\n"
+            f"  Custom visual: {meta['display_name']} ({guid})\n"
+            f"  Content measure: '{measure_name}' on table '{table}'\n"
+            f"  Position: ({xf:.0f},{yf:.0f}) {float(width):.0f}x{float(height):.0f}\n"
+            f"  View with pbix_get_html_visual; edit with pbix_set_html_visual."
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
+
+
+@mcp.tool()
+def pbix_get_html_visual(alias: str, page_index: int = -1) -> str:
+    """List the HTML custom visuals in the report and their content.
+
+    Returns each PBIX HTML visual with its page/visual index, position, the DAX
+    measure that feeds it (table + name), the raw measure expression, and — when
+    the measure is a plain HTML literal — the decoded HTML string.
+
+    Args:
+        alias: The alias of the open file
+        page_index: Restrict to one zero-based page (default -1 = all pages)
+    """
+    try:
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError("No legacy Report/Layout found.")
+
+        from pbix_mcp.formats.model_reader import ModelReader
+        model = ModelReader(info["path"], work_dir=info.get("work_dir"))
+        expr_by_key = {(m["TableName"], m["Name"]): m.get("Expression", "")
+                       for m in (model.dax_measures or [])}
+        expr_by_name = {m["Name"]: m.get("Expression", "")
+                        for m in (model.dax_measures or [])}
+
+        visuals = []
+        for pi, vi, vc, sv in _iter_html_visuals(layout):
+            if page_index >= 0 and pi != page_index:
+                continue
+            table, mname = _html_measure_ref(sv)
+            expr = expr_by_key.get((table, mname)) or expr_by_name.get(mname, "")
+            decoded = _decode_html_dax_literal(expr)
+            visuals.append({
+                "page_index": pi,
+                "visual_index": vi,
+                "position": {"x": vc.get("x"), "y": vc.get("y"),
+                             "width": vc.get("width"), "height": vc.get("height")},
+                "measure_table": table,
+                "measure_name": mname,
+                "dax_expression": expr,
+                "html": decoded,
+                "data_driven": decoded is None,
+            })
+
+        return ToolResponse.ok(
+            message=f"{len(visuals)} HTML visual(s) in the report.",
+            data={"count": len(visuals), "visuals": visuals},
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
+
+
+@mcp.tool()
+def pbix_set_html_visual(
+    alias: str,
+    page_index: int = 0,
+    visual_index: int = -1,
+    html: str = "",
+    dax: str = "",
+    css: str = "",
+    measure_name: str = "",
+) -> str:
+    """Edit an existing HTML custom visual's content (updates its DAX measure).
+
+    Locate the visual either by ``page_index`` + ``visual_index`` (as reported by
+    pbix_get_html_visual), or by the ``measure_name`` it is bound to. Provide the
+    new content as EITHER ``html`` (raw string, escaped for you) OR ``dax`` (full
+    DAX string expression). The visual container itself is untouched — only the
+    measure's expression changes, so position/size/binding are preserved.
+
+    Args:
+        alias: The alias of the open file
+        page_index: Page of the target visual (used with ``visual_index``)
+        visual_index: Visual index on the page (default -1 = first HTML visual on
+            the page, or the one matching ``measure_name``)
+        html: New raw HTML/CSS/SVG (mutually exclusive with ``dax``)
+        dax: New full DAX string expression (for data injection)
+        css: Optional CSS inlined as a leading ``<style>`` block (used with ``html``)
+        measure_name: Target by bound measure name instead of visual index
+    """
+    try:
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError("No legacy Report/Layout found.")
+
+        if bool(html) == bool(dax):
+            raise LayoutParseError("Provide exactly one of `html` or `dax`.")
+
+        # Resolve the target measure.
+        target_measure = None
+        target_table = None
+        candidates = list(_iter_html_visuals(layout))
+        if measure_name:
+            for pi, vi, vc, sv in candidates:
+                t, m = _html_measure_ref(sv)
+                if m == measure_name:
+                    target_table, target_measure = t, m
+                    break
+        else:
+            for pi, vi, vc, sv in candidates:
+                if pi != page_index:
+                    continue
+                if visual_index < 0 or vi == visual_index:
+                    target_table, target_measure = _html_measure_ref(sv)
+                    break
+
+        if not target_measure:
+            return ToolResponse.error(
+                "No matching HTML visual found. Use pbix_get_html_visual to list "
+                "the page_index/visual_index/measure_name of existing HTML visuals.",
+                "HTML_VISUAL_NOT_FOUND").to_text()
+
+        # New expression.
+        if dax:
+            expr = dax
+        else:
+            full_html = (f"<style>{css}</style>" if css else "") + html
+            if len(full_html) > _DAX_STRING_MAX:
+                raise LayoutParseError(
+                    f"HTML is {len(full_html)} chars; Power BI silently truncates a "
+                    f"text cell past ~{_DAX_STRING_MAX}. Trim it or split the content."
+                )
+            expr = _html_to_dax_literal(full_html)
+
+        mod_res = json.loads(pbix_datamodel_modify_measure(
+            alias, target_measure, expr))
+        if not mod_res.get("success", False):
+            return ToolResponse.error(
+                f"Failed to update HTML measure '{target_measure}': "
+                f"{mod_res.get('message') or mod_res.get('error')}",
+                "MEASURE_MODIFY_FAILED").to_text()
+
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"HTML visual content updated (measure '{target_measure}' on table "
+            f"'{target_table}')."
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
+
+
+@mcp.tool()
+def pbix_html_template(kind: str = "", spec_json: str = "") -> str:
+    """Render a professional, escaping-safe HTML/SVG snippet for an HTML visual.
+
+    Call with no ``kind`` to list the available templates and their spec keys.
+    Otherwise returns the ready HTML in ``data.html`` — pass it straight to
+    ``pbix_add_html_visual(html=...)`` (or use ``pbix_add_html_visual(template=...,
+    template_spec_json=...)`` to do both in one call). All user text is HTML-escaped.
+
+    Templates:
+      - kpi_card   {title, value, subtitle?, accent?, spark?[numbers]}
+      - bar_chart  {title, items:[[label,value],...], accent?, value_suffix?}
+      - gauge      {title, percent, accent?, center_label?}
+      - table      {headers:[...], rows:[[...],...], accent?, align_right_from?}
+      - progress   {title, items:[[label,percent],...], accent?}
+      - badge      {text, color?, filled?}
+
+    Args:
+        kind: Template name (empty = list the catalog)
+        spec_json: JSON object with the template's parameters
+    """
+    try:
+        from pbix_mcp import html_templates
+        if not kind:
+            catalog = {k: v[1] for k, v in html_templates.TEMPLATES.items()}
+            return ToolResponse.ok(
+                message="Available HTML templates (call with kind + spec_json).",
+                data={"templates": catalog}).to_text()
+        try:
+            spec = json.loads(spec_json) if spec_json else {}
+        except json.JSONDecodeError as e:
+            return ToolResponse.error(f"Invalid spec_json: {e}", "BAD_SPEC").to_text()
+        if not isinstance(spec, dict):
+            return ToolResponse.error("spec_json must be a JSON object.", "BAD_SPEC").to_text()
+        try:
+            html = html_templates.render(kind, spec)
+        except ValueError as e:
+            return ToolResponse.error(str(e), "BAD_TEMPLATE").to_text()
+        return ToolResponse.ok(
+            message=f"Rendered '{kind}' ({len(html)} chars).",
+            data={"html": html}).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
 # A custom report theme is applied as a customTheme OVERLAY on a valid built-in

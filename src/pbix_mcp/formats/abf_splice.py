@@ -145,19 +145,33 @@ def splice_metadata_in_abf(abf_bytes: bytes, new_sqlite: bytes) -> bytes:
                         buf[vdir_start:vdir_end] = new_vdir_bytes
                         vdir_end += vdir_size_diff
 
-        # Update offsets for entries that come after metadata
-        # Parse all m_cbOffsetHeader values and shift those > old_offset
+        # Shift every file offset that sits after the metadata by size_diff.
+        #
+        # This MUST be a single left-to-right rewrite of the decoded VDir text
+        # (re.sub), never a per-match `buf.find(old)+replace` loop. The old loop
+        # re-scanned the mutating buffer for each value: when two entries' offsets
+        # differed by exactly size_diff — near-certain when a page-aligned
+        # metadata grows (e.g. +8192) — `find` matched the entry just rewritten to
+        # that value, double-shifting it and leaving the real one stale. The stale
+        # offset then overlapped its neighbour and Power BI failed to load the
+        # VertiPaq segment ("DBCC failed while checking the data segments").
+        # re.sub scans the original string once and never re-matches replacements,
+        # and rewriting the whole region also tolerates offsets that gain/lose
+        # digits (the old `len(old)==len(new)` guard silently skipped those).
         vdir_region = buf[vdir_start:vdir_end].decode(xml_encoding)
-        for m in re.finditer(r"<m_cbOffsetHeader>(\d+)</m_cbOffsetHeader>", vdir_region):
-            offset_val = int(m.group(1))
-            if offset_val > old_offset:
-                new_offset_val = offset_val + size_diff
-                old_tag = m.group(0).encode(xml_encoding)
-                new_tag = f"<m_cbOffsetHeader>{new_offset_val}</m_cbOffsetHeader>".encode(xml_encoding)
-                # Find in buffer and replace
-                tag_pos = buf.find(old_tag, vdir_start)
-                if tag_pos >= 0 and len(old_tag) == len(new_tag):
-                    buf[tag_pos:tag_pos + len(old_tag)] = new_tag
+
+        def _shift_offset(m):
+            v = int(m.group(1))
+            if v > old_offset:
+                v += size_diff
+            return f"<m_cbOffsetHeader>{v}</m_cbOffsetHeader>"
+
+        new_vdir_region = re.sub(
+            r"<m_cbOffsetHeader>(\d+)</m_cbOffsetHeader>", _shift_offset, vdir_region)
+        if new_vdir_region != vdir_region:
+            new_vdir_bytes = new_vdir_region.encode(xml_encoding)
+            buf[vdir_start:vdir_end] = new_vdir_bytes
+            vdir_end = vdir_start + len(new_vdir_bytes)
 
     # Patch BackupLogHeader (bytes 72-4096) — update VDir offset and size
     # Header is always UTF-16-LE
@@ -173,8 +187,15 @@ def splice_metadata_in_abf(abf_bytes: bytes, new_sqlite: bytes) -> bytes:
             f"<m_cbOffsetHeader>{new_hdr_offset}</m_cbOffsetHeader>", 1
         )
 
-        # Update DataSize if VDir size changed
-        vdir_new_size = vdir_end - vdir_start if vdir_start >= 0 else 0
+        # Update DataSize (= the VirtualDirectory byte length the reader slices
+        # off m_cbOffsetHeader). `vdir_start` was located at "<VirtualDirectory>",
+        # which for a UTF-16-LE VDir sits AFTER the 2-byte BOM — but the header's
+        # m_cbOffsetHeader points AT the BOM. Sizing from the header offset makes
+        # DataSize BOM-inclusive so `abf[offset:offset+DataSize]` lands exactly on
+        # the closing "</VirtualDirectory>". Using `vdir_end - vdir_start` here
+        # dropped the trailing ">" (2 bytes) and corrupted every spliced file
+        # whose VDir carries a BOM (CWE: silent data corruption).
+        vdir_new_size = vdir_end - new_hdr_offset if vdir_start >= 0 else 0
         ds_match = re.search(r"<DataSize>(\d+)</DataSize>", new_hdr_xml)
         if ds_match and vdir_new_size > 0:
             new_hdr_xml = new_hdr_xml.replace(

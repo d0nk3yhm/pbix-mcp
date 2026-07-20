@@ -147,7 +147,8 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Cultures & Translations | **Stable** | Add cultures, translate table/column/measure names via `pbix_add_culture`, `pbix_add_translations`, `pbix_get_cultures`, `pbix_remove_culture` |
 | Partition Management | **Partial** | List/remove partitions via `pbix_get_partitions`, `pbix_remove_partition`. `pbix_add_partition` blocked for PBIX (needs PartitionStorage in VertiPaq), works for PBIP/TMDL export |
 | Sensitivity Labels | **Stable** | Strip MSIP sensitivity labels via `pbix_save(strip_sensitivity_label=True)` |
-| Custom Visuals | **Beta** | Import .pbiviz packages via `pbix_add_custom_visual`, place with `pbix_add_visual` |
+| Custom Visuals | **Beta** | Import any `.pbiviz` via `pbix_add_custom_visual` (embeds by GUID + `publicCustomVisuals`), place with `pbix_add_visual` |
+| HTML / CSS / SVG Visuals | **Beta** | Render custom HTML/CSS/SVG (and inline JS) from a DAX measure via the bundled `PBIX HTML` visual — `pbix_add_html_visual` (turnkey create), `pbix_get_html_visual`, `pbix_set_html_visual`, plus escaping-safe `pbix_html_template` builders (KPI cards, SVG charts/gauges/maps, tables). Desktop-verified |
 | Incremental Refresh | **Stable** | `pbix_set_incremental_refresh` / `pbix_get_incremental_refresh` — configure archive/refresh windows with change detection. Requires data source (source_csv/source_db); embedded-only files cannot use incremental refresh (same as PBI Desktop) |
 | Report diff (`pbix_diff`) | **Stable** | Compare two PBIX files — tables, columns, measures, relationships, pages/visuals, data sources, theme colors. Shows added/removed/changed |
 | Report documentation (`pbix_document`) | **Stable** | Auto-generate full report documentation (markdown + .docx) — tables, columns, measures, relationships, data sources, pages/visuals, RLS roles, theme colors |
@@ -169,7 +170,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 - **Full DataModel rebuild** — `set_table_data`, `update_table_rows`, `add/remove_relationship`, `remove_table` trigger a full DataModel rebuild via the builder pipeline. Most other tools (`add_measure`, `modify_measure`, `modify_column`, `set_rls_role`, `add_perspective`, `add_culture`, `add_translations`, `update_data_source`, etc.) use a lightweight metadata-only path.
 
 
-## Tools (101)
+## Tools (105)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
@@ -186,8 +187,8 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 ### DataModel Write (21)
 `pbix_datamodel_query_metadata` · `pbix_datamodel_modify_metadata` · `pbix_datamodel_add_measure` · `pbix_datamodel_modify_measure` · `pbix_datamodel_remove_measure` · `pbix_datamodel_modify_column` · `pbix_datamodel_add_relationship` · `pbix_datamodel_remove_relationship` · `pbix_datamodel_remove_table` · `pbix_datamodel_decompress` · `pbix_datamodel_recompress` · `pbix_datamodel_replace_file` · `pbix_datamodel_extract_file` · `pbix_datamodel_list_abf_files` · `pbix_set_table_data` · `pbix_update_table_rows` · `pbix_datamodel_add_field_parameter` · `pbix_datamodel_add_calculation_group` · `pbix_export_tmdl` · `pbix_export_pbip` · `pbix_replace_value`
 
-### Resources, Themes & Custom Visuals (9)
-`pbix_list_resources` · `pbix_get_theme` · `pbix_set_theme` · `pbix_extract_colors` · `pbix_recolor` · `pbix_get_linguistic_schema` · `pbix_set_linguistic_schema` · `pbix_add_custom_visual` · `pbix_remove_custom_visual`
+### Resources, Themes & Custom Visuals (13)
+`pbix_list_resources` · `pbix_get_theme` · `pbix_set_theme` · `pbix_extract_colors` · `pbix_recolor` · `pbix_get_linguistic_schema` · `pbix_set_linguistic_schema` · `pbix_add_custom_visual` · `pbix_remove_custom_visual` · `pbix_add_html_visual` · `pbix_get_html_visual` · `pbix_set_html_visual` · `pbix_html_template`
 
 ### DataMashup (2)
 `pbix_get_m_code` · `pbix_set_m_code`
