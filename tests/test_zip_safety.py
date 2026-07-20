@@ -136,7 +136,7 @@ class TestSetThemeTraversal:
             server.pbix_open(p, alias)
             wd = server._open_files[alias]["work_dir"]
             base = os.path.join(wd, "Report", "StaticResources",
-                                "SharedResources", "BaseThemes")
+                                "RegisteredResources")
             target_outside = tmp_path / "PWNED.json"
             trav = os.path.relpath(str(target_outside), base)
             res = json.loads(server.pbix_set_theme(alias, '{"name":"x"}', filename=trav))
@@ -152,10 +152,24 @@ class TestSetThemeTraversal:
         try:
             server.pbix_open(p, alias)
             wd = server._open_files[alias]["work_dir"]
-            res = json.loads(server.pbix_set_theme(alias, '{"name":"Ok"}', filename="Ok.json"))
+            res = json.loads(server.pbix_set_theme(
+                alias, '{"name":"Ok","dataColors":["#2E86DE"]}', filename="Ok.json"))
             assert res["success"] is True
+            # A custom theme lands in RegisteredResources (item type 201), NOT
+            # BaseThemes — and is registered as a customTheme overlay on a valid
+            # built-in baseTheme so Power BI Desktop actually applies its palette.
             written = os.path.join(wd, "Report", "StaticResources",
-                                   "SharedResources", "BaseThemes", "Ok.json")
+                                   "RegisteredResources", "Ok.json")
             assert os.path.exists(written)
+            assert not os.path.exists(os.path.join(
+                wd, "Report", "StaticResources", "SharedResources", "BaseThemes", "Ok.json"))
+            layout = server._get_layout(wd)
+            cfg = json.loads(layout["config"]) if isinstance(layout.get("config"), str) else layout["config"]
+            tc = cfg["themeCollection"]
+            assert tc["baseTheme"]["name"] == "CY24SU10" and tc["baseTheme"]["type"] == 2
+            assert tc["customTheme"]["name"] == "Ok.json" and tc["customTheme"]["type"] == 1
+            reg = next(pk["resourcePackage"] for pk in layout["resourcePackages"]
+                       if pk["resourcePackage"]["name"] == "RegisteredResources")
+            assert any(it["type"] == 201 and it["path"] == "Ok.json" for it in reg["items"])
         finally:
             server._open_files.pop(alias, None)

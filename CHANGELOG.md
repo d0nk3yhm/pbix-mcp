@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.21] - 2026-07-20
+
+Custom report themes now apply in Power BI Desktop (chart colors were wrong).
+
+### Fixed
+- **A custom theme set via `pbix_set_theme` now actually applies in Power BI Desktop.** Previously the report opened but charts rendered in Desktop's DEFAULT palette (teal) instead of the theme's colors. The theme was registered by overwriting `config.themeCollection.baseTheme.name` with the custom theme's name and writing the JSON into `SharedResources/BaseThemes`. But Power BI treats `baseTheme.name` as a BUILT-IN theme id (e.g. `CY24SU10`), so a custom name like "Modern Blue" fails to resolve and Desktop silently falls back to its default palette (`themeCollection: {}` renders in that same teal). `pbix_set_theme` now registers the theme the way Desktop expects: a `customTheme` OVERLAY on a valid built-in `baseTheme`, with the theme JSON in a `RegisteredResources` package (item type 201, not `BaseThemes`), and fills the report-level `config` keys Desktop expects (`version`, `activeSectionIndex`, `linguisticSchemaSyncVersion`). Power BI resolves the built-in base by name, so no base-theme file is shipped. Verified against real Power BI Desktop 2.152: a "Modern Blue" (`#2E86DE`) theme now renders its charts in that blue, matching Desktop-authored custom-themed reports (Cars Sales, Briqlab). `pbix_get_theme` now also reads themes from `RegisteredResources`.
+
 ## [0.9.20] - 2026-07-20
 
 Correct data bindings for matrix / pivotTable and slicer visuals (report render fix).

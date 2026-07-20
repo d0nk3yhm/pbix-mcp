@@ -2807,6 +2807,14 @@ def pbix_remove_custom_visual(alias: str, visual_name: str) -> str:
         raise LayoutParseError(str(e))
 
 
+# A custom report theme is applied as a customTheme OVERLAY on a valid built-in
+# baseTheme. Power BI resolves the built-in by name (no base-theme JSON needs to
+# ship); the overlay in RegisteredResources supplies the palette. Verified
+# against real Power BI Desktop 2.152.
+_BUILTIN_BASE_THEME = "CY24SU10"
+_BUILTIN_BASE_VERSION = "5.63"
+
+
 @mcp.tool()
 def pbix_get_theme(alias: str) -> str:
     """Get the current report theme JSON.
@@ -2817,16 +2825,29 @@ def pbix_get_theme(alias: str) -> str:
     try:
         info = _ensure_open(alias)
         work_dir = info["work_dir"]
-        theme_dir = os.path.join(work_dir, "Report", "StaticResources", "SharedResources", "BaseThemes")
-        if not os.path.isdir(theme_dir):
-            return ToolResponse.ok("No theme directory found.").to_text()
-
+        # Custom themes live in RegisteredResources; the built-in base (if any) in
+        # SharedResources/BaseThemes. Read both, custom first.
+        theme_dirs = [
+            os.path.join(work_dir, "Report", "StaticResources", "RegisteredResources"),
+            os.path.join(work_dir, "Report", "StaticResources", "SharedResources", "BaseThemes"),
+        ]
         themes = []
-        for f in sorted(os.listdir(theme_dir)):
-            if f.endswith(".json"):
+        seen = set()
+        for theme_dir in theme_dirs:
+            if not os.path.isdir(theme_dir):
+                continue
+            for f in sorted(os.listdir(theme_dir)):
+                if not f.endswith(".json") or f in seen:
+                    continue
                 fp = os.path.join(theme_dir, f)
-                with open(fp, "r", encoding="utf-8") as fh:
-                    theme = json.load(fh)
+                try:
+                    with open(fp, "r", encoding="utf-8") as fh:
+                        theme = json.load(fh)
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if "dataColors" not in theme and "visualStyles" not in theme:
+                    continue  # skip non-theme JSON in RegisteredResources
+                seen.add(f)
                 themes.append(f"Theme file: {f}\n{json.dumps(theme, indent=2, ensure_ascii=False)}")
         if not themes:
             return ToolResponse.ok("No theme JSON files found.").to_text()
@@ -2860,67 +2881,81 @@ def pbix_set_theme(alias: str, theme_json: str, filename: str = "CY24SU11.json")
 
         written_to = []
 
-        # `filename` is caller-controlled; contain it to work_dir to prevent
-        # path traversal / arbitrary file write (CWE-22/CWE-73).
-        # Write to BaseThemes
-        base_dir = os.path.join(work_dir, "Report", "StaticResources", "SharedResources", "BaseThemes")
-        os.makedirs(base_dir, exist_ok=True)
-        with open(_safe_join(base_dir, filename), "w", encoding="utf-8") as fh:
-            json.dump(theme, fh, indent=2, ensure_ascii=False)
-        written_to.append("BaseThemes")
-
-        # Also write to RegisteredResources if the file exists there
+        # A custom theme must be registered as a customTheme OVERLAY on a valid
+        # built-in baseTheme — NOT by overwriting baseTheme.name. Power BI reads
+        # baseTheme.name as a BUILT-IN theme id, so a custom name (e.g. "Modern
+        # Blue") fails to resolve and Desktop silently falls back to its default
+        # palette (the report loads but chart colors are wrong). The custom theme
+        # JSON belongs in RegisteredResources (item type 201); SharedResources/
+        # BaseThemes is only for the built-in base. Verified against real Power BI
+        # Desktop (Cars Sales / Briqlab): the theme's dataColors now apply.
+        # `filename` is caller-controlled; _safe_join contains it to work_dir
+        # (CWE-22/CWE-73).
         reg_dir = os.path.join(work_dir, "Report", "StaticResources", "RegisteredResources")
-        reg_path = _safe_join(reg_dir, filename)
-        if os.path.exists(reg_path):
-            with open(reg_path, "w", encoding="utf-8") as fh:
-                json.dump(theme, fh, indent=2, ensure_ascii=False)
-            written_to.append("RegisteredResources")
+        os.makedirs(reg_dir, exist_ok=True)
+        with open(_safe_join(reg_dir, filename), "w", encoding="utf-8") as fh:
+            json.dump(theme, fh, indent=2, ensure_ascii=False)
+        written_to.append("RegisteredResources")
+
+        # Drop the stale copy an older pbix-mcp wrote into BaseThemes (it made the
+        # custom theme masquerade as the base theme).
+        stale = _safe_join(
+            os.path.join(work_dir, "Report", "StaticResources", "SharedResources", "BaseThemes"),
+            filename)
+        if os.path.exists(stale):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
 
         # Update layout config to reference the theme
         layout = _get_layout(work_dir)
         if layout:
-            # Ensure resourcePackages includes SharedResources with theme
-            theme_name = theme.get("name", filename.replace(".json", ""))
-            rp = layout.get("resourcePackages", [])
+            rp = layout.get("resourcePackages", []) or []
 
-            # Find or create SharedResources package
-            shared_pkg = None
+            # Remove any stale SharedResources item that registered this custom
+            # theme as a base theme (BaseThemes/<filename>).
             for pkg in rp:
                 inner = pkg.get("resourcePackage", pkg)
-                if inner.get("name") == "SharedResources" or inner.get("type") in (2, "SharedResources"):
-                    shared_pkg = inner
-                    break
-            if shared_pkg is None:
-                shared_pkg = {"name": "SharedResources", "type": 2, "items": [], "disabled": False}
-                rp.append({"resourcePackage": shared_pkg})
-                layout["resourcePackages"] = rp
+                if inner.get("name") == "SharedResources":
+                    inner["items"] = [
+                        it for it in inner.get("items", [])
+                        if it.get("path") != f"BaseThemes/{filename}"]
 
-            # Ensure theme item exists in SharedResources
-            items = shared_pkg.get("items", [])
-            theme_item_found = False
-            for item in items:
-                if item.get("type") in (202, "BaseTheme"):
-                    item["name"] = theme_name
-                    item["path"] = f"BaseThemes/{filename}"
-                    theme_item_found = True
+            # Ensure a RegisteredResources package (type 1) with the theme item
+            # (type 201). The item name/path is the filename, matching customTheme.
+            reg_pkg = None
+            for pkg in rp:
+                inner = pkg.get("resourcePackage", pkg)
+                if inner.get("name") == "RegisteredResources":
+                    reg_pkg = inner
                     break
-            if not theme_item_found:
-                items.append({"type": 202, "path": f"BaseThemes/{filename}", "name": theme_name})
-                shared_pkg["items"] = items
+            if reg_pkg is None:
+                reg_pkg = {"name": "RegisteredResources", "type": 1, "items": [], "disabled": False}
+                rp.append({"resourcePackage": reg_pkg})
+            items = reg_pkg.setdefault("items", [])
+            theme_item = next(
+                (it for it in items if it.get("path") == filename or it.get("name") == filename), None)
+            if theme_item is None:
+                items.append({"type": 201, "path": filename, "name": filename})
+            else:
+                theme_item.update({"type": 201, "path": filename, "name": filename})
+            layout["resourcePackages"] = rp
 
-            # Update config.themeCollection
+            # config.themeCollection: a valid built-in baseTheme + the custom
+            # overlay. Power BI resolves the built-in by name (no base file
+            # shipped). Also fill the report-level config keys Desktop expects.
             config_str = layout.get("config", "{}")
             try:
-                config = json.loads(config_str) if isinstance(config_str, str) else config_str
+                config = json.loads(config_str) if isinstance(config_str, str) else (config_str or {})
             except json.JSONDecodeError:
                 config = {}
+            config.setdefault("version", "5.37")
+            config.setdefault("activeSectionIndex", 0)
+            config.setdefault("linguisticSchemaSyncVersion", 2)
             config["themeCollection"] = {
-                "baseTheme": {
-                    "name": theme_name,
-                    "version": {"visual": "1.0.0", "report": "1.0.0", "page": "1.0.0"},
-                    "type": 2
-                }
+                "baseTheme": {"name": _BUILTIN_BASE_THEME, "version": _BUILTIN_BASE_VERSION, "type": 2},
+                "customTheme": {"name": filename, "version": _BUILTIN_BASE_VERSION, "type": 1},
             }
             layout["config"] = json.dumps(config, ensure_ascii=False)
 
