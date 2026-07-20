@@ -157,6 +157,60 @@ class TestCompileBinding:
             for s in dt["selects"]:
                 assert s["queryName"] in proto_names
 
+    def test_matrix_rows_columns_values(self):
+        # matrix with a column field crosses rows (Primary) against columns +
+        # values (Secondary). NO isPivoted. Byte-exact to Matrix Bubble Chart.
+        sv = {
+            "visualType": "matrix",
+            "projections": {"Rows": [{"queryRef": "T.Class"}],
+                            "Columns": [{"queryRef": "T.Sex"}],
+                            "Values": [{"queryRef": "T.Rate"}]},
+            "prototypeQuery": {"Version": 2, "From": [{"Name": "t", "Entity": "T", "Type": 0}],
+                "Select": [
+                    {"Column": {"Expression": {"SourceRef": {"Source": "t"}}, "Property": "Class"}, "Name": "T.Class"},
+                    {"Column": {"Expression": {"SourceRef": {"Source": "t"}}, "Property": "Sex"}, "Name": "T.Sex"},
+                    {"Measure": {"Expression": {"SourceRef": {"Source": "t"}}, "Property": "Rate"}, "Name": "T.Rate"},
+                ]}}
+        q, dt = compile_visual_binding(sv, lambda e, p, m: None)
+        b = q["Commands"][0]["SemanticQueryDataShapeCommand"]["Binding"]
+        assert b["Primary"]["Groupings"] == [{"Projections": [0]}]           # rows
+        assert b["Secondary"]["Groupings"] == [{"Projections": [1, 2]}]      # cols + values
+        assert b["DataReduction"] == {"DataVolume": 3, "Primary": {"Window": {"Count": 100}},
+                                      "Secondary": {"Top": {"Count": 100}}}
+        assert "isPivoted" not in b
+        roles = {(r["Name"], r["isActive"]) for r in dt["visualElements"][0]["DataRoles"]}
+        assert ("Rows", True) in roles and ("Columns", True) in roles and ("Values", False) in roles
+
+    def test_matrix_without_columns_is_flat(self):
+        # a matrix with only Rows + Values (no column field) collapses to a
+        # single Primary grouping with a subtotal (like a table).
+        sv = {
+            "visualType": "matrix",
+            "projections": {"Rows": [{"queryRef": "T.Class"}], "Values": [{"queryRef": "T.Rate"}]},
+            "prototypeQuery": {"Version": 2, "From": [{"Name": "t", "Entity": "T", "Type": 0}],
+                "Select": [
+                    {"Column": {"Expression": {"SourceRef": {"Source": "t"}}, "Property": "Class"}, "Name": "T.Class"},
+                    {"Measure": {"Expression": {"SourceRef": {"Source": "t"}}, "Property": "Rate"}, "Name": "T.Rate"},
+                ]}}
+        q, _ = compile_visual_binding(sv, lambda e, p, m: None)
+        b = q["Commands"][0]["SemanticQueryDataShapeCommand"]["Binding"]
+        assert b["Primary"]["Groupings"] == [{"Projections": [0, 1], "Subtotal": 1}]
+        assert "Secondary" not in b
+        assert b["DataReduction"] == {"DataVolume": 3, "Primary": {"Window": {"Count": 500}}}
+
+    def test_slicer_include_empty_groups(self):
+        # slicer: empty Window (no Count), IncludeEmptyGroups, active data role.
+        sv = {
+            "visualType": "slicer",
+            "projections": {"Values": [{"queryRef": "T.Sex"}]},
+            "prototypeQuery": {"Version": 2, "From": [{"Name": "t", "Entity": "T", "Type": 0}],
+                "Select": [{"Column": {"Expression": {"SourceRef": {"Source": "t"}}, "Property": "Sex"}, "Name": "T.Sex"}]}}
+        q, dt = compile_visual_binding(sv, lambda e, p, m: "String")
+        b = q["Commands"][0]["SemanticQueryDataShapeCommand"]["Binding"]
+        assert b["DataReduction"] == {"DataVolume": 3, "Primary": {"Window": {}}}
+        assert b["IncludeEmptyGroups"] is True
+        assert dt["visualElements"][0]["DataRoles"] == [{"Name": "Values", "Projection": 0, "isActive": True}]
+
 
 class TestToolRegistration:
     """Guard against a helper stealing @mcp.tool() from a real tool (a function

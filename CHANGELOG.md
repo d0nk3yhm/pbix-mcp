@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.20] - 2026-07-20
+
+Correct data bindings for matrix / pivotTable and slicer visuals (report render fix).
+
+### Fixed
+- **Matrix, pivotTable, and slicer visuals now render in Power BI Desktop instead of throwing "An error occurred while rendering the report."** `compile_visual_binding` emitted a single flat `Primary` grouping (plus `isPivoted`) for every visual type. That is correct for cards / cartesian / pie / table, but wrong for a matrix — which crosses **rows on the Primary axis against columns + values on a Secondary axis** — and for a slicer, which needs `IncludeEmptyGroups` and an empty `Window` (no `Count`) DataReduction. The compiler now special-cases both: a matrix/pivotTable with a column field emits `Primary.Groupings` (one per row level) + `Secondary.Groupings` (`[columns…, values…]`) with a dual DataReduction and no `isPivoted` (a matrix with only rows collapses to a flat table grouping); a slicer emits the empty-window / `IncludeEmptyGroups` binding with active data roles. Byte-exact to Desktop-authored ground truth (Matrix Bubble Chart, Contoso IBCS, AI Sample); card / pie / table bindings are unchanged. Verified against real Power BI Desktop 2.152: a Titanic 3-pager whose matrix, three slicers, and data-bar table previously errored now render fully. New matrix/slicer tests in `tests/test_report_binding.py`.
+
 ## [0.9.19] - 2026-07-20
 
 Reports built by pbix-mcp now load in Power BI Desktop (critical report-layer fix).
