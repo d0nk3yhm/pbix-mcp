@@ -1870,6 +1870,12 @@ def pbix_add_visual(
                     container["query"] = json.dumps(q, ensure_ascii=False)
                     container["dataTransforms"] = json.dumps(dt, ensure_ascii=False)
                     container.setdefault("filters", "[]")
+                # compile_visual_binding rewrites bare value-role columns to
+                # implicit Aggregations IN the prototypeQuery/projections (as
+                # Desktop's field well does) — re-serialize the config so the
+                # prototype Desktop re-derives the live query from is aggregated
+                # too; the compiled query alone leaves the chart empty.
+                container["config"] = json.dumps(config, ensure_ascii=False)
             except Exception:
                 pass  # best-effort: never block visual creation on binding
 

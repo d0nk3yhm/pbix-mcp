@@ -287,23 +287,43 @@ def _cart_col_sv(vt, value_prop):
 
 
 class TestValueColumnAggregation:
-    """A plain numeric column on a value axis must be implicitly Summed, or the
-    cartesian chart renders empty in Power BI Desktop (the field becomes a
-    group-by dimension). Ground truth: AI Sample barChart Sum(Int64 column)."""
+    """A plain numeric column on a value axis must be implicitly Summed — IN THE
+    PROTOTYPE QUERY, not just the compiled query. Desktop re-derives the live
+    data query from config.singleVisual.prototypeQuery + projections, so an
+    unaggregated column there renders an empty chart even when the compiled
+    query carries an Aggregation (Desktop-verified). Ground truth: AI Sample
+    barChart stores Sum(Entity.Property) in the prototype and repoints the
+    projection queryRef at it."""
 
     def test_double_column_on_y_is_summed(self):
-        q, dt = compile_visual_binding(_cart_col_sv("clusteredColumnChart", "Amount"), _resolver)
+        sv = _cart_col_sv("clusteredColumnChart", "Amount")
+        q, dt = compile_visual_binding(sv, _resolver)
+        # the PROTOTYPE itself is rewritten (the part Desktop re-derives from)
+        proto_val = sv["prototypeQuery"]["Select"][1]
+        assert "Aggregation" in proto_val and "Column" not in proto_val
+        assert proto_val["Aggregation"]["Function"] == 0  # Sum
+        assert proto_val["Name"] == "Sum(Sales.Amount)"   # Desktop queryRef naming
+        assert sv["projections"]["Y"] == [{"queryRef": "Sum(Sales.Amount)"}]
+        # and the compiled query matches
         val = q["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]["Select"][1]
-        assert "Aggregation" in val and "Column" not in val
-        assert val["Aggregation"]["Function"] == 0  # Sum
-        # grouping still lists the value index (Desktop aggregates an Aggregation)
+        assert "Aggregation" in val and val["Name"] == "Sum(Sales.Amount)"
         binding = q["Commands"][0]["SemanticQueryDataShapeCommand"]["Binding"]
         assert binding["Primary"]["Groupings"] == [{"Projections": [0, 1]}]
         assert "Aggregation" in dt["selects"][1]["expr"]
+        assert dt["selects"][1]["queryName"] == "Sum(Sales.Amount)"
+        assert dt["selects"][1]["roles"] == {"Y": True}
 
     def test_int64_sum_uses_260_codes(self):
         _, dt = compile_visual_binding(_cart_col_sv("barChart", "Value"), _resolver)
         assert dt["selects"][1]["type"]["underlyingType"] == 260
+
+    def test_non_numeric_value_column_counts(self):
+        sv = _cart_col_sv("columnChart", "Region")  # String column on Y
+        sv["prototypeQuery"]["Select"][1]["Column"]["Property"] = "Region"
+        compile_visual_binding(sv, _resolver)
+        proto_val = sv["prototypeQuery"]["Select"][1]
+        assert proto_val["Aggregation"]["Function"] == 5  # CountNonNull
+        assert proto_val["Name"] == "CountNonNull(Sales.Region)"
 
     def test_measure_on_y_is_not_wrapped(self):
         sv = _cart_col_sv("columnChart", "Amount")

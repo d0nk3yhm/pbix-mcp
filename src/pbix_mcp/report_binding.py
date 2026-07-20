@@ -69,6 +69,70 @@ def _data_reduction(visual_type: str) -> dict:
     return {"DataVolume": 3, "Primary": {"Top": {}}}
 
 
+def apply_implicit_aggregations(single_visual: dict, resolve_type=None) -> dict[str, str]:
+    """Rewrite plain value-role columns in the PROTOTYPE query to Aggregations.
+
+    Power BI Desktop re-derives the live data query from
+    ``config.singleVisual.prototypeQuery`` + ``projections`` — aggregating only
+    the compiled ``query`` is not enough (Desktop-verified: the chart stays
+    empty). When Desktop's own field well receives a numeric column on a value
+    axis it stores an ``Aggregation`` select named ``Sum(Entity.Property)`` in
+    the prototype and points the projection at that name (ground truth: AI
+    Sample barChart). This mirrors that: every bare ``Column`` select projected
+    into a value role (``Y``/``Values``/``Y2``/``Size``) becomes
+    ``{"Aggregation": {"Expression": {"Column": ...}, "Function": Sum|CountNonNull}}``
+    with the Desktop queryRef naming, and the projections are updated in place.
+    Flat grids (``table``/``tableEx``) and slicers show raw values and are left
+    alone; measures and explicit aggregations are untouched.
+
+    Returns a mapping of old queryRef -> new queryRef (empty when nothing changed).
+    """
+    proto = single_visual.get("prototypeQuery") or {}
+    projections = single_visual.get("projections") or {}
+    visual_type = single_visual.get("visualType", "")
+    selects = proto.get("Select") or []
+    if not selects or visual_type in _TABLE_TYPES or visual_type in _SLICER_TYPES:
+        return {}
+
+    alias2entity = {f.get("Name"): f.get("Entity") for f in proto.get("From", [])}
+    ref2role = {it.get("queryRef"): role
+                for role, items in projections.items() for it in items}
+
+    renamed: dict[str, str] = {}
+    for sel in selects:
+        if "Column" not in sel:
+            continue                       # measures / explicit aggregations
+        old_ref = sel.get("Name")
+        if ref2role.get(old_ref) not in _VALUE_ROLES:
+            continue
+        col = sel["Column"]
+        src = col.get("Expression", {}).get("SourceRef", {})
+        entity = alias2entity.get(src.get("Source"), src.get("Entity"))
+        prop = col.get("Property", "")
+        vtype = None
+        if resolve_type is not None:
+            try:
+                vtype = resolve_type(entity, prop, False)
+            except Exception:
+                vtype = None
+        func = _AGG_SUM if vtype in _NUMERIC_TYPES else _AGG_COUNTNONNULL
+        fn_name = "Sum" if func == _AGG_SUM else "CountNonNull"
+        new_ref = (f"{fn_name}({entity}.{prop})" if entity and prop
+                   else f"{fn_name}({old_ref})")
+        sel.pop("Column")
+        sel["Aggregation"] = {"Expression": {"Column": col}, "Function": func}
+        sel["Name"] = new_ref
+        renamed[old_ref] = new_ref
+
+    if renamed:
+        for items in projections.values():
+            for it in items:
+                ref = it.get("queryRef")
+                if ref in renamed:
+                    it["queryRef"] = renamed[ref]
+    return renamed
+
+
 def compile_visual_binding(single_visual: dict, resolve_type=None):
     """Compile ``query`` and ``dataTransforms`` dicts for one visual.
 
@@ -86,12 +150,21 @@ def compile_visual_binding(single_visual: dict, resolve_type=None):
     (query, data_transforms) : tuple[dict, dict] | (None, None)
         ``(None, None)`` when the visual has no bindable projections (textbox,
         shape, image, button, …) and therefore needs no data binding.
+
+    Side effect: bare value-role columns are rewritten to implicit Aggregations
+    IN ``single_visual`` itself (prototypeQuery + projections) via
+    :func:`apply_implicit_aggregations` — the caller must persist the mutated
+    config, or Desktop re-derives an unaggregated query and the chart is empty.
     """
     proto = single_visual.get("prototypeQuery")
     projections = single_visual.get("projections") or {}
     visual_type = single_visual.get("visualType", "")
     if not proto or not proto.get("Select"):
         return None, None
+
+    # Mirror Desktop's field well: a numeric column dropped on a value axis is
+    # stored as Sum(...) in the PROTOTYPE (and the projection re-pointed).
+    apply_implicit_aggregations(single_visual, resolve_type)
 
     selects = proto["Select"]
     alias2entity = {f.get("Name"): f.get("Entity") for f in proto.get("From", [])}
@@ -117,10 +190,10 @@ def compile_visual_binding(single_visual: dict, resolve_type=None):
         node["Expression"]["SourceRef"] = {
             "Entity": alias2entity.get(ref.get("Source"), ref.get("Source"))}
 
-    def _entity_expr(sel, agg_func=None):
+    def _entity_expr(sel):
         """The Column / Measure / Aggregation expr with SourceRef.Source rewritten
-        to .Entity. ``agg_func`` (a QueryAggregateFunction code) wraps a plain
-        Column in that aggregation — used to implicitly Sum a value-role column."""
+        to .Entity (implicit value-role aggregations were already applied to the
+        prototype by :func:`apply_implicit_aggregations`)."""
         if "Aggregation" in sel:
             agg = copy.deepcopy(sel["Aggregation"])
             inner = agg.get("Expression", {})
@@ -131,8 +204,6 @@ def compile_visual_binding(single_visual: dict, resolve_type=None):
         key = "Measure" if "Measure" in sel else "Column"
         node = copy.deepcopy(sel[key])
         _rewrite_src(node)
-        if agg_func is not None and key == "Column":
-            return {"Aggregation": {"Expression": {"Column": node}, "Function": agg_func}}
         return {key: node}
 
     # Deduplicate NativeReferenceName across selects (query only): two fields
@@ -176,34 +247,6 @@ def compile_visual_binding(single_visual: dict, resolve_type=None):
     # is a data-shape property of pie/donut/stacked charts — NOT matrices, which
     # express rows-vs-columns through a Secondary grouping instead.
     pivoted = "Series" in roles_present and bool(roles_present & _VALUE_ROLES)
-
-    # A plain column on a value axis must be implicitly AGGREGATED, exactly as
-    # Power BI Desktop does when you drop a numeric column on Y/Values (it wraps
-    # it in Sum). Without this the column becomes a second group-by dimension and
-    # the chart renders empty (title + axes only) — the field has nothing to plot.
-    # Flat grids (table/tableEx) and slicers show raw values and are excluded;
-    # cartesian / pie / card / matrix-Values roles aggregate. Sum for numeric,
-    # else CountNonNull. Ground truth: AI Sample barChart — Sum(Int64 column) is
-    # an Aggregation (Function 0) and the grouping still lists the value index.
-    value_agg_idx: dict[int, int] = {}
-    if not (is_table or is_slicer):
-        for i, s in enumerate(selects):
-            if "Column" not in s:      # Measures / explicit Aggregations already aggregate
-                continue
-            if ref2role.get(s.get("Name")) not in _VALUE_ROLES:
-                continue
-            vtype = None
-            if resolve_type is not None:
-                try:
-                    vtype = resolve_type(_entity_of(s), _native(s), False)
-                except Exception:
-                    vtype = None
-            value_agg_idx[i] = _AGG_SUM if vtype in _NUMERIC_TYPES else _AGG_COUNTNONNULL
-    for i, func in value_agg_idx.items():
-        col = q["Select"][i].pop("Column", None)
-        if col is not None:
-            q["Select"][i]["Aggregation"] = {
-                "Expression": {"Column": col}, "Function": func}
 
     if is_matrix:
         # matrix / pivotTable: rows on the Primary axis (one grouping per row
@@ -291,7 +334,7 @@ def compile_visual_binding(single_visual: dict, resolve_type=None):
             "queryName": ref,
             "roles": ({role: True} if role else {}),
             "type": {"category": None, "underlyingType": underlying},
-            "expr": _entity_expr(s, value_agg_idx.get(i)),
+            "expr": _entity_expr(s),
         })
 
     data_transforms = {

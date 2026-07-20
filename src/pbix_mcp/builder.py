@@ -316,21 +316,27 @@ class PBIXBuilder:
                     "z": vis.get("z", 0),
                     "width": vis.get("width", 300),
                     "height": vis.get("height", 200),
-                    "config": json.dumps({
-                        "name": vis.get("name", f"visual_{j}"),
-                        "singleVisual": single_visual,
-                    }),
                 }
                 # Compile the data binding (query + dataTransforms) that Power BI
                 # Desktop's report loader requires on data visuals — without it a
                 # report carrying report-level config / visual objects fails to
                 # load ("Failed to load the report"), though the model opens fine.
+                # NOTE: this MUTATES single_visual (bare value-role columns become
+                # implicit Sum/Count aggregations in the prototypeQuery, as
+                # Desktop's field well stores them), so the config must be
+                # serialized AFTER the compile — Desktop re-derives the live data
+                # query from the prototype, and an unaggregated column there
+                # renders an empty chart.
                 if bindings:
                     q, dt = compile_visual_binding(single_visual, _resolve_type)
                     if q is not None:
                         container["query"] = json.dumps(q, ensure_ascii=False)
                         container["dataTransforms"] = json.dumps(dt, ensure_ascii=False)
                         container["filters"] = "[]"
+                container["config"] = json.dumps({
+                    "name": vis.get("name", f"visual_{j}"),
+                    "singleVisual": single_visual,
+                })
                 containers.append(container)
             sections.append({
                 "displayName": page["name"],
