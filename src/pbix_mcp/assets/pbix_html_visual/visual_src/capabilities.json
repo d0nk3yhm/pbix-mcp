@@ -1,0 +1,12 @@
+{
+  "privileges": [],
+  "dataRoles": [
+    { "name": "content", "kind": "GroupingOrMeasure", "displayName": "Content (HTML/CSS/SVG)" }
+  ],
+  "dataViewMappings": [
+    { "table": { "rows": { "select": [ { "for": { "in": "content" } } ], "dataReductionAlgorithm": { "top": {} } } } }
+  ],
+  "objects": {},
+  "supportsLandingPage": true,
+  "suppressDefaultTitle": true
+}

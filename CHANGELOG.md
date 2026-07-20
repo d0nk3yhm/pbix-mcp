@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.22] - 2026-07-20
+
+Custom HTML / CSS / SVG visuals — pbix-mcp's own custom visual + turnkey tools — plus two serious data-corruption fixes in the metadata splice that affected every measure/metadata edit.
+
+### Added
+- **Create, view, and edit custom HTML / CSS / SVG (and inline JS) visuals in a report.** pbix-mcp now ships its **own** Power BI custom visual (`PBIX HTML`, `src/pbix_mcp/assets/pbix_html_visual/`, ~3.8 KB, no third-party dependency) that renders a `content` data-role string as HTML inside Power BI's sandboxed visual iframe — build KPI cards, SVG charts / gauges / maps, badges, custom tables, or anything HTML/CSS/SVG can express. New tools:
+  - `pbix_add_html_visual(alias, page_index, html=|dax=|template=, x, y, width, height, measure_name=, measure_table=, css=, pbiviz_path=)` — one call embeds the visual, authors the DAX measure that produces the HTML (static literal or a data-driven `FORMAT()`/`&` expression), and places a fully data-bound container (the content measure is bound as `String`). Pass your own HTML-rendering `.pbiviz` via `pbiviz_path` if you prefer.
+  - `pbix_get_html_visual(alias, page_index=-1)` — list the report's HTML visuals with position, bound measure, and decoded HTML.
+  - `pbix_set_html_visual(alias, page_index, visual_index=|measure_name=, html=|dax=|css=)` — edit an existing HTML visual's content.
+  - `pbix_html_template(kind, spec_json)` — render professional, HTML-escaped snippets (`kpi_card`, `bar_chart`, `gauge`, `table`, `progress`, `badge`) from `src/pbix_mcp/html_templates.py`; usable directly or via `pbix_add_html_visual(template=...)`.
+  Verified in real Power BI Desktop: a showcase page of six HTML visuals (gradient KPI card with SVG sparkline, SVG bar chart, SVG radial gauge, inline SVG map, styled HTML table, and a live data-driven DAX card) all render.
+- **`pbix_add_custom_visual` rewritten to embed any `.pbiviz` correctly.** It now reads the visual GUID from the package manifest (never fabricates one), extracts the `.pbiviz` verbatim into `Report/CustomVisuals/<guid>/`, and registers the GUID in the top-level `publicCustomVisuals` array — exactly how Power BI Desktop embeds a custom visual. The previous implementation registered a non-canonical `resourcePackages` type-7 entry, named the folder by an alias, and generated a random GUID, so Desktop silently dropped the visual. `pbix_remove_custom_visual` now de-registers from `publicCustomVisuals`.
+
+### Fixed
+- **Metadata splice no longer corrupts the data model on measure / metadata edits (DBCC load failure).** `splice_metadata_in_abf` shifts every embedded-file offset after the metadata by the metadata's size change. It did this with a `buf.find(old)+replace` loop over the mutating buffer: when two files' offsets differed by exactly the size delta — near-certain when a page-aligned metadata block grows (e.g. +8192 bytes) — `find` matched the value it had just written, double-shifting one entry and leaving another **stale**. The stale offset then overlapped its neighbour and Power BI Desktop failed to load the model ("Database consistency checks (DBCC) failed while checking the data segments"). The shift is now a single-pass `re.sub` over the VirtualDirectory text, which never re-matches its own replacements and also tolerates offsets that gain or lose digits. This affected `pbix_datamodel_add_measure` / `modify_measure` and any metadata edit that grew the file — a latent silent-corruption bug since 0.x.
+- **Metadata splice no longer writes a truncated VirtualDirectory size.** The spliced BackupLogHeader `DataSize` was measured from the position of `<VirtualDirectory>` (which for a UTF-16 VDir sits after the 2-byte byte-order mark) while `m_cbOffsetHeader` points at the BOM, so `DataSize` came out 2 bytes short and the reader dropped the closing `>` of `</VirtualDirectory>`. Power BI tolerated it, but pbix-mcp's own reader raised `unclosed token` on the next read after an edit. `DataSize` is now sized from the header offset so it is byte-exact. New regression tests in `tests/test_abf_splice_datasize.py` (VDir close-tag reachable + no offset overlaps) and `tests/test_html_visuals.py`.
+
 ## [0.9.21] - 2026-07-20
 
 Custom report themes now apply in Power BI Desktop (chart colors were wrong).
