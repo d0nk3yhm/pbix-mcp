@@ -2842,7 +2842,34 @@ def _first_model_table(info: dict) -> str:
     stats = model.statistics or []
     if not stats:
         raise LayoutParseError("Model has no tables to attach the HTML measure to.")
-    return stats[0]["TableName"]
+    return str(stats[0]["TableName"])
+
+
+def _resolve_model_field(info: dict, field: str) -> tuple[str, str]:
+    """Resolve ``field`` to a (table, column) pair. Accepts ``Table[Column]``,
+    ``Table.Column``, or a bare ``Column`` (unique match across the model)."""
+    from pbix_mcp.formats.model_reader import ModelReader
+    schema = ModelReader(info["path"], work_dir=info.get("work_dir")).schema or []
+    raw = field.strip()
+    table_hint = None
+    col = raw
+    if "[" in raw and raw.endswith("]"):
+        table_hint, col = raw[:raw.index("[")].strip().strip("'"), raw[raw.index("[") + 1:-1].strip()
+    elif "." in raw:
+        table_hint, col = raw.rsplit(".", 1)
+        table_hint = table_hint.strip().strip("'")
+        col = col.strip()
+    matches = [(r["TableName"], r["ColumnName"]) for r in schema
+               if r["ColumnName"] == col and (table_hint is None or r["TableName"] == table_hint)]
+    if not matches:
+        raise LayoutParseError(
+            f"category_field '{field}' not found. Use Table[Column] / Table.Column / Column.")
+    if len({m[0] for m in matches}) > 1:
+        tables = ", ".join(sorted({m[0] for m in matches}))
+        raise LayoutParseError(
+            f"category_field '{field}' is ambiguous across tables ({tables}); "
+            "qualify it as Table[Column].")
+    return matches[0]
 
 
 def _iter_html_visuals(layout: dict):
@@ -2888,6 +2915,7 @@ def pbix_add_html_visual(
     pbiviz_path: str = "",
     template: str = "",
     template_spec_json: str = "",
+    category_field: str = "",
 ) -> str:
     """Create a custom HTML / CSS / SVG visual on a report page (turnkey).
 
@@ -2923,6 +2951,12 @@ def pbix_add_html_visual(
             with pbix_html_template().
         template_spec_json: JSON spec for ``template`` (e.g.
             ``{"title":"Sales","value":"1.2M","spark":[3,5,4,8]}``)
+        category_field: Optional column (``Table[Column]`` / ``Table.Column`` /
+            ``Column``) that makes the visual CROSS-FILTER the rest of the report,
+            like a native visual. Tag clickable elements in your HTML/SVG with
+            ``data-pbix-select="<value>"`` (the category value); clicking one
+            selects that value and filters every other visual bound to the same
+            field. Ctrl/Cmd-click multi-selects; clicking the background clears.
     """
     try:
         info = _ensure_open(alias)
@@ -3001,19 +3035,40 @@ def pbix_add_html_visual(
         yf = max(0.0, min(float(y), page_h - float(height)))
 
         import uuid as _uuid
+        proto_from = [{"Name": "t", "Entity": table, "Type": 0}]
+        proto_select = [{
+            "Measure": {
+                "Expression": {"SourceRef": {"Source": "t"}},
+                "Property": measure_name,
+            },
+            "Name": "C",
+        }]
+        projections = {_HTML_VISUAL_ROLE: [{"queryRef": "C"}]}
+
+        # Optional cross-filter category: bind a column so the visual receives
+        # per-value selection identities (wired in the visual to data-pbix-select).
+        cat_table = cat_col = None
+        if category_field:
+            cat_table, cat_col = _resolve_model_field(info, category_field)
+            src = "t" if cat_table == table else "c"
+            if src == "c":
+                proto_from.append({"Name": "c", "Entity": cat_table, "Type": 0})
+            proto_select.append({
+                "Column": {
+                    "Expression": {"SourceRef": {"Source": src}},
+                    "Property": cat_col,
+                },
+                "Name": "cat",
+            })
+            projections["category"] = [{"queryRef": "cat"}]
+
         single_visual = {
             "visualType": guid,
-            "projections": {_HTML_VISUAL_ROLE: [{"queryRef": "C"}]},
+            "projections": projections,
             "prototypeQuery": {
                 "Version": 2,
-                "From": [{"Name": "t", "Entity": table, "Type": 0}],
-                "Select": [{
-                    "Measure": {
-                        "Expression": {"SourceRef": {"Source": "t"}},
-                        "Property": measure_name,
-                    },
-                    "Name": "C",
-                }],
+                "From": proto_from,
+                "Select": proto_select,
             },
             "drillFilterOtherVisuals": True,
         }

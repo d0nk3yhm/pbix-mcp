@@ -12,7 +12,6 @@ from pbix_mcp import html_templates as ht
 from pbix_mcp import server
 from pbix_mcp.builder import PBIXBuilder
 
-
 # ---- DAX literal round-trip ------------------------------------------------
 
 def test_html_dax_literal_roundtrip():
@@ -103,6 +102,48 @@ def test_add_get_set_html_visual(tmp_path):
         assert s["success"], s
         got2 = json.loads(server.pbix_get_html_visual(alias, page))["data"]
         assert "<b>EDITED</b>" in got2["visuals"][0]["html"]
+    finally:
+        server._open_files.pop(alias, None)
+
+
+def test_add_html_visual_with_category_crossfilter(tmp_path):
+    """A category_field must bind a second column so the visual receives
+    per-value selection identities (the cross-filter path)."""
+    alias = "hvc"
+    try:
+        wd = _open_report(tmp_path, alias)
+        page = len(server._get_layout(wd)["sections"]) - 1
+        r = json.loads(server.pbix_add_html_visual(
+            alias, page,
+            html="<span data-pbix-select='N'>North</span><span data-pbix-select='S'>South</span>",
+            measure_name="Map HTML", category_field="Sales.Region"))
+        assert r["success"], r
+        layout = server._get_layout(wd)
+        vc = layout["sections"][page]["visualContainers"][-1]
+        sv = json.loads(vc["config"])["singleVisual"]
+        # projections carry both content and category
+        assert "category" in sv["projections"]
+        # prototypeQuery has the measure + the category column
+        sel = sv["prototypeQuery"]["Select"]
+        assert any("Measure" in s for s in sel) and any("Column" in s for s in sel)
+        # dataTransforms tags the category role
+        dt = json.loads(vc["dataTransforms"])
+        roles = {s["queryName"]: s.get("roles", {}) for s in dt["selects"]}
+        assert any(rl.get("category") for rl in roles.values())
+        assert any(rl.get("content") for rl in roles.values())
+    finally:
+        server._open_files.pop(alias, None)
+
+
+def test_category_field_unknown_errors(tmp_path):
+    alias = "hvcx"
+    try:
+        wd = _open_report(tmp_path, alias)
+        page = len(server._get_layout(wd)["sections"]) - 1
+        r = json.loads(server.pbix_add_html_visual(
+            alias, page, html="<i>x</i>", measure_name="M2 HTML",
+            category_field="Nope.NoColumn"))
+        assert r["success"] is False
     finally:
         server._open_files.pop(alias, None)
 

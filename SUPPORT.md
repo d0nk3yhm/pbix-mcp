@@ -32,6 +32,8 @@
 - Calculated column evaluation (per-row DAX; tested with synthetic data only)
 - Password extraction from protected dashboards (regex-based, limited test coverage)
 - Diagnostic health check (`pbix_doctor`) (implemented, limited test coverage)
+- Custom visual import — any `.pbiviz` (embeds by GUID + `publicCustomVisuals`, placed with `pbix_add_visual`)
+- HTML / CSS / SVG visuals — bundled "PBIX HTML" visual via `pbix_add_html_visual` / `pbix_get_html_visual` / `pbix_set_html_visual` / `pbix_html_template`, with optional `category_field` cross-filtering (see [docs/html-visuals.md](docs/html-visuals.md))
 
 ### Known Limitations
 - DAX engine is best-effort, not a strict runtime — unsupported functions return `None` with status `"unsupported"`, circular references raise `DAXEvaluationError`

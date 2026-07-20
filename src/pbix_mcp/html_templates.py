@@ -13,6 +13,7 @@ and stay well under the ~32 KB text-cell limit.
 from __future__ import annotations
 
 import html as _html
+from typing import Callable
 
 # A calm, professional default palette (Power BI "Modern" blue family).
 ACCENT = "#2E86DE"
@@ -188,7 +189,7 @@ def _fmt(v) -> str:
 
 # Registry for the pbix_html_template MCP tool. Each entry maps a kind name to a
 # builder + the spec keys it accepts (for docs/validation).
-TEMPLATES = {
+TEMPLATES: dict[str, tuple[Callable[..., str], list[str]]] = {
     "kpi_card": (kpi_card, ["title", "value", "subtitle", "accent", "spark"]),
     "badge": (badge, ["text", "color", "filled"]),
     "bar_chart": (svg_bar_chart, ["title", "items", "accent", "value_suffix"]),

@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.23] - 2026-07-20
+
+HTML visuals now cross-filter the rest of the report (native selection), full docs, and a pure-Python example.
+
+### Added
+- **HTML visuals can now cross-filter / cross-highlight the rest of the report — like a native visual.** Because the bundled `PBIX HTML` visual renders in its own DOM (not a sandboxed iframe), it can drive Power BI's selection manager directly. `pbix_add_html_visual` gained a `category_field` argument (`Table[Column]` / `Table.Column` / `Column`): bind a column, tag clickable HTML/SVG elements with `data-pbix-select="<category value>"`, and clicking one selects that value's identity and filters every other visual bound to the same field. Ctrl/Cmd-click multi-selects, clicking the background clears, right-click opens the report context menu, and unselected regions dim. The bundled visual was rebuilt (v1.1.0.0, same GUID) with an `ISelectionManager` + a `category` data role; the binding compiler now emits the category grouping alongside the String-typed content measure. (Filtering *into* an HTML visual already worked — the content is a live DAX measure that re-evaluates under cross-filter.)
+- **New guide `docs/html-visuals.md`** covering the visual, all four HTML tools, DAX-authoring rules, the template library, cross-filter, and the pure-Python (no-MCP) usage path — plus a runnable `examples/html_visual_pure_python.py`. Every `@mcp.tool()` is a plain importable Python function, so the whole feature is usable from pure Python (as the OpenBI runtime uses it), not only via an MCP client.
+
+### Fixed
+- **CI is green again.** The 0.9.22 push failed CI at `ruff check src/ tests/` — the new test files' import blocks were unsorted (local pre-commit only linted `src/`). Fixed the imports and tightened three mypy `no-any-return` / unknown-callable warnings in the new HTML code (the `TEMPLATES` registry is now typed). No behavior change.
+
 ## [0.9.22] - 2026-07-20
 
 Custom HTML / CSS / SVG visuals — pbix-mcp's own custom visual + turnkey tools — plus two serious data-corruption fixes in the metadata splice that affected every measure/metadata edit.
