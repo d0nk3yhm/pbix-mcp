@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import copy
 
-_TABLE_TYPES = {"tableEx", "table", "pivotTable", "matrix"}
+_TABLE_TYPES = {"tableEx", "table"}
+# matrix / pivotTable cross rows against columns — a fundamentally different
+# binding (Primary rows + Secondary columns) from a flat table.
+_MATRIX_TYPES = {"matrix", "pivotTable"}
 _SLICER_TYPES = {"slicer", "advancedSlicerVisual"}
 _CARTESIAN_TYPES = {
     "barChart", "columnChart", "clusteredBarChart", "clusteredColumnChart",
@@ -124,32 +127,11 @@ def compile_visual_binding(single_visual: dict, resolve_type=None):
     for i, s in enumerate(q["Select"]):
         s["NativeReferenceName"] = native_names[i]
     n = len(selects)
+    all_idx = list(range(n))
     roles_present = set(projections.keys())
-    # A binding is "pivoted" when a Series/legend dimension is crossed with a
-    # value axis (matches the Desktop-authored sales_demo pie: Series + Y). This
-    # is a data-shape property, NOT the visual type — a chart with only
-    # Category + Y (including a pie built that way) is not pivoted.
-    pivoted = (
-        ("Series" in roles_present and bool(roles_present & _VALUE_ROLES))
-        or (visual_type in _TABLE_TYPES and "Columns" in roles_present)
-    )
-    grouping: dict = {"Projections": list(range(n))}
-    if visual_type in _TABLE_TYPES:
-        grouping["Subtotal"] = 1
-    binding = {
-        "Primary": {"Groupings": [grouping]},
-        "DataReduction": _data_reduction(visual_type),
-        "Version": 1,
-    }
-    if pivoted:
-        binding["isPivoted"] = True
-    query = {"Commands": [{"SemanticQueryDataShapeCommand": {
-        "Query": q, "Binding": binding, "ExecutionMetricsKind": 1,
-    }}]}
 
-    # --- dataTransforms ---
+    # role -> ordered select indices (used by both binding + dataTransforms)
     projection_ordering: dict[str, list[int]] = {}
-    data_roles: list[dict] = []
     ref2role: dict[str, str] = {}
     for role, items in projections.items():
         idxs = []
@@ -160,8 +142,81 @@ def compile_visual_binding(single_visual: dict, resolve_type=None):
                 ref2role[ref] = role
         if idxs:
             projection_ordering[role] = idxs
-            for ix in idxs:
-                data_roles.append({"Name": role, "Projection": ix, "isActive": False})
+
+    is_matrix = visual_type in _MATRIX_TYPES
+    is_slicer = visual_type in _SLICER_TYPES
+    is_table = visual_type in _TABLE_TYPES
+    # A binding is "pivoted" when a Series/legend dimension is crossed with a
+    # value axis (matches the Desktop-authored sales_demo pie: Series + Y). This
+    # is a data-shape property of pie/donut/stacked charts — NOT matrices, which
+    # express rows-vs-columns through a Secondary grouping instead.
+    pivoted = "Series" in roles_present and bool(roles_present & _VALUE_ROLES)
+
+    if is_matrix:
+        # matrix / pivotTable: rows on the Primary axis (one grouping per row
+        # level), columns + values crossed on the Secondary axis. Ground truth:
+        # Matrix Bubble Chart.pbix + Contoso IBCS. A matrix with no column field
+        # collapses to a flat single-grouping table.
+        rows = projection_ordering.get("Rows", [])
+        cols = projection_ordering.get("Columns", [])
+        vals = projection_ordering.get("Values", [])
+        if not (rows or cols or vals):        # untagged projections -> rows
+            rows = all_idx
+        if cols:
+            primary = [{"Projections": [i]} for i in rows] or [{"Projections": []}]
+            binding = {
+                "Primary": {"Groupings": primary},
+                "Secondary": {"Groupings": [{"Projections": cols + vals}]},
+                "DataReduction": {"DataVolume": 3,
+                                  "Primary": {"Window": {"Count": 100}},
+                                  "Secondary": {"Top": {"Count": 100}}},
+                "Version": 1,
+            }
+        else:
+            binding = {
+                "Primary": {"Groupings": [{"Projections": rows + vals, "Subtotal": 1}]},
+                "DataReduction": {"DataVolume": 3, "Primary": {"Window": {"Count": 500}}},
+                "Version": 1,
+            }
+    elif is_slicer:
+        # slicer: enumerate every distinct value (empty Window, no Count) and
+        # keep empty groups. Ground truth: AI Sample / Cars Sales / Matrix Bubble.
+        binding = {
+            "Primary": {"Groupings": [{"Projections": all_idx}]},
+            "DataReduction": {"DataVolume": 3, "Primary": {"Window": {}}},
+            "IncludeEmptyGroups": True,
+            "Version": 1,
+        }
+    else:
+        grouping: dict = {"Projections": all_idx}
+        if is_table:
+            grouping["Subtotal"] = 1
+        binding = {
+            "Primary": {"Groupings": [grouping]},
+            "DataReduction": _data_reduction(visual_type),
+            "Version": 1,
+        }
+        if pivoted:
+            binding["isPivoted"] = True
+    query = {"Commands": [{"SemanticQueryDataShapeCommand": {
+        "Query": q, "Binding": binding, "ExecutionMetricsKind": 1,
+    }}]}
+
+    # --- dataTransforms ---
+    # A DataRole is "active" for the dimensions the visual pivots on: matrix
+    # rows/columns, and slicer values (Desktop marks these isActive:true).
+    def _is_active(role: str) -> bool:
+        if is_matrix:
+            return role in ("Rows", "Columns")
+        if is_slicer:
+            return True
+        return False
+
+    data_roles: list[dict] = []
+    for role, idxs in projection_ordering.items():
+        for ix in idxs:
+            data_roles.append({"Name": role, "Projection": ix,
+                               "isActive": _is_active(role)})
 
     qm_select: list[dict] = []
     dt_selects: list[dict] = []
