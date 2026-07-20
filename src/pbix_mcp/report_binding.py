@@ -32,6 +32,11 @@ _CARTESIAN_TYPES = {
 }
 # Roles that act as a value/measure axis (paired with Series => pivoted).
 _VALUE_ROLES = {"Y", "Values", "Y2", "Size"}
+# Model value types Power BI implicitly Sums when a bare column lands on a value
+# axis (everything else is Count-ed). QueryAggregateFunction: Sum=0, CountNonNull=5.
+_NUMERIC_TYPES = {"Int64", "Double", "Decimal"}
+_AGG_SUM = 0
+_AGG_COUNTNONNULL = 5
 
 # (underlyingType, queryMetadata.Type) per model data type — taken verbatim from
 # Desktop-authored reports (sales_demo + GeoSales/IT_Support/etc. corpus). Keyed
@@ -93,6 +98,11 @@ def compile_visual_binding(single_visual: dict, resolve_type=None):
     ref2idx = {s.get("Name"): i for i, s in enumerate(selects)}
 
     def _node(sel):
+        # Unwrap an Aggregation (e.g. Sum(col)) to its inner Column/Measure so the
+        # Property / SourceRef helpers work for aggregate selects too.
+        if "Aggregation" in sel:
+            inner = sel["Aggregation"].get("Expression", {})
+            return inner.get("Column") or inner.get("Measure") or {}
         return sel.get("Measure") or sel.get("Column") or {}
 
     def _native(sel):
@@ -102,12 +112,27 @@ def compile_visual_binding(single_visual: dict, resolve_type=None):
         src = _node(sel).get("Expression", {}).get("SourceRef", {})
         return alias2entity.get(src.get("Source"), src.get("Entity"))
 
-    def _entity_expr(sel):
-        """The Column/Measure expr with SourceRef.Source rewritten to .Entity."""
+    def _rewrite_src(node):
+        ref = node.get("Expression", {}).get("SourceRef", {})
+        node["Expression"]["SourceRef"] = {
+            "Entity": alias2entity.get(ref.get("Source"), ref.get("Source"))}
+
+    def _entity_expr(sel, agg_func=None):
+        """The Column / Measure / Aggregation expr with SourceRef.Source rewritten
+        to .Entity. ``agg_func`` (a QueryAggregateFunction code) wraps a plain
+        Column in that aggregation — used to implicitly Sum a value-role column."""
+        if "Aggregation" in sel:
+            agg = copy.deepcopy(sel["Aggregation"])
+            inner = agg.get("Expression", {})
+            for key in ("Column", "Measure"):
+                if key in inner:
+                    _rewrite_src(inner[key])
+            return {"Aggregation": agg}
         key = "Measure" if "Measure" in sel else "Column"
         node = copy.deepcopy(sel[key])
-        ref = node.get("Expression", {}).get("SourceRef", {})
-        node["Expression"]["SourceRef"] = {"Entity": alias2entity.get(ref.get("Source"), ref.get("Source"))}
+        _rewrite_src(node)
+        if agg_func is not None and key == "Column":
+            return {"Aggregation": {"Expression": {"Column": node}, "Function": agg_func}}
         return {key: node}
 
     # Deduplicate NativeReferenceName across selects (query only): two fields
@@ -151,6 +176,34 @@ def compile_visual_binding(single_visual: dict, resolve_type=None):
     # is a data-shape property of pie/donut/stacked charts — NOT matrices, which
     # express rows-vs-columns through a Secondary grouping instead.
     pivoted = "Series" in roles_present and bool(roles_present & _VALUE_ROLES)
+
+    # A plain column on a value axis must be implicitly AGGREGATED, exactly as
+    # Power BI Desktop does when you drop a numeric column on Y/Values (it wraps
+    # it in Sum). Without this the column becomes a second group-by dimension and
+    # the chart renders empty (title + axes only) — the field has nothing to plot.
+    # Flat grids (table/tableEx) and slicers show raw values and are excluded;
+    # cartesian / pie / card / matrix-Values roles aggregate. Sum for numeric,
+    # else CountNonNull. Ground truth: AI Sample barChart — Sum(Int64 column) is
+    # an Aggregation (Function 0) and the grouping still lists the value index.
+    value_agg_idx: dict[int, int] = {}
+    if not (is_table or is_slicer):
+        for i, s in enumerate(selects):
+            if "Column" not in s:      # Measures / explicit Aggregations already aggregate
+                continue
+            if ref2role.get(s.get("Name")) not in _VALUE_ROLES:
+                continue
+            vtype = None
+            if resolve_type is not None:
+                try:
+                    vtype = resolve_type(_entity_of(s), _native(s), False)
+                except Exception:
+                    vtype = None
+            value_agg_idx[i] = _AGG_SUM if vtype in _NUMERIC_TYPES else _AGG_COUNTNONNULL
+    for i, func in value_agg_idx.items():
+        col = q["Select"][i].pop("Column", None)
+        if col is not None:
+            q["Select"][i]["Aggregation"] = {
+                "Expression": {"Column": col}, "Function": func}
 
     if is_matrix:
         # matrix / pivotTable: rows on the Primary axis (one grouping per row
@@ -238,7 +291,7 @@ def compile_visual_binding(single_visual: dict, resolve_type=None):
             "queryName": ref,
             "roles": ({role: True} if role else {}),
             "type": {"category": None, "underlyingType": underlying},
-            "expr": _entity_expr(s),
+            "expr": _entity_expr(s, value_agg_idx.get(i)),
         })
 
     data_transforms = {

@@ -264,3 +264,71 @@ class TestBuilderEmitsBinding:
         # textbox must NOT get a binding
         tb = [vc for vc in vcs if json.loads(vc["config"])["singleVisual"].get("visualType") == "textbox"]
         assert tb and "query" not in tb[0]
+
+
+def _resolver(entity, prop, is_measure):
+    return {"Region": "String", "Amount": "Double", "Value": "Int64"}.get(prop)
+
+
+def _cart_col_sv(vt, value_prop):
+    """A cartesian chart with a Category column and a plain numeric COLUMN on Y."""
+    return {
+        "visualType": vt,
+        "projections": {"Category": [{"queryRef": "cat"}], "Y": [{"queryRef": "val"}]},
+        "prototypeQuery": {
+            "Version": 2,
+            "From": [{"Name": "t", "Entity": "Sales", "Type": 0}],
+            "Select": [
+                {"Column": {"Expression": {"SourceRef": {"Source": "t"}}, "Property": "Region"}, "Name": "cat"},
+                {"Column": {"Expression": {"SourceRef": {"Source": "t"}}, "Property": value_prop}, "Name": "val"},
+            ],
+        },
+    }
+
+
+class TestValueColumnAggregation:
+    """A plain numeric column on a value axis must be implicitly Summed, or the
+    cartesian chart renders empty in Power BI Desktop (the field becomes a
+    group-by dimension). Ground truth: AI Sample barChart Sum(Int64 column)."""
+
+    def test_double_column_on_y_is_summed(self):
+        q, dt = compile_visual_binding(_cart_col_sv("clusteredColumnChart", "Amount"), _resolver)
+        val = q["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]["Select"][1]
+        assert "Aggregation" in val and "Column" not in val
+        assert val["Aggregation"]["Function"] == 0  # Sum
+        # grouping still lists the value index (Desktop aggregates an Aggregation)
+        binding = q["Commands"][0]["SemanticQueryDataShapeCommand"]["Binding"]
+        assert binding["Primary"]["Groupings"] == [{"Projections": [0, 1]}]
+        assert "Aggregation" in dt["selects"][1]["expr"]
+
+    def test_int64_sum_uses_260_codes(self):
+        _, dt = compile_visual_binding(_cart_col_sv("barChart", "Value"), _resolver)
+        assert dt["selects"][1]["type"]["underlyingType"] == 260
+
+    def test_measure_on_y_is_not_wrapped(self):
+        sv = _cart_col_sv("columnChart", "Amount")
+        sv["prototypeQuery"]["Select"][1] = {
+            "Measure": {"Expression": {"SourceRef": {"Source": "t"}}, "Property": "Total"}, "Name": "val"}
+        q, _ = compile_visual_binding(sv, _resolver)
+        val = q["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]["Select"][1]
+        assert "Measure" in val and "Aggregation" not in val
+
+    def test_table_shows_raw_columns(self):
+        sv = _cart_col_sv("tableEx", "Amount")
+        sv["projections"] = {"Values": [{"queryRef": "cat"}, {"queryRef": "val"}]}
+        q, _ = compile_visual_binding(sv, _resolver)
+        assert all("Aggregation" not in s
+                   for s in q["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]["Select"])
+
+    def test_explicit_aggregation_select_is_handled(self):
+        sv = _cart_col_sv("columnChart", "Amount")
+        sv["prototypeQuery"]["Select"][1] = {
+            "Aggregation": {"Expression": {"Column": {
+                "Expression": {"SourceRef": {"Source": "t"}}, "Property": "Amount"}}, "Function": 0},
+            "Name": "val"}
+        q, dt = compile_visual_binding(sv, _resolver)
+        val = q["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]["Select"][1]
+        assert "Aggregation" in val
+        # dataTransforms expr entity-rewrites the inner column
+        inner = dt["selects"][1]["expr"]["Aggregation"]["Expression"]["Column"]
+        assert inner["Expression"]["SourceRef"] == {"Entity": "Sales"}
