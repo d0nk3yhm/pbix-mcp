@@ -1510,7 +1510,12 @@ def _modify_metadata_and_encode(
                     )""",
                     (col_id, table_id, col_name,
                      amo_type, amo_type,
-                     2,  # SummarizeBy: 2=None (default for all user columns)
+                     # SummarizeBy: numeric columns default to 1 (Default -> Sum),
+                     # so Power BI can implicitly aggregate them on a value axis
+                     # (a bar/column chart fed a raw numeric column renders empty
+                     # otherwise). Text / DateTime / Boolean stay 2 (None). Matches
+                     # Desktop's default + the corpus (numeric = Default).
+                     (1 if amo_type in (6, 8, 10) else 2),
                      cs_id,
                      col_name,  # SourceColumn
                      1 if col_name in _hier_cols else 0,  # IsAvailableInMDX
