@@ -332,3 +332,44 @@ class TestValueColumnAggregation:
         # dataTransforms expr entity-rewrites the inner column
         inner = dt["selects"][1]["expr"]["Aggregation"]["Expression"]["Column"]
         assert inner["Expression"]["SourceRef"] == {"Entity": "Sales"}
+
+
+class TestSummarizeByDefaults:
+    """Numeric columns must be SummarizeBy=Default(1) so Power BI can implicitly
+    aggregate them on a value axis; text/date/bool stay None(2). SummarizeBy=None
+    on a numeric column makes a cartesian chart render empty even with an
+    Aggregation in the binding (Desktop won't aggregate a 'don't summarize' col)."""
+
+    def test_numeric_columns_are_summable(self, tmp_path):
+        import sqlite3
+        import tempfile as _tf
+
+        from pbix_mcp.builder import PBIXBuilder
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        p = str(tmp_path / "t.pbix")
+        b = PBIXBuilder("T")
+        b.add_table("F", [
+            {"name": "Txt", "data_type": "String"},
+            {"name": "I", "data_type": "Int64"},
+            {"name": "D", "data_type": "Double"},
+            {"name": "Dec", "data_type": "Decimal"},
+            {"name": "Dt", "data_type": "DateTime"},
+            {"name": "B", "data_type": "Boolean"},
+        ], rows=[{"Txt": "a", "I": 1, "D": 1.5, "Dec": 2.0, "Dt": "2020-01-01", "B": True}])
+        b.save(p)
+        abf = decompress_datamodel(zipfile.ZipFile(p).read("DataModel"))
+        fd, db = _tf.mkstemp(suffix=".db")
+        import os as _os
+        _os.write(fd, read_metadata_sqlite(abf)); _os.close(fd)
+        try:
+            con = sqlite3.connect(db)
+            sb = dict(con.execute(
+                "SELECT ExplicitName, SummarizeBy FROM [Column] "
+                "WHERE ExplicitName IN ('Txt','I','D','Dec','Dt','B')").fetchall())
+            con.close()
+        finally:
+            _os.unlink(db)
+        assert sb["I"] == 1 and sb["D"] == 1 and sb["Dec"] == 1   # numeric -> Default
+        assert sb["Txt"] == 2 and sb["Dt"] == 2 and sb["B"] == 2  # else -> None
