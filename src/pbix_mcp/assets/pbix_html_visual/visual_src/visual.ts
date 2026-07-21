@@ -36,13 +36,15 @@ export class Visual implements IVisual {
         this.root.style.cssText = "width:100%;height:100%;overflow:auto;box-sizing:border-box;";
         options.element.appendChild(this.root);
 
-        // Background click clears the selection (native behaviour).
-        this.root.addEventListener("click", (ev: MouseEvent) => {
-            if (ev.target === this.root) {
-                this.selectionManager.clear();
-                this.selectedKeys = {};
-                this.applyDim();
-            }
+        // Background click clears the selection (native behaviour). Tagged
+        // [data-pbix-select] elements stopPropagation() in their own handler,
+        // so ANY click that reaches this listener is an untagged click — the
+        // author's HTML/SVG background — and must clear. (Checking
+        // ev.target === root would miss clicks landing on untagged SVG shapes.)
+        this.root.addEventListener("click", () => {
+            this.selectionManager.clear();
+            this.selectedKeys = {};
+            this.applyDim();
         });
 
         // Reflect selection cleared/changed elsewhere in the report.
@@ -126,15 +128,23 @@ export class Visual implements IVisual {
             el.addEventListener("click", (ev: MouseEvent) => {
                 ev.stopPropagation();
                 const multi = ev.ctrlKey || ev.metaKey;
+                // Re-clicking the sole selected element toggles the selection
+                // OFF (native behaviour) — clear the manager, don't re-select.
+                const wasOnly = !multi && !!this.selectedKeys[key] &&
+                    Object.keys(this.selectedKeys).length === 1;
+                if (wasOnly) {
+                    this.selectionManager.clear();
+                    this.selectedKeys = {};
+                    this.applyDim();
+                    return;
+                }
                 this.selectionManager.select(id, multi).then(() => {
                     if (multi) {
                         if (this.selectedKeys[key]) { delete this.selectedKeys[key]; }
                         else { this.selectedKeys[key] = true; }
                     } else {
-                        const wasOnly = this.selectedKeys[key] &&
-                            Object.keys(this.selectedKeys).length === 1;
                         this.selectedKeys = {};
-                        if (!wasOnly) { this.selectedKeys[key] = true; }
+                        this.selectedKeys[key] = true;
                     }
                     this.applyDim();
                 });

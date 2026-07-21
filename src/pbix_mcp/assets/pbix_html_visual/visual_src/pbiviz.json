@@ -4,7 +4,7 @@
     "displayName": "PBIX HTML",
     "guid": "pbixHtml5C3A2F1E9B7D46A8C0E1D2F3A4B5C6D7",
     "visualClassName": "Visual",
-    "version": "1.1.0.0",
+    "version": "1.2.0.0",
     "description": "Render HTML / CSS / SVG (and inline JS) from a DAX measure. By pbix-mcp.",
     "supportUrl": "https://github.com/d0nk3yhm/pbix-mcp",
     "gitHubUrl": ""
@@ -22,5 +22,5 @@
   "capabilities": "capabilities.json",
   "dependencies": null,
   "stringResources": [],
-  "version": "1.1.0.0"
+  "version": "1.2.0.0"
 }
