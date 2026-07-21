@@ -424,7 +424,9 @@ class TestEdgeCases:
             relationships=[]
         )
         result = engine.evaluate_measure('S', ctx)
-        assert result == 0
+        # SUM over no rows is BLANK in DAX (Desktop-verified) — so ISBLANK
+        # fires; it used to return 0, which made ISBLANK unusable.
+        assert result is None
 
     def test_comment_stripping(self, engine, ctx):
         ctx.measures['WithComment'] = """
@@ -513,3 +515,96 @@ class TestWithPBIX:
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+# ---------------------------------------------------------------------------
+# 0.9.24: iterator row-context evaluation (CONCATENATEX & friends)
+# ---------------------------------------------------------------------------
+
+class TestIteratorRowContext:
+    """Column refs inside an iterator's COMPOUND scalar expression must resolve
+    against the current row (not stringify the column identifier), extension
+    columns ([r]/[lbl]) must resolve, plain aggregates typed in the scalar see
+    the OUTER filter context (no implicit transition), and CONCATENATEX's
+    orderBy/direction args are honored. Desktop-verified: the natural form's
+    output matches a real card 1:1 (dax_check.pbix)."""
+
+    REGIONS = {
+        'Sales': {
+            'columns': ['Region', 'Amount'],
+            'rows': [['East', 150.0], ['North', 120.0],
+                     ['South', 90.0], ['West', 70.0]],
+        }
+    }
+
+    def _ev(self, expr):
+        engine = DAXEngine()
+        ctx = DAXContext(self.REGIONS, {'M': expr})
+        return engine.evaluate_measure('M', ctx)
+
+    def test_bare_column_data_order(self):
+        # VALUES iterates in data order (order-preserving dedup, not set order)
+        assert self._ev(
+            'CONCATENATEX(VALUES(Sales[Region]), Sales[Region], ", ")'
+        ) == 'East, North, South, West'
+
+    def test_column_in_compound_concat(self):
+        assert self._ev(
+            'CONCATENATEX(VALUES(Sales[Region]), Sales[Region] & ": " & '
+            'FORMAT(CALCULATE(SUM(Sales[Amount])), "#,0"), " | ")'
+        ) == 'East: 150 | North: 120 | South: 90 | West: 70'
+
+    def test_column_inside_format_and_concatenate(self):
+        assert self._ev(
+            'CONCATENATEX(VALUES(Sales[Region]), FORMAT(Sales[Region], "") & "!", ", ")'
+        ) == 'East!, North!, South!, West!'
+        assert self._ev(
+            'CONCATENATEX(VALUES(Sales[Region]), CONCATENATE(Sales[Region], "?"), ", ")'
+        ) == 'East?, North?, South?, West?'
+
+    def test_selectcolumns_and_addcolumns_named_columns(self):
+        assert self._ev(
+            'CONCATENATEX(SELECTCOLUMNS(VALUES(Sales[Region]), "r", '
+            'Sales[Region] & ""), [r], ", ")'
+        ) == 'East, North, South, West'
+        assert self._ev(
+            'CONCATENATEX(ADDCOLUMNS(VALUES(Sales[Region]), "lbl", '
+            'Sales[Region] & "!"), [lbl], ", ")'
+        ) == 'East!, North!, South!, West!'
+
+    def test_concatenatex_orderby_desc(self):
+        # ASC on the measure reverses the amount order
+        assert self._ev(
+            'CONCATENATEX(VALUES(Sales[Region]), Sales[Region], ", ", '
+            'CALCULATE(SUM(Sales[Amount])), ASC)'
+        ) == 'West, South, North, East'
+
+    def test_context_transition_workaround_unchanged(self):
+        # The CALCULATE(SELECTEDVALUE(...)) form (valid DAX) must keep working
+        assert self._ev(
+            'CONCATENATEX(VALUES(Sales[Region]), '
+            'CALCULATE(SELECTEDVALUE(Sales[Region])) & ": " & '
+            'FORMAT(CALCULATE(SUM(Sales[Amount])), "#,0"), " | ", '
+            'CALCULATE(SUM(Sales[Amount])), DESC)'
+        ) == 'East: 150 | North: 120 | South: 90 | West: 70'
+
+    def test_plain_sum_in_iterator_sees_outer_total(self):
+        # Row context does NOT transition a plain aggregate (Desktop semantics)
+        assert self._ev('MAXX(VALUES(Sales[Region]), SUM(Sales[Amount]))') == 430.0
+        assert self._ev('SUMX(VALUES(Sales[Region]), SUM(Sales[Amount]))') == 1720.0
+
+    def test_calculate_sum_in_iterator_is_row_sliced(self):
+        assert self._ev(
+            'MAXX(VALUES(Sales[Region]), CALCULATE(SUM(Sales[Amount])))') == 150.0
+
+    def test_sum_over_empty_selection_is_blank(self):
+        assert self._ev(
+            'IF(ISBLANK(CALCULATE(SUM(Sales[Amount]), Sales[Region] = "Nowhere")), '
+            '"blank", "notblank")') == 'blank'
+
+    def test_now_today_and_scientific_literals(self):
+        import datetime as _dt
+        assert self._ev('IF(ISBLANK(NOW()), "blank", "ok")') == 'ok'
+        assert self._ev('FORMAT(TODAY(), "yyyy")') == str(_dt.date.today().year)
+        assert self._ev('1e6') == 1000000.0
+        assert self._ev('1e6 / 2') == 500000.0
