@@ -123,11 +123,12 @@ class TestEmptySelectionNoGrandTotalLeak:
         rels = [{'FromTable': 'Fact', 'FromColumn': 'FK',
                  'ToTable': 'Dim', 'ToColumn': 'K', 'IsActive': True}]
         # Beta is Region 'S'; filtering Region='N' AND Name='Beta' selects zero
-        # Dim rows -> the fact must filter to zero -> 0, not the grand total 30.
+        # Dim rows -> the fact must filter to zero rows -> BLANK (Desktop
+        # semantics for SUM over an empty selection), not the grand total 30.
         r = dax_engine.evaluate_measures_batch(
             ['S'], tables, measures, {'Dim.Region': ['N'], 'Dim.Name': ['Beta']},
             None, None, rels)
-        assert r['S'] in (0, 0.0)
+        assert r['S'] is None
 
     def test_nonempty_selection_still_correct(self):
         tables = {

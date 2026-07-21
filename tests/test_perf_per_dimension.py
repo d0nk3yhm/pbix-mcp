@@ -105,7 +105,8 @@ class TestCorrectness:
         )
         assert fast["Total Revenue"]["West"] == 80.0
         assert fast["Total Revenue"]["East"] == 25.0
-        assert fast["Total Revenue"]["North"] in (0, 0.0)   # no customers
+        # no customers -> SUM over an empty selection is BLANK (Desktop semantics)
+        assert fast["Total Revenue"]["North"] is None
         # identical to per-value
         for v in vals:
             slow = dax_engine.evaluate_measures_batch(

@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.24] - 2026-07-21
+
+DAX engine: column refs inside iterator scalar expressions (CONCATENATEX & friends) now evaluate like Desktop — the natural data-driven HTML form works.
+
+### Fixed
+- **Bare column references inside an iterator's COMPOUND scalar expression now resolve against the current row.** `CONCATENATEX(VALUES(T[C]), T[C] & ": " & FORMAT(...), " | ")` — the most idiomatic way to build data-driven HTML lists — stringified the column identifier (`('Sales', 'Region')`) instead of the row value; the same leak hit `FORMAT(T[C], ...)` and `CONCATENATE(T[C], ...)` arguments. The row binding is now visible to sub-expression evaluation for every iteration shape (full-row `SUMX` dicts, single-column `VALUES`/`ALL` dicts, and extension columns). **Desktop cross-checked 1:1**: a real card bound to the natural-form measure renders exactly the engine's output.
+- **`SELECTCOLUMNS`/`ADDCOLUMNS` extension columns (`[r]`, `[lbl]`) resolve inside iterators** instead of evaluating to blank (measures still take precedence, matching DAX name resolution).
+- **A plain aggregate typed directly in an iterator's scalar expression sees the OUTER filter context** — `SUMX(VALUES(T[C]), ... SUM(T[Val]) ...)` used a row-sliced sum where Desktop (correctly) uses the un-transitioned grand total; row context does not filter a plain aggregate. `CALCULATE(SUM(...))` and measure invocations still transition (row-sliced), so existing measures are unchanged — the transition now happens exactly at CALCULATE / measure boundaries, which also stops the row context leaking INTO `CALCULATE` (a column ref there resolves against the filter context, so `CALCULATE(SELECTEDVALUE(T[C]))` keeps working). Plain aggregates (`SUM`/`AVERAGE`/`MIN`/`MAX`/`COUNT`/`DISTINCTCOUNT`) now parse their column-reference argument syntactically, as DAX defines them.
+- **`SUM` over an empty selection returns BLANK** (Desktop semantics) instead of `0` — `ISBLANK(...)` finally fires; use `COALESCE(x, 0)` where a zero is wanted.
+- **`NOW()` / `TODAY()` / `UTCNOW()` implemented** (were unsupported → blank), with DAX date patterns (`yyyy`, `MM`, `dd`, `HH:mm:ss`, …) in `FORMAT`.
+- **Scientific-notation literals (`1e6`, `2.5E-3`) parse** (were null).
+- **`VALUES()` iterates in data order** (order-preserving dedup) instead of Python hash-set order, and **`CONCATENATEX` honors its `orderBy`/`ASC|DESC` arguments** (previously silently ignored — output order was nondeterministic).
+  New `TestIteratorRowContext` suite in `tests/test_dax_engine.py`; the empty-`SUM` expectations in three older tests were updated to the Desktop-verified BLANK semantics.
+
 ## [0.9.23] - 2026-07-20
 
 HTML visuals now cross-filter the rest of the report (native selection), full docs, and a pure-Python example.

@@ -73,7 +73,17 @@ class DAXContext:
             self.date_table = date_table
         else:
             self.date_table = self._auto_detect_date_table(tables, self.relationships)
-        self._current_row = None  # Set during row iteration (SUMX, AVERAGEX, etc.)
+        # Set during row iteration (SUMX, AVERAGEX, etc.)
+        self._current_row: Optional[dict] = None
+        # Pre-transition (outer) context, set by _make_row_context. In real DAX a
+        # row context does NOT filter — only CALCULATE / a measure invocation
+        # performs the row->filter transition. This engine applies the transition
+        # eagerly (row filters are baked into the iteration context), so plain
+        # column aggregates typed directly in an iterator's scalar expression
+        # (SUM(T[Col]) as a grand-total denominator) evaluate against _outer_ctx
+        # to see the un-transitioned filter context, exactly like Desktop.
+        # CALCULATE and evaluate_measure clear it (they ARE the transition).
+        self._outer_ctx: Optional['DAXContext'] = None
         self._measure_cache = {}
         self._eval_stack = set()  # Prevent circular refs
         # Bound total sub-expression evaluations per top-level measure so a
@@ -539,6 +549,9 @@ class DAXEngine:
             'GENERATESERIES': self._fn_generateseries,
             # --- Text ---
             'FORMAT': self._fn_format,
+            'NOW': self._fn_now,
+            'TODAY': self._fn_today,
+            'UTCNOW': self._fn_utcnow,
             'CONCATENATE': self._fn_concatenate,
             'LEFT': self._fn_left,
             'RIGHT': self._fn_right,
@@ -643,6 +656,11 @@ class DAXEngine:
         self._eval_depth += 1
         if self._eval_depth == 1:
             self._deadline = time.monotonic() + self._max_eval_seconds
+        # A measure invocation IS the row->filter context transition (implicit
+        # CALCULATE): inside the body, the iteration row's filters are real
+        # filters, so plain aggregates must NOT step back to the outer context.
+        _prev_outer = getattr(ctx, '_outer_ctx', None)
+        ctx._outer_ctx = None
         try:
             result = self._eval_expr(expr.strip(), ctx)
             if cache_key:
@@ -652,6 +670,7 @@ class DAXEngine:
             # Graceful degradation
             return None
         finally:
+            ctx._outer_ctx = _prev_outer
             ctx._eval_stack.discard(measure_name)
             self._eval_depth -= 1
             if self._eval_depth == 0:
@@ -758,8 +777,10 @@ class DAXEngine:
         if expr.startswith('"') and expr.endswith('"') and expr.count('"') == 2:
             return expr[1:-1]
 
-        # Numeric literal
+        # Numeric literal (incl. scientific notation: 1e6, 2.5E-3)
         try:
+            if re.match(r'^[+-]?\d+(?:\.\d+)?[eE][+-]?\d+$', expr):
+                return float(expr)
             if '.' in expr:
                 return float(expr)
             return int(expr)
@@ -784,9 +805,15 @@ class DAXEngine:
                 if k.lower() == var_name.lower():
                     return v
 
-        # Measure reference: [MeasureName] — only if no operators between brackets
+        # Measure reference: [MeasureName] — only if no operators between brackets.
+        # In a row context, a bracket ref that is NOT a measure resolves to an
+        # extension column of the iterated table (SELECTCOLUMNS/ADDCOLUMNS names
+        # like [r]/[lbl]); measures take precedence, matching DAX resolution.
         if expr.startswith('[') and expr.endswith(']') and expr.count('[') == 1 and expr.count(']') == 1:
             measure_name = expr[1:-1]
+            if (measure_name not in ctx.measures and ctx._current_row
+                    and measure_name in ctx._current_row):
+                return ctx._current_row[measure_name]
             return self.evaluate_measure(measure_name, ctx)
 
         # Table[Column] reference — must be the ENTIRE expression (no trailing operators)
@@ -794,15 +821,22 @@ class DAXEngine:
         if col_match and '(' not in expr:
             table_name = col_match.group(1).strip()
             col_name = col_match.group(2).strip()
-            # In row iteration context, resolve directly from current row
+            # In row iteration context, resolve directly from current row —
+            # full-row dicts carry the column as a plain key; single-column
+            # dicts (VALUES/ALL iteration) carry it as __column__/__value__.
             if ctx._current_row and ctx._current_row.get('__table__') == table_name:
                 if col_name in ctx._current_row:
                     return ctx._current_row[col_name]
+                if ctx._current_row.get('__column__') == col_name:
+                    return ctx._current_row.get('__value__')
             return (table_name, col_name)  # Return as column ref
 
         # Simple column ref without table: [Column] — only if it's the entire expression
         if re.match(r'^\[[^\]]+\]$', expr):
             inner = expr[1:-1]
+            if (inner not in ctx.measures and ctx._current_row
+                    and inner in ctx._current_row):
+                return ctx._current_row[inner]
             return self.evaluate_measure(inner, ctx)
 
         # NOT prefix without parens: "NOT expr" or "not expr"
@@ -1077,10 +1111,15 @@ class DAXEngine:
         if col and val is not None:
             filters[f"{table_name}.{col}"] = [val]
         new_ctx = ctx.with_filters(filters)
-        # For full-row iteration (SUMX(Table, expr)), set current_row so
-        # column references like Table[Col] resolve directly without filtering
-        if row_item.get('__row__'):
-            new_ctx._current_row = row_item
+        # Bind the current row for ALL iteration shapes (full-row SUMX dicts,
+        # single-column VALUES/ALL dicts, ADDCOLUMNS/SELECTCOLUMNS extension
+        # columns) so column references resolve against the row even inside
+        # compound scalar expressions (T[C] & "...", FORMAT(T[C], ...)) — not
+        # only when the column ref is the entire expression.
+        new_ctx._current_row = row_item
+        # Keep the pre-transition context reachable for plain column aggregates
+        # (see DAXContext._outer_ctx).
+        new_ctx._outer_ctx = ctx
         return new_ctx
 
     def _resolve_row_result(self, result, row_item, row_ctx):
@@ -1164,28 +1203,83 @@ class DAXEngine:
     # DAX Functions
     # =========================================================================
 
+    @staticmethod
+    def _parse_column_ref(s: str):
+        """Syntactically parse a bare ``Table[Column]`` reference -> (table, col).
+
+        Plain aggregates (SUM/AVERAGE/MIN/...) take a column REFERENCE, not an
+        expression — parsing it here keeps the ref out of the row-context scalar
+        resolution in _eval_expr (which would collapse it to the current row's
+        value and break the aggregation)."""
+        m = re.match(r"^\s*'?([^'\[\]()]+)'?\s*\[([^\]]+)\]\s*$", s or "")
+        if m:
+            return m.group(1).strip(), m.group(2).strip()
+        return None
+
+    def _charge_eval(self, ctx: DAXContext) -> None:
+        """Charge one unit of the eval budget (same accounting _eval_expr does).
+
+        The syntactic column-ref fast path in the plain aggregates skips
+        _eval_expr for the argument, so it must charge the budget itself or a
+        runaway measure could dodge the guard."""
+        ctx._eval_calls += 1
+        if ctx._eval_calls > ctx._max_eval_calls:
+            from pbix_mcp.errors import DAXEvaluationError
+            raise DAXEvaluationError(
+                "DAX evaluation budget exceeded (possible non-terminating measure)"
+            )
+
+    @staticmethod
+    def _agg_ctx(ctx: DAXContext) -> DAXContext:
+        """Context a PLAIN column aggregate evaluates against.
+
+        In real DAX a row context does not filter — SUM(T[Col]) typed directly
+        in an iterator's scalar expression sees the OUTER filter context (the
+        grand total), unless CALCULATE / a measure invocation performed the
+        row->filter transition. The engine applies the transition eagerly, so
+        step back to the stashed pre-transition context when present (CALCULATE
+        and evaluate_measure clear it)."""
+        outer = getattr(ctx, '_outer_ctx', None)
+        return outer if outer is not None else ctx
+
     def _fn_sum(self, args_str: str, ctx: DAXContext) -> Any:
-        ref = self._eval_expr(args_str.strip(), ctx)
-        if isinstance(ref, tuple) and len(ref) == 2:
-            table_name, col_name = ref
-            values = ctx.get_column_data(table_name, col_name)
-            return sum(v for v in values if isinstance(v, (int, float)))
-        return 0
+        col = self._parse_column_ref(args_str)
+        if col is not None:
+            self._charge_eval(ctx)
+        if col is None:
+            ref = self._eval_expr(args_str.strip(), ctx)
+            if not (isinstance(ref, tuple) and len(ref) == 2):
+                return 0
+            col = ref
+        values = self._agg_ctx(ctx).get_column_data(*col)
+        nums = [v for v in values if isinstance(v, (int, float))]
+        # SUM over no rows is BLANK in DAX (so ISBLANK fires), not 0.
+        return sum(nums) if nums else None
 
     def _fn_average(self, args_str: str, ctx: DAXContext) -> Any:
-        ref = self._eval_expr(args_str.strip(), ctx)
-        if isinstance(ref, tuple) and len(ref) == 2:
-            table_name, col_name = ref
-            values = [v for v in ctx.get_column_data(table_name, col_name) if isinstance(v, (int, float))]
-            return sum(values) / len(values) if values else 0
-        return 0
+        col = self._parse_column_ref(args_str)
+        if col is not None:
+            self._charge_eval(ctx)
+        if col is None:
+            ref = self._eval_expr(args_str.strip(), ctx)
+            if not (isinstance(ref, tuple) and len(ref) == 2):
+                return 0
+            col = ref
+        values = [v for v in self._agg_ctx(ctx).get_column_data(*col)
+                  if isinstance(v, (int, float))]
+        return sum(values) / len(values) if values else 0
 
     def _fn_count(self, args_str: str, ctx: DAXContext) -> Any:
-        ref = self._eval_expr(args_str.strip(), ctx)
-        if isinstance(ref, tuple) and len(ref) == 2:
-            table_name, col_name = ref
-            return len([v for v in ctx.get_column_data(table_name, col_name) if v is not None])
-        return 0
+        col = self._parse_column_ref(args_str)
+        if col is not None:
+            self._charge_eval(ctx)
+        if col is None:
+            ref = self._eval_expr(args_str.strip(), ctx)
+            if not (isinstance(ref, tuple) and len(ref) == 2):
+                return 0
+            col = ref
+        return len([v for v in self._agg_ctx(ctx).get_column_data(*col)
+                    if v is not None])
 
     def _fn_countrows(self, args_str: str, ctx: DAXContext) -> Any:
         # Try evaluating as an expression first (handles TOPN, FILTER, etc.)
@@ -1200,9 +1294,15 @@ class DAXEngine:
     def _fn_min(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
         if len(args) == 1:
-            ref = self._eval_expr(args[0].strip(), ctx)
-            if isinstance(ref, tuple) and len(ref) == 2:
-                values = [v for v in ctx.get_column_data(ref[0], ref[1]) if isinstance(v, (int, float))]
+            col = self._parse_column_ref(args[0])
+            if col is not None:
+                self._charge_eval(ctx)
+            if col is None:
+                ref = self._eval_expr(args[0].strip(), ctx)
+                col = ref if isinstance(ref, tuple) and len(ref) == 2 else None
+            if col:
+                values = [v for v in self._agg_ctx(ctx).get_column_data(*col)
+                          if isinstance(v, (int, float))]
                 return min(values) if values else 0
         elif len(args) == 2:
             a = self._eval_expr(args[0].strip(), ctx)
@@ -1214,9 +1314,15 @@ class DAXEngine:
     def _fn_max(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
         if len(args) == 1:
-            ref = self._eval_expr(args[0].strip(), ctx)
-            if isinstance(ref, tuple) and len(ref) == 2:
-                values = [v for v in ctx.get_column_data(ref[0], ref[1]) if isinstance(v, (int, float))]
+            col = self._parse_column_ref(args[0])
+            if col is not None:
+                self._charge_eval(ctx)
+            if col is None:
+                ref = self._eval_expr(args[0].strip(), ctx)
+                col = ref if isinstance(ref, tuple) and len(ref) == 2 else None
+            if col:
+                values = [v for v in self._agg_ctx(ctx).get_column_data(*col)
+                          if isinstance(v, (int, float))]
                 return max(values) if values else 0
         elif len(args) == 2:
             a = self._eval_expr(args[0].strip(), ctx)
@@ -1226,11 +1332,16 @@ class DAXEngine:
         return 0
 
     def _fn_distinctcount(self, args_str: str, ctx: DAXContext) -> Any:
-        ref = self._eval_expr(args_str.strip(), ctx)
-        if isinstance(ref, tuple) and len(ref) == 2:
-            values = ctx.get_column_data(ref[0], ref[1])
-            return len(set(str(v) for v in values if v is not None))
-        return 0
+        col = self._parse_column_ref(args_str)
+        if col is not None:
+            self._charge_eval(ctx)
+        if col is None:
+            ref = self._eval_expr(args_str.strip(), ctx)
+            if not (isinstance(ref, tuple) and len(ref) == 2):
+                return 0
+            col = ref
+        values = self._agg_ctx(ctx).get_column_data(*col)
+        return len(set(str(v) for v in values if v is not None))
 
     def _fn_divide(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
@@ -1444,7 +1555,21 @@ class DAXEngine:
                     new_ctx = new_ctx.with_filters({f"{tbl_name}.{col_name}": [val]})
                 continue
 
-        return self._eval_expr(base_expr, new_ctx)
+        # CALCULATE performs the row->filter context transition: inside its
+        # expression the iteration row's filters are real filters, plain
+        # aggregates must NOT step back to the pre-transition outer context, and
+        # the ROW CONTEXT ITSELF is consumed — a column ref inside CALCULATE
+        # resolves against the (single-value) filter context, not the row (so
+        # SELECTEDVALUE(T[C]) sees a column reference, exactly like Desktop).
+        _prev_outer = getattr(new_ctx, '_outer_ctx', None)
+        _prev_row = new_ctx._current_row
+        new_ctx._outer_ctx = None
+        new_ctx._current_row = None
+        try:
+            return self._eval_expr(base_expr, new_ctx)
+        finally:
+            new_ctx._outer_ctx = _prev_outer
+            new_ctx._current_row = _prev_row
 
     @staticmethod
     def _two_col_refs(filter_arg: str) -> list:
@@ -1634,7 +1759,9 @@ class DAXEngine:
     def _fn_values(self, args_str: str, ctx: DAXContext) -> Any:
         ref = self._eval_expr(args_str.strip(), ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
-            values = list(set(ctx.get_column_data(ref[0], ref[1])))
+            # Order-preserving dedup: Desktop iterates VALUES in data order, and
+            # hash-set order made CONCATENATEX output nondeterministic.
+            values = list(dict.fromkeys(ctx.get_column_data(ref[0], ref[1])))
             # Return as row-dict list so CONCATENATEX / FILTER / iterators work
             return [{'__table__': ref[0], '__column__': ref[1], '__value__': v} for v in values]
         return []
@@ -1649,12 +1776,49 @@ class DAXEngine:
         default = self._eval_expr(args[1].strip(), ctx) if len(args) > 1 else None
         return default
 
+    def _fn_now(self, args_str: str, ctx: DAXContext) -> Any:
+        """NOW() — current date and time."""
+        return datetime.now()
+
+    def _fn_today(self, args_str: str, ctx: DAXContext) -> Any:
+        """TODAY() — current date at midnight."""
+        now = datetime.now()
+        return datetime(now.year, now.month, now.day)
+
+    def _fn_utcnow(self, args_str: str, ctx: DAXContext) -> Any:
+        """UTCNOW() — current UTC date and time."""
+        return datetime.utcnow()
+
+    # DAX date format tokens -> strftime. Ordered longest-first so "MMMM" isn't
+    # eaten by "MM" (dict preserves insertion order).
+    _DATE_FMT_TOKENS = (
+        ('yyyy', '%Y'), ('yy', '%y'), ('MMMM', '%B'), ('MMM', '%b'), ('MM', '%m'),
+        ('dddd', '%A'), ('ddd', '%a'), ('dd', '%d'), ('HH', '%H'), ('hh', '%I'),
+        ('mm', '%M'), ('ss', '%S'), ('AM/PM', '%p'), ('am/pm', '%p'),
+    )
+
     def _fn_format(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
         val = self._eval_expr(args[0].strip(), ctx)
         fmt = self._eval_expr(args[1].strip(), ctx) if len(args) > 1 else None
         if val is None:
             return ''
+        # Datetime formatting (NOW()/TODAY()/date columns): translate the DAX
+        # date pattern to strftime token by token.
+        if isinstance(val, (datetime, date)) and fmt:
+            out = ''
+            fmt_str = str(fmt)
+            i = 0
+            while i < len(fmt_str):
+                for tok, strf in self._DATE_FMT_TOKENS:
+                    if fmt_str.startswith(tok, i):
+                        out += val.strftime(strf)
+                        i += len(tok)
+                        break
+                else:
+                    out += fmt_str[i]
+                    i += 1
+            return out
         if fmt and isinstance(val, (int, float)):
             # Handle common DAX format strings
             fmt_str = str(fmt)
@@ -2870,27 +3034,42 @@ class DAXEngine:
         return delimiter.join(parts)
 
     def _fn_concatenatex(self, args_str: str, ctx: DAXContext) -> Any:
-        """CONCATENATEX(table, expression, delimiter) — iterate table, evaluate expression per row, join with delimiter."""
+        """CONCATENATEX(table, expression, delimiter[, orderBy_expr[, order]]) —
+        iterate table, evaluate expression per row, join with delimiter,
+        optionally sorted by orderBy_expr (ASC default, DESC supported)."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return ''
         table_ref = self._eval_expr(args[0].strip(), ctx)
         row_expr = args[1].strip()
         delimiter = str(self._eval_expr(args[2].strip(), ctx) or '') if len(args) > 2 else ''
+        order_expr = args[3].strip() if len(args) > 3 else None
+        descending = len(args) > 4 and 'DESC' in args[4].strip().upper()
 
-        parts = []
+        parts: list[Any] = []   # (sort_key, text) when sorting, else just text
         if isinstance(table_ref, list):
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
                     row_ctx = self._make_row_context(row_item, ctx)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
-                    if result is not None:
-                        parts.append(str(result))
                 else:
+                    row_ctx = ctx
                     result = self._eval_expr(row_expr, ctx)
-                    if result is not None:
-                        parts.append(str(result))
+                if result is None:
+                    continue
+                if order_expr is not None:
+                    key = self._eval_expr(order_expr, row_ctx)
+                    parts.append((key, str(result)))
+                else:
+                    parts.append(str(result))
+        if order_expr is not None:
+            # Stable sort; BLANK keys sort first (as smallest).
+            def _key(item):
+                k = item[0]
+                return (k is None, k if isinstance(k, (int, float, str)) else str(k))
+            parts.sort(key=_key, reverse=descending)
+            return delimiter.join(text for _, text in parts)
         return delimiter.join(parts)
 
     def _fn_rankx(self, args_str: str, ctx: DAXContext) -> Any:
