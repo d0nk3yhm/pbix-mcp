@@ -8,7 +8,7 @@
 
 An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python — no templates, no skeletons, no Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026.
 
-Exposes 109 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
+Exposes 112 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
@@ -120,7 +120,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Roundtrip DataModel modify | **Stable** | Add/remove tables, relationships, measures on existing files. Metadata-only changes (measures, RLS, column properties) use binary splice for PBI Desktop files; structural changes use full builder rebuild |
 | H$ attribute hierarchies | **Stable** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities; MaterializationType=0 |
 | Report layout read/write | **Stable** | Pages, visuals, filters, positions, bookmarks |
-| Visual add/remove | **Stable** | Cards, charts, shapes/buttons, images (auto-embed local files via `sourcePath`), textboxes, slicers — with full data bindings, bounds clamping, and ResourcePackageItem image references |
+| Visual add/remove | **Stable** | Cards, charts, shapes/buttons, textboxes, slicers — with full data bindings, bounds clamping and optional sort authoring. Images have their own first-class tools (`pbix_add_image` / `pbix_set_image`); the legacy private `sourcePath` hook on `pbix_add_visual` still works but is superseded |
 | Visual formatting | **Stable** | `pbix_format_visual` — human-readable API for titles, backgrounds, borders, drop shadows, padding, spacing, data labels, legend, axis, colors, table alternating row colors (backColorPrimary/Secondary, fontColorPrimary/Secondary), grid line colors, and 25+ more categories. Per-series/category dataColors with auto-generated selectors. Ground truth validated against PBI Desktop |
 | Color extraction & recolor | **Stable** | `pbix_extract_colors` scans themes + all visuals. `pbix_recolor` replaces hex + ThemeDataColor refs, auto-extends palette, injects per-series/category chart colors, generates themed table rows, strips borders and pie/donut backgrounds, hides card titles (shows categoryLabels), fixes text contrast (WCAG 2.0) including theme foreground, chart axis/legend/labels, table rows, and card calloutValue |
 | Visual property editing | **Stable** | Dot-path and full JSON |
@@ -148,6 +148,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Partition Management | **Partial** | List/remove partitions via `pbix_get_partitions`, `pbix_remove_partition`. `pbix_add_partition` blocked for PBIX (needs PartitionStorage in VertiPaq), works for PBIP/TMDL export |
 | Sensitivity Labels | **Stable** | Strip MSIP sensitivity labels via `pbix_save(strip_sensitivity_label=True)` |
 | Custom Visuals | **Beta** | Import any `.pbiviz` via `pbix_add_custom_visual` (embeds by GUID + `publicCustomVisuals`), place with `pbix_add_visual` |
+| Images & resources | **Stable** | `pbix_add_image` (register + Desktop-exact placement in one call), `pbix_register_resource` (images, shape maps, themes), `pbix_set_image` (repoint/restyle an existing image visual). Magic-byte type detection (png/jpg/gif/webp/svg), 5 MB cap, sanitized + uniquified item names. See [docs/rich-content.md](docs/rich-content.md) |
 | AppSource visual references | **Stable** | `pbix_reference_public_visual` — reference a certified AppSource visual (e.g. Deneb) by GUID only, zero file payload; the service auto-loads it from AppSource (service-verified). See [docs/rich-content.md](docs/rich-content.md) |
 | SVG image measures | **Stable** | `pbix_svg_measure` — DAX codegen (data_bar, bullet, pill, icon_updown, sparkline) for `data:image/svg+xml;utf8` measures with `DataCategory='ImageUrl'`; live vector images in table/matrix cells in Desktop AND the service, zero custom visuals |
 | HTML / CSS / SVG Visuals | **Beta** | Render custom HTML/CSS/SVG (and inline JS) from a DAX measure via the bundled `PBIX HTML` visual — `pbix_add_html_visual` (turnkey create), `pbix_get_html_visual`, `pbix_set_html_visual`, plus escaping-safe `pbix_html_template` builders (KPI cards, SVG charts/gauges/maps, tables). Clickable elements can **cross-filter the report** like a native visual (`category_field` + `data-pbix-select`). Desktop-verified. See **[docs/html-visuals.md](docs/html-visuals.md)** |
@@ -172,7 +173,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 - **Full DataModel rebuild** — `set_table_data`, `update_table_rows`, `add/remove_relationship`, `remove_table` trigger a full DataModel rebuild via the builder pipeline. Most other tools (`add_measure`, `modify_measure`, `modify_column`, `set_rls_role`, `add_perspective`, `add_culture`, `add_translations`, `update_data_source`, etc.) use a lightweight metadata-only path.
 
 
-## Tools (109)
+## Tools (112)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
@@ -189,8 +190,8 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 ### DataModel Write (22)
 `pbix_datamodel_query_metadata` · `pbix_datamodel_modify_metadata` · `pbix_datamodel_add_measure` · `pbix_datamodel_modify_measure` · `pbix_datamodel_set_measure_category` · `pbix_datamodel_remove_measure` · `pbix_datamodel_modify_column` · `pbix_datamodel_add_relationship` · `pbix_datamodel_remove_relationship` · `pbix_datamodel_remove_table` · `pbix_datamodel_decompress` · `pbix_datamodel_recompress` · `pbix_datamodel_replace_file` · `pbix_datamodel_extract_file` · `pbix_datamodel_list_abf_files` · `pbix_set_table_data` · `pbix_update_table_rows` · `pbix_datamodel_add_field_parameter` · `pbix_datamodel_add_calculation_group` · `pbix_export_tmdl` · `pbix_export_pbip` · `pbix_replace_value`
 
-### Resources, Themes & Custom Visuals (15)
-`pbix_list_resources` · `pbix_get_theme` · `pbix_set_theme` · `pbix_extract_colors` · `pbix_recolor` · `pbix_get_linguistic_schema` · `pbix_set_linguistic_schema` · `pbix_add_custom_visual` · `pbix_reference_public_visual` · `pbix_remove_custom_visual` · `pbix_add_html_visual` · `pbix_get_html_visual` · `pbix_set_html_visual` · `pbix_html_template` · `pbix_svg_measure`
+### Resources, Themes & Custom Visuals (18)
+`pbix_list_resources` · `pbix_add_image` · `pbix_set_image` · `pbix_register_resource` · `pbix_get_theme` · `pbix_set_theme` · `pbix_extract_colors` · `pbix_recolor` · `pbix_get_linguistic_schema` · `pbix_set_linguistic_schema` · `pbix_add_custom_visual` · `pbix_reference_public_visual` · `pbix_remove_custom_visual` · `pbix_add_html_visual` · `pbix_get_html_visual` · `pbix_set_html_visual` · `pbix_html_template` · `pbix_svg_measure`
 
 ### DataMashup (2)
 `pbix_get_m_code` · `pbix_set_m_code`
@@ -519,11 +520,12 @@ PBIX_TEST_SAMPLES=test_corpus pytest tests/test_cross_report.py -v
 | `test_cross_report.py` | 19 | `slow`, `integration` | Yes (4 public PBIX dashboards) |
 | `test_dax_multihop.py` | 15 | `unit` | No |
 | `test_found_issues.py` | 32 | `unit` | No |
+| `test_images.py` | 23 | `unit` | No |
 | `test_rich_content.py` | 22 | `unit` | 1 skips without the public test corpus |
 | `test_zip_safety.py` | 10 | `unit` | No |
 | `test_perf_per_dimension.py` | 14 | `unit` | No |
 
-**From a fresh clone: 466 tests collected, 434 passed, 32 skipped, 0 failures.** All 32 skipped tests are gated on the public test corpus (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
+**From a fresh clone: 489 tests collected, 457 passed, 32 skipped, 0 failures.** All 32 skipped tests are gated on the public test corpus (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
 
 ## Architecture
 
@@ -555,7 +557,7 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (109 tools)
+  server.py              # MCP server (112 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX builder (metadata, VertiPaq, layout, relationships)
   html_templates.py      # HTML/SVG template builders (kpi_card, bar_chart, gauge, table, …)

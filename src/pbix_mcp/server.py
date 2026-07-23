@@ -1777,54 +1777,30 @@ def pbix_add_visual(
             img_url = (sv.get("objects", {}).get("general", [{}])[0]
                        .get("properties", {}).get("imageUrl", {}))
             src_path = img_url.get("sourcePath", "")  # custom field for local files
-            if src_path and os.path.isfile(src_path):
-                import shutil as _shutil
-                ext = os.path.splitext(src_path)[1].lower()
-                # Generate unique filename
-                item_name = f"{visual_name}{ext}"
-                # Copy to RegisteredResources (item_name derives from the
-                # visual name; contain it to work_dir against traversal).
-                res_dir = os.path.join(info["work_dir"], "Report", "StaticResources", "RegisteredResources")
-                os.makedirs(res_dir, exist_ok=True)
-                _shutil.copy2(src_path, _safe_join(res_dir, item_name))
-
-                # Set imageUrl to ResourcePackageItem
-                sv.setdefault("objects", {})["general"] = [{"properties": {
-                    "imageUrl": {"expr": {"ResourcePackageItem": {
-                        "PackageName": "RegisteredResources",
-                        "PackageType": 1,
-                        "ItemName": item_name,
-                    }}}
-                }}]
-
-                # Update Content_Types.xml for this extension
-                ct_path = os.path.join(info["work_dir"], "[Content_Types].xml")
-                if os.path.exists(ct_path):
-                    with open(ct_path, "r", encoding="utf-8") as f:
-                        ct_xml = f.read()
-                    ext_no_dot = ext.lstrip(".")
-                    if f'Extension="{ext_no_dot}"' not in ct_xml:
-                        ct_xml = ct_xml.replace(
-                            '<Default Extension="json"',
-                            f'<Default Extension="{ext_no_dot}" ContentType=""/><Default Extension="json"',
-                        )
-                        with open(ct_path, "w", encoding="utf-8") as f:
-                            f.write(ct_xml)
-
-                # Add to resourcePackages in layout
-                rp = layout.setdefault("resourcePackages", [])
-                reg_pkg = None
-                for pkg in rp:
-                    inner = pkg.get("resourcePackage", pkg)
-                    if inner.get("name") == "RegisteredResources":
-                        reg_pkg = inner
-                        break
-                if reg_pkg is None:
-                    reg_pkg = {"name": "RegisteredResources", "type": 1, "items": [], "disabled": False}
-                    rp.append({"resourcePackage": reg_pkg})
-                items = reg_pkg.setdefault("items", [])
-                if not any(i.get("name") == item_name for i in items):
-                    items.append({"type": 100, "path": item_name, "name": item_name})
+            if src_path:
+                # NEVER persist the private key: it is not Power BI schema and
+                # would leak the author's local filesystem path into the saved
+                # report. A path that cannot be read fails LOUD rather than
+                # silently shipping a visual with no image.
+                img_url.pop("sourcePath", None)
+                if not os.path.isfile(src_path):
+                    raise LayoutParseError(
+                        f"Image file not found: {src_path} (pbix_add_image is "
+                        "the supported API and also accepts base64 bytes)")
+            if src_path:
+                # LEGACY private hook. pbix_add_image is the supported API —
+                # it does this registration plus Desktop's full container
+                # (howCreated / z / tabOrder / padding) and accepts bytes as
+                # well as a path. Kept working for existing callers, and now
+                # sharing the same registration helpers, so it inherits the
+                # [Content_Types].xml `</Types>` fallback (the old
+                # json-anchored replace silently no-opped on documents with no
+                # json Default) and the no-clobber item naming.
+                data, ext = _resolve_image_source(src_path, "")
+                item_name = _register_resource(
+                    info, layout, data, visual_name, ext, 100)
+                sv.setdefault("objects", {})["general"] = \
+                    _image_url_object(item_name)
 
         page = sections[page_index]
         # If this visual belongs to a singleVisualGroup, its container x/y are
@@ -2699,6 +2675,574 @@ def pbix_list_resources(alias: str) -> str:
     except Exception as e:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
+
+# --- Registered resources (images & friends) -------------------------------
+#
+# A file-backed report resource is registered by three touchpoints (all
+# verified against Desktop-authored corpus files — GeoSales_Dashboard,
+# Agents_Performance):
+#   1. the bytes at Report/StaticResources/RegisteredResources/<item>
+#   2. a `<Default Extension="<ext>" ContentType=""/>` in [Content_Types].xml
+#   3. a type-tagged entry in the layout's top-level `resourcePackages`
+#      RegisteredResources package
+# An image visual then points at it with an `ImageUrl` ResourcePackageItem
+# expr (PackageType 1). Item types: 100 = image, 200 = shape map,
+# 201 = custom theme, 202 = base theme.
+
+_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+_RESOURCE_ITEM_TYPES = {"image": 100, "shapemap": 200,
+                        "customtheme": 201, "basetheme": 202}
+# Scaling literals live under objects.imageScaling (NOT objects.general) as
+# single-quoted PBI string literals. 'Fit' is corpus-verified.
+_IMAGE_SCALING = {"fit": "Fit", "fill": "Fill", "normal": "Normal"}
+
+
+def _sniff_image_ext(data: bytes) -> str | None:
+    """Canonical extension from the file's MAGIC BYTES — never from a caller's
+    filename or content-type claim. Returns None for anything unrecognized.
+
+    Raster formats are exact magic-byte matches. SVG is text, so its detection
+    skips a UTF-8/UTF-16 BOM, whitespace, the XML declaration, DOCTYPE, and
+    comments, then requires the ROOT ELEMENT to be <svg> — a substring search
+    would classify any XML that merely mentions svg somewhere.
+    """
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if data[:2] == b"BM":
+        return "bmp"
+    if data[:4] in (b"II*\x00", b"MM\x00*"):
+        return "tiff"
+    if data[:4] == b"\x00\x00\x01\x00":
+        return "ico"
+
+    # --- SVG (text) ---
+    head = data[:8192]
+    for bom, enc in ((b"\xef\xbb\xbf", "utf-8"),
+                     (b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")):
+        if head.startswith(bom):
+            head = head[len(bom):]
+            try:
+                head = head.decode(enc, errors="ignore").encode("utf-8")
+            except Exception:
+                return None
+            break
+    i, n = 0, len(head)
+    while i < n:
+        while i < n and head[i:i + 1].isspace():
+            i += 1
+        if head[i:i + 4] == b"<!--":                      # comment
+            end = head.find(b"-->", i)
+            if end < 0:
+                return None
+            i = end + 3
+        elif head[i:i + 5] == b"<?xml" or head[i:i + 2] == b"<?":   # decl / PI
+            end = head.find(b"?>", i)
+            if end < 0:
+                return None
+            i = end + 2
+        elif head[i:i + 9].upper() == b"<!DOCTYPE":       # doctype (may nest [])
+            depth = 0
+            while i < n:
+                c = head[i:i + 1]
+                if c == b"[":
+                    depth += 1
+                elif c == b"]":
+                    depth -= 1
+                elif c == b">" and depth <= 0:
+                    i += 1
+                    break
+                i += 1
+        else:
+            break
+    tag = head[i:i + 4].lower()
+    if tag == b"<svg" and head[i + 4:i + 5] in (b"", b" ", b"\t", b"\r", b"\n", b">", b"/"):
+        return "svg"
+    return None
+
+
+def _sniff_resource_ext(data: bytes, item_type: int) -> str | None:
+    """Extension for a registered resource of ``item_type``.
+
+    Images (100) must be images. Shape maps (200) and themes (201/202) are
+    JSON in Desktop-authored files (corpus-verified: a type-200
+    ``us-states….json`` TopoJSON, a type-202 ``BaseThemes/….json``), so those
+    types accept JSON — and NOT an image, which Power BI could not consume.
+    """
+    if item_type == 100:
+        return _sniff_image_ext(data)
+    text = data.lstrip(b"\xef\xbb\xbf").lstrip()
+    if text[:1] in (b"{", b"["):
+        try:
+            json.loads(data.decode("utf-8-sig"))
+        except Exception:
+            return None
+        return "json"
+    return None
+
+
+def _sanitize_item_name(name: str, ext: str) -> str:
+    """Restrict an item name to [A-Za-z0-9._-] and force the sniffed
+    extension, so the name always agrees with [Content_Types].xml."""
+    stem = os.path.basename(name or "").strip()
+    stem = os.path.splitext(stem)[0]
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", stem).strip("._-")
+    if not stem:
+        stem = "image"
+    return f"{stem[:80]}.{ext}"
+
+
+def _load_resource_bytes(image_path: str, image_base64: str) -> bytes:
+    """Read resource bytes from a local path or a base64 payload (exactly one).
+
+    No remote fetching: a URL would make the engine download untrusted content
+    on the caller's behalf. Callers holding a URL fetch it themselves and pass
+    the bytes.
+    """
+    if bool(image_path) == bool(image_base64):
+        raise LayoutParseError(
+            "Provide exactly one image source: image_path or image_base64.")
+    if image_path:
+        if not os.path.isfile(image_path):
+            raise LayoutParseError(f"Image file not found: {image_path}")
+        if os.path.getsize(image_path) > _IMAGE_MAX_BYTES:
+            raise LayoutParseError(
+                f"Image exceeds the {_IMAGE_MAX_BYTES // (1024 * 1024)} MB limit.")
+        with open(image_path, "rb") as f:
+            return f.read()
+    import base64 as _b64
+    payload = (image_base64 or "").strip()
+    if payload.startswith("data:"):          # tolerate a full data: URI
+        payload = payload.split(",", 1)[-1]
+    # Strip line wrapping first: MIME / `base64` / openssl output is wrapped at
+    # 64-76 columns, which validate=True would reject outright.
+    payload = re.sub(r"\s+", "", payload)
+    try:
+        data = _b64.b64decode(payload, validate=True)
+    except Exception as e:
+        raise LayoutParseError(f"image_base64 is not valid base64: {e}")
+    if len(data) > _IMAGE_MAX_BYTES:
+        raise LayoutParseError(
+            f"Image exceeds the {_IMAGE_MAX_BYTES // (1024 * 1024)} MB limit.")
+    return data
+
+
+def _ensure_content_type_default(work_dir: str, ext: str) -> bool:
+    """Ensure [Content_Types].xml declares ``ext`` (empty ContentType, as
+    Desktop writes). Returns True when the file was changed.
+
+    Inserts before the json Default when present, else before ``</Types>`` —
+    the old json-anchored string replace SILENTLY no-opped on documents with
+    no json Default (e.g. the repo's own fixtures), shipping a pbix whose
+    image part had no declared extension.
+    """
+    ct_path = os.path.join(work_dir, "[Content_Types].xml")
+    if not os.path.exists(ct_path):
+        return False
+    with open(ct_path, "r", encoding="utf-8") as f:
+        ct_xml = f.read()
+    if re.search(rf'Extension\s*=\s*"{re.escape(ext)}"', ct_xml, re.IGNORECASE):
+        return False
+    entry = f'<Default Extension="{ext}" ContentType=""/>'
+    if '<Default Extension="json"' in ct_xml:
+        ct_xml = ct_xml.replace('<Default Extension="json"',
+                                entry + '<Default Extension="json"', 1)
+    elif "</Types>" in ct_xml:
+        ct_xml = ct_xml.replace("</Types>", entry + "</Types>", 1)
+    else:
+        return False
+    with open(ct_path, "w", encoding="utf-8") as f:
+        f.write(ct_xml)
+    return True
+
+
+def _registered_resource_items(layout: dict) -> list:
+    """The RegisteredResources package's item list, created if absent."""
+    rp = layout.setdefault("resourcePackages", [])
+    for pkg in rp:
+        inner = pkg.get("resourcePackage", pkg)
+        if inner.get("name") == "RegisteredResources":
+            return inner.setdefault("items", [])
+    reg = {"name": "RegisteredResources", "type": 1, "items": [],
+           "disabled": False}
+    rp.append({"resourcePackage": reg})
+    return reg["items"]
+
+
+def _ensure_resource_item(layout: dict, item_name: str, item_type: int = 100) -> None:
+    """Idempotently register an item in RegisteredResources (path == name ==
+    the bare filename, exactly as Desktop writes it)."""
+    items = _registered_resource_items(layout)
+    if not any(i.get("name") == item_name for i in items):
+        items.append({"type": item_type, "path": item_name, "name": item_name})
+
+
+def _register_resource(info: dict, layout: dict, data: bytes, name: str,
+                       ext: str, item_type: int = 100) -> str:
+    """Write the bytes + declare the extension + register the layout item.
+
+    Returns the final (possibly uniquified) item name; the caller persists the
+    mutated ``layout``.
+    """
+    work_dir = info["work_dir"]
+    item_name = _sanitize_item_name(name, ext)
+    res_dir = os.path.join(work_dir, "Report", "StaticResources",
+                           "RegisteredResources")
+    os.makedirs(res_dir, exist_ok=True)
+
+    # Never clobber a DIFFERENT resource that already uses this name; reuse the
+    # name when the bytes are identical. Name matching is CASE-INSENSITIVE and
+    # adopts the existing casing: on a case-insensitive filesystem (macOS,
+    # Windows — where Desktop runs) "logo.png" and "Logo.png" are one file, so
+    # keeping the caller's casing would register a layout item + visual
+    # reference for a part that never lands in the .pbix.
+    existing = {}
+    for it in _registered_resource_items(layout):
+        nm = it.get("name")
+        if nm:
+            existing.setdefault(nm.lower(), nm)
+    try:
+        for entry in os.listdir(res_dir):
+            existing.setdefault(entry.lower(), entry)
+    except OSError:
+        pass
+
+    stem, dot_ext = os.path.splitext(item_name)
+    n = 0
+    while True:
+        match = existing.get(item_name.lower())
+        if match is None:
+            break                                  # free name
+        target = _safe_join(res_dir, match)
+        if os.path.isfile(target):
+            with open(target, "rb") as f:
+                if f.read() == data:
+                    item_name = match              # identical bytes — reuse
+                    break
+        elif not os.path.exists(target):
+            item_name = match      # registered but absent: rewrite that item
+            break
+        n += 1                     # different bytes (or a directory) — uniquify
+        item_name = f"{stem}_{n}{dot_ext}"
+
+    with open(_safe_join(res_dir, item_name), "wb") as f:
+        f.write(data)
+    _ensure_content_type_default(work_dir, ext)
+    _ensure_resource_item(layout, item_name, item_type)
+    return item_name
+
+
+def _image_url_object(item_name: str) -> list:
+    """objects.general holding the ImageUrl ResourcePackageItem expr."""
+    return [{"properties": {"imageUrl": {"expr": {"ResourcePackageItem": {
+        "PackageName": "RegisteredResources",
+        "PackageType": 1,
+        "ItemName": item_name,
+    }}}}}]
+
+
+def _image_scaling_object(scaling: str) -> list:
+    """objects.imageScaling for 'Fit' | 'Fill' | 'Normal'."""
+    return [{"properties": {"imageScalingType": {
+        "expr": {"Literal": {"Value": f"'{scaling}'"}}}}}]
+
+
+def _next_layer_z(page: dict) -> int:
+    """Desktop assigns z in 1000-steps per insert (corpus-verified)."""
+    zs = []
+    for vc in page.get("visualContainers", []):
+        try:
+            zs.append(float(vc.get("z", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    return int(max(zs) + 1000) if zs else 0
+
+
+def _resolve_image_source(image_path: str, image_base64: str,
+                         item_type: int = 100) -> tuple[bytes, str]:
+    """Bytes + sniffed extension, with a typed error on unusable payloads."""
+    data = _load_resource_bytes(image_path, image_base64)
+    ext = _sniff_resource_ext(data, item_type)
+    if ext is None:
+        if item_type == 100:
+            raise LayoutParseError(
+                "Unrecognized image data — supported: PNG, JPEG, GIF, WebP, "
+                "BMP, TIFF, ICO, SVG (detected from the file contents, not "
+                "the name).")
+        raise LayoutParseError(
+            "Shape maps and themes must be JSON (Desktop stores them as "
+            "JSON resources) — the supplied data is not valid JSON.")
+    return data, ext
+
+
+@mcp.tool()
+def pbix_register_resource(
+    alias: str, name: str, image_path: str = "", image_base64: str = "",
+    resource_type: str = "image",
+) -> str:
+    """Register a file resource (image, shape map, theme) in the report.
+
+    Writes the bytes to ``Report/StaticResources/RegisteredResources/``,
+    declares the extension in ``[Content_Types].xml``, and adds the item to
+    the layout's ``resourcePackages`` — the three touchpoints Power BI Desktop
+    uses. Returns the final item name; point an image visual at it with
+    pbix_set_image (or use pbix_add_image, which registers AND places in one
+    call).
+
+    The file TYPE comes from the CONTENT, never from the name or a caller's
+    claim: images (type 100) must be PNG/JPEG/GIF/WebP/BMP/TIFF/ICO/SVG, and
+    shape maps / themes (200/201/202) must be JSON — the form Desktop stores
+    them in. 5 MB max. Item names are sanitized to
+    ``[A-Za-z0-9._-]``, forced to the sniffed extension, and uniquified rather
+    than overwriting a different existing resource.
+
+    Args:
+        alias: The alias of the open file
+        name: Desired item name (its extension is replaced with the sniffed one)
+        image_path: Local file to read (exactly one of image_path/image_base64)
+        image_base64: Base64-encoded bytes — for callers holding an upload or a
+            data URI (a full ``data:...;base64,...`` string is accepted). The
+            engine never fetches remote URLs itself.
+        resource_type: image (100, default), shapeMap (200), customTheme (201),
+            or baseTheme (202)
+    """
+    try:
+        logger.info("pbix_register_resource name=%r type=%r", name, resource_type)
+        info = _ensure_open(alias)
+        item_type = _RESOURCE_ITEM_TYPES.get(
+            (resource_type or "image").replace("_", "").replace(" ", "").lower())
+        if item_type is None:
+            raise LayoutParseError(
+                f"Unknown resource_type {resource_type!r} — use one of: "
+                "image, shapeMap, customTheme, baseTheme")
+
+        data, ext = _resolve_image_source(image_path, image_base64, item_type)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError(
+                "No legacy Report/Layout found. Resource registration for the "
+                "PBIR (Report/definition) format is not yet supported.")
+        item_name = _register_resource(info, layout, data, name or image_path,
+                                       ext, item_type)
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Registered '{item_name}' ({len(data):,} bytes, {ext}) in "
+            f"RegisteredResources (item type {item_type}).",
+            data={"item_name": item_name, "bytes": len(data), "format": ext},
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_add_image(
+    alias: str, page_index: int = 0, image_path: str = "",
+    image_base64: str = "", name: str = "", x: int = 40, y: int = 40,
+    width: int = 300, height: int = 200, scaling: str = "Fit",
+) -> str:
+    """Add an image visual to a page — registration + placement in one call.
+
+    Registers the bytes as a report resource (see pbix_register_resource) and
+    adds a visual container matching Desktop's own image insert field-for-field
+    (verified against Desktop-authored corpus reports): ``howCreated``,
+    1000-step ``z`` / ``tabOrder``, ``layouts[0].position``,
+    ``drillFilterOtherVisuals``, the ``ImageUrl`` ResourcePackageItem expr,
+    ``objects.imageScaling``, and ``vcObjects.padding`` 0D on all four sides.
+
+    Args:
+        alias: The alias of the open file
+        page_index: Zero-based page index
+        image_path: Local image file (exactly one of image_path/image_base64)
+        image_base64: Base64-encoded image bytes (a full data: URI is accepted)
+        name: Optional item name (default: derived from the file name)
+        x: X position in pixels
+        y: Y position in pixels
+        width: Width in pixels
+        height: Height in pixels
+        scaling: "Fit" (default), "Fill", or "Normal"; empty omits the
+            imageScaling object (Desktop also writes image visuals without it)
+    """
+    try:
+        logger.info("pbix_add_image page=%d name=%r", page_index, name)
+        info = _ensure_open(alias)
+        scale = None
+        if scaling:
+            scale = _IMAGE_SCALING.get(scaling.strip().lower())
+            if scale is None:
+                raise LayoutParseError(
+                    f"Invalid scaling {scaling!r} — use Fit, Fill, or Normal "
+                    "(or empty to omit).")
+
+        data, ext = _resolve_image_source(image_path, image_base64)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError(
+                "No legacy Report/Layout found. Image authoring for the PBIR "
+                "(Report/definition) format is not yet supported.")
+        sections = layout.get("sections", [])
+        if page_index < 0 or page_index >= len(sections):
+            raise LayoutParseError(f"Page index {page_index} out of range")
+        page = sections[page_index]
+
+        item_name = _register_resource(info, layout, data,
+                                       name or image_path, ext, 100)
+
+        # Clamp to the page, like pbix_add_visual.
+        xf = max(0.0, min(float(x), page.get("width", 1280) - float(width)))
+        yf = max(0.0, min(float(y), page.get("height", 720) - float(height)))
+        z = _next_layer_z(page)
+        tab_order = z + 1000
+
+        import uuid as _uuid
+        objects: dict = {"general": _image_url_object(item_name)}
+        if scale:
+            objects["imageScaling"] = _image_scaling_object(scale)
+        pad_lit = {"expr": {"Literal": {"Value": "0D"}}}
+        config = {
+            "name": _uuid.uuid4().hex[:20],
+            "layouts": [{"id": 0, "position": {
+                "x": xf, "y": yf, "z": z,
+                "width": float(width), "height": float(height),
+                "tabOrder": tab_order,
+            }}],
+            "singleVisual": {
+                "visualType": "image",
+                "drillFilterOtherVisuals": True,
+                "objects": objects,
+                "vcObjects": {"padding": [{"properties": {
+                    "left": pad_lit, "top": pad_lit,
+                    "right": pad_lit, "bottom": pad_lit}}]},
+            },
+            "howCreated": "InsertVisualButton",
+        }
+        page.setdefault("visualContainers", []).append({
+            "x": xf, "y": yf, "z": z,
+            "width": float(width), "height": float(height),
+            "tabOrder": tab_order,
+            "config": json.dumps(config, ensure_ascii=False),
+            "filters": "[]",
+        })
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+
+        idx = len(page["visualContainers"]) - 1
+        page_name = page.get("displayName", f"Page {page_index}")
+        return ToolResponse.ok(
+            f"Image '{item_name}' ({len(data):,} bytes, {ext}) added to "
+            f"'{page_name}' at ({xf:.0f},{yf:.0f}) {width}x{height}"
+            + (f", scaling {scale}" if scale else "")
+            + f" (visual index {idx}).",
+            data={"item_name": item_name, "visual_index": idx,
+                  "visual_name": config["name"], "format": ext},
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_set_image(
+    alias: str, page_index: int, visual_index: int, image_path: str = "",
+    image_base64: str = "", item_name: str = "", name: str = "",
+    scaling: str = "",
+) -> str:
+    """Repoint or restyle an EXISTING image visual.
+
+    Supply new bytes (image_path / image_base64) to register a fresh resource
+    and point the visual at it, and/or ``item_name`` to point at an
+    already-registered item, and/or ``scaling`` to change the fit. The
+    previously referenced resource is left in place — another visual may
+    reference the same item.
+
+    Args:
+        alias: The alias of the open file
+        page_index: Zero-based page index
+        visual_index: Zero-based visual index on the page (must be an image visual)
+        image_path: New local image file (optional)
+        image_base64: New image bytes, base64 (optional)
+        item_name: Point at this already-registered item instead (optional)
+        name: Item name to use when registering new bytes (optional)
+        scaling: "Fit", "Fill", or "Normal" (optional; unchanged when empty)
+    """
+    try:
+        logger.info("pbix_set_image page=%d visual=%d", page_index, visual_index)
+        info = _ensure_open(alias)
+        if not (image_path or image_base64 or item_name or scaling):
+            raise LayoutParseError(
+                "Nothing to change — provide image_path/image_base64, "
+                "item_name, and/or scaling.")
+        if (image_path or image_base64) and item_name:
+            raise LayoutParseError(
+                "Provide either new bytes (image_path/image_base64) or an "
+                "existing item_name, not both — the registered name of new "
+                "bytes is chosen by `name`.")
+        scale = None
+        if scaling:
+            scale = _IMAGE_SCALING.get(scaling.strip().lower())
+            if scale is None:
+                raise LayoutParseError(
+                    f"Invalid scaling {scaling!r} — use Fit, Fill, or Normal.")
+
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError("No legacy Report/Layout found.")
+        sections = layout.get("sections", [])
+        if page_index < 0 or page_index >= len(sections):
+            raise LayoutParseError(f"Page index {page_index} out of range")
+        containers = sections[page_index].get("visualContainers", [])
+        if visual_index < 0 or visual_index >= len(containers):
+            raise LayoutParseError(f"Visual index {visual_index} out of range")
+
+        vc = containers[visual_index]
+        config = _parse_visual_config(vc)
+        sv = config.get("singleVisual", {})
+        if sv.get("visualType") != "image":
+            raise LayoutParseError(
+                f"Visual {visual_index} is a "
+                f"'{sv.get('visualType', 'unknown')}', not an image visual.")
+
+        changes = []
+        if image_path or image_base64:
+            data, ext = _resolve_image_source(image_path, image_base64)
+            item_name = _register_resource(info, layout, data,
+                                           name or image_path, ext, 100)
+            changes.append(f"image -> '{item_name}' ({len(data):,} bytes, {ext})")
+        elif item_name:
+            known = {i.get("name") for i in _registered_resource_items(layout)}
+            if item_name not in known:
+                raise LayoutParseError(
+                    f"Item '{item_name}' is not registered in "
+                    "RegisteredResources. Known items: "
+                    f"{', '.join(sorted(k for k in known if k)) or '(none)'}")
+            changes.append(f"image -> '{item_name}'")
+
+        objects = sv.setdefault("objects", {})
+        if item_name:
+            objects["general"] = _image_url_object(item_name)
+        if scale:
+            objects["imageScaling"] = _image_scaling_object(scale)
+            changes.append(f"scaling {scale}")
+
+        vc["config"] = json.dumps(config, ensure_ascii=False)
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Image visual {visual_index} updated: " + "; ".join(changes) + ".",
+            data={"item_name": item_name or None, "visual_index": visual_index},
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 # --- Custom visual (.pbiviz) embedding -------------------------------------
 #

@@ -66,7 +66,7 @@ DAX evaluation returns extended results:
 | `pbix_save` | `strip_sensitivity_label` | `False` | Removes MSIP sensitivity labels when True |
 | `pbix_close` | `force` | `False` | Refuses to close with unsaved changes |
 
-## Tool Categories (109 tools)
+## Tool Categories (112 tools)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
@@ -85,8 +85,8 @@ Schema, measures, relationships, Power Query, columns, table data, data sources,
 ### DataModel Write (22)
 Metadata SQL read/write, measure CRUD (incl. `pbix_datamodel_set_measure_category` — set or CLEAR a measure's DataCategory without touching the expression), column modification, relationship CRUD, table removal, field parameters, calculation groups, TMDL export, PBIP export, decompress/recompress, ABF file ops, table data write, value replace.
 
-### Resources, Themes & Custom Visuals (15)
-Static resources, theme read/write, color extraction/recolor, linguistic schema, custom visual import/remove (GUID embedded into `Report/CustomVisuals/` + `publicCustomVisuals`), reference-only registration of certified AppSource visuals by GUID (`pbix_reference_public_visual` — zero file payload, e.g. Deneb), turnkey HTML/CSS/SVG visual authoring — create/view/edit plus a template renderer — and SVG data-URI image-measure codegen (`pbix_svg_measure`). Detailed contracts in [Custom Visual & HTML Tools](#custom-visual--html-tools); recipes in [rich-content.md](rich-content.md).
+### Resources, Themes & Custom Visuals (18)
+Static resources, image / registered-resource authoring (`pbix_add_image`, `pbix_register_resource`, `pbix_set_image` — see [Image & Resource Tools](#image--resource-tools)), theme read/write, color extraction/recolor, linguistic schema, custom visual import/remove (GUID embedded into `Report/CustomVisuals/` + `publicCustomVisuals`), reference-only registration of certified AppSource visuals by GUID (`pbix_reference_public_visual` — zero file payload, e.g. Deneb), turnkey HTML/CSS/SVG visual authoring — create/view/edit plus a template renderer — and SVG data-URI image-measure codegen (`pbix_svg_measure`). Detailed contracts in [Custom Visual & HTML Tools](#custom-visual--html-tools); recipes in [rich-content.md](rich-content.md).
 
 ### DataMashup (2)
 M code read/write.
@@ -111,6 +111,59 @@ Get/set incremental refresh policies. `pbix_set_incremental_refresh` works for f
 
 ### Diagnostics & Security (5)
 17-point diagnostic (`pbix_doctor`), report documentation (`pbix_document`), file diff (`pbix_diff`), performance analysis (`pbix_performance`), password extraction (`pbix_get_password`).
+
+## Image & Resource Tools
+
+Registering a file resource touches three places (all Desktop-verified against `test_corpus/GeoSales_Dashboard.pbix`): the bytes at `Report/StaticResources/RegisteredResources/<item>`, a `<Default Extension="<ext>" ContentType=""/>` in `[Content_Types].xml`, and a type-tagged entry in the layout's top-level `resourcePackages` `RegisteredResources` package (`path` == `name` == the bare filename). Item types: **100** image, **200** shape map, **201** custom theme, **202** base theme.
+
+Common to all three tools: the file type is decided by the **content**, never by a filename or a caller's claim — images (type 100) must be PNG/JPEG/GIF/WebP/BMP/TIFF/ICO/SVG (magic bytes; SVG detection tolerates a BOM, XML declaration, DOCTYPE and comments but requires an `<svg>` root), and shape maps / themes (200/201/202) must be **JSON**, the form Desktop stores them in; **5 MB** cap; item names are sanitized to `[A-Za-z0-9._-]`, forced to the sniffed extension, contained inside `RegisteredResources`, and uniquified rather than overwriting a different resource (identical bytes under the same name reuse it). The engine never fetches remote URLs; callers holding one fetch it and pass bytes.
+
+### `pbix_add_image`
+
+Register an image and place an image visual — one call.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `alias` | str | required | Alias of the open file |
+| `page_index` | int | `0` | Zero-based page index |
+| `image_path` | str | `""` | Local image file (exactly one of image_path / image_base64) |
+| `image_base64` | str | `""` | Base64 bytes; a full `data:image/png;base64,…` URI is accepted |
+| `name` | str | `""` | Item name (extension is replaced with the sniffed one) |
+| `x` / `y` | int | `40` | Position in pixels (clamped to the page) |
+| `width` / `height` | int | `300` / `200` | Size in pixels |
+| `scaling` | str | `"Fit"` | `Fit`, `Fill`, or `Normal` (case-insensitive); empty omits the `imageScaling` object, which Desktop also does |
+
+The container matches Desktop's own insert: `howCreated: "InsertVisualButton"`, 1000-step `z` and `tabOrder` (on the container AND `layouts[0].position`), `drillFilterOtherVisuals`, `objects.general` holding the `ImageUrl` ResourcePackageItem expr (`PackageType: 1`), `objects.imageScaling` (**not** under `general`), and `vcObjects.padding` `0D` on all four sides. **Returns** `data.item_name`, `data.visual_index`, `data.visual_name`, `data.format`. **Errors:** `LAYOUT_JSON_INVALID` (unrecognized image data, bad scaling, page index out of range, both/neither image source, oversize, PBIR layout), `FILE_NOT_OPEN`.
+
+### `pbix_register_resource`
+
+Register a file resource without placing a visual.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `alias` | str | required | Alias of the open file |
+| `name` | str | required | Desired item name |
+| `image_path` | str | `""` | Local file (exactly one of image_path / image_base64) |
+| `image_base64` | str | `""` | Base64 bytes (data: URI and line-wrapped base64 accepted) |
+| `resource_type` | str | `"image"` | `image` (100, image payload), `shapeMap` (200), `customTheme` (201), `baseTheme` (202) — the last three take **JSON** |
+
+**Returns** `data.item_name`, `data.bytes`, `data.format`. **Errors:** `LAYOUT_JSON_INVALID` (unknown resource_type, unrecognized data, source/size problems), `FILE_NOT_OPEN`.
+
+### `pbix_set_image`
+
+Repoint or restyle an existing image visual.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `alias` | str | required | Alias of the open file |
+| `page_index` | int | required | Zero-based page index |
+| `visual_index` | int | required | Zero-based visual index (must be an `image` visual) |
+| `image_path` / `image_base64` | str | `""` | New bytes — registers a fresh resource and repoints (mutually exclusive with `item_name`) |
+| `item_name` | str | `""` | Point at an already-registered item instead (validated against the package) |
+| `name` | str | `""` | Item name to use when registering new bytes |
+| `scaling` | str | `""` | `Fit` / `Fill` / `Normal`; unchanged when empty |
+
+At least one of bytes / `item_name` / `scaling` is required (else `LAYOUT_JSON_INVALID`, "Nothing to change"). The previously referenced resource is left in place — another visual may reference the same item. **Returns** `data.item_name`, `data.visual_index`. **Errors:** `LAYOUT_JSON_INVALID` (not an image visual, index out of range, unknown item_name — the message lists what IS registered), `FILE_NOT_OPEN`.
 
 ## Visual Sort Authoring
 
