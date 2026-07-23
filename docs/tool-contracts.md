@@ -66,7 +66,7 @@ DAX evaluation returns extended results:
 | `pbix_save` | `strip_sensitivity_label` | `False` | Removes MSIP sensitivity labels when True |
 | `pbix_close` | `force` | `False` | Refuses to close with unsaved changes |
 
-## Tool Categories (108 tools)
+## Tool Categories (109 tools)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
@@ -77,11 +77,13 @@ Visual CRUD, visual-level sort authoring (`pbix_set_visual_sort`), page manageme
 ### DAX Engine (4)
 Measure evaluation, per-dimension evaluation, calculated columns, cache management.
 
+**Default-filter contract** (`pbix_evaluate_dax` / `pbix_evaluate_dax_per_dimension`): a non-empty `filter_context` always wins. With an empty `filter_context`, `apply_default_filters` controls whether the report's persisted default slicer selections are auto-applied — `pbix_evaluate_dax` defaults to **True** (historic behavior), `pbix_evaluate_dax_per_dimension` defaults to **False** (its historic raw iteration; the iterated dimension's own key is always owned by the per-value loop). Pass the flag explicitly for identical behavior across both tools. `page_index` scopes the applied defaults: `-1` (default) merges every page's slicers; `>= 0` applies only that page's — the service scopes a slicer's default selection to its own page, so pass the page a visual lives on to reproduce that visual's service number. `apply_default_filters=False` evaluates the raw, truly unfiltered model.
+
 ### DataModel Read (16)
 Schema, measures, relationships, Power Query, columns, table data, data sources, metadata, CSV export (single/all), value search, SQL-like query, table profiling, data diff.
 
-### DataModel Write (21)
-Metadata SQL read/write, measure CRUD, column modification, relationship CRUD, table removal, field parameters, calculation groups, TMDL export, PBIP export, decompress/recompress, ABF file ops, table data write, value replace.
+### DataModel Write (22)
+Metadata SQL read/write, measure CRUD (incl. `pbix_datamodel_set_measure_category` — set or CLEAR a measure's DataCategory without touching the expression), column modification, relationship CRUD, table removal, field parameters, calculation groups, TMDL export, PBIP export, decompress/recompress, ABF file ops, table data write, value replace.
 
 ### Resources, Themes & Custom Visuals (15)
 Static resources, theme read/write, color extraction/recolor, linguistic schema, custom visual import/remove (GUID embedded into `Report/CustomVisuals/` + `publicCustomVisuals`), reference-only registration of certified AppSource visuals by GUID (`pbix_reference_public_visual` — zero file payload, e.g. Deneb), turnkey HTML/CSS/SVG visual authoring — create/view/edit plus a template renderer — and SVG data-URI image-measure codegen (`pbix_svg_measure`). Detailed contracts in [Custom Visual & HTML Tools](#custom-visual--html-tools); recipes in [rich-content.md](rich-content.md).
@@ -109,6 +111,17 @@ Get/set incremental refresh policies. `pbix_set_incremental_refresh` works for f
 
 ### Diagnostics & Security (5)
 17-point diagnostic (`pbix_doctor`), report documentation (`pbix_document`), file diff (`pbix_diff`), performance analysis (`pbix_performance`), password extraction (`pbix_get_password`).
+
+## Visual Sort Authoring
+
+`pbix_set_visual_sort(alias, page_index, visual_index, sort_by="", sort_direction="desc")` sets or clears the visual-level sort; `pbix_add_visual(..., sort_by=..., sort_direction=...)` authors it at creation. Both write the Desktop-style `prototypeQuery.OrderBy` clause AND the same clause in the compiled `query` (empty `sort_by` on `pbix_set_visual_sort` clears the sort).
+
+| Parameter | Accepted values |
+|-----------|----------------|
+| `sort_by` | One of the visual's own fields, as a bare name (`Pipeline Value`), DAX-style reference (`[Pipeline Value]`, `'Table'[Col]`, `Table[Col]` — DAX `''` quote-escapes supported), or queryRef (`Table.Field`). Matching is case-sensitive first, then case-insensitive. |
+| `sort_direction` | `asc` / `ascending` / `desc` / `descending` (case-insensitive; also numeric `1` / `2`). Default `desc`. |
+
+**Errors** (surfaced as `LAYOUT_JSON_INVALID`): invalid direction; the visual has no `prototypeQuery.Select` (no data binding); `sort_by` matching none of the visual's fields — the message lists the fields that ARE available; a matched field with an unsupported expression shape (only Column, Measure, and Aggregation selects can be sorted — not HierarchyLevel). Sorting by a bare numeric value-role column follows the implicit-Sum rewrite into the OrderBy `Aggregation` expression, exactly as Desktop stores such sorts.
 
 ## Custom Visual & HTML Tools
 
@@ -143,7 +156,7 @@ Reference a **public (AppSource) custom visual** by GUID — registration only, 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `alias` | str | required | Alias of the open file |
-| `guid` | str | required | The visual's marketplace GUID (letters/digits/underscores) |
+| `guid` | str | required | The visual's marketplace GUID, registered VERBATIM (letters/digits/underscores/hyphens — legacy `PBI_CV_<GUID>` hyphenated ids are accepted; the service resolves by exact GUID, so no normalization is ever applied) |
 
 Appends the GUID to `Layout["publicCustomVisuals"]` (created when missing, deduped). No `Report/CustomVisuals/` folder, no `[Content_Types].xml` change, `resourcePackages` untouched. De-register with `pbix_remove_custom_visual` (its folder branch is a no-op for references). **Returns** the resulting array in `data.publicCustomVisuals`. **Errors:** `LAYOUT_JSON_INVALID` (invalid GUID / no legacy layout / PBIR), `FILE_NOT_OPEN`.
 

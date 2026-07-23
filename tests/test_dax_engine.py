@@ -608,3 +608,65 @@ class TestIteratorRowContext:
         assert self._ev('FORMAT(TODAY(), "yyyy")') == str(_dt.date.today().year)
         assert self._ev('1e6') == 1000000.0
         assert self._ev('1e6 / 2') == 500000.0
+
+
+class TestLiteralFirstArithmetic:
+    """Issues-9 §5: a bare Table[Col] ref preceded by a literal and operator
+    ("1 - S[D]") was swallowed by the column-reference regex as a column of
+    table "1 - S", making the whole expression BLANK — ai_report's
+    Total Sales (SUMX with a (1 - Discount) factor) evaluated to 0."""
+
+    TABLES = {'S': {'columns': ['Q', 'D'], 'rows': [[3, 0.1], [2, 0.5]]}}
+
+    def _ev(self, expr):
+        engine = DAXEngine()
+        ctx = DAXContext(self.TABLES, {'M': expr})
+        return engine.evaluate_measure('M', ctx)
+
+    def test_literal_first_forms(self):
+        cases = {
+            "SUMX(S, 1 - S[D])": 1.4,
+            "SUMX(S, (1 - S[D]))": 1.4,
+            "SUMX(S, 1 + S[D])": 2.6,
+            "SUMX(S, 2 * S[D])": 1.2,
+            "SUMX(S, 0 - S[D])": -0.6,
+            "SUMX(S, S[Q] * (1 - S[D]))": 3.7,
+            "SUMX(S, (1 - S[D]) * S[Q])": 3.7,
+        }
+        for expr, want in cases.items():
+            got = self._ev(expr)
+            assert got is not None and abs(got - want) < 1e-9, (expr, got, want)
+
+    def test_column_first_forms_still_work(self):
+        assert abs(self._ev("SUMX(S, S[D] - 1)") - (-1.4)) < 1e-9
+        assert abs(self._ev("SUMX(S, 'S'[D] - 1)") - (-1.4)) < 1e-9
+        assert self._ev("SUMX(S, S[Q])") == 5
+
+    def test_unary_minus_on_column_ref(self):
+        assert abs(self._ev("SUMX(S, -S[D])") - (-0.6)) < 1e-9
+        assert abs(self._ev("SUMX(S, -S[D] + 1)") - 1.4) < 1e-9
+
+    def test_total_sales_shape(self):
+        # the exact ai_report shape: SUMX(T, Q * U * (1 - D))
+        tables = {'Sales': {'columns': ['Quantity', 'UnitPrice', 'Discount'],
+                            'rows': [[3, 1200, 0.08], [2, 100, 0.0]]}}
+        engine = DAXEngine()
+        ctx = DAXContext(tables, {
+            'Total Sales': 'SUMX(Sales, Sales[Quantity] * Sales[UnitPrice] '
+                           '* (1 - Sales[Discount]))'})
+        got = engine.evaluate_measure('Total Sales', ctx)
+        assert abs(got - (3 * 1200 * 0.92 + 200)) < 1e-6
+
+    def test_leading_negative_comparisons_and_concat(self):
+        # review round: the unary-minus branch must NOT swallow top-level
+        # comparisons/concats whose left operand starts with '-' (unary minus
+        # binds tighter than comparison/& in DAX)
+        assert self._ev('IF(-1 < 0, 10, 20)') == 10
+        assert self._ev('IF(-1 = -1, 10, 20)') == 10
+        assert self._ev('IF(-1 <> 1, 10, 20)') == 10
+        assert self._ev('IF(-1 >= -2, 10, 20)') == 10
+        assert self._ev('-1 & "x"') == "-1x"
+        # RLS-substitution shape: negative row value on the comparison LHS
+        assert self._ev('-3.0 < 0') is True
+        # and inside iterators (fixed by the ordering — was BLANK even at HEAD)
+        assert self._ev('SUMX(S, IF(-S[D] < 0, 1, 0))') == 2

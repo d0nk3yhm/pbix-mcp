@@ -2,13 +2,13 @@
 
 ## Overview
 
-pbix-mcp is an MCP (Model Context Protocol) server that provides programmatic access to Power BI `.pbix` and `.pbit` files. It exposes 108 tools via stdio transport. Every tool is also a plain importable Python function, so the whole API is usable in-process without an MCP client (see [html-visuals.md](html-visuals.md#pure-python-usage)).
+pbix-mcp is an MCP (Model Context Protocol) server that provides programmatic access to Power BI `.pbix` and `.pbit` files. It exposes 109 tools via stdio transport. Every tool is also a plain importable Python function, so the whole API is usable in-process without an MCP client (see [html-visuals.md](html-visuals.md#pure-python-usage)).
 
 ## Module Layout
 
 ```
 src/pbix_mcp/
-  server.py              # MCP tool definitions (108 tools)
+  server.py              # MCP tool definitions (109 tools)
   cli.py                 # Entry point with --log-level flag
   builder.py             # PBIX creation (entirely from scratch — metadata, VertiPaq, ABF, layout)
   builder_v2.py          # Template-free ABF + ZIP generation

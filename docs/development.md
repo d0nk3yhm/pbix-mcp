@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast tests (424 pass, 13 skip, 19 slow/integration deselected)
+# Fast tests (434 pass, 13 skip, 19 slow/integration deselected)
 pytest -m "not slow"
 
 # With coverage
@@ -27,14 +27,14 @@ PBIX_TEST_SAMPLES=test_corpus pytest -v
 
 | File | Purpose | Count |
 |------|---------|-------|
-| `test_dax_engine.py` | DAX function unit tests | 55 (6 skip without the corpus) |
-| `test_dax_accuracy.py` | DAX evaluation accuracy | 69 |
+| `test_dax_engine.py` | DAX function unit tests | 70 (6 skip without the corpus) |
+| `test_dax_accuracy.py` | DAX evaluation accuracy | 72 |
 | `test_golden.py` | Round-trip and artifact tests | 49 (3 skip without the corpus) |
 | `test_fixtures.py` | Public fixture verification | 18 |
 | `test_beta_features.py` | RLS, password, doctor tests | 10 |
 | `test_cross_report.py` | 4-file integration tests | 19 (all skip without the corpus) |
-| `test_dax_multihop.py` | Multi-hop DAX + empty-selection + bidirectional | 9 |
-| `test_found_issues.py` | OpenBI-found regressions (measure-name forms, sort authoring, save flag, MAXID) | 27 |
+| `test_dax_multihop.py` | Multi-hop DAX + empty-selection + bidirectional | 15 |
+| `test_found_issues.py` | OpenBI-found regressions (measure-name forms, sort authoring, eval defaults, MAXID) | 32 |
 | `test_rich_content.py` | Deneb references, ImageUrl DataCategory, field parameters, SVG measures | 22 |
 | `test_zip_safety.py` | ZIP + path-traversal hardening (bomb, Zip-Slip, `_safe_join`, `set_theme`) | 10 |
 | `test_perf_per_dimension.py` | Bucketed per-dimension eval (correctness, adversarial, fuzz, perf) | 14 |

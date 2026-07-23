@@ -816,11 +816,21 @@ class DAXEngine:
                 return ctx._current_row[measure_name]
             return self.evaluate_measure(measure_name, ctx)
 
-        # Table[Column] reference — must be the ENTIRE expression (no trailing operators)
-        col_match = re.match(r"'?([^'\[\]]+)'?\s*\[([^\]]+)\]$", expr)
+        # Table[Column] reference — must be the ENTIRE expression (no trailing
+        # operators). The table part is either 'quoted' (anything goes) or an
+        # unquoted identifier — crucially containing NO arithmetic/comparison
+        # operators: "1 - S[D]" is arithmetic on column D, NOT column D of a
+        # table named "1 - S". The old permissive class swallowed the leading
+        # operand+operator, so any literal-first arithmetic around a bare
+        # column ref ("1 - Sales[Discount]") evaluated to BLANK (issues-9 §5:
+        # Total Sales = 0).
+        # Unquoted names use Unicode word classes ([^\W\d] = any letter or
+        # underscore) so non-ASCII table names (æøå, umlauts, …) keep working.
+        col_match = re.match(
+            r"(?:'([^'\[\]]+)'|([^\W\d][\w .]*))\s*\[([^\]]+)\]$", expr)
         if col_match and '(' not in expr:
-            table_name = col_match.group(1).strip()
-            col_name = col_match.group(2).strip()
+            table_name = (col_match.group(1) or col_match.group(2)).strip()
+            col_name = col_match.group(3).strip()
             # In row iteration context, resolve directly from current row —
             # full-row dicts carry the column as a plain key; single-column
             # dicts (VALUES/ALL iteration) carry it as __column__/__value__.
@@ -880,6 +890,19 @@ class DAXEngine:
             if len(parts) > 1:
                 results = [str(self._eval_expr(p.strip(), ctx, var_scope) or '') for p in parts]
                 return ''.join(results)
+
+        # Unary minus on a non-literal operand ("-S[D]", "-[Measure]",
+        # "-CALCULATE(...)"): only AFTER binary/comparison/& splitting has
+        # declined — unary minus binds TIGHTER than those operators in DAX, so
+        # "-a + b" must parse as (-a) + b via the binary split, "-1 < 0" as
+        # (-1) < 0 via the comparison split, and "-1 & \"x\"" as (-1) & "x"
+        # via the concat split — never -(a + b) / -(1 < 0). Numeric literals
+        # ("-5", "-1e-5") were already handled by the number branch above.
+        if expr.startswith('-'):
+            inner_val = self._eval_expr(expr[1:].strip(), ctx, var_scope)
+            if isinstance(inner_val, (int, float)) and not isinstance(inner_val, bool):
+                return -inner_val
+            return None  # -BLANK() / non-numeric operand -> BLANK
 
         # Function call: FUNC(args) — after binary/comparison so FUNC() + expr works
         func_match = re.match(r'([A-Za-z_]\w*)\s*\(', expr)
