@@ -13,7 +13,7 @@ import zipfile
 
 import pytest
 
-from pbix_mcp.report_binding import compile_visual_binding
+from pbix_mcp.report_binding import attach_order_by, compile_visual_binding
 
 pytestmark = pytest.mark.unit
 
@@ -106,6 +106,18 @@ class TestCompileBinding:
 
         line = _pie_series_sv(); line["visualType"] = "lineChart"
         assert dr(line)["DataReduction"] == {"DataVolume": 4, "Primary": {"Window": {"Count": 1000}}}
+
+    def test_order_by_carried_into_compiled_query(self):
+        # attach_order_by writes prototypeQuery.OrderBy; the compile deep-copies
+        # the prototype, so the compiled query must carry the same clause.
+        sv = _pie_series_sv()
+        ref, dcode = attach_order_by(sv, "[Total Qty]", "desc")
+        assert (ref, dcode) == ("Sales.Total Qty", 2)
+        expected = [{"Direction": 2, "Expression": {"Measure": {
+            "Expression": {"SourceRef": {"Source": "s"}}, "Property": "Total Qty"}}}]
+        assert sv["prototypeQuery"]["OrderBy"] == expected
+        q, _dt = compile_visual_binding(sv, lambda e, p, m: None)
+        assert q["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]["OrderBy"] == expected
 
     def test_type_codes_by_data_type(self):
         # underlyingType tracks the field VALUE type, for columns AND measures.
@@ -393,3 +405,128 @@ class TestSummarizeByDefaults:
             _os.unlink(db)
         assert sb["I"] == 1 and sb["D"] == 1 and sb["Dec"] == 1   # numeric -> Default
         assert sb["Txt"] == 2 and sb["Dt"] == 2 and sb["B"] == 2  # else -> None
+
+
+def _bar_bare_col_sv():
+    """Bar chart with a BARE numeric column on Y (becomes an implicit Sum)."""
+    return {
+        "visualType": "barChart",
+        "projections": {"Category": [{"queryRef": "Products.Product"}],
+                        "Y": [{"queryRef": "Sales.Amount"}]},
+        "prototypeQuery": {
+            "Version": 2,
+            "From": [{"Name": "s", "Entity": "Sales", "Type": 0},
+                     {"Name": "p", "Entity": "Products", "Type": 0}],
+            "Select": [
+                {"Column": {"Expression": {"SourceRef": {"Source": "p"}},
+                            "Property": "Product"}, "Name": "Products.Product"},
+                {"Column": {"Expression": {"SourceRef": {"Source": "s"}},
+                            "Property": "Amount"}, "Name": "Sales.Amount"},
+            ],
+        },
+    }
+
+
+class TestAttachOrderBy:
+    """Visual-level sort authoring (found_issues #C)."""
+
+    def test_all_reference_forms_resolve(self):
+        for form in ("Total Qty", "[Total Qty]", "'Sales'[Total Qty]",
+                     "Sales[Total Qty]", "Sales.Total Qty", "total qty"):
+            sv = _pie_series_sv()
+            ref, dcode = attach_order_by(sv, form, "asc")
+            assert (ref, dcode) == ("Sales.Total Qty", 1), form
+
+    def test_direction_aliases(self):
+        for d, code in (("asc", 1), ("Ascending", 1), ("desc", 2),
+                        ("DESCENDING", 2), ("1", 1), ("2", 2)):
+            sv = _pie_series_sv()
+            assert attach_order_by(sv, "Total Qty", d)[1] == code, d
+
+    def test_column_sort(self):
+        sv = _pie_series_sv()
+        ref, _ = attach_order_by(sv, "'Products'[Product]", "asc")
+        assert ref == "Products.Product"
+        ob = sv["prototypeQuery"]["OrderBy"][0]
+        assert ob["Expression"] == {"Column": {
+            "Expression": {"SourceRef": {"Source": "p"}}, "Property": "Product"}}
+
+    def test_unknown_field_raises_with_available(self):
+        with pytest.raises(ValueError, match="matches none"):
+            attach_order_by(_pie_series_sv(), "[Nope]")
+
+    def test_bad_direction_raises(self):
+        with pytest.raises(ValueError, match="direction"):
+            attach_order_by(_pie_series_sv(), "Total Qty", "sideways")
+
+    def test_no_prototype_raises(self):
+        with pytest.raises(ValueError, match="prototypeQuery"):
+            attach_order_by({"visualType": "card"}, "X")
+
+    def test_implicit_aggregation_rewrites_order_by(self):
+        # Sorting by a bare numeric value-role column: when the compile turns
+        # the column into an implicit Sum aggregation, the OrderBy must follow
+        # (Desktop stores the Aggregation expression in OrderBy for such sorts).
+        sv = _bar_bare_col_sv()
+        ref, _ = attach_order_by(sv, "[Amount]", "desc")
+        assert ref == "Sales.Amount"
+        q, _dt = compile_visual_binding(
+            sv, lambda e, p, m: "Double" if p == "Amount" else "String")
+        expected_ob = [{"Direction": 2, "Expression": {"Aggregation": {
+            "Expression": {"Column": {"Expression": {"SourceRef": {"Source": "s"}},
+                                      "Property": "Amount"}},
+            "Function": 0}}}]
+        assert sv["prototypeQuery"]["OrderBy"] == expected_ob
+        assert q["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]["OrderBy"] == expected_ob
+        # the select itself was renamed to the Sum(...) aggregation as before
+        assert sv["prototypeQuery"]["Select"][1]["Name"] == "Sum(Sales.Amount)"
+
+    def test_sort_by_aggregation_select_directly(self):
+        # A prototype whose select is ALREADY an Aggregation (e.g. re-sorting a
+        # compiled visual): matching by inner property must still work.
+        sv = _bar_bare_col_sv()
+        compile_visual_binding(sv, lambda e, p, m: "Double" if p == "Amount" else "String")
+        ref, _ = attach_order_by(sv, "[Amount]", "asc")
+        assert ref == "Sum(Sales.Amount)"
+        ob = sv["prototypeQuery"]["OrderBy"][0]
+        assert "Aggregation" in ob["Expression"]
+
+    def test_hierarchy_level_select_refused_cleanly(self):
+        # A HierarchyLevel select (Desktop date hierarchies) matched by bare
+        # name must raise a clean ValueError, not UnboundLocalError.
+        sv = {
+            "visualType": "lineChart",
+            "projections": {"Category": [{"queryRef": "d.Date Hierarchy.Year"}]},
+            "prototypeQuery": {
+                "Version": 2,
+                "From": [{"Name": "d", "Entity": "Dates", "Type": 0}],
+                "Select": [{
+                    "HierarchyLevel": {"Expression": {"Hierarchy": {
+                        "Expression": {"SourceRef": {"Source": "d"}},
+                        "Hierarchy": "Date Hierarchy"}}, "Level": "Year"},
+                    "Name": "d.Date Hierarchy.Year",
+                }],
+            },
+        }
+        with pytest.raises(ValueError, match="unsupported expression shape"):
+            attach_order_by(sv, "d.Date Hierarchy.Year", "asc")
+        assert "OrderBy" not in sv["prototypeQuery"]
+
+    def test_escaped_quote_table_reference(self):
+        # DAX escapes an apostrophe in a table name by doubling it:
+        # 'O''Brien Sales'[Qty] refers to table "O'Brien Sales".
+        sv = {
+            "visualType": "barChart",
+            "projections": {"Y": [{"queryRef": "O'Brien Sales.Qty"}]},
+            "prototypeQuery": {
+                "Version": 2,
+                "From": [{"Name": "o", "Entity": "O'Brien Sales", "Type": 0}],
+                "Select": [{
+                    "Measure": {"Expression": {"SourceRef": {"Source": "o"}},
+                                "Property": "Qty"},
+                    "Name": "O'Brien Sales.Qty",
+                }],
+            },
+        }
+        ref, _ = attach_order_by(sv, "'O''Brien Sales'[Qty]", "desc")
+        assert ref == "O'Brien Sales.Qty"

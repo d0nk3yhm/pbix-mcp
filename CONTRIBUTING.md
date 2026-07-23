@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast unit tests only (359 pass, 10 skip, 21 slow/integration deselected)
+# Fast unit tests only (424 pass, 13 skip, 19 slow/integration deselected)
 pytest -m "not slow"
 
 # Download public test corpus, then run integration tests
@@ -32,7 +32,7 @@ pytest --cov=src/pbix_mcp --cov-report=term-missing -m "not slow"
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (105 tools)
+  server.py              # MCP server (108 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX file builder (create from scratch with row data)
   errors.py              # Typed exceptions with stable error codes (12 classes)
@@ -54,7 +54,8 @@ tests/
   test_fixtures.py       # Fixture tests (18; ships with repo)
   test_beta_features.py  # Beta feature tests (10; RLS, password, doctor)
   test_dax_multihop.py   # Multi-hop DAX + empty-selection + bidirectional (9)
-  test_found_issues.py   # OpenBI-found regressions: save flag, envelope, group coords, MAXID (6)
+  test_found_issues.py   # OpenBI-found regressions: measure-name forms, sort authoring, save flag (27)
+  test_rich_content.py   # Deneb refs, ImageUrl DataCategory, field parameters, SVG measures (22)
   test_zip_safety.py     # ZIP + path-traversal hardening: bomb, Zip-Slip, _safe_join, set_theme (10)
   test_perf_per_dimension.py  # Bucketed per-dimension eval: correctness, adversarial, fuzz, perf (14)
   test_cross_report.py   # Integration tests (19; requires the public test corpus:

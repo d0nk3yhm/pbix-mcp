@@ -8,7 +8,7 @@
 
 An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python — no templates, no skeletons, no Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026.
 
-Exposes 105 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
+Exposes 108 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (156 functions), RLS security, and binary format internals.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
@@ -138,7 +138,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Password extraction | **Beta** | Regex scan of DAX measures for embedded passwords |
 | Row-Level Security (RLS) | **Stable** | Read, write, and evaluate RLS roles. `set_rls_role` uses binary splice — roles persist across save/reopen. MAXID-based ID allocation. Verified on PBI Desktop files |
 | Bookmark creation | **Beta** | Create/remove bookmarks with page targeting and visual visibility state |
-| Field Parameters | **Stable** | Create field parameter tables via `pbix_datamodel_add_field_parameter` — uses full DataModel rebuild for VertiPaq storage |
+| Field Parameters | **Stable** | `pbix_datamodel_add_field_parameter` authors the complete Desktop shape (calculated NAMEOF-tuple partition, `ParameterMetadata` ExtendedProperty, sort/hidden/group-by wiring — diffed against Desktop-authored ground truth) with full VertiPaq storage; survives rebuild-based edits |
 | Calculation Groups | **Stable** | Create calculation groups via `pbix_datamodel_add_calculation_group` — table with CalculationItem DAX expressions, Partition Type=7, DiscourageImplicitMeasures enforced |
 | TMDL Export | **Stable** | Export data model as Git-friendly TMDL text files via `pbix_export_tmdl`. Validated with Adventure Works DW 2020 — correct partition types, CrossFilteringBehavior, model properties, shared expressions |
 | PBIP Export | **Stable** | Convert PBIX to PBIP (Power BI Project) folder structure via `pbix_export_pbip` — full TMDL semantic model + report layout + static resources, ready for Git |
@@ -148,6 +148,8 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Partition Management | **Partial** | List/remove partitions via `pbix_get_partitions`, `pbix_remove_partition`. `pbix_add_partition` blocked for PBIX (needs PartitionStorage in VertiPaq), works for PBIP/TMDL export |
 | Sensitivity Labels | **Stable** | Strip MSIP sensitivity labels via `pbix_save(strip_sensitivity_label=True)` |
 | Custom Visuals | **Beta** | Import any `.pbiviz` via `pbix_add_custom_visual` (embeds by GUID + `publicCustomVisuals`), place with `pbix_add_visual` |
+| AppSource visual references | **Stable** | `pbix_reference_public_visual` — reference a certified AppSource visual (e.g. Deneb) by GUID only, zero file payload; the service auto-loads it from AppSource (service-verified). See [docs/rich-content.md](docs/rich-content.md) |
+| SVG image measures | **Stable** | `pbix_svg_measure` — DAX codegen (data_bar, bullet, pill, icon_updown, sparkline) for `data:image/svg+xml;utf8` measures with `DataCategory='ImageUrl'`; live vector images in table/matrix cells in Desktop AND the service, zero custom visuals |
 | HTML / CSS / SVG Visuals | **Beta** | Render custom HTML/CSS/SVG (and inline JS) from a DAX measure via the bundled `PBIX HTML` visual — `pbix_add_html_visual` (turnkey create), `pbix_get_html_visual`, `pbix_set_html_visual`, plus escaping-safe `pbix_html_template` builders (KPI cards, SVG charts/gauges/maps, tables). Clickable elements can **cross-filter the report** like a native visual (`category_field` + `data-pbix-select`). Desktop-verified. See **[docs/html-visuals.md](docs/html-visuals.md)** |
 | Incremental Refresh | **Stable** | `pbix_set_incremental_refresh` / `pbix_get_incremental_refresh` — configure archive/refresh windows with change detection. Requires data source (source_csv/source_db); embedded-only files cannot use incremental refresh (same as PBI Desktop) |
 | Report diff (`pbix_diff`) | **Stable** | Compare two PBIX files — tables, columns, measures, relationships, pages/visuals, data sources, theme colors. Shows added/removed/changed |
@@ -170,13 +172,13 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 - **Full DataModel rebuild** — `set_table_data`, `update_table_rows`, `add/remove_relationship`, `remove_table` trigger a full DataModel rebuild via the builder pipeline. Most other tools (`add_measure`, `modify_measure`, `modify_column`, `set_rls_role`, `add_perspective`, `add_culture`, `add_translations`, `update_data_source`, etc.) use a lightweight metadata-only path.
 
 
-## Tools (105)
+## Tools (108)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
 
-### Report Layout & Visuals (21)
-`pbix_add_visual` · `pbix_remove_visual` · `pbix_format_visual` · `pbix_get_pages` · `pbix_add_page` · `pbix_remove_page` · `pbix_get_page_visuals` · `pbix_get_visual_detail` · `pbix_get_visual_positions` · `pbix_set_visual_property` · `pbix_update_visual_json` · `pbix_get_layout_raw` · `pbix_set_layout_raw` · `pbix_get_filters` · `pbix_set_filters` · `pbix_get_default_filters` · `pbix_get_settings` · `pbix_set_settings` · `pbix_get_bookmarks` · `pbix_add_bookmark` · `pbix_remove_bookmark`
+### Report Layout & Visuals (22)
+`pbix_add_visual` · `pbix_remove_visual` · `pbix_format_visual` · `pbix_set_visual_sort` · `pbix_get_pages` · `pbix_add_page` · `pbix_remove_page` · `pbix_get_page_visuals` · `pbix_get_visual_detail` · `pbix_get_visual_positions` · `pbix_set_visual_property` · `pbix_update_visual_json` · `pbix_get_layout_raw` · `pbix_set_layout_raw` · `pbix_get_filters` · `pbix_set_filters` · `pbix_get_default_filters` · `pbix_get_settings` · `pbix_set_settings` · `pbix_get_bookmarks` · `pbix_add_bookmark` · `pbix_remove_bookmark`
 
 ### DAX Engine (4)
 `pbix_evaluate_dax` · `pbix_evaluate_dax_per_dimension` · `pbix_evaluate_calculated_columns` · `pbix_clear_dax_cache`
@@ -187,8 +189,8 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 ### DataModel Write (21)
 `pbix_datamodel_query_metadata` · `pbix_datamodel_modify_metadata` · `pbix_datamodel_add_measure` · `pbix_datamodel_modify_measure` · `pbix_datamodel_remove_measure` · `pbix_datamodel_modify_column` · `pbix_datamodel_add_relationship` · `pbix_datamodel_remove_relationship` · `pbix_datamodel_remove_table` · `pbix_datamodel_decompress` · `pbix_datamodel_recompress` · `pbix_datamodel_replace_file` · `pbix_datamodel_extract_file` · `pbix_datamodel_list_abf_files` · `pbix_set_table_data` · `pbix_update_table_rows` · `pbix_datamodel_add_field_parameter` · `pbix_datamodel_add_calculation_group` · `pbix_export_tmdl` · `pbix_export_pbip` · `pbix_replace_value`
 
-### Resources, Themes & Custom Visuals (13)
-`pbix_list_resources` · `pbix_get_theme` · `pbix_set_theme` · `pbix_extract_colors` · `pbix_recolor` · `pbix_get_linguistic_schema` · `pbix_set_linguistic_schema` · `pbix_add_custom_visual` · `pbix_remove_custom_visual` · `pbix_add_html_visual` · `pbix_get_html_visual` · `pbix_set_html_visual` · `pbix_html_template`
+### Resources, Themes & Custom Visuals (15)
+`pbix_list_resources` · `pbix_get_theme` · `pbix_set_theme` · `pbix_extract_colors` · `pbix_recolor` · `pbix_get_linguistic_schema` · `pbix_set_linguistic_schema` · `pbix_add_custom_visual` · `pbix_reference_public_visual` · `pbix_remove_custom_visual` · `pbix_add_html_visual` · `pbix_get_html_visual` · `pbix_set_html_visual` · `pbix_html_template` · `pbix_svg_measure`
 
 ### DataMashup (2)
 `pbix_get_m_code` · `pbix_set_m_code`
@@ -516,11 +518,12 @@ PBIX_TEST_SAMPLES=test_corpus pytest tests/test_cross_report.py -v
 | `test_beta_features.py` | 10 | `unit` | No |
 | `test_cross_report.py` | 19 | `slow`, `integration` | Yes (4 public PBIX dashboards) |
 | `test_dax_multihop.py` | 9 | `unit` | No |
-| `test_found_issues.py` | 7 | `unit` | No |
+| `test_found_issues.py` | 27 | `unit` | No |
+| `test_rich_content.py` | 22 | `unit` | 1 skips without the public test corpus |
 | `test_zip_safety.py` | 10 | `unit` | No |
 | `test_perf_per_dimension.py` | 14 | `unit` | No |
 
-**From a fresh clone: 390 tests collected, 359 passed, 31 skipped, 0 failures.** All 31 skipped tests are gated on the public test corpus (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
+**From a fresh clone: 456 tests collected, 424 passed, 32 skipped, 0 failures.** All 32 skipped tests are gated on the public test corpus (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
 
 ## Architecture
 
@@ -552,10 +555,11 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (105 tools)
+  server.py              # MCP server (108 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX builder (metadata, VertiPaq, layout, relationships)
   html_templates.py      # HTML/SVG template builders (kpi_card, bar_chart, gauge, table, …)
+  svg_measures.py        # DAX codegen for SVG data-URI image measures (data_bar, sparkline, …)
   assets/pbix_html_visual/  # bundled "PBIX HTML" custom visual (.pbiviz) + source
   builder_v2.py          # Template-free ABF + ZIP generation
   errors.py              # Typed exceptions with stable error codes

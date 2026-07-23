@@ -11,6 +11,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from pbix_mcp.errors import DimensionParseError
+
 
 class FilterContext(BaseModel):
     """Parsed filter context for DAX evaluation."""
@@ -40,8 +42,12 @@ class DimensionRef(BaseModel):
 
     @classmethod
     def parse(cls, s: str) -> DimensionRef:
-        """Parse 'Table.Column' string."""
+        """Parse 'Table.Column' string.
+
+        Raises DimensionParseError (a PBIXMCPError AND a ValueError) on any
+        other shape, e.g. the DAX-style "Table[Column]" bracket form.
+        """
         parts = s.split(".", 1)
         if len(parts) != 2:
-            raise ValueError(f"Expected 'Table.Column' format, got: {s!r}")
+            raise DimensionParseError(f"Expected 'Table.Column' format, got: {s!r}")
         return cls(table=parts[0], column=parts[1])
