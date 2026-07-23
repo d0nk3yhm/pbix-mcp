@@ -102,6 +102,29 @@ Hand-written SVG measure rules (the templates already obey all of these):
   `FORMAT(x, "0.#")` emits a comma decimal under many locales and corrupts
   coordinates.
 
+## Images and logos
+
+`pbix_add_image` registers the bytes as a report resource and places a
+Desktop-exact image visual in one call:
+
+```python
+pbix_add_image(alias, page_index=0, image_path="/path/logo.png",
+               x=40, y=40, width=200, height=80, scaling="Fit")
+```
+
+Callers holding bytes (an upload, a data URI) pass `image_base64` instead —
+the engine never fetches remote URLs itself. `pbix_register_resource`
+registers a resource without placing a visual (images, shape maps, themes),
+and `pbix_set_image` repoints or restyles an existing image visual (new
+bytes, an already-registered `item_name`, and/or `scaling`).
+
+Registration always covers the three touchpoints Desktop uses — the bytes
+under `Report/StaticResources/RegisteredResources/`, the
+`[Content_Types].xml` extension Default, and the `resourcePackages` item —
+and the file type comes from magic bytes (PNG/JPEG/GIF/WebP/SVG), never from
+the filename. Images render everywhere: Desktop, the service, PDF export,
+subscriptions. Parameter contracts: [tool-contracts.md](tool-contracts.md#image--resource-tools).
+
 ## Rail A — field parameters
 
 `pbix_datamodel_add_field_parameter(alias, name, fields_json)` authors the
@@ -141,4 +164,5 @@ via `InferredDataType` when `ExplicitDataType` is "automatic".
 | Arbitrary charts beyond native visuals | B | `pbix_reference_public_visual` + Deneb spec |
 | Field/measure switching via slicer | A | `pbix_datamodel_add_field_parameter` |
 | Clickable links in cells | A | `data_category="WebUrl"` |
+| Logos / static images | A | `pbix_add_image` |
 | Arbitrary HTML/JS (Desktop-only, opt-in) | — | `pbix_add_html_visual` |
