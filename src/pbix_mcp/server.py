@@ -2894,20 +2894,27 @@ def pbix_reference_public_visual(alias: str, guid: str) -> str:
 
     Args:
         alias: The alias of the open file
-        guid: The visual's marketplace GUID (from its pbiviz manifest —
-            letters/digits/underscores only, e.g.
-            "deneb7E15AEF80B9E4D4F8E12924291ECE89A")
+        guid: The visual's marketplace GUID, used VERBATIM (the service
+            resolves certified visuals by exact GUID — no normalization).
+            Letters/digits/underscores/hyphens, e.g.
+            "deneb7E15AEF80B9E4D4F8E12924291ECE89A" or the legacy
+            "PBI_CV_23E12E97-..." hyphenated form.
     """
     try:
         logger.info("pbix_reference_public_visual guid=%r", guid)
         info = _ensure_open(alias)
         work_dir = info["work_dir"]
 
-        # Same validity rule as the .pbiviz manifest reader.
+        # The manifest reader's rule widened with '-': legacy PBI_CV_<GUID>
+        # marketplace ids carry hyphenated GUID segments, and a
+        # publicCustomVisuals entry is a plain string, so hyphens are
+        # structurally safe. The GUID is registered verbatim — never
+        # normalized — because the service resolves by exact GUID.
         guid = (guid or "").strip()
-        if not guid or not guid.replace("_", "").isalnum():
-            raise LayoutParseError(f"Invalid custom visual GUID: {guid!r} "
-                                   "(letters, digits, and underscores only)")
+        if not guid or not guid.replace("_", "").replace("-", "").isalnum():
+            raise LayoutParseError(
+                f"Invalid custom visual GUID: {guid!r} "
+                "(letters, digits, underscores, and hyphens only)")
 
         layout = _get_layout(work_dir)
         if not layout:
@@ -6842,28 +6849,38 @@ def pbix_datamodel_modify_metadata(alias: str, sql_statement: str) -> str:
 
 @mcp.tool()
 def pbix_datamodel_modify_measure(
-    alias: str, measure_name: str, new_expression: str,
+    alias: str, measure_name: str, new_expression: str = "",
     new_format_string: str = "", new_data_category: str = ""
 ) -> str:
-    """Modify a DAX measure's expression in the DataModel.
+    """Modify a DAX measure's expression / format / data category.
 
-    Performs a full ABF rebuild so expressions of any length are supported.
+    Performs a metadata-only splice so expressions of any length are
+    supported. Every parameter is optional — empty string means "leave
+    unchanged", so a format-string or DataCategory change no longer forces
+    the caller to read and re-send the current expression. At least one
+    change must be provided. To CLEAR an existing DataCategory use
+    pbix_datamodel_set_measure_category.
 
     Args:
         alias: The alias of the open file
         measure_name: Name of the measure to modify
-        new_expression: New DAX expression for the measure
-        new_format_string: Optional new format string
-        new_data_category: Optional DataCategory to set — e.g. "ImageUrl" so
+        new_expression: New DAX expression (empty = leave unchanged)
+        new_format_string: New format string (empty = leave unchanged)
+        new_data_category: DataCategory to set — e.g. "ImageUrl" so
             table/matrix cells (and the Power BI service) render the measure's
-            data-URI string as an image. Empty = leave unchanged (clear an
-            existing category with pbix_datamodel_modify_metadata).
+            data-URI string as an image. Empty = leave unchanged; clear with
+            pbix_datamodel_set_measure_category.
     """
     try:
         info = _ensure_open(alias)
         dm_path = os.path.join(info["work_dir"], "DataModel")
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
+        if not (new_expression or new_format_string or new_data_category):
+            return ToolResponse.error(
+                "Nothing to change — provide new_expression, "
+                "new_format_string, and/or new_data_category.",
+                "NOTHING_TO_CHANGE").to_text()
 
         old_info = {}
 
@@ -6876,8 +6893,11 @@ def pbix_datamodel_modify_measure(
             old_info["id"] = row[0]
             old_info["expression"] = row[1]
 
-            updates = ["Expression = ?"]
-            params = [new_expression]
+            updates = []
+            params: list = []
+            if new_expression:
+                updates.append("Expression = ?")
+                params.append(new_expression)
             if new_format_string:
                 updates.append("FormatString = ?")
                 params.append(new_format_string)
@@ -6891,11 +6911,65 @@ def pbix_datamodel_modify_measure(
 
         old_size, new_size = _modify_metadata_only(dm_path, _do_modify)
         info["modified"] = True
+        changed = []
+        if new_expression:
+            changed.append(f"  Old: {old_info.get('expression', '?')}\n"
+                           f"  New: {new_expression}")
+        if new_format_string:
+            changed.append(f"  FormatString: {new_format_string}")
+        if new_data_category:
+            changed.append(f"  DataCategory: {new_data_category}")
         return ToolResponse.ok(
             f"Measure '{measure_name}' updated:\n"
-            f"  Old: {old_info.get('expression', '?')}\n"
-            f"  New: {new_expression}\n"
+            + "\n".join(changed) + "\n"
             f"  DataModel: {old_size:,} → {new_size:,} bytes"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
+
+
+@mcp.tool()
+def pbix_datamodel_set_measure_category(
+    alias: str, measure_name: str, data_category: str = ""
+) -> str:
+    """Set or CLEAR a measure's DataCategory — no expression required.
+
+    A metadata-only splice touching nothing but Measure.DataCategory.
+    Empty ``data_category`` clears it (SQL NULL) — the only first-class
+    clearing path (pbix_datamodel_modify_measure treats empty as "leave
+    unchanged"). Common values: "ImageUrl" (cells render a data-URI string
+    as an image), "WebUrl" (clickable link).
+
+    Args:
+        alias: The alias of the open file
+        measure_name: Name of the measure
+        data_category: The category to set, or empty to clear it
+    """
+    try:
+        logger.info("pbix_datamodel_set_measure_category %r -> %r",
+                    measure_name, data_category)
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
+
+        def _do_set(conn: sqlite3.Connection):
+            c = conn.cursor()
+            c.execute("SELECT ID FROM Measure WHERE Name = ?", (measure_name,))
+            if not c.fetchone():
+                raise ValueError(f"Measure '{measure_name}' not found")
+            c.execute("UPDATE Measure SET DataCategory = ? WHERE Name = ?",
+                      (data_category or None, measure_name))
+            conn.commit()
+
+        old_size, new_size = _modify_metadata_only(dm_path, _do_set)
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Measure '{measure_name}' DataCategory "
+            + (f"set to '{data_category}'." if data_category else "cleared.")
+            + f"\n  DataModel: {old_size:,} → {new_size:,} bytes"
         ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
@@ -8006,11 +8080,44 @@ def _parse_measure_names(measures: str, measure_defs: dict) -> list[str]:
     return names
 
 
+def _resolve_default_filters(ctx: dict, page_index: int) -> dict | None:
+    """Default slicer filters for an evaluation.
+
+    ``page_index=-1`` merges every page's slicer defaults (the historical
+    behavior; mtime-cached). ``page_index>=0`` uses ONLY that page's slicers —
+    the Power BI service scopes a slicer's default selection to the slicer's
+    own page, so page-scoped application is what matches a visual on that
+    page. An out-of-range page_index raises LayoutParseError (a typo'd index
+    must not silently mean "raw model" — indistinguishable from a valid
+    slicer-less page). On PARSE errors, fail CLOSED (no defaults) rather than
+    reuse a possibly stale snapshot."""
+    if page_index >= 0:
+        work_dir = ctx.get("work_dir")
+        layout = _get_layout(work_dir) if work_dir else None
+        if not layout and work_dir:
+            layout = _get_layout_pbir(work_dir)
+        n_pages = len((layout or {}).get("sections", []))
+        if page_index >= n_pages:
+            raise LayoutParseError(
+                f"Page index {page_index} out of range ({n_pages} page(s))")
+        try:
+            return _extract_default_filters_dict(
+                work_dir, page_index, layout=layout) or None
+        except Exception:
+            return None
+    try:
+        return _get_default_filters_current(ctx) or None
+    except Exception:
+        return None
+
+
 @mcp.tool()
 def pbix_evaluate_dax(
     alias: str,
     measures: str,
     filter_context: str = "",
+    apply_default_filters: bool = True,
+    page_index: int = -1,
 ) -> str:
     """Evaluate one or more DAX measures against the data model.
 
@@ -8023,7 +8130,19 @@ def pbix_evaluate_dax(
     Args:
         alias: The alias of the open file
         measures: Comma-separated measure names to evaluate, e.g. "Sales,Profit Margin,Sales LY"
-        filter_context: Optional JSON filter context, e.g. '{"dim-Date.Year": [2015]}'
+        filter_context: Optional JSON filter context, e.g. '{"dim-Date.Year": [2015]}'.
+            A non-empty filter_context always wins (defaults are not merged in).
+        apply_default_filters: When filter_context is empty: True (default)
+            auto-applies the report's persisted default slicer selections;
+            False evaluates against the RAW, truly unfiltered model.
+            NOTE: pbix_evaluate_dax_per_dimension defaults this to False —
+            pass the flag explicitly when you need identical behavior across
+            both tools.
+        page_index: Scope for the auto-applied defaults: -1 (default) merges
+            every page's slicer defaults; >= 0 applies ONLY that page's
+            slicers — the service scopes a slicer's default selection to its
+            own page, so pass the page a visual lives on to reproduce the
+            number that visual shows in the service.
     """
     try:
         info = _ensure_open(alias)
@@ -8043,17 +8162,13 @@ def pbix_evaluate_dax(
         fc: dict | None
         if parsed_fc.filters:
             fc = parsed_fc.filters
-        else:
+        elif apply_default_filters:
             # Auto-apply default slicer filters from the report layout, re-derived
             # from the current layout (not the open-time snapshot) so a slicer/
-            # filter edit is honored on the next evaluate (OpenBI #7). The
-            # derivation is mtime-cached, so the steady state is one stat(), not a
-            # full layout re-parse. On error, fail CLOSED (apply no defaults)
-            # rather than reuse a possibly-stale snapshot.
-            try:
-                fc = _get_default_filters_current(ctx) or None
-            except Exception:
-                fc = None
+            # filter edit is honored on the next evaluate (OpenBI #7).
+            fc = _resolve_default_filters(ctx, page_index)
+        else:
+            fc = None
 
         # Reset unsupported tracker before evaluation
         dax_engine._engine.unsupported_functions.clear()
@@ -8106,6 +8221,8 @@ def pbix_evaluate_dax_per_dimension(
     dimension: str,
     filter_context: str = "",
     max_values: int = 20,
+    apply_default_filters: bool = False,
+    page_index: int = -1,
 ) -> str:
     """Evaluate DAX measures for each value of a dimension (e.g., Sales per State).
 
@@ -8116,8 +8233,20 @@ def pbix_evaluate_dax_per_dimension(
         alias: The alias of the open file
         measures: Comma-separated measure names, e.g. "Sales,Sales LY,Sales change"
         dimension: Table.Column to iterate over, e.g. "dim-Geo.State"
-        filter_context: Optional JSON base filter, e.g. '{"dim-Date.Year": [2015]}'
+        filter_context: Optional JSON base filter, e.g. '{"dim-Date.Year": [2015]}'.
+            A non-empty filter_context always wins (defaults are not merged in).
         max_values: Maximum dimension values to evaluate (default 20)
+        apply_default_filters: When filter_context is empty: False (default)
+            iterates against the raw model — the historical behavior, which
+            matches a visual on a page without restrictive slicers; True
+            auto-applies the report's persisted default slicer selections
+            (same machinery as pbix_evaluate_dax).
+            NOTE: pbix_evaluate_dax defaults this to True — pass the flag
+            explicitly when you need identical behavior across both tools.
+        page_index: Scope for the auto-applied defaults: -1 (default) merges
+            every page's slicer defaults; >= 0 applies ONLY that page's
+            slicers (service semantics — a slicer's default selection scopes
+            to its own page).
     """
     try:
         from pbix_mcp.dax import engine as dax_engine
@@ -8126,6 +8255,8 @@ def pbix_evaluate_dax_per_dimension(
         measure_names = _parse_measure_names(measures, ctx['measure_defs'])
         parsed_fc = FilterContext.from_json_str(filter_context)
         base_fc = parsed_fc.filters
+        if not base_fc and apply_default_filters:
+            base_fc = _resolve_default_filters(ctx, page_index) or {}
 
         try:
             dim_ref = DimensionRef.parse(dimension)
@@ -8237,11 +8368,22 @@ def _get_layout_pbir(work_dir: str) -> dict | None:
             if pid:
                 page_dirs.append(pid)
     elif isinstance(pages_meta, dict):
-        # Single page or some other structure
-        for pid in os.listdir(pages_dir):
-            pdir = os.path.join(pages_dir, pid)
-            if os.path.isdir(pdir) and os.path.exists(os.path.join(pdir, "visuals")):
-                page_dirs.append(pid)
+        # Real PBIR pages.json is an object whose "pageOrder" array IS the
+        # page order (Microsoft's pagesMetadata schema). Honor it — page
+        # indices are load-bearing (page-scoped default filters) — and fall
+        # back to a SORTED directory listing so the order is at least
+        # deterministic when pageOrder is absent (os.listdir order is
+        # filesystem-dependent).
+        on_disk = [pid for pid in sorted(os.listdir(pages_dir))
+                   if os.path.isdir(os.path.join(pages_dir, pid))
+                   and os.path.exists(os.path.join(pages_dir, pid, "visuals"))]
+        page_order = pages_meta.get("pageOrder")
+        if isinstance(page_order, list) and page_order:
+            ordered = [pid for pid in page_order if pid in on_disk]
+            # any folder pageOrder missed still appends (deterministically)
+            page_dirs = ordered + [pid for pid in on_disk if pid not in ordered]
+        else:
+            page_dirs = on_disk
 
     for pid in page_dirs:
         visuals_dir = os.path.join(pages_dir, pid, "visuals")

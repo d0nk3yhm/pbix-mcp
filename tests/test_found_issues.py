@@ -568,3 +568,241 @@ class TestMeasureNameEdgeCases:
         pbir = server._pbix_config_to_pbir_visual(cfg, 0, 0, 100, 100)
         assert pbir["visual"]["query"]["sortDefinition"] == \
             {"sort": [], "isDefaultSort": True}
+
+
+class TestIssues9DefaultFilterSemantics:
+    """Issues-9 §1: opt-out + page-scoped defaults, consistent machinery."""
+
+    def _build(self, path):
+        b = PBIXBuilder("T")
+        b.add_table("Sales", [
+            {"name": "Region", "data_type": "String"},
+            {"name": "Amount", "data_type": "Int64"},
+        ], rows=[{"Region": "N", "Amount": 10}, {"Region": "S", "Amount": 30}])
+        b.add_measure("Sales", "Total", "SUM(Sales[Amount])")
+        b.save(path)
+
+    def _add_slicer_with_default(self, alias, page_index, value):
+        """A slicer whose filter carries a persisted default selection."""
+        cfg = json.dumps({"singleVisual": {
+            "visualType": "slicer",
+            "projections": {"Values": [{"queryRef": "Sales.Region"}]},
+            "prototypeQuery": {
+                "Version": 2,
+                "From": [{"Name": "s", "Entity": "Sales", "Type": 0}],
+                "Select": [{"Column": {"Expression": {"SourceRef": {"Source": "s"}},
+                                       "Property": "Region"}, "Name": "Sales.Region"}],
+            }}})
+        out = json.loads(server.pbix_add_visual(alias, page_index, "slicer",
+                                                config_json=cfg))
+        assert out["success"], out
+        # persist the default selection where slicers store it:
+        # config.singleVisual.objects.general[].properties.filter.filter
+        wd = server._open_files[alias]["work_dir"]
+        layout = server._get_layout(wd)
+        vc = layout["sections"][page_index]["visualContainers"][-1]
+        config = json.loads(vc["config"])
+        sv = config["singleVisual"]
+        sv.setdefault("objects", {})["general"] = [{"properties": {"filter": {
+            "filter": {
+                "Version": 2,
+                "From": [{"Name": "s", "Entity": "Sales", "Type": 0}],
+                "Where": [{"Condition": {"In": {
+                    "Expressions": [{"Column": {
+                        "Expression": {"SourceRef": {"Source": "s"}},
+                        "Property": "Region"}}],
+                    "Values": [[{"Literal": {"Value": f"'{value}'"}}]]}}}],
+            }}}}]
+        vc["config"] = json.dumps(config)
+        server._set_layout(wd, layout)
+
+    def test_opt_out_and_page_scoping(self, tmp_path):
+        p = str(tmp_path / "df.pbix")
+        self._build(p)
+        alias = "iss9df"
+        try:
+            server.pbix_open(p, alias)
+            server.pbix_add_page(alias, "P1")
+            server.pbix_add_page(alias, "P2")
+            # page 1 (index 1) gets a slicer defaulting Region = S
+            self._add_slicer_with_default(alias, 1, "S")
+
+            def total(**kw):
+                out = json.loads(server.pbix_evaluate_dax(
+                    alias=alias, measures="Total", **kw))
+                return out["results"][0]["value"]
+
+            assert total() == 30                        # all-pages defaults (historic)
+            assert total(apply_default_filters=False) == 40   # raw model opt-out
+            assert total(page_index=0) == 40            # page 0 has no slicers
+            assert total(page_index=1) == 30            # the slicer's own page
+            # explicit filter_context always wins over defaults
+            assert total(filter_context='{"Sales.Region": ["N"]}') == 10
+        finally:
+            server._open_files.pop(alias, None)
+            server._dax_cache.pop(alias, None)
+
+    def test_per_dimension_flag_parity(self, tmp_path):
+        # Default filter on Region; iterate a DIFFERENT column (Cat) — the
+        # iterated dimension's own key is always owned by the per-value loop
+        # (pre-existing contract), so the default must land on another column
+        # to be observable.
+        p = str(tmp_path / "dfp.pbix")
+        b = PBIXBuilder("T")
+        b.add_table("Sales", [
+            {"name": "Region", "data_type": "String"},
+            {"name": "Cat", "data_type": "String"},
+            {"name": "Amount", "data_type": "Int64"},
+        ], rows=[{"Region": "N", "Cat": "X", "Amount": 10},
+                 {"Region": "S", "Cat": "X", "Amount": 30},
+                 {"Region": "S", "Cat": "Y", "Amount": 5}])
+        b.add_measure("Sales", "Total", "SUM(Sales[Amount])")
+        b.save(p)
+        alias = "iss9dfp"
+        try:
+            server.pbix_open(p, alias)
+            server.pbix_add_page(alias, "P1")
+            self._add_slicer_with_default(alias, 0, "S")
+
+            def x_value(**kw):
+                out = json.loads(server.pbix_evaluate_dax_per_dimension(
+                    alias=alias, measures="Total", dimension="Sales.Cat", **kw))
+                line = [ln for ln in out["message"].splitlines()
+                        if ln.startswith("X")][0]
+                return line.split()[-1]
+
+            assert x_value() == "40"                          # raw (historic)
+            assert x_value(apply_default_filters=True) == "30"  # S-default applied
+            assert x_value(apply_default_filters=True, page_index=0) == "30"
+            # a page with no slicers contributes nothing
+            assert x_value(apply_default_filters=True, page_index=1) == "40"
+        finally:
+            server._open_files.pop(alias, None)
+            server._dax_cache.pop(alias, None)
+
+
+class TestIssues9DataCategoryErgonomics:
+    """Issues-9 §2: category changes without re-sending the expression, and a
+    first-class clearing path."""
+
+    def _build(self, path):
+        b = PBIXBuilder("T")
+        b.add_table("S", [{"name": "A", "data_type": "Int64"}], rows=[{"A": 1}])
+        b.add_measure("S", "M", "SUM(S[A])", data_category="ImageUrl")
+        b.save(path)
+
+    def _category(self, alias):
+        info = server._open_files[alias]
+        import sqlite3 as _sq
+        import tempfile as _tf
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        with open(os.path.join(info["work_dir"], "DataModel"), "rb") as f:
+            db = read_metadata_sqlite(decompress_datamodel(f.read()))
+        fd, tmp = _tf.mkstemp(suffix=".db")
+        os.write(fd, db)
+        os.close(fd)
+        conn = _sq.connect(tmp)
+        try:
+            row = conn.execute(
+                "SELECT DataCategory, Expression FROM Measure WHERE Name='M'"
+            ).fetchone()
+            return row
+        finally:
+            conn.close()
+            os.unlink(tmp)
+
+    def test_modify_without_expression_and_clear(self, tmp_path):
+        p = str(tmp_path / "dc.pbix")
+        self._build(p)
+        alias = "iss9dc"
+        try:
+            server.pbix_open(p, alias)
+            # change ONLY the category — expression untouched
+            out = json.loads(server.pbix_datamodel_modify_measure(
+                alias, "M", new_data_category="WebUrl"))
+            assert out["success"], out
+            cat, expr = self._category(alias)
+            assert cat == "WebUrl" and expr == "SUM(S[A])"
+
+            # change ONLY the format string
+            out = json.loads(server.pbix_datamodel_modify_measure(
+                alias, "M", new_format_string="0.0%"))
+            assert out["success"], out
+
+            # no-op call fails loud
+            out = json.loads(server.pbix_datamodel_modify_measure(alias, "M"))
+            assert out["success"] is False
+            assert out["error_code"] == "NOTHING_TO_CHANGE"
+
+            # first-class CLEAR
+            out = json.loads(server.pbix_datamodel_set_measure_category(alias, "M"))
+            assert out["success"], out
+            cat, expr = self._category(alias)
+            assert cat is None and expr == "SUM(S[A])"
+
+            # and set again via the dedicated setter
+            out = json.loads(server.pbix_datamodel_set_measure_category(
+                alias, "M", "ImageUrl"))
+            assert out["success"], out
+            assert self._category(alias)[0] == "ImageUrl"
+
+            # unknown measure -> clean error
+            out = json.loads(server.pbix_datamodel_set_measure_category(alias, "Nope"))
+            assert out["success"] is False and "not found" in out["message"]
+        finally:
+            server._open_files.pop(alias, None)
+            server._dax_cache.pop(alias, None)
+
+
+class TestIssues9GuidHyphens:
+    """Issues-9 §4: legacy PBI_CV_<GUID> hyphenated marketplace ids register."""
+
+    def test_hyphenated_guid_accepted_verbatim(self, tmp_path):
+        p = str(tmp_path / "guid.pbix")
+        b = PBIXBuilder("T")
+        b.add_table("S", [{"name": "A", "data_type": "Int64"}], rows=[{"A": 1}])
+        b.save(p)
+        alias = "iss9guid"
+        legacy = "PBI_CV_23E12E97-A82F-4667-B8D6-2ECA76A3E8F2"
+        try:
+            server.pbix_open(p, alias)
+            out = json.loads(server.pbix_reference_public_visual(alias, legacy))
+            assert out["success"], out
+            assert out["data"]["publicCustomVisuals"] == [legacy]  # verbatim
+            for bad in ("a b", "x;y", "x!y", ""):
+                out = json.loads(server.pbix_reference_public_visual(alias, bad))
+                assert out["success"] is False, bad
+        finally:
+            server._open_files.pop(alias, None)
+
+
+class TestIssues9PageIndexValidation:
+    """Review round: an out-of-range page_index must error loudly, never
+    silently mean 'raw model' (indistinguishable from a slicer-less page)."""
+
+    def test_out_of_range_page_index_errors(self, tmp_path):
+        p = str(tmp_path / "oor.pbix")
+        b = PBIXBuilder("T")
+        b.add_table("Items", [{"name": "Name", "data_type": "String"},
+                              {"name": "Price", "data_type": "Double"}],
+                    rows=[{"Name": "A", "Price": 1.0}])
+        b.add_measure("Items", "Total", "SUM(Items[Price])")
+        b.save(p)
+        alias = "iss9oor"
+        try:
+            server.pbix_open(p, alias)
+            for tool_kwargs in (
+                dict(fn=server.pbix_evaluate_dax, measures="Total"),
+                dict(fn=server.pbix_evaluate_dax_per_dimension,
+                     measures="Total", dimension="Items.Name",
+                     apply_default_filters=True),
+            ):
+                fn = tool_kwargs.pop("fn")
+                out = json.loads(fn(alias=alias, page_index=99, **tool_kwargs))
+                assert out["success"] is False, out
+                assert "out of range" in out["message"], out
+        finally:
+            server._open_files.pop(alias, None)
+            server._dax_cache.pop(alias, None)
