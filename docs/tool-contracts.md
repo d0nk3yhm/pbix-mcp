@@ -50,6 +50,8 @@ DAX evaluation returns extended results:
 | `DAX_UNSUPPORTED_FUNCTION` | `DAXUnsupportedError` | DAX function not implemented |
 | `DAX_EVAL_FAILED` | `DAXEvaluationError` | DAX evaluation failed at runtime |
 | `DAX_PARSE_FAILED` | `DAXParseError` | DAX expression parse failure |
+| `DAX_MEASURE_NOT_FOUND` | `DAXMeasureNotFoundError` | Requested measure does not exist in the model |
+| `DIMENSION_INVALID` | `DimensionParseError` | Dimension reference is not in `Table.Column` format |
 | `UNSAFE_WRITE` | `UnsafeWriteError` | Destructive write without confirmation |
 | `SESSION_ERROR` | `SessionError` | File session error |
 | `FILE_NOT_OPEN` | `FileNotOpenError` | Requested alias not open |
@@ -64,13 +66,13 @@ DAX evaluation returns extended results:
 | `pbix_save` | `strip_sensitivity_label` | `False` | Removes MSIP sensitivity labels when True |
 | `pbix_close` | `force` | `False` | Refuses to close with unsaved changes |
 
-## Tool Categories (105 tools)
+## Tool Categories (108 tools)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
 
-### Report Layout & Visuals (21)
-Visual CRUD, page management, filters, positions, bookmarks (add/remove), settings, layout read/write, default filter extraction.
+### Report Layout & Visuals (22)
+Visual CRUD, visual-level sort authoring (`pbix_set_visual_sort`), page management, filters, positions, bookmarks (add/remove), settings, layout read/write, default filter extraction.
 
 ### DAX Engine (4)
 Measure evaluation, per-dimension evaluation, calculated columns, cache management.
@@ -81,8 +83,8 @@ Schema, measures, relationships, Power Query, columns, table data, data sources,
 ### DataModel Write (21)
 Metadata SQL read/write, measure CRUD, column modification, relationship CRUD, table removal, field parameters, calculation groups, TMDL export, PBIP export, decompress/recompress, ABF file ops, table data write, value replace.
 
-### Resources, Themes & Custom Visuals (13)
-Static resources, theme read/write, color extraction/recolor, linguistic schema, custom visual import/remove (GUID embedded into `Report/CustomVisuals/` + `publicCustomVisuals`), and turnkey HTML/CSS/SVG visual authoring — create/view/edit plus a template renderer. Detailed contracts in [Custom Visual & HTML Tools](#custom-visual--html-tools).
+### Resources, Themes & Custom Visuals (15)
+Static resources, theme read/write, color extraction/recolor, linguistic schema, custom visual import/remove (GUID embedded into `Report/CustomVisuals/` + `publicCustomVisuals`), reference-only registration of certified AppSource visuals by GUID (`pbix_reference_public_visual` — zero file payload, e.g. Deneb), turnkey HTML/CSS/SVG visual authoring — create/view/edit plus a template renderer — and SVG data-URI image-measure codegen (`pbix_svg_measure`). Detailed contracts in [Custom Visual & HTML Tools](#custom-visual--html-tools); recipes in [rich-content.md](rich-content.md).
 
 ### DataMashup (2)
 M code read/write.
@@ -130,6 +132,49 @@ Reads the GUID from the package manifest, extracts the package into `Report/Cust
   "success": true,
   "message": "Custom visual 'PBIX HTML' imported successfully!\n  GUID: pbixHtml5C3A2F1E9B7D46A8C0E1D2F3A4B5C6D7\n  Version: 1.1.0.0  (apiVersion 5.11.0)\n  Files: 3 extracted to Report/CustomVisuals/pbixHtml5C3A2F1E9B7D46A8C0E1D2F3A4B5C6D7/\n  Registered in publicCustomVisuals.",
   "data": null,
+  "warnings": []
+}
+```
+
+### `pbix_reference_public_visual`
+
+Reference a **public (AppSource) custom visual** by GUID — registration only, zero file payload. Certified visuals (e.g. Deneb, GUID `deneb7E15AEF80B9E4D4F8E12924291ECE89A`) are resolved by the Power BI service **from AppSource** for report consumers; the service-verified recipe (spec in `objects.vega`, single `dataset` role) is in [rich-content.md](rich-content.md).
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `alias` | str | required | Alias of the open file |
+| `guid` | str | required | The visual's marketplace GUID (letters/digits/underscores) |
+
+Appends the GUID to `Layout["publicCustomVisuals"]` (created when missing, deduped). No `Report/CustomVisuals/` folder, no `[Content_Types].xml` change, `resourcePackages` untouched. De-register with `pbix_remove_custom_visual` (its folder branch is a no-op for references). **Returns** the resulting array in `data.publicCustomVisuals`. **Errors:** `LAYOUT_JSON_INVALID` (invalid GUID / no legacy layout / PBIR), `FILE_NOT_OPEN`.
+
+```json
+{
+  "success": true,
+  "message": "Public visual 'deneb7E15AEF80B9E4D4F8E12924291ECE89A' registered in publicCustomVisuals.\nThe service auto-loads certified visuals from AppSource; place one with:\n  pbix_add_visual(alias, page_index, visual_type=\"deneb7E15AEF80B9E4D4F8E12924291ECE89A\", ...)",
+  "data": {"publicCustomVisuals": ["deneb7E15AEF80B9E4D4F8E12924291ECE89A"]},
+  "warnings": []
+}
+```
+
+### `pbix_svg_measure`
+
+Generate DAX for an **SVG data-URI image measure** — optionally author it directly. With `DataCategory='ImageUrl'` the measure renders as a live, filter-context-aware vector image in table/matrix cells (Desktop, service, PDF export, subscriptions) with zero custom visuals. Rules baked in: utf8 (never base64), `%23`-encoded colors, single-quoted SVG attributes, locale-proof `FORMAT(INT(…),"0")` interpolation, ~32k budget check.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `kind` | str | `""` | Template: `data_bar`, `bullet`, `pill`, `icon_updown`, `sparkline` (empty = list templates) |
+| `spec_json` | str | `""` | JSON object of template parameters; dynamic parts are DAX sub-expressions (e.g. `"value": "[Total Revenue]"`) |
+| `alias` | str | `""` | With `measure_name`: also ADD the measure (DataCategory=ImageUrl) |
+| `measure_table` | str | `""` | Home table for the added measure (default: first table) |
+| `measure_name` | str | `""` | Name for the added measure |
+
+**Returns** `data.dax` (the generated expression), `data.chars`, `data.added`. **Errors:** `BAD_SPEC` (invalid spec_json / add without both alias+measure_name), `BAD_TEMPLATE` (unknown kind, bad parameter, over-budget), `FILE_NOT_OPEN`, or the propagated measure-add error.
+
+```json
+{
+  "success": true,
+  "message": "Rendered 'data_bar' DAX (407 chars). Added measure 'Rev Bar' on 'Sales' with DataCategory=ImageUrl.",
+  "data": {"dax": "VAR _r0 = DIVIDE([Total Revenue], 2000)\n...", "chars": 407, "added": true},
   "warnings": []
 }
 ```

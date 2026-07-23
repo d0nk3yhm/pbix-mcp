@@ -89,6 +89,24 @@ class DAXParseError(DAXError):
     code = "DAX_PARSE_FAILED"
 
 
+class DAXMeasureNotFoundError(DAXError):
+    """A requested measure name does not exist in the model.
+
+    Raised by the evaluate tools instead of silently returning BLANK, so an
+    unknown (or mis-spelled) measure is distinguishable from a measure that
+    genuinely evaluates to BLANK."""
+    code = "DAX_MEASURE_NOT_FOUND"
+
+
+class DimensionParseError(DAXError, ValueError):
+    """A dimension reference is not in 'Table.Column' format.
+
+    Subclasses ValueError too, so pre-existing callers that catch ValueError
+    keep working — but with .message/.code available like every other
+    PBIXMCPError."""
+    code = "DIMENSION_INVALID"
+
+
 # ---------------------------------------------------------------------------
 # Write / safety errors
 # ---------------------------------------------------------------------------
@@ -129,6 +147,8 @@ ERROR_CODES = {
     "DAX_UNSUPPORTED_FUNCTION": "DAX function not implemented",
     "DAX_EVAL_FAILED": "DAX evaluation failed at runtime",
     "DAX_PARSE_FAILED": "DAX expression parse failure",
+    "DAX_MEASURE_NOT_FOUND": "Requested measure does not exist in the model",
+    "DIMENSION_INVALID": "Dimension reference is not in 'Table.Column' format",
     "UNSAFE_WRITE": "Destructive write attempted without confirmation",
     "SESSION_ERROR": "File session error",
     "FILE_NOT_OPEN": "Requested file alias is not open",

@@ -1,5 +1,13 @@
 # Custom HTML / CSS / SVG visuals
 
+> **Desktop-only.** The bundled HTML visual is intentionally uncertified, and
+> the Power BI **service** blocks uncertified file-embedded visuals under
+> default tenant trust policy — a report that looks perfect in Desktop ships
+> **blank** to app.powerbi.com. Use HTML visuals deliberately; for content
+> that must render in the service, use the portable rails in
+> [rich-content.md](rich-content.md) (native visuals + SVG data-URI image
+> measures, and certified Deneb references).
+
 pbix-mcp ships **its own** Power BI custom visual — `PBIX HTML` — that renders an
 HTML / CSS / SVG (and inline `<script>`) string produced by a DAX measure. That
 lets you build anything HTML can express — KPI cards, SVG charts / gauges / maps,

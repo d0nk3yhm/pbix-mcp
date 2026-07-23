@@ -301,19 +301,34 @@ def _evaluate_table_expression(
 
 
 def _extract_balanced_tuples(text: str) -> list:
-    """Extract balanced parenthesized groups from text, handling nested parens."""
+    """Extract balanced parenthesized groups from text, handling nested parens.
+
+    Quote-aware: parens inside "double-quoted" strings are text, not structure
+    (a display name like "Growth :)" or "a) Revenue" must not close the
+    tuple). DAX's doubled-quote escape ("") toggles the state twice — a no-op,
+    which is exactly right for balance counting."""
     results = []
     i = 0
+    in_str = False
     while i < len(text):
-        if text[i] == '(':
+        ch = text[i]
+        if ch == '"':
+            in_str = not in_str
+            i += 1
+            continue
+        if ch == '(' and not in_str:
             depth = 1
             start = i + 1
             i += 1
             while i < len(text) and depth > 0:
-                if text[i] == '(':
-                    depth += 1
-                elif text[i] == ')':
-                    depth -= 1
+                ch = text[i]
+                if ch == '"':
+                    in_str = not in_str
+                elif not in_str:
+                    if ch == '(':
+                        depth += 1
+                    elif ch == ')':
+                        depth -= 1
                 i += 1
             if depth == 0:
                 results.append(text[start:i - 1])
@@ -359,11 +374,21 @@ def _parse_field_parameter(expr: str, tdef: dict) -> Optional[dict]:
             if not remaining:
                 break
 
-            # Quoted string
+            # Quoted string (DAX escapes an embedded quote by doubling it)
             if remaining.startswith('"'):
-                end = remaining.index('"', 1)
-                parts.append(remaining[1:end])
-                remaining = remaining[end + 1:]
+                buf = []
+                j = 1
+                while j < len(remaining):
+                    if remaining[j] == '"':
+                        if j + 1 < len(remaining) and remaining[j + 1] == '"':
+                            buf.append('"')
+                            j += 2
+                            continue
+                        break
+                    buf.append(remaining[j])
+                    j += 1
+                parts.append(''.join(buf))
+                remaining = remaining[j + 1:]
             # NAMEOF('Table'[Column])
             elif remaining.upper().startswith('NAMEOF'):
                 m = re.match(r"NAMEOF\s*\(\s*'([^']+)'\s*\[([^\]]+)\]\s*\)", remaining, re.IGNORECASE)

@@ -643,19 +643,24 @@ def read_table_from_abf(
             raise ValueError(f"Table '{table_name}' not found in metadata")
         table_id = table_row["ID"]
 
-        # Get columns (Type=1 is data, Type=3 is calculated; Type=2 is RowNumber).
+        # Get columns (Type=1 data, Type=3 legacy/calculated, Type=4 calc-table
+        # columns — Desktop field parameters and calculated tables store real
+        # VertiPaq data under Type=4 columns, so excluding them read those
+        # tables back EMPTY; RowNumber system columns have no readable store
+        # and are skipped by the file-matching below either way).
         # Also pull the DictionaryStorage encoding so we can decode VALUE-encoded
         # columns (DictionaryStorage.Type=2, no external .dictionary file):
         # BaseId + Magnitude reconstruct value = (data_id + BaseId) / Magnitude.
         columns = conn.execute(
             """SELECT c.ID, c.ExplicitName, c.ExplicitDataType, c.IsHidden,
+                      c.InferredDataType, c.InferredName,
                       c.ColumnStorageID, c.Type,
                       ds.Type AS DSType, ds.BaseId AS DSBaseId,
                       ds.Magnitude AS DSMagnitude
                FROM [Column] c
                LEFT JOIN ColumnStorage cs ON cs.ID = c.ColumnStorageID
                LEFT JOIN DictionaryStorage ds ON ds.ID = cs.DictionaryStorageID
-               WHERE c.TableID = ? AND c.Type IN (1, 3)
+               WHERE c.TableID = ? AND c.Type IN (1, 3, 4)
                ORDER BY c.ID""",
             (table_id,),
         ).fetchall()
@@ -695,9 +700,18 @@ def read_table_from_abf(
     decode_errors: list[tuple[str, str, str]] = []  # (col_name, stage, message)
 
     for col in columns:
-        col_name = col["ExplicitName"]
+        # Desktop's DATATABLE/manual calc-table columns store NULL in
+        # ExplicitName with the real name in InferredName (field-parameter
+        # columns carry both). A nameless column is unusable — skip it.
+        col_name = col["ExplicitName"] or col["InferredName"]
+        if col_name is None:
+            continue
         col_id = col["ID"]
         amo_type = col["ExplicitDataType"]
+        if amo_type == 1:
+            # ExplicitDataType=1 = "automatic" (Desktop's calc-table columns);
+            # the real storage type is in InferredDataType.
+            amo_type = col["InferredDataType"] or 1
         data_type = _AMO_TO_TYPE_NAME.get(amo_type, "String")
         # DictionaryStorage.Type=2 => VALUE encoding (no external .dictionary):
         # values reconstruct from raw index + BaseId + Magnitude.

@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast tests (359 pass, 10 skip, 21 slow/integration deselected)
+# Fast tests (424 pass, 13 skip, 19 slow/integration deselected)
 pytest -m "not slow"
 
 # With coverage
@@ -34,7 +34,8 @@ PBIX_TEST_SAMPLES=test_corpus pytest -v
 | `test_beta_features.py` | RLS, password, doctor tests | 10 |
 | `test_cross_report.py` | 4-file integration tests | 19 (all skip without the corpus) |
 | `test_dax_multihop.py` | Multi-hop DAX + empty-selection + bidirectional | 9 |
-| `test_found_issues.py` | OpenBI-found regressions (save flag, envelope, group coords, MAXID) | 6 |
+| `test_found_issues.py` | OpenBI-found regressions (measure-name forms, sort authoring, save flag, MAXID) | 27 |
+| `test_rich_content.py` | Deneb references, ImageUrl DataCategory, field parameters, SVG measures | 22 |
 | `test_zip_safety.py` | ZIP + path-traversal hardening (bomb, Zip-Slip, `_safe_join`, `set_theme`) | 10 |
 | `test_perf_per_dimension.py` | Bucketed per-dimension eval (correctness, adversarial, fuzz, perf) | 14 |
 

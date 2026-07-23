@@ -3,6 +3,11 @@
 - #4  MAXID invariant: MAXID >= highest object id after a build.
 - #5  pbix_save must NOT clear the modified flag on a copy-export.
 - #6  pbix_get_default_filters must return a JSON envelope (not a bare string).
+- #A  Bracketed/table-qualified measure names must NOT silently evaluate to
+      BLANK in the evaluate tools; unknown names raise a typed error.
+- #B  A bad dimension string must return the parse message, not the masked
+      "'ValueError' object has no attribute 'message'" AttributeError.
+- #C  Visual-level sort authoring: prototypeQuery.OrderBy + compiled query.
 """
 import json
 import os
@@ -285,3 +290,281 @@ class TestFormatObjectCoverage:
         got = objs.get("_objects", objs)
         assert "categoryLabels" in got
         assert "categoryLabelFontColor" in got["categoryLabels"][0]["properties"]
+
+
+def _build_pbix_with_measures(path):
+    """A pbix with a category column and two measures, for DAX-evaluate tests."""
+    b = PBIXBuilder("T")
+    b.add_table("Items", [
+        {"name": "Category", "data_type": "String"},
+        {"name": "Price", "data_type": "Double"},
+    ], rows=[
+        {"Category": "A", "Price": 10.0},
+        {"Category": "A", "Price": 20.0},
+        {"Category": "B", "Price": 5.0},
+    ])
+    b.add_measure("Items", "Total Price", "SUM(Items[Price])")
+    b.add_measure("Items", "Item Count", "COUNTROWS(Items)")
+    b.save(path)
+
+
+class TestBracketedMeasureNames:
+    """Issue #A: [Measure] / 'Table'[Measure] silently evaluated to BLANK
+    because measure_defs is keyed by bare names — every form must now resolve
+    to the same values, and an unknown name must raise a typed error."""
+
+    def _per_dim_values(self, alias, measures):
+        out = server.pbix_evaluate_dax_per_dimension(
+            alias=alias, measures=measures, dimension="Items.Category")
+        parsed = json.loads(out)
+        assert parsed["success"] is True, out
+        assert "(null)" not in parsed["message"], out
+        return parsed["message"]
+
+    def test_all_forms_equal_bare_form(self, tmp_path):
+        p = str(tmp_path / "brkt.pbix")
+        _build_pbix_with_measures(p)
+        alias = "issueA"
+        try:
+            server.pbix_open(p, alias)
+            bare = self._per_dim_values(alias, "Total Price, Item Count")
+            assert "30.00" in bare and "5.00" in bare  # A=30, B=5
+            for form in ("[Total Price], [Item Count]",
+                         "'Items'[Total Price], Items[Item Count]"):
+                assert self._per_dim_values(alias, form) == bare, form
+        finally:
+            server._open_files.pop(alias, None)
+            server._dax_cache.pop(alias, None)
+
+    def test_evaluate_dax_bracketed(self, tmp_path):
+        p = str(tmp_path / "brkt2.pbix")
+        _build_pbix_with_measures(p)
+        alias = "issueA2"
+        try:
+            server.pbix_open(p, alias)
+            out = json.loads(server.pbix_evaluate_dax(
+                alias=alias, measures="'Items'[Total Price]"))
+            assert out["success"] is True
+            assert out["results"][0]["name"] == "Total Price"
+            assert out["results"][0]["value"] == 35.0
+            assert out["results"][0]["status"] == "ok"
+        finally:
+            server._open_files.pop(alias, None)
+            server._dax_cache.pop(alias, None)
+
+    def test_unknown_measure_typed_error(self, tmp_path):
+        p = str(tmp_path / "brkt3.pbix")
+        _build_pbix_with_measures(p)
+        alias = "issueA3"
+        try:
+            server.pbix_open(p, alias)
+            for tool in (server.pbix_evaluate_dax,
+                         lambda **kw: server.pbix_evaluate_dax_per_dimension(
+                             dimension="Items.Category", **kw)):
+                out = json.loads(tool(alias=alias, measures="[Total Pric]"))
+                assert out["success"] is False
+                assert out["error_code"] == "DAX_MEASURE_NOT_FOUND"
+                assert "Total Price" in out["message"]  # close-match hint
+                assert "Traceback" not in out["message"]
+        finally:
+            server._open_files.pop(alias, None)
+            server._dax_cache.pop(alias, None)
+
+    def test_split_respects_brackets_and_quotes(self):
+        assert server._split_measure_list("[A, B],'T, U'[C], D") == \
+            ["[A, B]", "'T, U'[C]", "D"]
+
+    def test_normalization_forms(self):
+        defs = {"Pipeline Value": "1", "Win %": "2"}
+        assert server._parse_measure_names(
+            "[Pipeline Value], 'Sales'[Win %], Pipeline Value", defs) == \
+            ["Pipeline Value", "Win %", "Pipeline Value"]
+
+
+class TestDimensionParseTypedError:
+    """Issue #B: the per-dimension tool's `except ValueError` handler read
+    e.message/e.code, which plain ValueError lacks — the handler itself raised
+    AttributeError and the tool reported a double traceback."""
+
+    def test_bracket_dimension_clean_error(self, tmp_path):
+        p = str(tmp_path / "dim.pbix")
+        _build_pbix_with_measures(p)
+        alias = "issueB"
+        try:
+            server.pbix_open(p, alias)
+            out = json.loads(server.pbix_evaluate_dax_per_dimension(
+                alias=alias, measures="Total Price", dimension="Items[Category]"))
+            assert out["success"] is False
+            assert "Expected 'Table.Column' format" in out["message"]
+            assert "has no attribute" not in out["message"]
+            assert "Traceback" not in out["message"]
+            assert out["error_code"] == "DIMENSION_INVALID"
+        finally:
+            server._open_files.pop(alias, None)
+            server._dax_cache.pop(alias, None)
+
+    def test_dimension_parse_error_type(self):
+        import pytest
+
+        from pbix_mcp.errors import DimensionParseError, PBIXMCPError
+        from pbix_mcp.models.requests import DimensionRef
+        with pytest.raises(DimensionParseError) as ei:
+            DimensionRef.parse("NoDotHere")
+        # both a ValueError (old callers) and a typed PBIXMCPError (.message/.code)
+        assert isinstance(ei.value, ValueError)
+        assert isinstance(ei.value, PBIXMCPError)
+        assert ei.value.code == "DIMENSION_INVALID"
+        assert "Expected 'Table.Column' format" in ei.value.message
+
+
+class TestVisualSortAuthoring:
+    """Issue #C: no visual-level sort was ever authored — the service fell back
+    to category-ascending order on every pbix-mcp visual. Opt-in sort_by must
+    write prototypeQuery.OrderBy AND the same clause in the compiled query."""
+
+    _CFG = json.dumps({"singleVisual": {
+        "visualType": "clusteredColumnChart",
+        "projections": {"Category": [{"queryRef": "Items.Category"}],
+                        "Y": [{"queryRef": "Items.Total Price"}]},
+        "prototypeQuery": {
+            "Version": 2,
+            "From": [{"Name": "i", "Entity": "Items", "Type": 0}],
+            "Select": [
+                {"Column": {"Expression": {"SourceRef": {"Source": "i"}},
+                            "Property": "Category"}, "Name": "Items.Category"},
+                {"Measure": {"Expression": {"SourceRef": {"Source": "i"}},
+                             "Property": "Total Price"}, "Name": "Items.Total Price"},
+            ],
+        },
+    }})
+
+    def _last_vc(self, alias):
+        layout = server._get_layout(server._open_files[alias]["work_dir"])
+        return (layout.get("sections") or layout.get("pages"))[0]["visualContainers"][-1]
+
+    def test_add_visual_sort_in_prototype_and_query(self, tmp_path):
+        p = str(tmp_path / "sort.pbix")
+        _build_pbix_with_measures(p)
+        alias = "issueC"
+        try:
+            server.pbix_open(p, alias)
+            out = json.loads(server.pbix_add_visual(
+                alias, 0, "clusteredColumnChart", config_json=self._CFG,
+                sort_by="[Total Price]", sort_direction="desc"))
+            assert out["success"] is True, out
+            vc = self._last_vc(alias)
+            ob = json.loads(vc["config"])["singleVisual"]["prototypeQuery"]["OrderBy"]
+            assert ob == [{"Direction": 2, "Expression": {"Measure": {
+                "Expression": {"SourceRef": {"Source": "i"}},
+                "Property": "Total Price"}}}]
+            q = json.loads(vc["query"])
+            assert q["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]["OrderBy"] == ob
+        finally:
+            server._open_files.pop(alias, None)
+
+    def test_add_visual_unknown_sort_field_fails_loud(self, tmp_path):
+        p = str(tmp_path / "sort2.pbix")
+        _build_pbix_with_measures(p)
+        alias = "issueC2"
+        try:
+            server.pbix_open(p, alias)
+            out = json.loads(server.pbix_add_visual(
+                alias, 0, "clusteredColumnChart", config_json=self._CFG,
+                sort_by="[Nope]"))
+            assert out["success"] is False
+            assert "matches none" in out["message"]
+        finally:
+            server._open_files.pop(alias, None)
+
+    def test_set_visual_sort_and_clear(self, tmp_path):
+        p = str(tmp_path / "sort3.pbix")
+        _build_pbix_with_measures(p)
+        alias = "issueC3"
+        try:
+            server.pbix_open(p, alias)
+            server.pbix_add_visual(alias, 0, "clusteredColumnChart",
+                                   config_json=self._CFG)
+            out = json.loads(server.pbix_set_visual_sort(
+                alias, 0, 0, sort_by="Items.Category", sort_direction="asc"))
+            assert out["success"] is True, out
+            vc = self._last_vc(alias)
+            ob = json.loads(vc["config"])["singleVisual"]["prototypeQuery"]["OrderBy"]
+            assert ob[0]["Direction"] == 1 and "Column" in ob[0]["Expression"]
+            q = json.loads(vc["query"])
+            assert q["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]["OrderBy"] == ob
+
+            out = json.loads(server.pbix_set_visual_sort(alias, 0, 0, sort_by=""))
+            assert out["success"] is True
+            vc = self._last_vc(alias)
+            assert "OrderBy" not in json.loads(vc["config"])["singleVisual"]["prototypeQuery"]
+        finally:
+            server._open_files.pop(alias, None)
+
+    def test_pbir_export_translates_order_by(self, tmp_path):
+        p = str(tmp_path / "sort4.pbix")
+        _build_pbix_with_measures(p)
+        alias = "issueC4"
+        try:
+            server.pbix_open(p, alias)
+            server.pbix_add_visual(alias, 0, "clusteredColumnChart",
+                                   config_json=self._CFG,
+                                   sort_by="'Items'[Total Price]")
+            cfg = json.loads(self._last_vc(alias)["config"])
+            pbir = server._pbix_config_to_pbir_visual(cfg, 0, 0, 300, 200)
+            sd = pbir["visual"]["query"]["sortDefinition"]
+            assert sd["isDefaultSort"] is False
+            assert sd["sort"] == [{"field": {"Measure": {
+                "Expression": {"SourceRef": {"Entity": "Items"}},
+                "Property": "Total Price"}}, "direction": "Descending"}]
+        finally:
+            server._open_files.pop(alias, None)
+
+
+class TestMeasureNameEdgeCases:
+    """Hardening from the pre-release adversarial review of issue #A/#C fixes."""
+
+    def test_apostrophe_in_bare_name_does_not_swallow_comma(self):
+        assert server._split_measure_list("Tom's Margin, Sales") == \
+            ["Tom's Margin", "Sales"]
+        assert server._parse_measure_names(
+            "Tom's Margin, Sales", {"Tom's Margin": "1", "Sales": "2"}) == \
+            ["Tom's Margin", "Sales"]
+
+    def test_escaped_quote_table_qualifier(self):
+        # 'O''Brien Sales'[M] -> table "O'Brien Sales", measure M
+        assert server._parse_measure_names(
+            "'O''Brien Sales'[M]", {"M": "1"}) == ["M"]
+
+    def test_exact_model_name_beats_normalization(self):
+        # A real measure literally named "Cost [USD]" must never be re-parsed
+        # as table "Cost" + measure "USD".
+        defs = {"Cost [USD]": "1", "USD": "2"}
+        assert server._parse_measure_names("Cost [USD]", defs) == ["Cost [USD]"]
+        # ...but when no exact match exists, normalization still applies.
+        assert server._parse_measure_names("Cost [USD]", {"USD": "2"}) == ["USD"]
+
+    def test_case_insensitive_fallback_to_canonical(self):
+        # Power BI names are case-insensitive; resolve to the model's casing
+        # (matching attach_order_by's semantics on the sort path).
+        defs = {"Total Price": "1"}
+        assert server._parse_measure_names("[total price]", defs) == ["Total Price"]
+        assert server._parse_measure_names("TOTAL PRICE", defs) == ["Total Price"]
+
+    def test_pbir_export_skips_unknown_order_by_shapes(self):
+        # A HierarchyLevel OrderBy (Desktop-authored) must not leak alias-based
+        # SourceRefs into the PBIR sortDefinition — skip -> default marker.
+        cfg = {"name": "v1", "singleVisual": {
+            "visualType": "lineChart",
+            "projections": {"Category": [{"queryRef": "d.H.Year"}]},
+            "prototypeQuery": {
+                "Version": 2,
+                "From": [{"Name": "d", "Entity": "Dates", "Type": 0}],
+                "Select": [{"HierarchyLevel": {"Expression": {}}, "Name": "d.H.Year"}],
+                "OrderBy": [{"Direction": 1, "Expression": {
+                    "HierarchyLevel": {"Expression": {"Hierarchy": {
+                        "Expression": {"SourceRef": {"Source": "d"}}}}}}}],
+            },
+        }}
+        pbir = server._pbix_config_to_pbir_visual(cfg, 0, 0, 100, 100)
+        assert pbir["visual"]["query"]["sortDefinition"] == \
+            {"sort": [], "isDefaultSort": True}

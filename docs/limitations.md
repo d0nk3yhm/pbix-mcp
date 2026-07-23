@@ -37,7 +37,7 @@ The bundled `PBIX HTML` custom visual (`pbix_add_html_visual`, see
 | Content size | The HTML content measure must stay under ~32,000 characters (Analysis Services silently truncates a longer text cell); `pbix_add_html_visual` raises before the limit. |
 | Legacy layout only | Embedding the custom visual requires the legacy `Report/Layout` format; the PBIR `Report/definition` format is not yet supported. |
 | Cross-filter needs a bound field | `category_field` cross-filtering only affects visuals reachable (through model relationships) from the bound column — same as any native visual. |
-| Uncertified | The visual uses `innerHTML` and is intentionally uncertified (not published to AppSource). |
+| Uncertified | The visual uses `innerHTML` and is intentionally uncertified (not published to AppSource). **Consequence: it renders EMPTY in the Power BI service** under default tenant trust policy (uncertified file-embedded visuals are blocked) — it is a Desktop-only capability. For service-portable rich content use [rich-content.md](rich-content.md) (SVG image measures, Deneb references). |
 
 ## Data Sources (from-scratch creation)
 
@@ -144,7 +144,12 @@ computes their VertiPaq data from a DAX expression, and the builder can't
 recompute it — a rebuild would reopen those tables empty or drop the calculated
 column. Rather than corrupt the file, a rebuild tool **refuses with a clear
 error** (`MODEL_EDIT_UNSUPPORTED`) that names the offending tables and points at
-the surgical tools (which work on all models). Full support for editing models
+the surgical tools (which work on all models). Two carve-outs: **field
+parameters** (a calculated table whose partition holds a
+`{("d", NAMEOF('T'[C]), n)}` tuple set) ARE preserved — the rebuild rebuilds
+their static rows and re-stamps the Desktop metadata shape — and a special
+table being **removed** never blocks the edit (`pbix_datamodel_remove_table`
+always works). Full support for editing models
 with **calculated** tables/columns needs verbatim VertiPaq preservation (copying
 the computed column bytes through untouched, rather than re-encoding them) and is
 a tracked follow-up.

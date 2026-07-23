@@ -17,6 +17,7 @@ type codes were taken from real Desktop reports (sales_demo, GeoSales corpus).
 from __future__ import annotations
 
 import copy
+import re
 
 _TABLE_TYPES = {"tableEx", "table"}
 # matrix / pivotTable cross rows against columns — a fundamentally different
@@ -51,6 +52,21 @@ _TYPE_CODES: dict[str, tuple[int, int]] = {
     "DateTime": (519, 4),
 }
 _DEFAULT_CODES = (259, 1)  # unknown -> numeric/decimal (the common measure case)
+
+# prototypeQuery.OrderBy Direction codes (Desktop's semantic-query sort enum).
+SORT_ASCENDING = 1
+SORT_DESCENDING = 2
+_DIRECTIONS = {
+    "asc": SORT_ASCENDING, "ascending": SORT_ASCENDING, "1": SORT_ASCENDING,
+    "desc": SORT_DESCENDING, "descending": SORT_DESCENDING, "2": SORT_DESCENDING,
+}
+
+# DAX-style field reference: [Name], 'Table'[Name], or Table[Name].
+# The quoted alternative accepts DAX's doubled-quote escape ('O''Brien'[Col]);
+# the captured table is unescaped before comparison.
+_FIELD_REF_RE = re.compile(
+    r"^\s*(?:'((?:[^']|'')+)'|([^'\[\]]+?))?\s*\[\s*([^\[\]]+?)\s*\]\s*$"
+)
 
 
 def _type_codes(data_type: str | None) -> tuple[int, int]:
@@ -99,6 +115,7 @@ def apply_implicit_aggregations(single_visual: dict, resolve_type=None) -> dict[
                 for role, items in projections.items() for it in items}
 
     renamed: dict[str, str] = {}
+    agg_selects: dict = {}   # (source alias/entity, property) -> mutated select
     for sel in selects:
         if "Column" not in sel:
             continue                       # measures / explicit aggregations
@@ -123,6 +140,7 @@ def apply_implicit_aggregations(single_visual: dict, resolve_type=None) -> dict[
         sel["Aggregation"] = {"Expression": {"Column": col}, "Function": func}
         sel["Name"] = new_ref
         renamed[old_ref] = new_ref
+        agg_selects[(src.get("Source") or src.get("Entity"), prop)] = sel
 
     if renamed:
         for items in projections.values():
@@ -130,7 +148,115 @@ def apply_implicit_aggregations(single_visual: dict, resolve_type=None) -> dict[
                 ref = it.get("queryRef")
                 if ref in renamed:
                     it["queryRef"] = renamed[ref]
+        # An OrderBy on a column that just became an implicit Aggregation must
+        # sort by the aggregate too (Desktop stores the Aggregation expression
+        # in OrderBy for such sorts), or the sort references a field the query
+        # no longer selects.
+        for ob in (proto.get("OrderBy") or []):
+            col = (ob.get("Expression") or {}).get("Column")
+            if not col:
+                continue
+            src = col.get("Expression", {}).get("SourceRef", {})
+            key = (src.get("Source") or src.get("Entity"), col.get("Property", ""))
+            sel = agg_selects.get(key)
+            if sel is not None:
+                ob["Expression"] = {"Aggregation": copy.deepcopy(sel["Aggregation"])}
     return renamed
+
+
+def attach_order_by(single_visual: dict, sort_by: str,
+                    direction: str = "desc") -> tuple[str, int]:
+    """Attach a Desktop-style ``prototypeQuery.OrderBy`` clause sorting the
+    visual by one of its own projected fields.
+
+    Desktop authors ``OrderBy: [{Direction: 1|2, Expression: {Measure|Column|
+    Aggregation: ...}}]`` on the prototype; :func:`compile_visual_binding`
+    deep-copies the prototype into the compiled ``query``, so calling this
+    BEFORE compiling carries the clause into both places. Without an OrderBy
+    the Power BI service falls back to category-ascending query order.
+
+    Parameters
+    ----------
+    single_visual : dict
+        The ``config.singleVisual`` object (needs ``prototypeQuery.Select``).
+    sort_by : str
+        The field to sort by, accepted as a bare name (``Pipeline Value``), a
+        DAX-style reference (``[Pipeline Value]``, ``'Table'[Col]``,
+        ``Table[Col]``), or a queryRef (``Table.Field``).
+    direction : str
+        ``asc``/``ascending`` or ``desc``/``descending`` (case-insensitive).
+
+    Returns
+    -------
+    (query_ref, direction_code) : tuple[str, int]
+        The queryRef of the matched Select and the numeric Direction written.
+
+    Raises
+    ------
+    ValueError
+        Unknown direction, no prototypeQuery, or ``sort_by`` matching none of
+        the visual's fields (the message lists what IS available).
+    """
+    dcode = _DIRECTIONS.get(str(direction).strip().lower())
+    if dcode is None:
+        raise ValueError(
+            f"Invalid sort direction {direction!r} — use 'asc' or 'desc'.")
+
+    proto = single_visual.get("prototypeQuery") or {}
+    selects = proto.get("Select") or []
+    if not selects:
+        raise ValueError("Visual has no prototypeQuery.Select — nothing to sort by.")
+    alias2entity = {f.get("Name"): f.get("Entity") for f in proto.get("From", [])}
+
+    ref_m = _FIELD_REF_RE.match(sort_by or "")
+    want_table = (ref_m.group(1) or ref_m.group(2) or "").strip() if ref_m else None
+    if want_table:
+        want_table = want_table.replace("''", "'")
+    want_name = ref_m.group(3).strip() if ref_m else (sort_by or "").strip()
+    if not want_name:
+        raise ValueError("sort_by must name a field on the visual.")
+
+    def _inner(sel):
+        if "Aggregation" in sel:
+            inner = sel["Aggregation"].get("Expression", {})
+            return inner.get("Column") or inner.get("Measure") or {}
+        return sel.get("Measure") or sel.get("Column") or {}
+
+    def _matches(sel, fold):
+        node = _inner(sel)
+        prop = node.get("Property", "")
+        src = node.get("Expression", {}).get("SourceRef", {})
+        entity = alias2entity.get(src.get("Source"), src.get("Entity")) or ""
+        name = sel.get("Name", "")
+        w_name, w_table = fold(want_name), fold(want_table or "")
+        if ref_m:  # bracketed: match Property (+ entity when qualified)
+            return fold(prop) == w_name and (not want_table or fold(entity) == w_table)
+        return (fold(name) == w_name or fold(prop) == w_name
+                or fold(f"{entity}.{prop}") == w_name)
+
+    match = next((s for s in selects if _matches(s, str)), None)
+    if match is None:  # retry case-insensitively (PBI names are case-insensitive)
+        match = next((s for s in selects if _matches(s, str.lower)), None)
+    if match is None:
+        available = ", ".join(repr(s.get("Name", "?")) for s in selects)
+        raise ValueError(
+            f"sort_by {sort_by!r} matches none of the visual's fields. "
+            f"Available: {available}")
+
+    expr = None
+    for key in ("Aggregation", "Measure", "Column"):
+        if key in match:
+            expr = {key: copy.deepcopy(match[key])}
+            break
+    if expr is None:
+        # e.g. a HierarchyLevel select (Desktop date hierarchies) — refuse
+        # cleanly rather than author an OrderBy shape Desktop never writes.
+        raise ValueError(
+            f"Field {match.get('Name', sort_by)!r} has an unsupported "
+            "expression shape for sorting — only Column, Measure, and "
+            "Aggregation fields can be sorted.")
+    proto["OrderBy"] = [{"Direction": dcode, "Expression": expr}]
+    return match.get("Name", ""), dcode
 
 
 def compile_visual_binding(single_visual: dict, resolve_type=None):

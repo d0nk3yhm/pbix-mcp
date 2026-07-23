@@ -153,6 +153,7 @@ class PBIXBuilder:
         description: str = "",
         *,
         format_string: str | None = None,
+        data_category: str | None = None,
     ) -> "PBIXBuilder":
         """Add a DAX measure to a table.
 
@@ -166,6 +167,8 @@ class PBIXBuilder:
                            so PBI Desktop renders the measure formatted.
                            Keyword-only to prevent positional mix-ups with
                            description. None or "" means no explicit format.
+            data_category: Optional Measure.DataCategory (e.g. "ImageUrl" so
+                           cells render a data-URI string as an image).
         """
         self._measures.append({
             "table": table,
@@ -173,6 +176,7 @@ class PBIXBuilder:
             "expression": expression,
             "description": description,
             "format_string": format_string,
+            "data_category": data_category,
         })
         return self
 
@@ -447,7 +451,7 @@ class PBIXBuilder:
             for entity, alias in from_sources.items()
         ]
 
-        return {
+        result = {
             "projections": projections,
             "prototypeQuery": {
                 "Version": 2,
@@ -455,6 +459,28 @@ class PBIXBuilder:
                 "Select": selects,
             },
         }
+
+        # Opt-in visual-level sort: cfg["sort"] is either a field name (sorted
+        # descending, Desktop's usual chart default) or {"by": <field>,
+        # "direction": "asc"|"desc"}. Authors prototypeQuery.OrderBy; the
+        # binding compile deep-copies it into the compiled query.
+        sort_cfg = cfg.get("sort")
+        if sort_cfg:
+            if isinstance(sort_cfg, str):
+                sort_field, sort_dir = sort_cfg, "desc"
+            elif isinstance(sort_cfg, dict):
+                sort_field = sort_cfg.get("by") or sort_cfg.get("field") or ""
+                sort_dir = sort_cfg.get("direction", "desc")
+            else:
+                raise ValueError(
+                    f"visual sort must be a field name or dict, got: {sort_cfg!r}")
+            from pbix_mcp.report_binding import attach_order_by
+            try:
+                attach_order_by(result, sort_field, sort_dir)
+            except ValueError as e:
+                raise ValueError(f"visual sort ({visual_type}): {e}")
+
+        return result
 
     # ------------------------------------------------------------------
     # Pre-build validation
@@ -1502,7 +1528,7 @@ def _modify_metadata_and_encode(
                     ) VALUES (
                         ?, ?, ?, NULL,
                         ?, ?,
-                        NULL, NULL, 0, 1,
+                        ?, NULL, 0, 1,
                         0, 0, 1, 1,
                         -1, 0, 0,
                         ?, ?, 1,
@@ -1516,6 +1542,9 @@ def _modify_metadata_and_encode(
                     )""",
                     (col_id, table_id, col_name,
                      amo_type, amo_type,
+                     # DataCategory (e.g. "ImageUrl" -> cells render the value
+                     # as an image; survives rebuilds via the collection query).
+                     col_def.get("data_category") or None,
                      # SummarizeBy: numeric columns default to 1 (Default -> Sum),
                      # so Power BI can implicitly aggregate them on a value axis
                      # (a bar/column chart fed a raw numeric column renders empty
@@ -1702,13 +1731,14 @@ def _modify_metadata_and_encode(
                     ?, ?, 0, 1,
                     ?, ?,
                     0, 0, NULL, NULL,
-                    0, NULL,
+                    0, ?,
                     0, ?, NULL
                 )""",
                 (m_id, tid, mdef["name"], mdef.get("description", ""),
                  mdef["expression"],
                  mdef.get("format_string") or None,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP,
+                 mdef.get("data_category") or None,
                  str(uuid.uuid4())),
             )
 

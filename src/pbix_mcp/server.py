@@ -16,9 +16,12 @@ Architecture:
   - DataModel writing works via ABF round-trip (decompress → modify → recompress)
 """
 
+import copy
+import difflib
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import struct
@@ -34,6 +37,7 @@ from mcp.server.fastmcp import FastMCP
 from pbix_mcp.errors import (
     ABFRebuildError,
     DataModelCompressionError,
+    DAXMeasureNotFoundError,
     FileAlreadyOpenError,
     FileNotOpenError,
     InvalidPBIXError,
@@ -1670,6 +1674,8 @@ def pbix_add_visual(
     width: int = 300,
     height: int = 200,
     config_json: str = "",
+    sort_by: str = "",
+    sort_direction: str = "desc",
 ) -> str:
     """Add a new visual to a report page.
 
@@ -1686,6 +1692,15 @@ def pbix_add_visual(
         width: Width in pixels
         height: Height in pixels
         config_json: Optional full config JSON to merge (for advanced properties)
+        sort_by: Optional visual-level sort field — one of the visual's own
+            fields, as a bare name ("Pipeline Value"), DAX-style reference
+            ("[Pipeline Value]", "'Table'[Col]"), or queryRef ("Table.Field").
+            Authors the Desktop-style prototypeQuery.OrderBy clause (and the
+            same clause in the compiled query); without it the Power BI
+            service falls back to category-ascending query order. Requires a
+            data binding in config_json (prototypeQuery + projections).
+        sort_direction: "asc"/"ascending" or "desc"/"descending" (default
+            "desc", matching Desktop's usual value-descending chart default)
     """
     try:
         info = _ensure_open(alias)
@@ -1845,6 +1860,23 @@ def pbix_add_visual(
                 pos["x"] = x
                 pos["y"] = y
 
+        # Opt-in visual-level sort: author prototypeQuery.OrderBy BEFORE the
+        # config is serialized and the binding compiled (the compiler deep-
+        # copies the prototype, carrying the clause into the compiled query).
+        # Unlike the best-effort binding compile below, a bad sort fails LOUD —
+        # silently dropping a requested sort would be another silent-wrong.
+        if sort_by:
+            sv_sort = config.get("singleVisual", {})
+            if not (sv_sort.get("prototypeQuery") or {}).get("Select"):
+                raise LayoutParseError(
+                    "sort_by requires a data binding — provide config_json with "
+                    "singleVisual.prototypeQuery + projections.")
+            from pbix_mcp.report_binding import attach_order_by
+            try:
+                attach_order_by(sv_sort, sort_by, sort_direction)
+            except ValueError as e:
+                raise LayoutParseError(str(e))
+
         container = {
             "x": x,
             "y": y,
@@ -1891,6 +1923,86 @@ def pbix_add_visual(
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         raise LayoutParseError(str(e))
+
+
+@mcp.tool()
+def pbix_set_visual_sort(
+    alias: str,
+    page_index: int,
+    visual_index: int,
+    sort_by: str = "",
+    sort_direction: str = "desc",
+) -> str:
+    """Set (or clear) the visual-level sort on an existing data visual.
+
+    Authors the Desktop-style ``prototypeQuery.OrderBy`` clause and recompiles
+    the visual's query/dataTransforms binding so the compiled query carries the
+    same clause. Without an OrderBy, the Power BI service falls back to
+    category-ascending query order — Desktop's usual value-descending bar/
+    column default comes from Desktop AUTHORING an OrderBy, not the renderer.
+
+    Args:
+        alias: The alias of the open file
+        page_index: Zero-based page index
+        visual_index: Zero-based visual index on the page
+        sort_by: Field to sort by — one of the visual's own fields, as a bare
+            name ("Pipeline Value"), DAX-style reference ("[Pipeline Value]",
+            "'Table'[Col]", "Table[Col]"), or queryRef ("Table.Field").
+            Empty string clears any existing sort.
+        sort_direction: "asc"/"ascending" or "desc"/"descending" (default "desc")
+    """
+    try:
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError("No layout found")
+
+        sections = layout.get("sections", [])
+        if page_index < 0 or page_index >= len(sections):
+            raise LayoutParseError(f"Page index {page_index} out of range")
+        containers = sections[page_index].get("visualContainers", [])
+        if visual_index < 0 or visual_index >= len(containers):
+            raise LayoutParseError(f"Visual index {visual_index} out of range")
+
+        vc = containers[visual_index]
+        config = _parse_visual_config(vc)
+        sv = config.get("singleVisual", {})
+        proto = sv.get("prototypeQuery") or {}
+        if not proto.get("Select"):
+            raise LayoutParseError(
+                f"Visual {visual_index} ({sv.get('visualType', 'unknown')}) has "
+                "no data binding (prototypeQuery) — nothing to sort.")
+
+        from pbix_mcp.report_binding import SORT_ASCENDING, attach_order_by, compile_visual_binding
+        if sort_by:
+            try:
+                matched_ref, dcode = attach_order_by(sv, sort_by, sort_direction)
+            except ValueError as e:
+                raise LayoutParseError(str(e))
+            word = "ascending" if dcode == SORT_ASCENDING else "descending"
+            msg = f"Sort set: {matched_ref} {word}."
+        else:
+            proto.pop("OrderBy", None)
+            msg = "Sort cleared (service will use its default query order)."
+
+        # Recompile so the compiled query/dataTransforms match the prototype
+        # (compile also re-applies implicit value-role aggregations, mutating
+        # the config — serialize it AFTER, like pbix_add_visual does).
+        q, dt = compile_visual_binding(sv, _report_type_resolver(info))
+        if q is not None:
+            vc["query"] = json.dumps(q, ensure_ascii=False)
+            vc["dataTransforms"] = json.dumps(dt, ensure_ascii=False)
+            vc.setdefault("filters", "[]")
+        vc["config"] = json.dumps(config, ensure_ascii=False)
+
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+        return ToolResponse.ok(msg).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}",
+                                  getattr(e, "code", None)).to_text()
 
 
 @mcp.tool()
@@ -2760,6 +2872,75 @@ def pbix_add_custom_visual(alias: str, pbiviz_path: str) -> str:
 
 
 @mcp.tool()
+def pbix_reference_public_visual(alias: str, guid: str) -> str:
+    """Reference a public (AppSource) custom visual by GUID — no file payload.
+
+    Certified AppSource visuals (e.g. Deneb, GUID
+    ``deneb7E15AEF80B9E4D4F8E12924291ECE89A``) are resolved by the Power BI
+    service FROM APPSOURCE for report consumers — referencing one needs only
+    its GUID in the layout's top-level ``publicCustomVisuals`` array. Unlike
+    pbix_add_custom_visual, NOTHING is extracted into
+    ``Report/CustomVisuals/`` and no .pbiviz is required: zero file parts,
+    zero [Content_Types].xml changes, resourcePackages untouched
+    (service-verified against app.powerbi.com on a certified-only tenant).
+
+    After registering, place the visual with
+    ``pbix_add_visual(alias, page_index, visual_type="<guid>", ...)`` — for
+    Deneb, put the Vega-Lite/Vega spec in
+    ``config.singleVisual.objects.vega`` (string-Literal properties
+    ``provider``/``version``/``jsonSpec``/``jsonConfig``) and bind fields to
+    its single ``dataset`` role. De-register with pbix_remove_custom_visual
+    (the folder branch is a no-op for reference-only registrations).
+
+    Args:
+        alias: The alias of the open file
+        guid: The visual's marketplace GUID (from its pbiviz manifest —
+            letters/digits/underscores only, e.g.
+            "deneb7E15AEF80B9E4D4F8E12924291ECE89A")
+    """
+    try:
+        logger.info("pbix_reference_public_visual guid=%r", guid)
+        info = _ensure_open(alias)
+        work_dir = info["work_dir"]
+
+        # Same validity rule as the .pbiviz manifest reader.
+        guid = (guid or "").strip()
+        if not guid or not guid.replace("_", "").isalnum():
+            raise LayoutParseError(f"Invalid custom visual GUID: {guid!r} "
+                                   "(letters, digits, and underscores only)")
+
+        layout = _get_layout(work_dir)
+        if not layout:
+            raise LayoutParseError(
+                "No legacy Report/Layout found. Custom-visual registration for "
+                "the PBIR (Report/definition) format is not yet supported."
+            )
+
+        pcv = layout.get("publicCustomVisuals")
+        if not isinstance(pcv, list):
+            pcv = []
+        already = guid in pcv
+        if not already:
+            pcv.append(guid)
+        layout["publicCustomVisuals"] = pcv
+        _set_layout(work_dir, layout)
+        info["modified"] = True
+
+        return ToolResponse.ok(
+            (f"GUID '{guid}' was already registered." if already else
+             f"Public visual '{guid}' registered in publicCustomVisuals.") +
+            "\nThe service auto-loads certified visuals from AppSource; "
+            "place one with:\n"
+            f"  pbix_add_visual(alias, page_index, visual_type=\"{guid}\", ...)",
+            data={"publicCustomVisuals": pcv},
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
+
+
+@mcp.tool()
 def pbix_remove_custom_visual(alias: str, visual_name: str) -> str:
     """Remove a custom visual package from the report.
 
@@ -3319,6 +3500,93 @@ def pbix_html_template(kind: str = "", spec_json: str = "") -> str:
         return ToolResponse.ok(
             message=f"Rendered '{kind}' ({len(html)} chars).",
             data={"html": html}).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_svg_measure(kind: str = "", spec_json: str = "", alias: str = "",
+                     measure_table: str = "", measure_name: str = "") -> str:
+    """Generate DAX for an SVG data-URI image measure — optionally add it.
+
+    Emits a DAX expression evaluating to ``data:image/svg+xml;utf8,<svg …>``.
+    With ``DataCategory='ImageUrl'`` such a measure renders as a live vector
+    image in table/matrix cells — in Power BI Desktop AND the service
+    (service-verified), PDF export, and subscriptions — with zero custom
+    visuals; the SVG recomputes under any filter context. Colors are
+    percent-encoded (%23…), utf8 (never base64), and numeric interpolation is
+    locale-proof.
+
+    Call with no ``kind`` to list the available templates. Templates:
+    data_bar (proportional bar), bullet (bar + target tick), pill (badge with
+    a DAX text expression), icon_updown (arrow by sign), sparkline (polyline
+    of a measure per category column). Dynamic parts of a spec are DAX
+    sub-expressions (e.g. "value": "[Total Revenue]"); styling parts are
+    plain values.
+
+    Args:
+        kind: Template name (empty = list templates)
+        spec_json: JSON object with the template's parameters, e.g.
+            '{"value": "[Total Revenue]", "max_value": "CALCULATE([Total Revenue], ALL(Sales))"}'
+        alias: Optional — with measure_name, also ADD the measure to this open
+            file (with DataCategory='ImageUrl') instead of just returning DAX
+        measure_table: Optional home table for the added measure
+            (default: first table)
+        measure_name: Optional name for the added measure
+    """
+    try:
+        logger.info("pbix_svg_measure kind=%r add=%s", kind, bool(measure_name))
+        from pbix_mcp import svg_measures
+        if not kind:
+            return ToolResponse.ok(
+                message=("SVG measure templates. Provide `kind` + `spec_json`; "
+                         "add `alias` + `measure_name` to author the measure "
+                         "directly (DataCategory=ImageUrl)."),
+                data={"templates": {k: v[1] for k, v in svg_measures.TEMPLATES.items()}},
+            ).to_text()
+        try:
+            spec = json.loads(spec_json) if spec_json else {}
+        except json.JSONDecodeError as e:
+            return ToolResponse.error(f"Invalid spec_json: {e}", "BAD_SPEC").to_text()
+        if not isinstance(spec, dict):
+            return ToolResponse.error("spec_json must be a JSON object.", "BAD_SPEC").to_text()
+        try:
+            dax = svg_measures.render(kind, spec)
+        except (ValueError, TypeError) as e:
+            return ToolResponse.error(str(e), "BAD_TEMPLATE").to_text()
+        if len(dax) > _DAX_STRING_MAX:
+            return ToolResponse.error(
+                f"Generated DAX is {len(dax)} chars; Power BI silently "
+                f"truncates text past ~{_DAX_STRING_MAX}.", "BAD_TEMPLATE").to_text()
+
+        added = False
+        if alias or measure_name:
+            if not (alias and measure_name):
+                return ToolResponse.error(
+                    "To add the measure, provide BOTH alias and measure_name.",
+                    "BAD_SPEC").to_text()
+            info = _ensure_open(alias)
+            home = measure_table or _first_model_table(info)
+            add_res = json.loads(pbix_datamodel_add_measure(
+                alias, home, measure_name, dax,
+                description=f"SVG image measure ({kind})",
+                data_category="ImageUrl"))
+            if not add_res.get("success", False):
+                return ToolResponse.error(
+                    f"Measure add failed: {add_res.get('message')}",
+                    add_res.get("error_code") or "MEASURE_ADD_FAILED").to_text()
+            added = True
+            measure_table = home
+
+        msg = f"Rendered '{kind}' DAX ({len(dax)} chars)."
+        if added:
+            msg += (f" Added measure '{measure_name}' on '{measure_table}' "
+                    f"with DataCategory=ImageUrl.")
+        return ToolResponse.ok(
+            message=msg,
+            data={"dax": dax, "chars": len(dax), "added": added}).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
@@ -5432,7 +5700,7 @@ def pbix_replace_value(
             _AMO_TO_TYPE = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime",
                             10: "Decimal", 11: "Boolean"}
             col_rows = conn.execute(
-                """SELECT c.ExplicitName, c.ExplicitDataType
+                """SELECT c.ExplicitName, c.ExplicitDataType, c.DataCategory
                    FROM [Column] c
                    JOIN [Table] t ON c.TableID = t.ID
                    WHERE t.Name = ? AND c.Type = 1
@@ -5453,7 +5721,8 @@ def pbix_replace_value(
 
         columns_def = [
             {"name": cr["ExplicitName"],
-             "data_type": _AMO_TO_TYPE.get(cr["ExplicitDataType"], "String")}
+             "data_type": _AMO_TO_TYPE.get(cr["ExplicitDataType"], "String"),
+             "data_category": cr["DataCategory"]}
             for cr in col_rows
         ]
 
@@ -5480,6 +5749,229 @@ def pbix_replace_value(
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "REPLACE_ERROR").to_text()
+
+
+# --- Field parameters (Desktop-recognized) ---------------------------------
+#
+# A real Desktop field parameter is a CALCULATED table whose partition holds a
+# {("Display", NAMEOF('T'[C]), n), ...} tuple set, whose three columns are
+# calc-table columns (Type=4) with the display column sorted by the hidden
+# Order column, and whose Fields column carries the ExtendedProperty
+# 'ParameterMetadata' = {"version":3,"kind":2}. Every value below was diffed
+# against Desktop-authored ground truth (test_corpus/Ecommerce_Conversion.pbix,
+# two genuine field parameters).
+#
+# pbix-mcp authors the table as ordinary static data (full VertiPaq storage —
+# exactly what Desktop's own files physically contain, since NAMEOF tuples are
+# constants) and then stamps the Desktop metadata shape on top with a
+# metadata-only splice. _rebuild_datamodel recognizes the shape, rebuilds the
+# static data, and re-stamps — so field parameters survive every rebuild-based
+# edit instead of tripping the calculated-table refusal.
+
+_FIELD_PARAM_METADATA_JSON = '{"version":3,"kind":2}'
+
+_FIELD_REF_RE = re.compile(
+    r"^\s*(?:'((?:[^']|'')+)'|([^'\[\]]+?))\s*\[\s*([^\[\]]+?)\s*\]\s*$"
+)
+
+
+def _normalize_field_ref(ref: str) -> tuple[str, str, str]:
+    """Parse a field reference ("Table[Col]" / "'Table'[Col]") and return
+    (table, name, canonical) where canonical is the DAX-quoted form
+    ("'Table'[Col]") that NAMEOF() evaluates to — the exact string Desktop
+    stores in a field parameter's Fields column."""
+    m = _FIELD_REF_RE.match(ref or "")
+    if not m:
+        raise ValueError(
+            f"Invalid field ref {ref!r} — use \"Table[Field]\" or "
+            f"\"'Table'[Field]\" (field = column or measure name)")
+    table = (m.group(1) or m.group(2) or "").strip()
+    if m.group(1):
+        table = table.replace("''", "'")
+    name = m.group(3).strip()
+    canonical = f"'{table.replace(chr(39), chr(39) * 2)}'[{name}]"
+    return table, name, canonical
+
+
+def _field_parameter_query_definition(fields: list[dict]) -> str:
+    """Build the calculated-table tuple-set DAX exactly as Desktop writes it.
+
+    ``fields`` entries carry "display" and the CANONICAL "ref" from
+    _normalize_field_ref."""
+    lines = []
+    for i, f in enumerate(fields):
+        display = f["display"].replace('"', '""')
+        lines.append(f'    ("{display}", NAMEOF({f["ref"]}), {i})')
+    return "{\n" + ",\n".join(lines) + "\n}"
+
+
+def _detect_field_parameter_shape(conn, tid: int) -> dict | None:
+    """Return {"columns": [...], "query_definition": str} when table ``tid``
+    is a field parameter whose static rows the rebuild can reproduce
+    (calculated partition + parseable NAMEOF tuple set + exactly 3 data
+    columns with physical VertiPaq storage). None = not a field parameter."""
+    prow = conn.execute(
+        "SELECT Type, QueryDefinition FROM [Partition] WHERE TableID = ? LIMIT 1",
+        (tid,),
+    ).fetchone()
+    if prow is None or prow["Type"] != 2 or not prow["QueryDefinition"]:
+        return None
+    crows = conn.execute(
+        "SELECT ExplicitName, ExplicitDataType, InferredDataType FROM [Column] "
+        "WHERE TableID = ? AND Type IN (1, 4) "
+        "AND ExplicitName NOT LIKE 'RowNumber%' ORDER BY ID",
+        (tid,),
+    ).fetchall()
+    if len(crows) != 3:
+        return None
+    col_names = [c["ExplicitName"] for c in crows]
+    try:
+        from pbix_mcp.dax.calc_tables import _parse_field_parameter
+        # Strip DAX comments first (Desktop-authored field parameters carry
+        # them), mirroring calc_tables._evaluate_table_expression.
+        qd = re.sub(r'--[^\n]*', '', prow["QueryDefinition"])
+        qd = re.sub(r'//[^\n]*', '', qd).strip()
+        parsed = _parse_field_parameter(qd, {"columns": col_names})
+    except Exception:
+        parsed = None
+    if not parsed:
+        return None
+    amo_map = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime",
+               10: "Decimal", 11: "Boolean"}
+    cols = []
+    for c in crows:
+        amo = c["ExplicitDataType"]
+        if amo == 1:  # automatic (Desktop calc-table column) -> inferred type
+            amo = c["InferredDataType"] or 2
+        cols.append({"name": c["ExplicitName"],
+                     "data_type": amo_map.get(amo, "String")})
+    return {"columns": cols, "query_definition": prow["QueryDefinition"]}
+
+
+def _apply_field_parameter_metadata(dm_path: str, specs: list[dict]) -> tuple[int, int]:
+    """Stamp Desktop's field-parameter metadata onto static 3-column tables.
+
+    Each spec = {"table": name, "query_definition": tuple-set DAX}. Applies,
+    per table (all values from Desktop-authored ground truth): Table
+    SystemFlags=2; the three data columns become calc-table columns (Type=4,
+    ExplicitDataType=1 automatic + real InferredDataType, SourceColumn
+    [Value1..3]); display column visible + sorted by the hidden Order column;
+    Fields column hidden + sorted by Order + ExtendedProperty
+    ParameterMetadata; Order column hidden, FormatString '0', SummarizeBy Sum;
+    partition flipped to calculated (Type=2) holding the NAMEOF tuple set; and
+    the display->Fields group-by wiring (RelatedColumnDetails/GroupByColumn).
+    """
+    def _do_apply(conn: sqlite3.Connection):
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        # Older pbix-mcp-built files predate these metadata tables.
+        c.execute(
+            'CREATE TABLE IF NOT EXISTS [ExtendedProperty]( [ID] INTEGER, '
+            '[ObjectID] INTEGER, [ObjectType] INTEGER, [Name] TEXT, '
+            '[Type] INTEGER, [Value] TEXT, [ModifiedTime] INTEGER, '
+            'PRIMARY KEY("ID" ASC) )')
+        c.execute(
+            'CREATE TABLE IF NOT EXISTS [RelatedColumnDetails]( [ID] INTEGER, '
+            '[ColumnID] INTEGER, [ModifiedTime] INTEGER, '
+            'PRIMARY KEY("ID" ASC) )')
+        c.execute(
+            'CREATE TABLE IF NOT EXISTS [GroupByColumn]( [ID] INTEGER, '
+            '[RelatedColumnDetailsID] INTEGER, [GroupingColumnID] INTEGER, '
+            '[ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )')
+
+        maxid_row = c.execute(
+            "SELECT Value FROM DBPROPERTIES WHERE Name = 'MAXID'").fetchone()
+        max_id = int(maxid_row[0]) if maxid_row else 0
+        import datetime
+        epoch = datetime.datetime(1601, 1, 1)
+        filetime = int(
+            (datetime.datetime.utcnow() - epoch).total_seconds() * 10_000_000)
+
+        for spec in specs:
+            tname = spec["table"]
+            trow = c.execute(
+                "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
+                (tname,)).fetchone()
+            if not trow:
+                raise ValueError(f"Field parameter table '{tname}' not found")
+            tid = trow["ID"]
+            crows = c.execute(
+                "SELECT ID FROM [Column] WHERE TableID = ? AND Type IN (1, 4) "
+                "AND ExplicitName NOT LIKE 'RowNumber%' ORDER BY ID",
+                (tid,)).fetchall()
+            if len(crows) != 3:
+                raise ValueError(
+                    f"Field parameter table '{tname}' must have exactly 3 "
+                    f"data columns, found {len(crows)}")
+            disp_id, fields_id, order_id = (r["ID"] for r in crows)
+
+            c.execute("UPDATE [Table] SET SystemFlags = 2 WHERE ID = ?", (tid,))
+            # Desktop stamps SystemFlags=2 on EVERY calc-table object (all
+            # columns incl. RowNumber, and the partition) and keeps columns
+            # MDX-visible (IsAvailableInMDX=1) — ground truth Ecommerce corpus.
+            c.execute("UPDATE [Column] SET SystemFlags = 2 WHERE TableID = ?",
+                      (tid,))
+            common = ("Type = 4, ExplicitDataType = 1, SourceColumn = ?, "
+                      "InferredName = ?, IsAvailableInMDX = 1")
+            c.execute(
+                f"UPDATE [Column] SET {common}, InferredDataType = 2, "
+                f"IsHidden = 0, SortByColumnID = ?, SummarizeBy = 2 "
+                f"WHERE ID = ?",
+                ("[Value1]", "Value1", order_id, disp_id))
+            c.execute(
+                f"UPDATE [Column] SET {common}, InferredDataType = 2, "
+                f"IsHidden = 1, SortByColumnID = ?, SummarizeBy = 2 "
+                f"WHERE ID = ?",
+                ("[Value2]", "Value2", order_id, fields_id))
+            c.execute(
+                f"UPDATE [Column] SET {common}, InferredDataType = 6, "
+                f"IsHidden = 1, SortByColumnID = 0, SummarizeBy = 3, "
+                f"FormatString = '0' WHERE ID = ?",
+                ("[Value3]", "Value3", order_id))
+            c.execute(
+                "UPDATE [Partition] SET Type = 2, Mode = 0, SystemFlags = 2, "
+                "QueryDefinition = ? WHERE TableID = ?",
+                (spec["query_definition"], tid))
+
+            # ParameterMetadata marker on the Fields column (idempotent).
+            c.execute(
+                "DELETE FROM [ExtendedProperty] WHERE ObjectID = ? "
+                "AND ObjectType = 4 AND Name = 'ParameterMetadata'",
+                (fields_id,))
+            max_id += 1
+            c.execute(
+                "INSERT INTO [ExtendedProperty] (ID, ObjectID, ObjectType, "
+                "Name, Type, Value, ModifiedTime) "
+                "VALUES (?, ?, 4, 'ParameterMetadata', 1, ?, ?)",
+                (max_id, fields_id, _FIELD_PARAM_METADATA_JSON, filetime))
+
+            # Display column groups by the Fields column (Desktop wiring).
+            c.execute(
+                "DELETE FROM [GroupByColumn] WHERE RelatedColumnDetailsID IN "
+                "(SELECT ID FROM [RelatedColumnDetails] WHERE ColumnID = ?)",
+                (disp_id,))
+            c.execute(
+                "DELETE FROM [RelatedColumnDetails] WHERE ColumnID = ?",
+                (disp_id,))
+            max_id += 1
+            rcd_id = max_id
+            c.execute(
+                "INSERT INTO [RelatedColumnDetails] (ID, ColumnID, "
+                "ModifiedTime) VALUES (?, ?, ?)", (rcd_id, disp_id, filetime))
+            c.execute(
+                "UPDATE [Column] SET RelatedColumnDetailsID = ? WHERE ID = ?",
+                (rcd_id, disp_id))
+            max_id += 1
+            c.execute(
+                "INSERT INTO [GroupByColumn] (ID, RelatedColumnDetailsID, "
+                "GroupingColumnID, ModifiedTime) VALUES (?, ?, ?, ?)",
+                (max_id, rcd_id, fields_id, filetime))
+
+        c.execute("UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'",
+                  (str(max_id),))
+        conn.commit()
+
+    return _modify_metadata_only(dm_path, _do_apply)
 
 
 def _rebuild_datamodel(
@@ -5540,6 +6032,7 @@ def _rebuild_datamodel(
         # Get all existing user tables
         tables = []
         special_tables: list[tuple[str, str]] = []
+        field_param_specs: list[dict] = []
         for trow in conn.execute(
             "SELECT ID, Name FROM [Table] WHERE ModelID = 1 "
             "AND Name NOT LIKE 'H$%' AND Name NOT LIKE 'R$%' ORDER BY ID"
@@ -5547,11 +6040,12 @@ def _rebuild_datamodel(
             tid, tname = trow["ID"], trow["Name"]
             cols = []
             for crow in conn.execute(
-                "SELECT ExplicitName, ExplicitDataType FROM [Column] "
+                "SELECT ExplicitName, ExplicitDataType, DataCategory FROM [Column] "
                 "WHERE TableID = ? AND Type = 1 ORDER BY ID", (tid,)
             ):
                 dt = _AMO_TO_TYPE.get(crow["ExplicitDataType"], "String")
-                cols.append({"name": crow["ExplicitName"], "data_type": dt})
+                cols.append({"name": crow["ExplicitName"], "data_type": dt,
+                             "data_category": crow["DataCategory"]})
 
             # Detect tables the from-scratch rebuild can't faithfully reproduce.
             # A CALCULATED table (Partition.Type=2, e.g. DATATABLE/GENERATESERIES),
@@ -5563,6 +6057,18 @@ def _rebuild_datamodel(
             # These are refused. A MEASURE-ONLY container (no data columns — a
             # "_Measures" table) IS preserved: it re-emits as a RowNumber-only
             # empty table, which the builder now supports.
+            #
+            # EXCEPTION — field parameters: a calculated table whose partition
+            # holds a {("d", NAMEOF('T'[C]), n)} tuple set IS reproducible
+            # (its rows are constants with full physical VertiPaq storage), so
+            # it is rebuilt as static data and the Desktop metadata shape is
+            # re-stamped after the rebuild (_apply_field_parameter_metadata).
+            fp = _detect_field_parameter_shape(conn, tid)
+            if fp is not None:
+                field_param_specs.append(
+                    {"table": tname, "query_definition": fp["query_definition"]})
+                tables.append({"name": tname, "columns": fp["columns"]})
+                continue
             prow = conn.execute(
                 "SELECT Type FROM [Partition] WHERE TableID = ? LIMIT 1", (tid,)
             ).fetchone()
@@ -5570,7 +6076,11 @@ def _rebuild_datamodel(
                 "SELECT COUNT(*) FROM [Column] WHERE TableID = ? AND Type IN (2, 4)",
                 (tid,),
             ).fetchone()[0]
-            if (prow is not None and prow["Type"] == 2) or n_calc_cols > 0:
+            if ((prow is not None and prow["Type"] == 2) or n_calc_cols > 0) \
+                    and tname not in remove_tables:
+                # A special table being REMOVED needs no reproduction — never
+                # let it block the edit (also the escape hatch for any
+                # unsupported table: pbix_datamodel_remove_table always works).
                 kind = ("calculated table" if (prow is not None and prow["Type"] == 2)
                         else "table with calculated columns")
                 special_tables.append((tname, kind))
@@ -5597,7 +6107,7 @@ def _rebuild_datamodel(
         measures = []
         for mrow in conn.execute(
             "SELECT t.Name as tbl, m.Name, m.Expression, m.FormatString, "
-            "m.Description "
+            "m.Description, m.DataCategory "
             "FROM Measure m JOIN [Table] t ON m.TableID = t.ID"
         ):
             measures.append({
@@ -5605,6 +6115,7 @@ def _rebuild_datamodel(
                 "expression": mrow["Expression"],
                 "format_string": mrow["FormatString"] or "",
                 "description": mrow["Description"] or "",
+                "data_category": mrow["DataCategory"],
             })
 
         # Get existing relationships — preserve the semantic columns (IsActive,
@@ -5731,11 +6242,13 @@ def _rebuild_datamodel(
         if m["table"] not in remove_tables:
             builder.add_measure(m["table"], m["name"], m["expression"],
                                 m.get("description", ""),
-                                format_string=m.get("format_string"))
+                                format_string=m.get("format_string"),
+                                data_category=m.get("data_category"))
     for m in extra_measures:
         builder.add_measure(m["table"], m["name"], m["expression"],
                             m.get("description", ""),
-                            format_string=m.get("format_string"))
+                            format_string=m.get("format_string"),
+                            data_category=m.get("data_category"))
 
     # Add all relationships (existing + new), skip removed ones and those referencing removed tables
     remove_rel_set = {(r[0], r[1], r[2], r[3]) for r in remove_relationships}
@@ -5835,10 +6348,22 @@ def _rebuild_datamodel(
 
         _modify_metadata_only(dm_path, _restore_rls)
 
+    # Re-stamp preserved field parameters (builder rebuilt them as plain
+    # static tables; restore the Desktop calculated-partition shape). A table
+    # explicitly replaced via table_updates is deliberately demoted to a
+    # plain data table — the caller overwrote its columns/rows.
+    new_size = len(new_dm)
+    if field_param_specs:
+        specs = [s for s in field_param_specs
+                 if s["table"] not in remove_tables
+                 and s["table"] not in table_updates]
+        if specs:
+            _, new_size = _apply_field_parameter_metadata(dm_path, specs)
+
     # Clear DAX cache — rebuild changes data
     _dax_cache.clear()
 
-    return len(dm_bytes), len(new_dm)
+    return len(dm_bytes), new_size
 
 
 @mcp.tool()
@@ -5856,14 +6381,19 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
             {
               "columns": [
                 {"name": "Col1", "data_type": "String", "nullable": true},
-                {"name": "Col2", "data_type": "Int64", "nullable": false}
+                {"name": "Col2", "data_type": "Int64", "nullable": false},
+                {"name": "Img", "data_type": "String", "data_category": "ImageUrl"}
               ],
               "rows": [
-                {"Col1": "hello", "Col2": 42},
-                {"Col1": "world", "Col2": 99}
+                {"Col1": "hello", "Col2": 42, "Img": "data:image/svg+xml;utf8,..."},
+                {"Col1": "world", "Col2": 99, "Img": "data:image/svg+xml;utf8,..."}
               ]
             }
-            Supported data_types: String, Int64, Float64, DateTime, Decimal, Boolean
+            Supported data_types: String, Int64, Float64, DateTime, Decimal, Boolean.
+            Optional per-column "data_category" sets Column.DataCategory —
+            e.g. "ImageUrl" so table/matrix cells (and the Power BI service)
+            render the value as an image, or "WebUrl" for clickable links.
+            It survives later rebuild-based edits.
     """
     try:
         info = _ensure_open(alias)
@@ -5962,7 +6492,7 @@ def pbix_update_table_rows(alias: str, table_name: str, rows_json: str) -> str:
             _AMO_TO_TYPE = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime",
                             10: "Decimal", 11: "Boolean"}
             col_rows = conn.execute(
-                """SELECT c.ExplicitName, c.ExplicitDataType
+                """SELECT c.ExplicitName, c.ExplicitDataType, c.DataCategory
                    FROM [Column] c
                    JOIN [Table] t ON c.TableID = t.ID
                    WHERE t.Name = ? AND c.Type = 1
@@ -5980,7 +6510,8 @@ def pbix_update_table_rows(alias: str, table_name: str, rows_json: str) -> str:
             ).to_text()
 
         columns = [{"name": cr["ExplicitName"],
-                     "data_type": _AMO_TO_TYPE.get(cr["ExplicitDataType"], "String")}
+                     "data_type": _AMO_TO_TYPE.get(cr["ExplicitDataType"], "String"),
+                     "data_category": cr["DataCategory"]}
                     for cr in col_rows]
 
         old_size, new_size = _rebuild_datamodel(
@@ -6192,7 +6723,8 @@ def _modify_metadata_sqlite(
     for m in modified_measures:
         builder.add_measure(m["table"], m["name"], m["expression"],
                             m.get("description", ""),
-                            format_string=m.get("format_string"))
+                            format_string=m.get("format_string"),
+                            data_category=m.get("data_category"))
 
     for r in modified_rels:
         builder.add_relationship(
@@ -6311,7 +6843,7 @@ def pbix_datamodel_modify_metadata(alias: str, sql_statement: str) -> str:
 @mcp.tool()
 def pbix_datamodel_modify_measure(
     alias: str, measure_name: str, new_expression: str,
-    new_format_string: str = ""
+    new_format_string: str = "", new_data_category: str = ""
 ) -> str:
     """Modify a DAX measure's expression in the DataModel.
 
@@ -6322,6 +6854,10 @@ def pbix_datamodel_modify_measure(
         measure_name: Name of the measure to modify
         new_expression: New DAX expression for the measure
         new_format_string: Optional new format string
+        new_data_category: Optional DataCategory to set — e.g. "ImageUrl" so
+            table/matrix cells (and the Power BI service) render the measure's
+            data-URI string as an image. Empty = leave unchanged (clear an
+            existing category with pbix_datamodel_modify_metadata).
     """
     try:
         info = _ensure_open(alias)
@@ -6345,6 +6881,9 @@ def pbix_datamodel_modify_measure(
             if new_format_string:
                 updates.append("FormatString = ?")
                 params.append(new_format_string)
+            if new_data_category:
+                updates.append("DataCategory = ?")
+                params.append(new_data_category)
             params.append(measure_name)
 
             c.execute(f"UPDATE Measure SET {', '.join(updates)} WHERE Name = ?", params)
@@ -6367,7 +6906,7 @@ def pbix_datamodel_modify_measure(
 @mcp.tool()
 def pbix_datamodel_add_measure(
     alias: str, table_name: str, measure_name: str, expression: str,
-    format_string: str = "", description: str = ""
+    format_string: str = "", description: str = "", data_category: str = ""
 ) -> str:
     """Create a new DAX measure in the specified table.
 
@@ -6380,6 +6919,10 @@ def pbix_datamodel_add_measure(
         expression: DAX expression
         format_string: Optional format string
         description: Optional description
+        data_category: Optional DataCategory — e.g. "ImageUrl" so table/matrix
+            cells (and the Power BI service) render the measure's
+            ``data:image/svg+xml;utf8,...`` string as an image, or "WebUrl"
+            for clickable links. Default: none (current behavior).
     """
     try:
         info = _ensure_open(alias)
@@ -6429,10 +6972,10 @@ def pbix_datamodel_add_measure(
                     DisplayFolder, DetailRowsDefinitionID, DataCategory,
                     FormatStringDefinitionID, LineageTag, SourceLineageTag)
                 VALUES (?, ?, ?, ?, 6, ?, ?, 0, 1, ?, ?, 0, 0, NULL,
-                    NULL, 0, NULL, 0, ?, NULL)""",
+                    NULL, 0, ?, 0, ?, NULL)""",
                 (new_id, table_id, measure_name, description or None,
                  expression, format_string or None,
-                 filetime, filetime, lineage_tag)
+                 filetime, filetime, data_category or None, lineage_tag)
             )
             # Update MAXID so subsequent adds get a fresh ID
             c.execute(
@@ -6674,18 +7217,26 @@ def pbix_datamodel_add_field_parameter(
 ) -> str:
     """Create a field parameter — a slicer-driven column/measure switcher.
 
-    Field parameters let users dynamically choose which column or measure
-    to display in a visual via a slicer.
+    Authors the COMPLETE Desktop shape (diffed against Desktop-authored ground
+    truth): a calculated-table partition holding the
+    ``{("Display", NAMEOF('Table'[Field]), n), ...}`` tuple set with full
+    static VertiPaq storage, the ``ParameterMetadata`` ExtendedProperty on the
+    hidden Fields column, the display column sorted by the hidden Order
+    column, and the display→Fields group-by wiring — so Power BI Desktop and
+    the service treat it as a REAL field parameter (field-swapping in
+    visuals), not just a lookup table. Field parameters survive later
+    rebuild-based edits (they are recognized and re-stamped).
 
     Args:
         alias: The alias of the open file
         parameter_name: Name for the field parameter table (e.g. "Metric Selector")
         fields_json: JSON array of fields to include, e.g.
             '[{"display": "Revenue", "ref": "Sales[Revenue]"},
-              {"display": "Profit",  "ref": "Sales[Profit]"},
+              {"display": "Profit",  "ref": "'Sales'[Profit]"},
               {"display": "Units",   "ref": "Sales[Units]"}]'
-            Each entry has "display" (label shown in slicer) and "ref"
-            (table[column] or table[measure] reference).
+            Each entry has "display" (label shown in slicer; must not contain
+            double quotes) and "ref" (Table[Field] or 'Table'[Field], where
+            Field is a column or measure that must exist in the model).
     """
     try:
         fields = json.loads(fields_json)
@@ -6695,22 +7246,72 @@ def pbix_datamodel_add_field_parameter(
         for f in fields:
             if "display" not in f or "ref" not in f:
                 raise ValueError("Each field must have 'display' and 'ref' keys")
+            if '"' in str(f["display"]):
+                raise ValueError(
+                    f"display {f['display']!r} must not contain double quotes")
 
         info = _ensure_open(alias)
         dm_path = os.path.join(info["work_dir"], "DataModel")
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
 
-        # Build row data for the field parameter table
+        # Normalize refs to the DAX-quoted 'Table'[Field] form (what NAMEOF()
+        # evaluates to — verified against Desktop-authored files) and validate
+        # every target against the model. Silently authoring a parameter over
+        # a typo'd field would be another silent-wrong.
+        norm_fields = []
+        for f in fields:
+            table, name, canonical = _normalize_field_ref(str(f["ref"]))
+            norm_fields.append({"display": str(f["display"]),
+                                "ref": canonical, "table": table, "name": name})
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        with open(dm_path, "rb") as fh:
+            meta_bytes = read_metadata_sqlite(decompress_datamodel(fh.read()))
+        fd, tmp_path = tempfile.mkstemp(suffix=".db")
+        os.write(fd, meta_bytes)
+        os.close(fd)
+        try:
+            conn = sqlite3.connect(tmp_path)
+            conn.row_factory = sqlite3.Row
+            if conn.execute("SELECT 1 FROM [Table] WHERE Name = ? AND ModelID = 1",
+                            (parameter_name,)).fetchone():
+                raise ValueError(f"Table '{parameter_name}' already exists")
+            missing = []
+            for nf in norm_fields:
+                trow = conn.execute(
+                    "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
+                    (nf["table"],)).fetchone()
+                if not trow:
+                    missing.append(f"{nf['ref']} (no table '{nf['table']}')")
+                    continue
+                hit = conn.execute(
+                    "SELECT 1 FROM [Column] WHERE TableID = ? AND ExplicitName = ? "
+                    "UNION SELECT 1 FROM Measure WHERE TableID = ? AND Name = ?",
+                    (trow["ID"], nf["name"], trow["ID"], nf["name"])).fetchone()
+                if not hit:
+                    missing.append(nf["ref"])
+            conn.close()
+            if missing:
+                raise ValueError(
+                    "Field ref(s) not found in the model: " + ", ".join(missing))
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        # Static row data — the same constants NAMEOF() evaluates to.
         rows = []
-        for i, f in enumerate(fields):
+        for i, nf in enumerate(norm_fields):
             rows.append({
-                parameter_name: f["display"],
-                f"{parameter_name} Fields": f["ref"],
+                parameter_name: nf["display"],
+                f"{parameter_name} Fields": nf["ref"],
                 f"{parameter_name} Order": i,
             })
 
-        # Create the table via _rebuild_datamodel (full VertiPaq storage)
+        # 1) Create the table via _rebuild_datamodel (full VertiPaq storage).
         extra_table = {
             "name": parameter_name,
             "columns": [
@@ -6720,16 +7321,18 @@ def pbix_datamodel_add_field_parameter(
             ],
             "rows": rows,
         }
+        old_size, _ = _rebuild_datamodel(info, extra_tables=[extra_table])
 
-        old_size, new_size = _rebuild_datamodel(
-            info,
-            extra_tables=[extra_table],
-        )
+        # 2) Stamp the Desktop field-parameter metadata shape on top.
+        qd = _field_parameter_query_definition(norm_fields)
+        _, new_size = _apply_field_parameter_metadata(
+            dm_path, [{"table": parameter_name, "query_definition": qd}])
         info["modified"] = True
 
         field_list = ", ".join(f["display"] for f in fields)
         return ToolResponse.ok(
             f"Field parameter '{parameter_name}' created with {len(fields)} fields: {field_list}\n"
+            f"  Calculated partition: {{(\"…\", NAMEOF(…), n), …}} + ParameterMetadata\n"
             f"  DataModel: {old_size:,} → {new_size:,} bytes\n"
             f"Use as a slicer to let users switch between these fields in visuals."
         ).to_text()
@@ -7312,6 +7915,97 @@ def _get_dax_context(alias: str) -> dict:
     return ctx
 
 
+# Measure references accepted by the evaluate tools: bare (Pipeline Value),
+# bracketed ([Pipeline Value]), and table-qualified ('SalesPipeline'[Pipeline
+# Value] / SalesPipeline[Pipeline Value]). measure_defs is keyed by BARE names,
+# and the engine treats an unknown measure as BLANK by design — so without
+# normalization the DAX-style forms silently evaluated to (null) for every row.
+# The quoted-table alternative accepts DAX's '' escape ('O''Brien Sales'[M]).
+_MEASURE_NAME_RE = re.compile(
+    r"^\s*(?:'(?:[^']|'')+'|[^'\[\]]+?)?\s*\[\s*([^\[\]]+?)\s*\]\s*$"
+)
+
+
+def _split_measure_list(measures: str) -> list[str]:
+    """Split the comma-separated ``measures`` argument, ignoring commas inside
+    [brackets] or 'quoted table names' so "[A, B],[C]" yields two names.
+
+    A quote only OPENS at the start of a token (the 'Table'[Measure] form) —
+    an apostrophe inside a bare name ("Tom's Margin, Sales") is plain text and
+    must not swallow the following comma. Inside a quoted table name, DAX's
+    doubled-quote escape ('') stays part of the name.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    in_quote = False
+    i = 0
+    while i < len(measures):
+        ch = measures[i]
+        if ch == "'" and depth == 0:
+            if in_quote:
+                if i + 1 < len(measures) and measures[i + 1] == "'":
+                    buf.append("''")           # escaped quote, stay in quote
+                    i += 2
+                    continue
+                in_quote = False
+            elif not "".join(buf).strip():     # token start -> table qualifier
+                in_quote = True
+        elif not in_quote:
+            if ch == "[":
+                depth += 1
+            elif ch == "]" and depth:
+                depth -= 1
+        if ch == "," and depth == 0 and not in_quote:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _parse_measure_names(measures: str, measure_defs: dict) -> list[str]:
+    """Split + normalize measure references to bare names, validating every
+    name against the model.
+
+    An exact model match always wins (a real measure named "Cost [USD]" is
+    never mis-parsed as table "Cost" + measure "USD"); otherwise DAX-style
+    forms are unwrapped to the bare name, with a case-insensitive fallback to
+    the model's canonical casing (Power BI names are case-insensitive).
+
+    Raises DAXMeasureNotFoundError (with close-match hints) for unknown names,
+    so a typo is distinguishable from a measure that genuinely returns BLANK.
+    """
+    lower_map = {k.lower(): k for k in measure_defs}
+    names = []
+    unknown = []
+    for raw in _split_measure_list(measures):
+        if raw in measure_defs:
+            names.append(raw)
+            continue
+        m = _MEASURE_NAME_RE.match(raw)
+        n = m.group(1).strip() if m else raw
+        if n not in measure_defs:
+            n = lower_map.get(n.lower(), n)
+        names.append(n)
+        if n not in measure_defs:
+            unknown.append(n)
+
+    if unknown:
+        hints = []
+        for n in unknown:
+            close = difflib.get_close_matches(
+                n, list(measure_defs.keys()), n=3, cutoff=0.6)
+            hints.append(f"'{n}'"
+                         + (f" (did you mean: {', '.join(close)}?)" if close else ""))
+        raise DAXMeasureNotFoundError(
+            "Measure(s) not found in the model: " + "; ".join(hints)
+            + ". Use pbix_get_model_measures to list available measures.")
+    return names
+
+
 @mcp.tool()
 def pbix_evaluate_dax(
     alias: str,
@@ -7343,7 +8037,7 @@ def pbix_evaluate_dax(
         from pbix_mcp.dax import engine as dax_engine
 
         ctx = _get_dax_context(alias)
-        measure_names = [m.strip() for m in measures.split(',') if m.strip()]
+        measure_names = _parse_measure_names(measures, ctx['measure_defs'])
 
         parsed_fc = FilterContext.from_json_str(filter_context)
         fc: dict | None
@@ -7429,14 +8123,19 @@ def pbix_evaluate_dax_per_dimension(
         from pbix_mcp.dax import engine as dax_engine
 
         ctx = _get_dax_context(alias)
-        measure_names = [m.strip() for m in measures.split(',') if m.strip()]
+        measure_names = _parse_measure_names(measures, ctx['measure_defs'])
         parsed_fc = FilterContext.from_json_str(filter_context)
         base_fc = parsed_fc.filters
 
         try:
             dim_ref = DimensionRef.parse(dimension)
         except ValueError as e:
-            return ToolResponse.error(e.message, e.code).to_text()
+            # DimensionParseError carries .message/.code; a plain ValueError
+            # does not — never let the handler itself raise AttributeError.
+            return ToolResponse.error(
+                getattr(e, "message", None) or str(e),
+                getattr(e, "code", None) or "INVALID_INPUT",
+            ).to_text()
         dim_table, dim_col = dim_ref.table, dim_ref.column
 
         # Get unique dimension values
@@ -10917,7 +11616,40 @@ def _pbix_config_to_pbir_visual(config: dict, x: float, y: float, w: float, h: f
                 query["queryState"][role_name] = {"projections": role_items}
         visual_obj["query"] = query
         if proto:
-            visual_obj["query"]["sortDefinition"] = {"sort": [], "isDefaultSort": True}
+            # Translate an authored prototypeQuery.OrderBy into the PBIR
+            # sortDefinition (alias SourceRefs become Entity refs); visuals
+            # without one keep the default-sort marker.
+            alias2entity = {f.get("Name"): f.get("Entity")
+                            for f in (proto.get("From") or [])}
+
+            def _entityize(node: dict) -> None:
+                ref = (node.get("Expression") or {}).get("SourceRef") or {}
+                if "Source" in ref:
+                    node["Expression"]["SourceRef"] = {
+                        "Entity": alias2entity.get(ref["Source"], ref["Source"])}
+
+            sort_entries = []
+            for ob in (proto.get("OrderBy") or []):
+                expr = copy.deepcopy(ob.get("Expression") or {})
+                inner = expr.get("Measure") or expr.get("Column")
+                if inner is None and "Aggregation" in expr:
+                    agg_inner = expr["Aggregation"].get("Expression") or {}
+                    inner = agg_inner.get("Column") or agg_inner.get("Measure")
+                if inner is None:
+                    # Unknown expression shape (e.g. HierarchyLevel) — skip it
+                    # rather than leak alias-based SourceRefs into the PBIR.
+                    continue
+                _entityize(inner)
+                sort_entries.append({
+                    "field": expr,
+                    "direction": ("Ascending" if ob.get("Direction") == 1
+                                  else "Descending"),
+                })
+            if sort_entries:
+                visual_obj["query"]["sortDefinition"] = {
+                    "sort": sort_entries, "isDefaultSort": False}
+            else:
+                visual_obj["query"]["sortDefinition"] = {"sort": [], "isDefaultSort": True}
             # Add prototypeQuery as dataViewMappings source
             visual_obj["query"]["queryRef"] = proto
     else:
