@@ -7394,9 +7394,10 @@ def pbix_datamodel_modify_metadata(alias: str, sql_statement: str) -> str:
 @mcp.tool()
 def pbix_datamodel_modify_measure(
     alias: str, measure_name: str, new_expression: str = "",
-    new_format_string: str = "", new_data_category: str = ""
+    new_format_string: str = "", new_data_category: str = "",
+    new_data_type: str = ""
 ) -> str:
-    """Modify a DAX measure's expression / format / data category.
+    """Modify a DAX measure's expression / format / data category / data type.
 
     Performs a metadata-only splice so expressions of any length are
     supported. Every parameter is optional — empty string means "leave
@@ -7414,16 +7415,40 @@ def pbix_datamodel_modify_measure(
             table/matrix cells (and the Power BI service) render the measure's
             data-URI string as an image. Empty = leave unchanged; clear with
             pbix_datamodel_set_measure_category.
+        new_data_type: Measure result type to set — a name
+            (String/Int64/Double/Decimal/DateTime/Boolean) or AMO code. Empty =
+            leave unchanged. Use this to fix a measure whose stored DataType
+            lies about its result (e.g. a decimal measure stuck at Int64, which
+            the Power BI service truncates to a whole number).
     """
     try:
+        from pbix_mcp.builder import (
+            find_reserved_var_names,
+            normalize_measure_data_type,
+        )
+        resolved_new_dt = normalize_measure_data_type(new_data_type)
+
+        # Reject reserved DAX/MDX names used as VARs (see pbix_datamodel_add_measure).
+        if new_expression:
+            reserved = find_reserved_var_names(new_expression)
+            if reserved:
+                names = ", ".join(f"'{n}'" for n in reserved)
+                return ToolResponse.error(
+                    f"new_expression uses reserved DAX/MDX name(s) as VAR "
+                    f"variable(s): {names}. Analysis Services rejects them and "
+                    f"the visual goes blank in the Power BI service. Rename the "
+                    f"VAR(s), e.g. VAR {reserved[0]} -> VAR _{reserved[0]}.",
+                    "RESERVED_VAR_NAME").to_text()
+
         info = _ensure_open(alias)
         dm_path = os.path.join(info["work_dir"], "DataModel")
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
-        if not (new_expression or new_format_string or new_data_category):
+        if not (new_expression or new_format_string or new_data_category
+                or resolved_new_dt):
             return ToolResponse.error(
                 "Nothing to change — provide new_expression, "
-                "new_format_string, and/or new_data_category.",
+                "new_format_string, new_data_category, and/or new_data_type.",
                 "NOTHING_TO_CHANGE").to_text()
 
         old_info = {}
@@ -7448,6 +7473,9 @@ def pbix_datamodel_modify_measure(
             if new_data_category:
                 updates.append("DataCategory = ?")
                 params.append(new_data_category)
+            if resolved_new_dt:
+                updates.append("DataType = ?")
+                params.append(resolved_new_dt)
             params.append(measure_name)
 
             c.execute(f"UPDATE Measure SET {', '.join(updates)} WHERE Name = ?", params)
@@ -7463,6 +7491,11 @@ def pbix_datamodel_modify_measure(
             changed.append(f"  FormatString: {new_format_string}")
         if new_data_category:
             changed.append(f"  DataCategory: {new_data_category}")
+        if resolved_new_dt:
+            _dt_names = {2: "String", 6: "Int64", 8: "Double",
+                         9: "DateTime", 10: "Decimal", 11: "Boolean"}
+            changed.append(
+                f"  DataType: {_dt_names.get(resolved_new_dt, resolved_new_dt)}")
         return ToolResponse.ok(
             f"Measure '{measure_name}' updated:\n"
             + "\n".join(changed) + "\n"
@@ -7524,7 +7557,8 @@ def pbix_datamodel_set_measure_category(
 @mcp.tool()
 def pbix_datamodel_add_measure(
     alias: str, table_name: str, measure_name: str, expression: str,
-    format_string: str = "", description: str = "", data_category: str = ""
+    format_string: str = "", description: str = "", data_category: str = "",
+    data_type: str = ""
 ) -> str:
     """Create a new DAX measure in the specified table.
 
@@ -7541,8 +7575,38 @@ def pbix_datamodel_add_measure(
             cells (and the Power BI service) render the measure's
             ``data:image/svg+xml;utf8,...`` string as an image, or "WebUrl"
             for clickable links. Default: none (current behavior).
+        data_type: Optional measure result type — a name
+            (String/Int64/Double/Decimal/DateTime/Boolean) or AMO code. When
+            omitted, the type is inferred from the expression (text -> String,
+            otherwise Double). Double is used instead of a hardcoded Int64 so
+            decimal and percentage measures are not truncated in the service.
     """
     try:
+        from pbix_mcp.builder import (
+            find_reserved_var_names,
+            infer_measure_data_type,
+            normalize_measure_data_type,
+        )
+        resolved_dt = normalize_measure_data_type(data_type)
+        if not resolved_dt:
+            resolved_dt = infer_measure_data_type(expression)
+
+        # A VAR whose name is a DAX function or reserved keyword compiles in our
+        # lenient engine but makes Analysis Services fail the whole visual in the
+        # Power BI service (MdxScript "Failed to resolve name 'SYNTAXERROR'").
+        # Reject it here, matching what Power BI Desktop enforces.
+        reserved = find_reserved_var_names(expression)
+        if reserved:
+            names = ", ".join(f"'{n}'" for n in reserved)
+            return ToolResponse.error(
+                f"Measure '{measure_name}' uses reserved DAX/MDX name(s) as VAR "
+                f"variable(s): {names}. These are valid in the local engine but "
+                f"Analysis Services rejects them, blanking the visual in the "
+                f"Power BI service. Rename the VAR(s) (e.g. prefix with an "
+                f"underscore or a word like 'v'): VAR {reserved[0]} -> "
+                f"VAR _{reserved[0]}.",
+                "RESERVED_VAR_NAME").to_text()
+
         info = _ensure_open(alias)
         dm_path = os.path.join(info["work_dir"], "DataModel")
         if not os.path.exists(dm_path):
@@ -7562,6 +7626,30 @@ def pbix_datamodel_add_measure(
             c.execute("SELECT ID FROM Measure WHERE Name = ?", (measure_name,))
             if c.fetchone():
                 raise ValueError(f"Measure '{measure_name}' already exists")
+
+            # A measure cannot share its name (case-insensitively) with a
+            # column on the SAME table. Analysis Services rejects the resulting
+            # calculation script — the model fails to process with "One or more
+            # errors were encountered in the MDX script" when opened in the
+            # Power BI service, even though our lenient local engine renders it
+            # fine. Power BI Desktop's UI prevents this collision; enforce it
+            # here so we never emit a file that loads locally but breaks online.
+            c.execute(
+                "SELECT ExplicitName, InferredName FROM [Column] "
+                "WHERE TableID = ?",
+                (table_id,),
+            )
+            mname_lower = measure_name.lower()
+            for exp_name, inf_name in c.fetchall():
+                col_disp = exp_name if exp_name is not None else inf_name
+                if col_disp and col_disp.lower() == mname_lower:
+                    raise ValueError(
+                        f"Measure '{measure_name}' collides with column "
+                        f"{table_name}[{col_disp}] on the same table "
+                        f"(same name, case-insensitive). Analysis Services "
+                        f"rejects this and the model will fail to load in the "
+                        f"Power BI service. Rename the measure or the column."
+                    )
 
             # Get next ID from MAXID (PBI's global ID counter).
             # MAXID is always >= the highest ID across all tables.
@@ -7589,10 +7677,10 @@ def pbix_datamodel_add_measure(
                     StructureModifiedTime, KPIID, IsSimpleMeasure, ErrorMessage,
                     DisplayFolder, DetailRowsDefinitionID, DataCategory,
                     FormatStringDefinitionID, LineageTag, SourceLineageTag)
-                VALUES (?, ?, ?, ?, 6, ?, ?, 0, 1, ?, ?, 0, 0, NULL,
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, 0, 0, NULL,
                     NULL, 0, ?, 0, ?, NULL)""",
                 (new_id, table_id, measure_name, description or None,
-                 expression, format_string or None,
+                 resolved_dt, expression, format_string or None,
                  filetime, filetime, data_category or None, lineage_tag)
             )
             # Update MAXID so subsequent adds get a fresh ID
@@ -7604,9 +7692,15 @@ def pbix_datamodel_add_measure(
 
         old_size, new_size = _modify_metadata_only(dm_path, _do_add)
         info["modified"] = True
+        _dt_names = {2: "String", 6: "Int64", 8: "Double",
+                     9: "DateTime", 10: "Decimal", 11: "Boolean"}
+        dt_label = _dt_names.get(resolved_dt, str(resolved_dt))
+        dt_note = "inferred" if not normalize_measure_data_type(data_type) \
+            else "explicit"
         return ToolResponse.ok(
             f"Measure '{measure_name}' added to table '{table_name}':\n"
             f"  Expression: {expression}\n"
+            f"  DataType: {dt_label} ({dt_note})\n"
             f"  DataModel: {old_size:,} → {new_size:,} bytes"
         ).to_text()
     except PBIXMCPError as e:

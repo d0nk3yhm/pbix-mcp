@@ -25,6 +25,7 @@ Usage:
 import io
 import json
 import os
+import re
 import sqlite3
 import struct
 import tempfile
@@ -42,6 +43,419 @@ _TYPE_NAME_TO_AMO = {
     "Decimal": 10,
     "Boolean": 11,
 }
+
+# AMO/TOM measure DataType codes we emit. A measure's DataType tells
+# Analysis Services how to store/format the scalar result. The historical
+# code hardcoded Int64 (6) for every measure, which truncated decimal and
+# percentage results in the Power BI service (0.153 -> 0). We now infer
+# String vs. numeric and default numeric measures to Double (8), which holds
+# integers and decimals without truncation. Callers may override explicitly.
+MEASURE_DT_STRING = 2
+MEASURE_DT_INT64 = 6
+MEASURE_DT_DOUBLE = 8
+MEASURE_DT_DATETIME = 9
+MEASURE_DT_DECIMAL = 10
+MEASURE_DT_BOOLEAN = 11
+
+_MEASURE_DT_NAME_TO_CODE = {
+    "string": MEASURE_DT_STRING,
+    "text": MEASURE_DT_STRING,
+    "int64": MEASURE_DT_INT64,
+    "integer": MEASURE_DT_INT64,
+    "whole": MEASURE_DT_INT64,
+    "double": MEASURE_DT_DOUBLE,
+    "float": MEASURE_DT_DOUBLE,
+    "decimal": MEASURE_DT_DECIMAL,
+    "fixed": MEASURE_DT_DECIMAL,
+    "currency": MEASURE_DT_DECIMAL,
+    "datetime": MEASURE_DT_DATETIME,
+    "date": MEASURE_DT_DATETIME,
+    "boolean": MEASURE_DT_BOOLEAN,
+    "bool": MEASURE_DT_BOOLEAN,
+}
+_MEASURE_DT_VALID_CODES = frozenset(
+    {MEASURE_DT_STRING, MEASURE_DT_INT64, MEASURE_DT_DOUBLE,
+     MEASURE_DT_DATETIME, MEASURE_DT_DECIMAL, MEASURE_DT_BOOLEAN}
+)
+
+# DAX functions whose scalar result is text. If a measure's result expression
+# is a call to one of these, the measure returns a string (DataType String).
+_TEXT_DAX_FUNCS = frozenset({
+    "CONCATENATE", "CONCATENATEX", "FORMAT", "LEFT", "RIGHT", "MID",
+    "UPPER", "LOWER", "TRIM", "SUBSTITUTE", "REPLACE", "REPT", "UNICHAR",
+    "COMBINEVALUES", "FIXED", "PATHITEM", "PATH",
+})
+
+
+def normalize_measure_data_type(value: object) -> int | None:
+    """Map a user-supplied data_type (name or AMO code) to an AMO code.
+
+    Accepts friendly names ("String", "Double", "Int64", "Decimal",
+    "DateTime", "Boolean") case-insensitively, or an integer AMO code.
+    Returns None for an empty/blank value (meaning "infer"). Raises
+    ValueError for an unrecognized value.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"invalid data_type: {value!r}")
+    if isinstance(value, int):
+        if value in _MEASURE_DT_VALID_CODES:
+            return value
+        raise ValueError(
+            f"invalid data_type code {value!r}; expected one of "
+            f"{sorted(_MEASURE_DT_VALID_CODES)}"
+        )
+    if isinstance(value, str):
+        key = value.strip().lower()
+        if key == "":
+            return None
+        if key.isdigit():
+            return normalize_measure_data_type(int(key))
+        if key in _MEASURE_DT_NAME_TO_CODE:
+            return _MEASURE_DT_NAME_TO_CODE[key]
+        raise ValueError(
+            f"invalid data_type {value!r}; expected a name "
+            f"(String/Int64/Double/Decimal/DateTime/Boolean) or AMO code"
+        )
+    raise ValueError(f"invalid data_type: {value!r}")
+
+
+def _parse_measure_body(expression: str) -> tuple[dict[str, str], str]:
+    """Split a DAX measure into its ``VAR`` bindings and result expression.
+
+    Returns ``(bindings, result)`` where ``bindings`` maps each top-level VAR
+    name (lower-cased) to its defining expression and ``result`` is the text
+    after the top-level ``RETURN`` (or the whole expression when there is no
+    VAR/RETURN block). Only top-level VAR/RETURN keywords are considered —
+    those nested inside parentheses or string literals are ignored.
+    """
+    s = (expression or "").strip()
+    n = len(s)
+    tokens: list[tuple[str, int, int]] = []  # (keyword, start, end)
+    depth = 0
+    in_str = False
+    i = 0
+    while i < n:
+        ch = s[i]
+        if in_str:
+            if ch == '"':
+                if i + 1 < n and s[i + 1] == '"':
+                    i += 2
+                    continue
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            i += 1
+            continue
+        if ch in "([{":
+            depth += 1
+            i += 1
+            continue
+        if ch in ")]}":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0 and (ch.isalpha() or ch == "_"):
+            j = i
+            while j < n and (s[j].isalnum() or s[j] == "_"):
+                j += 1
+            word = s[i:j].upper()
+            before = s[i - 1] if i > 0 else " "
+            if word in ("VAR", "RETURN") and not (
+                    before.isalnum() or before == "_"):
+                tokens.append((word, i, j))
+            i = j
+            continue
+        i += 1
+
+    if not tokens:
+        return {}, s
+
+    bindings: dict[str, str] = {}
+    result = s
+    for idx, (kw, start, end) in enumerate(tokens):
+        seg_end = tokens[idx + 1][1] if idx + 1 < len(tokens) else n
+        segment = s[end:seg_end]
+        if kw == "VAR":
+            eq = segment.find("=")
+            if eq != -1:
+                name = segment[:eq].strip()
+                value = segment[eq + 1:].strip()
+                if name:
+                    bindings[name.lower()] = value
+        else:  # RETURN
+            result = segment.strip()
+    return bindings, result
+
+
+def _split_top_level_args(inner: str) -> list[str]:
+    """Split a function-call argument list on top-level commas."""
+    args: list[str] = []
+    depth = 0
+    in_str = False
+    cur: list[str] = []
+    i = 0
+    n = len(inner)
+    while i < n:
+        ch = inner[i]
+        if in_str:
+            cur.append(ch)
+            if ch == '"':
+                if i + 1 < n and inner[i + 1] == '"':
+                    cur.append('"')
+                    i += 2
+                    continue
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            cur.append(ch)
+        elif ch in "([{":
+            depth += 1
+            cur.append(ch)
+        elif ch in ")]}":
+            depth -= 1
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            args.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    tail = "".join(cur).strip()
+    if tail:
+        args.append(tail)
+    return args
+
+
+def _dax_expr_is_text(
+    expr: str, bindings: dict[str, str] | None = None, _depth: int = 0
+) -> bool:
+    """Best-effort: does this scalar DAX expression return text?
+
+    ``bindings`` maps VAR names (lower-cased) to their defining expressions so
+    a bare ``RETURN <var>`` — or a branch that references a VAR — resolves to
+    the type of what the variable holds.
+    """
+    s = (expr or "").strip()
+    if not s or _depth > 12:
+        return False
+    # Unwrap a single fully-enclosing pair of parentheses.
+    while s.startswith("(") and s.endswith(")"):
+        inner = s[1:-1]
+        if _split_top_level_args(inner) == [inner.strip()] and inner.strip():
+            s = inner.strip()
+        else:
+            break
+    # A leading string literal (whole expression is/begins a string) -> text.
+    if s.startswith('"'):
+        return True
+    # A bare VAR reference -> resolve to the variable's defining expression.
+    if bindings and s.lower() in bindings:
+        return _dax_expr_is_text(bindings[s.lower()], bindings, _depth + 1)
+    # Top-level '&' concatenation anywhere -> text.
+    depth = 0
+    in_str = False
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_str:
+            if ch == '"':
+                if i + 1 < n and s[i + 1] == '"':
+                    i += 2
+                    continue
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "&" and depth == 0:
+            return True
+        i += 1
+    # Leading function call: FUNC( args ).
+    m = 0
+    while m < n and (s[m].isalnum() or s[m] == "_" or s[m] == "."):
+        m += 1
+    func = s[:m].upper()
+    rest = s[m:].lstrip()
+    if func and rest.startswith("("):
+        # find matching close paren for the arg list
+        d = 0
+        j = m
+        instr = False
+        while j < n:
+            c = s[j]
+            if instr:
+                if c == '"':
+                    if j + 1 < n and s[j + 1] == '"':
+                        j += 2
+                        continue
+                    instr = False
+            elif c == '"':
+                instr = True
+            elif c == "(":
+                d += 1
+            elif c == ")":
+                d -= 1
+                if d == 0:
+                    break
+            j += 1
+        inner = s[s.index("(", m) + 1:j]
+        args = _split_top_level_args(inner)
+        if func in _TEXT_DAX_FUNCS:
+            return True
+        if func in ("IF", "IFERROR"):
+            branches = args[1:] if func == "IF" else args
+            return any(
+                _dax_expr_is_text(a, bindings, _depth + 1) for a in branches)
+        if func == "SWITCH":
+            # SWITCH(expr, v1, r1, v2, r2, ..., [else]) — results are the
+            # even-indexed args after the first, plus a trailing else.
+            results = [args[k] for k in range(2, len(args), 2)]
+            if len(args) >= 2 and (len(args) - 1) % 2 == 1:
+                results.append(args[-1])
+            return any(
+                _dax_expr_is_text(r, bindings, _depth + 1) for r in results)
+        return False
+    return False
+
+
+def infer_measure_data_type(expression: str) -> int:
+    """Infer an AMO measure DataType from a DAX expression.
+
+    Returns ``MEASURE_DT_STRING`` (2) when the result is text, otherwise
+    ``MEASURE_DT_DOUBLE`` (8). Double is a deliberately safe numeric default:
+    it stores integers and decimals without truncation, unlike the historical
+    hardcoded Int64. Callers who know the exact type should pass it explicitly.
+    """
+    bindings, result = _parse_measure_body(expression)
+    if _dax_expr_is_text(result, bindings):
+        return MEASURE_DT_STRING
+    return MEASURE_DT_DOUBLE
+
+
+# --- Reserved-identifier detection ------------------------------------------
+# Analysis Services (the Power BI service engine) rejects a VAR name that
+# collides with a DAX function name or a DAX/MDX reserved keyword — the measure
+# compiles into an MDX-hosted model script, so the identifier must avoid BOTH
+# grammars. Our own DAX engine is lenient and accepts them, so a measure like
+# `VAR status = ... RETURN status & ...` evaluates fine locally but makes the
+# Power BI service fail the whole visual with
+#   MdxScript(Model) (1,1) Failed to resolve name 'SYNTAXERROR'.
+# Empirically verified against app.powerbi.com's DAX query engine: `status`,
+# `value`, `level`, `count`, `name`, `date`, `filter`, `rank`, `member`,
+# `dimension`, `parent`, `scope`, `current` are all rejected as VAR names,
+# while `result`, `total`, `amount`, `position`, `selected`, `temp` are fine —
+# i.e. the rejected set is (DAX function names) ∪ (DAX/MDX reserved keywords).
+
+# DAX/DEFINE-query structural keywords, DAX type names, and the specific MDX
+# reserved words we have EMPIRICALLY CONFIRMED are rejected as VAR names by
+# app.powerbi.com's engine. Deliberately conservative: not every MDX reserved
+# word is rejected (`position`, for instance, is accepted), so we include only
+# confirmed words to avoid false positives that would block a valid measure.
+# DAX function names (below) are a separate, safe-to-reject set.
+_DAX_MDX_KEYWORDS = {
+    # structural keywords (cannot be an unquoted identifier)
+    "measure", "column", "table", "var", "return", "define", "evaluate",
+    "order", "by", "start", "at", "asc", "desc", "true", "false", "not", "in",
+    # DAX type keywords
+    "boolean", "integer", "double", "currency", "string", "datetime",
+    # MDX reserved words confirmed rejected as VAR names against the service
+    "status", "level", "scope", "name", "member", "dimension", "parent",
+    "current",
+}
+
+# Comprehensive DAX function names. A VAR (or any unquoted identifier) that
+# equals one of these is rejected by Analysis Services.
+_DAX_FUNCTIONS = {
+    # aggregation / stats
+    "sum", "sumx", "average", "averagex", "averagea", "min", "minx", "mina",
+    "max", "maxx", "maxa", "count", "countx", "counta", "countax", "countrows",
+    "countblank", "distinctcount", "distinctcountnoblank", "product",
+    "productx", "median", "medianx", "percentile", "percentilex",
+    "percentile_inc", "percentile_exc", "percentilex_inc", "percentilex_exc",
+    "geomean", "geomeanx", "stdev_s", "stdev_p", "stdevx_s", "stdevx_p",
+    "var_s", "var_p", "varx_s", "varx_p", "rank", "rankx", "rank_eq", "topn",
+    "topnskip", "sample", "sumx",
+    # logical / info
+    "if", "if_eager", "iferror", "switch", "and", "or", "not", "in", "true",
+    "false", "coalesce", "isblank", "iserror", "iseven", "isodd", "islogical",
+    "isnumber", "isnontext", "istext", "isonorafter", "isfiltered",
+    "iscrossfiltered", "isselectedmeasure", "isinscope", "isempty",
+    "hasonevalue", "hasonefilter", "contains", "containsrow", "containsstring",
+    "containsstringexact", "selectedmeasure", "selectedmeasurename",
+    "selectedmeasureformatstring",
+    # text
+    "concatenate", "concatenatex", "combinevalues", "exact", "find", "fixed",
+    "format", "left", "len", "lower", "mid", "replace", "rept", "right",
+    "search", "substitute", "trim", "unichar", "unicode", "upper", "value",
+    "blank", "code", "char",
+    # date/time
+    "date", "datediff", "datevalue", "day", "edate", "eomonth", "hour",
+    "minute", "month", "now", "second", "time", "timevalue", "today", "weekday",
+    "weeknum", "year", "yearfrac", "calendar", "calendarauto", "quarter",
+    "utcnow", "utctoday", "networkdays",
+    # time intelligence
+    "dateadd", "datesbetween", "datesinperiod", "datesmtd", "datesqtd",
+    "datesytd", "endofmonth", "endofquarter", "endofyear", "firstdate",
+    "firstnonblank", "firstnonblankvalue", "lastdate", "lastnonblank",
+    "lastnonblankvalue", "nextday", "nextmonth", "nextquarter", "nextyear",
+    "opening", "openingbalancemonth", "openingbalancequarter",
+    "openingbalanceyear", "closingbalancemonth", "closingbalancequarter",
+    "closingbalanceyear", "parallelperiod", "previousday", "previousmonth",
+    "previousquarter", "previousyear", "sameperiodlastyear", "startofmonth",
+    "startofquarter", "startofyear", "totalmtd", "totalqtd", "totalytd",
+    # math / trig
+    "abs", "acos", "acosh", "acot", "acoth", "asin", "asinh", "atan", "atanh",
+    "ceiling", "combin", "combina", "convert", "cos", "cosh", "cot", "coth",
+    "currency", "degrees", "divide", "even", "exp", "fact", "floor", "gcd",
+    "int", "iso_ceiling", "lcm", "ln", "log", "log10", "mod", "mround", "odd",
+    "pi", "power", "quotient", "radians", "rand", "randbetween", "round",
+    "rounddown", "roundup", "sign", "sin", "sinh", "sqrt", "sqrtpi", "tan",
+    "tanh", "trunc",
+    # filter / relationship / table
+    "calculate", "calculatetable", "filter", "all", "allexcept", "allnoblankrow",
+    "allselected", "allcrossfiltered", "earlier", "earliest", "keepfilters",
+    "related", "relatedtable", "removefilters", "selectedvalue", "userelationship",
+    "crossfilter", "distinct", "values", "addcolumns", "addmissingitems",
+    "crossjoin", "currentgroup", "datatable", "detailrows", "except", "generate",
+    "generateall", "generateseries", "groupby", "ignore", "intersect",
+    "naturalinnerjoin", "naturalleftouterjoin", "rollup", "rollupaddissubtotal",
+    "rollupgroup", "rollupissubtotal", "row", "selectcolumns", "substitutewithindex",
+    "summarize", "summarizecolumns", "treatas", "union", "lookupvalue",
+    "nonvisual", "path", "pathcontains", "pathitem", "pathitemreverse",
+    "pathlength", "userprincipalname", "username", "userobjectid",
+    "customdata", "hasoneavalue",
+}
+
+DAX_RESERVED_IDENTIFIERS = frozenset(_DAX_MDX_KEYWORDS | _DAX_FUNCTIONS)
+
+_VAR_NAME_RE = re.compile(r"\bVAR\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+
+
+def find_reserved_var_names(expression: str) -> list[str]:
+    """Return VAR names in a DAX measure that Analysis Services would reject.
+
+    A VAR name equal (case-insensitively) to a DAX function name or a DAX/MDX
+    reserved keyword compiles in our lenient engine but makes the Power BI
+    service fail the visual. Returns the offending names in source order,
+    de-duplicated. Empty list = safe.
+    """
+    seen: set[str] = set()
+    hits: list[str] = []
+    for name in _VAR_NAME_RE.findall(expression or ""):
+        low = name.lower()
+        if low in DAX_RESERVED_IDENTIFIERS and low not in seen:
+            seen.add(low)
+            hits.append(name)
+    return hits
 
 # Timestamp used for ModifiedTime / StructureModifiedTime (Windows FILETIME)
 _FIXED_TIMESTAMP = 133534961699396761
@@ -154,6 +568,7 @@ class PBIXBuilder:
         *,
         format_string: str | None = None,
         data_category: str | None = None,
+        data_type: object = None,
     ) -> "PBIXBuilder":
         """Add a DAX measure to a table.
 
@@ -169,6 +584,12 @@ class PBIXBuilder:
                            description. None or "" means no explicit format.
             data_category: Optional Measure.DataCategory (e.g. "ImageUrl" so
                            cells render a data-URI string as an image).
+            data_type: Optional measure result type — a name
+                       (String/Int64/Double/Decimal/DateTime/Boolean) or AMO
+                       code. When omitted, the type is inferred from the
+                       expression (text -> String, otherwise Double). Double
+                       is used instead of the old hardcoded Int64 so decimal
+                       and percentage measures are not truncated.
         """
         self._measures.append({
             "table": table,
@@ -177,6 +598,7 @@ class PBIXBuilder:
             "description": description,
             "format_string": format_string,
             "data_category": data_category,
+            "data_type": normalize_measure_data_type(data_type),
         })
         return self
 
@@ -535,6 +957,28 @@ class PBIXBuilder:
                     )
 
         # --- Measure checks ---
+        # A measure that shares its name (case-insensitively) with a column on
+        # the SAME table is rejected by Analysis Services — the calculation
+        # script cannot bind an ambiguous unqualified reference, and the model
+        # fails to process with "One or more errors were encountered in the
+        # MDX script" when opened in the Power BI service. Power BI Desktop's
+        # UI prevents this collision; our lenient DAX engine resolves measures
+        # and columns separately and never noticed. Reject it here so we don't
+        # emit a file that loads locally but breaks in the service.
+        for m in self._measures:
+            mtable = m["table"]
+            mname_lower = m["name"].lower()
+            for col in table_columns.get(mtable, set()):
+                if col.lower() == mname_lower:
+                    issues.append(
+                        f"CRITICAL: Measure '{m['name']}' on table '{mtable}' "
+                        f"collides with column {mtable}[{col}] (same name, "
+                        f"case-insensitive). Analysis Services rejects this and "
+                        f"the model will fail to load in the Power BI service. "
+                        f"Rename the measure or the column."
+                    )
+                    break
+
         for m in self._measures:
             if m["table"] not in table_names:
                 issues.append(
@@ -542,6 +986,19 @@ class PBIXBuilder:
                     f"non-existent table '{m['table']}'"
                 )
             expr = m.get("expression", "")
+            # A VAR named after a DAX function or reserved keyword compiles in
+            # our lenient engine but makes Analysis Services fail the visual in
+            # the Power BI service ("Failed to resolve name 'SYNTAXERROR'").
+            reserved = find_reserved_var_names(expr)
+            if reserved:
+                names = ", ".join(f"'{n}'" for n in reserved)
+                issues.append(
+                    f"CRITICAL: Measure '{m['name']}' uses reserved DAX/MDX "
+                    f"name(s) as VAR variable(s): {names}. Analysis Services "
+                    f"rejects these and the visual goes blank in the Power BI "
+                    f"service. Rename the VAR(s) (e.g. VAR {reserved[0]} -> "
+                    f"VAR _{reserved[0]})."
+                )
             # Check RELATED() calls have a relationship path
             if "RELATED(" in expr.upper():
                 # Extract RELATED(Table[Column]) references
@@ -1718,6 +2175,9 @@ def _modify_metadata_and_encode(
                 # This shouldn't normally happen but handle gracefully.
                 continue
             m_id = alloc.next()
+            m_data_type = mdef.get("data_type")
+            if not m_data_type:
+                m_data_type = infer_measure_data_type(mdef["expression"])
             c.execute(
                 """INSERT INTO [Measure] (
                     ID, TableID, Name, Description, DataType,
@@ -1727,7 +2187,7 @@ def _modify_metadata_and_encode(
                     DetailRowsDefinitionID, DataCategory,
                     FormatStringDefinitionID, LineageTag, SourceLineageTag
                 ) VALUES (
-                    ?, ?, ?, ?, 6,
+                    ?, ?, ?, ?, ?,
                     ?, ?, 0, 1,
                     ?, ?,
                     0, 0, NULL, NULL,
@@ -1735,6 +2195,7 @@ def _modify_metadata_and_encode(
                     0, ?, NULL
                 )""",
                 (m_id, tid, mdef["name"], mdef.get("description", ""),
+                 m_data_type,
                  mdef["expression"],
                  mdef.get("format_string") or None,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP,
