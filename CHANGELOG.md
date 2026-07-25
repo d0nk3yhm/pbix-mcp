@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.31] - 2026-07-25
+
+Date-part DAX functions (they were missing entirely), predicate filter contexts, live Top-N, and calculated columns no longer leak into the partition query.
+
+### Fixed
+- **`YEAR`, `MONTH`, `DAY`, `QUARTER`, `HOUR`, `MINUTE`, `SECOND`, `WEEKDAY`, `DATE`, `EDATE`, `EOMONTH` were not implemented at all.** Any expression using one evaluated to BLANK and was reported as an unsupported function — so a `Year = YEAR(Sales[Date])` calculated column, a month grouping, or any date-part measure simply did not work. All eleven are now implemented with DAX semantics: `DATE()` rolls over out-of-range months/days (`DATE(2024,13,1)` → 2025-01-01), `EDATE`/`EOMONTH` clamp to the end of a short month (2024-01-31 + 1 month → 2024-02-29), and `WEEKDAY` supports return types 1/2/3. Implementing `DATE()` also made **`CALENDAR()` usable**, so a real Date dimension can now be authored as a calculated table.
+- **A datetime cell was substituted into row-context DAX unquoted**, producing unparseable text (`YEAR(2024-01-15 00:00:00)`), which is why date-part calculated columns failed even once the functions existed. Dates now go in as quoted ISO literals — in both the calculated-column evaluator and `FILTER`.
+- **A calculated column's values leaked into the partition's "Enter data" query.** The values are materialized into VertiPaq and *then* the column is re-stamped as calculated, so the M literal still carried them — stale data the engine ignores and that Desktop would never write. The M now embeds source columns only (`builder.add_table(..., calc_columns=[...])`); VertiPaq storage is unchanged.
+
+### Added
+- **`filter_context` accepts structured predicates, not just In-sets.** A value may now be a dict instead of a list, so a caller no longer has to enumerate every matching value of a high-cardinality column before evaluating: `{"op": ">", "value": 100}` (also `>=`, `<`, `<=`, `=`, `<>`), `{"between": [lo, hi]}`, `{"in": [...]}` / `{"not_in": [...]}`, `{"contains"|"starts_with"|"ends_with": "text"}` (case-insensitive), `{"relative_date": {"last": 7, "unit": "day", "anchor": "2024-03-10"}}`, and `{"is_blank": true}`. Several keys in one dict are ANDed, and predicates mix freely with list filters. Comparisons are numeric when both sides are numbers, date-aware when both parse as dates, and text otherwise. **List values keep their exact previous semantics.** Applied at every filter site, including relationship propagation.
+- **Live Top-N on `pbix_evaluate_dax_grouped`** via `top_n`, `order_by` and `order`. Every group is still evaluated, so the ranking reflects real measure values; groups with no value sink to the bottom in both directions rather than outranking real numbers.
+
+### Notes
+- **Desktop's *automatic* date hierarchies (`LocalDateTable_<guid>` + `Variation` wiring) are still not generated** — deliberately. No Desktop-authored sample in the public corpus has auto date/time enabled, so the structure could only be guessed, and a wrong guess is exactly the class of defect that makes the Power BI service reject a model. The user-facing need is met with verified primitives instead: author a Date dimension (`CALENDAR(DATE(y,1,1), DATE(y,12,31))` as a calculated table), add date-part calculated columns, and build the drill path with `pbix_add_hierarchy` — covered end-to-end in `tests/test_issues14.py::TestDateHierarchyRecipe`.
+
 ## [0.9.30] - 2026-07-25
 
 Calculated-table authoring, a single-call GROUP-BY evaluator, in-place relationship edits — and a FILTER fix that was silently zeroing measures.

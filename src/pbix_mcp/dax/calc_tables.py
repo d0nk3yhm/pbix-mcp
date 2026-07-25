@@ -324,6 +324,12 @@ def evaluate_row_context_column(
                     elif isinstance(val, bool):
                         row_expr = row_expr.replace(
                             pat, "TRUE()" if val else "FALSE()")
+                    elif isinstance(val, (datetime, date)):
+                        # A date must go in as a QUOTED literal — bare
+                        # 2024-01-15 00:00:00 is not parseable DAX, which made
+                        # every date-part expression fail.
+                        row_expr = row_expr.replace(
+                            pat, '"' + val.isoformat() + '"')
                     else:
                         row_expr = row_expr.replace(pat, str(val))
         try:

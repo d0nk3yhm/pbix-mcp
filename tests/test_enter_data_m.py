@@ -120,6 +120,31 @@ class TestBuildMExpressionDispatch:
         assert "Odbc.DataSource" in m
         assert "Table.FromRows" not in m
 
+    def test_excluded_calc_column_left_out_of_payload(self):
+        """A calculated column is recomputed from DAX on refresh, so its values
+        must NOT be embedded in the Enter-data literal (Desktop ships source
+        columns only)."""
+        cols = self.COLS + [{"name": "Doubled", "data_type": "Int64"}]
+        rows = [{"K": "a", "V": 1, "Doubled": 2},
+                {"K": "b", "V": 2, "Doubled": 4}]
+        m = _build_m_expression("T", cols, rows=rows,
+                                exclude_columns=["Doubled"])
+        assert "Doubled" not in m
+        assert _decode_payload(m) == [["a", "1"], ["b", "2"]]
+
+    def test_exclusion_is_case_insensitive(self):
+        cols = self.COLS + [{"name": "Doubled", "data_type": "Int64"}]
+        rows = [{"K": "a", "V": 1, "Doubled": 2}]
+        m = _build_m_expression("T", cols, rows=rows,
+                                exclude_columns=["doubled"])
+        assert "Doubled" not in m
+
+    def test_all_columns_excluded_falls_back(self):
+        """Never emit an empty Enter-data table."""
+        m = _build_m_expression("T", self.COLS, rows=self.ROWS,
+                                exclude_columns=["K", "V"])
+        assert "#table(type table" in m
+
 
 class TestEndToEnd:
     def _partition_qd(self, pbix_path, table_name):

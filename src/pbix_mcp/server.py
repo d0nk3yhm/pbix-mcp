@@ -6885,7 +6885,8 @@ def _rebuild_datamodel(
             continue
         if tname in table_updates:
             upd = table_updates[tname]
-            builder.add_table(tname, upd["columns"], rows=upd["rows"])
+            builder.add_table(tname, upd["columns"], rows=upd["rows"],
+                              calc_columns=upd.get("calc_columns"))
         else:
             # Read existing row data from VertiPaq. If a column cannot be
             # decoded we must NOT fall back to rebuilding the table with no
@@ -8878,7 +8879,10 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None):
         data_rows = [dict(zip(td["columns"], rv)) for rv in td.get("rows", [])]
         cols_out, rows_out, restamp = _materialize_table_calc_columns(
             tname, data_cols, data_rows, specs, relationships)
-        table_updates[tname] = {"columns": cols_out, "rows": rows_out}
+        # The calc columns' values go into VertiPaq, but must NOT be embedded in
+        # the partition's Enter-data M — Power BI recomputes them from DAX.
+        table_updates[tname] = {"columns": cols_out, "rows": rows_out,
+                                "calc_columns": [r["column"] for r in restamp]}
         column_restamp.extend(restamp)
 
     return table_updates, column_restamp, table_restamp
@@ -9733,6 +9737,9 @@ def pbix_evaluate_dax_grouped(
     max_groups: int = 3500,
     apply_default_filters: bool = False,
     page_index: int = -1,
+    top_n: int = 0,
+    order_by: str = "",
+    order: str = "desc",
 ) -> str:
     """Evaluate measures for every group key in ONE call, returning STRUCTURED rows.
 
@@ -9762,6 +9769,12 @@ def pbix_evaluate_dax_grouped(
             persisted default slicer selections (default False = raw model).
         page_index: Scope for those defaults: -1 merges every page, >= 0 scopes
             to that page (service semantics).
+        top_n: Keep only the highest/lowest N groups after evaluation — a live
+            Top-N ranking (0 = keep all). Every group is still evaluated, so the
+            ranking reflects real measure values.
+        order_by: Measure to rank by when top_n is set (defaults to the first
+            measure). Also sorts the returned rows.
+        order: "desc" (default) or "asc".
     """
     try:
         from pbix_mcp.dax import engine as dax_engine
@@ -9852,15 +9865,40 @@ def pbix_evaluate_dax_grouped(
                     "values": {m: vals.get(m) for m in measure_names},
                 })
 
+        # Live Top-N / ordering over the evaluated groups.
+        ranked_by = ""
+        if top_n or order_by:
+            ranked_by = order_by or (measure_names[0] if measure_names else "")
+            if ranked_by and ranked_by not in measure_names:
+                return ToolResponse.error(
+                    f"order_by '{ranked_by}' is not one of the evaluated "
+                    f"measures: {measure_names}", "INVALID_INPUT").to_text()
+            if ranked_by:
+                # Groups with no value (BLANK) always sink to the bottom, in
+                # BOTH directions — otherwise a null would outrank a real
+                # number in a Top-N.
+                def _has_val(g):
+                    return isinstance(g["values"].get(ranked_by), (int, float))
+                scored = [g for g in results if _has_val(g)]
+                blanks = [g for g in results if not _has_val(g)]
+                scored.sort(key=lambda g: g["values"][ranked_by],
+                            reverse=str(order).lower() != "asc")
+                results = scored + blanks
+            if top_n and top_n > 0:
+                results = results[:top_n]
+
         return ToolResponse.ok(
             f"Evaluated {len(measure_names)} measure(s) across "
-            f"{len(results):,} of {total:,} group(s).",
+            f"{len(results):,} of {total:,} group(s)."
+            + (f" Top {top_n} by '{ranked_by}' ({order})." if top_n else ""),
             data={
                 "group_by": [k[0] for k in keys],
                 "measures": measure_names,
                 "group_count": total,
                 "returned": len(results),
                 "truncated": total > len(results),
+                "order_by": ranked_by or None,
+                "order": order if ranked_by else None,
                 "groups": results,
             },
         ).to_text()

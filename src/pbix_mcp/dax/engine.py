@@ -31,6 +31,7 @@ Supports 150+ DAX functions:
 - String concatenation with &
 """
 
+import json
 import math
 import os
 import random
@@ -59,6 +60,163 @@ _AGG_CALL_RE = re.compile(
 )
 
 
+def _as_number(v):
+    """Best-effort numeric coercion; None when the value isn't numeric."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _as_date(v):
+    """Best-effort date coercion from a value or ISO-ish string."""
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
+                    "%d/%m/%Y", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(s[:len(fmt) + 2].strip(), fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
+def _as_datetime(v):
+    """Best-effort datetime coercion from a value or ISO-ish string."""
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, date):
+        return datetime(v.year, v.month, v.day)
+    if isinstance(v, str):
+        s = v.strip()
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
+                    "%d/%m/%Y", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(s[:len(fmt) + 2].strip(), fmt)
+            except ValueError:
+                continue
+    return None
+
+
+def _compare(cell, op: str, target) -> bool:
+    """Compare a cell against a target — numerically when both are numbers, by
+    date when both parse as dates, else as text."""
+    a_num, b_num = _as_number(cell), _as_number(target)
+    if a_num is not None and b_num is not None:
+        a, b = a_num, b_num
+    else:
+        a_dt, b_dt = _as_date(cell), _as_date(target)
+        if a_dt is not None and b_dt is not None:
+            a, b = a_dt, b_dt
+        else:
+            a = "" if cell is None else str(cell)
+            b = "" if target is None else str(target)
+    if op == ">":
+        return bool(a > b)
+    if op in (">=", "=>"):
+        return bool(a >= b)
+    if op == "<":
+        return bool(a < b)
+    if op in ("<=", "=<"):
+        return bool(a <= b)
+    if op in ("=", "==", "eq"):
+        return bool(a == b)
+    if op in ("<>", "!=", "ne"):
+        return bool(a != b)
+    raise ValueError(f"unsupported filter operator {op!r}")
+
+
+def _relative_date_bounds(spec: dict):
+    """(lo, hi) date bounds for a relative-date spec.
+
+    ``{"last": 7, "unit": "day"}`` covers the last 7 days up to and including
+    the anchor; ``{"next": 3, "unit": "month"}`` looks forward. ``unit`` is
+    day/week/month/year. ``anchor`` (an ISO date) defaults to today and lets a
+    caller pin the window deterministically.
+    """
+    unit = str(spec.get("unit", "day")).lower().rstrip("s")
+    anchor = _as_date(spec.get("anchor")) or date.today()
+    n = int(spec.get("last", spec.get("next", 0)) or 0)
+    per = {"day": 1, "week": 7, "month": 30, "year": 365}.get(unit)
+    if per is None:
+        raise ValueError(f"unsupported relative_date unit {unit!r}")
+    span = timedelta(days=per * n)
+    if "next" in spec:
+        return anchor, anchor + span
+    return anchor - span, anchor
+
+
+def make_value_matcher(spec):
+    """Build a predicate ``f(cell) -> bool`` for one filter_context entry.
+
+    A LIST keeps the historical In-set semantics EXACTLY (string membership).
+    A DICT is a structured predicate, so a caller no longer has to enumerate a
+    column's matching values before evaluating:
+
+      ``{"op": ">", "value": 100}``   comparison (>, >=, <, <=, =, <>)
+      ``{"between": [lo, hi]}``       inclusive range
+      ``{"in": [...]}`` / ``{"not_in": [...]}``
+      ``{"contains"|"starts_with"|"ends_with": "text"}``  (case-insensitive)
+      ``{"relative_date": {"last": 7, "unit": "day"}}``
+      ``{"is_blank": true|false}``
+
+    Several keys in one dict are ANDed.
+    """
+    if not isinstance(spec, dict):
+        values = spec if isinstance(spec, (list, tuple, set)) else [spec]
+        allowed = {str(v) for v in values}
+        return lambda cell: str(cell) in allowed
+
+    tests = []
+    if "op" in spec:
+        op, target = spec["op"], spec.get("value")
+        tests.append(lambda c: _compare(c, op, target))
+    if "between" in spec:
+        lo, hi = spec["between"]
+        tests.append(lambda c: _compare(c, ">=", lo) and _compare(c, "<=", hi))
+    if "in" in spec:
+        allowed_in = {str(v) for v in spec["in"]}
+        tests.append(lambda c: str(c) in allowed_in)
+    if "not_in" in spec:
+        denied = {str(v) for v in spec["not_in"]}
+        tests.append(lambda c: str(c) not in denied)
+    if "contains" in spec:
+        needle = str(spec["contains"]).lower()
+        tests.append(lambda c: needle in str("" if c is None else c).lower())
+    if "starts_with" in spec:
+        pre = str(spec["starts_with"]).lower()
+        tests.append(
+            lambda c: str("" if c is None else c).lower().startswith(pre))
+    if "ends_with" in spec:
+        suf = str(spec["ends_with"]).lower()
+        tests.append(
+            lambda c: str("" if c is None else c).lower().endswith(suf))
+    if "relative_date" in spec:
+        _lo, _hi = _relative_date_bounds(spec["relative_date"])
+
+        def _rd(c, lo=_lo, hi=_hi):
+            d = _as_date(c)
+            return d is not None and lo <= d <= hi
+
+        tests.append(_rd)
+    if "is_blank" in spec:
+        want = bool(spec["is_blank"])
+        tests.append(lambda c: (c is None or str(c) == "") is want)
+    if not tests:
+        raise ValueError(f"filter predicate {spec!r} has no recognized keys")
+    return lambda cell: all(t(cell) for t in tests)
+
+
 def _substitute_row_refs(expr: str, table_name: str, row_item: dict) -> str:
     """Replace ``Table[Col]`` references with the row's literal values.
 
@@ -76,6 +234,8 @@ def _substitute_row_refs(expr: str, table_name: str, row_item: dict) -> str:
             literal = "BLANK()"
         elif isinstance(val, bool):
             literal = "TRUE()" if val else "FALSE()"
+        elif isinstance(val, (datetime, date)):
+            literal = '"' + val.isoformat() + '"'
         else:
             literal = str(val)
         for pat in (f"'{table_name}'[{col_name}]", f"{table_name}[{col_name}]"):
@@ -289,8 +449,8 @@ class DAXContext:
             for src_col, values in col_filters:
                 col_idx = self._find_col_idx(src_tbl['columns'], src_col)
                 if col_idx >= 0:
-                    allowed = set(str(v) for v in values)
-                    filtered_dim_rows = [r for r in filtered_dim_rows if str(r[col_idx]) in allowed]
+                    _m = make_value_matcher(values)
+                    filtered_dim_rows = [r for r in filtered_dim_rows if _m(r[col_idx])]
 
             # Get allowed join key values. Append even an EMPTY set: an empty
             # dimension selection must filter the fact to zero rows (BLANK), not
@@ -339,8 +499,8 @@ class DAXContext:
         for src_col, values in col_filters:
             idx = self._find_col_idx(src_tbl['columns'], src_col)
             if idx >= 0:
-                allowed = set(str(v) for v in values)
-                frontier_rows = [r for r in frontier_rows if str(r[idx]) in allowed]
+                _m = make_value_matcher(values)
+                frontier_rows = [r for r in frontier_rows if _m(r[idx])]
         frontier_tbl = src_tbl
         for (cur_name, nxt_name, col_cur, col_nxt) in path:
             cur_idx = self._find_col_idx(frontier_tbl['columns'], col_cur)
@@ -373,8 +533,8 @@ class DAXContext:
         for col_name, values in col_filters:
             col_idx = self._find_col_idx(date_cols, col_name)
             if col_idx >= 0:
-                allowed = set(str(v) for v in values)
-                filtered_rows = [r for r in filtered_rows if str(r[col_idx]) in allowed]
+                _m = make_value_matcher(values)
+                filtered_rows = [r for r in filtered_rows if _m(r[col_idx])]
 
         # An empty allowed_dates set is a legitimate empty selection (filter the
         # fact to zero rows -> BLANK), NOT a reason to drop the filter and leak
@@ -420,8 +580,8 @@ class DAXContext:
                 filt_col = parts[1]
                 filt_idx = self._find_col_idx(cols, filt_col)
                 if filt_idx >= 0:
-                    allowed = set(str(v) for v in allowed_values)
-                    rows = [row for row in rows if str(row[filt_idx]) in allowed]
+                    _m = make_value_matcher(allowed_values)
+                    rows = [row for row in rows if _m(row[filt_idx])]
 
         # Apply ALL cross-table filters (star-schema propagation via relationships)
         for allowed_vals, join_idx in self._get_cross_table_filters(table_name):
@@ -445,8 +605,8 @@ class DAXContext:
                 col_name = parts[1]
                 col_idx = self._find_col_idx(cols, col_name)
                 if col_idx >= 0:
-                    allowed_set = set(str(v) for v in allowed_values)
-                    filtered = [r for r in filtered if str(r[col_idx]) in allowed_set]
+                    _m = make_value_matcher(allowed_values)
+                    filtered = [r for r in filtered if _m(r[col_idx])]
 
         # Apply ALL cross-table filters via relationships
         for allowed_vals, join_idx in self._get_cross_table_filters(table_name):
@@ -586,6 +746,17 @@ class DAXEngine:
             'FORMAT': self._fn_format,
             'NOW': self._fn_now,
             'TODAY': self._fn_today,
+            'YEAR': self._fn_year,
+            'MONTH': self._fn_month,
+            'DAY': self._fn_day,
+            'QUARTER': self._fn_quarter,
+            'HOUR': self._fn_hour,
+            'MINUTE': self._fn_minute,
+            'SECOND': self._fn_second,
+            'WEEKDAY': self._fn_weekday,
+            'DATE': self._fn_date,
+            'EDATE': self._fn_edate,
+            'EOMONTH': self._fn_eomonth,
             'UTCNOW': self._fn_utcnow,
             'CONCATENATE': self._fn_concatenate,
             'LEFT': self._fn_left,
@@ -666,9 +837,22 @@ class DAXEngine:
         """Evaluate a named measure in the given context."""
         # Check cache
         try:
-            fc_key = tuple(sorted((k, tuple(v) if isinstance(v, list) else v) for k, v in ctx.filter_context.items())) if ctx.filter_context else ()
+            # A filter value is a list (In-set) or a dict (structured
+            # predicate). Dicts are unhashable, so serialize them
+            # deterministically instead of letting the cache key blow up —
+            # an exception here used to surface as a null measure result.
+            def _fc_part(v):
+                if isinstance(v, list):
+                    return tuple(v)
+                if isinstance(v, dict):
+                    return ("__pred__", json.dumps(v, sort_keys=True,
+                                                   default=str))
+                return v
+            fc_key = tuple(sorted(
+                (k, _fc_part(v)) for k, v in ctx.filter_context.items()
+            )) if ctx.filter_context else ()
             cache_key = (measure_name, fc_key)
-        except:
+        except Exception:
             cache_key = None
         if cache_key and cache_key in ctx._measure_cache:
             return ctx._measure_cache[cache_key]
@@ -1846,6 +2030,101 @@ class DAXEngine:
     def _fn_utcnow(self, args_str: str, ctx: DAXContext) -> Any:
         """UTCNOW() — current UTC date and time."""
         return datetime.utcnow()
+
+    # --- date-part functions -------------------------------------------------
+    # YEAR/MONTH/DAY/QUARTER and friends were not implemented at all, so any
+    # expression using one (a Year calc column, a month grouping, a date-based
+    # measure) evaluated to BLANK and was reported as an unsupported function.
+
+    def _date_arg(self, args_str: str, ctx: DAXContext):
+        """Evaluate a date-part function's single argument to a datetime."""
+        return _as_datetime(self._eval_expr(args_str.strip(), ctx))
+
+    def _fn_year(self, args_str: str, ctx: DAXContext) -> Any:
+        d = self._date_arg(args_str, ctx)
+        return d.year if d else None
+
+    def _fn_month(self, args_str: str, ctx: DAXContext) -> Any:
+        d = self._date_arg(args_str, ctx)
+        return d.month if d else None
+
+    def _fn_day(self, args_str: str, ctx: DAXContext) -> Any:
+        d = self._date_arg(args_str, ctx)
+        return d.day if d else None
+
+    def _fn_quarter(self, args_str: str, ctx: DAXContext) -> Any:
+        d = self._date_arg(args_str, ctx)
+        return (d.month - 1) // 3 + 1 if d else None
+
+    def _fn_hour(self, args_str: str, ctx: DAXContext) -> Any:
+        d = self._date_arg(args_str, ctx)
+        return d.hour if d else None
+
+    def _fn_minute(self, args_str: str, ctx: DAXContext) -> Any:
+        d = self._date_arg(args_str, ctx)
+        return d.minute if d else None
+
+    def _fn_second(self, args_str: str, ctx: DAXContext) -> Any:
+        d = self._date_arg(args_str, ctx)
+        return d.second if d else None
+
+    def _fn_weekday(self, args_str: str, ctx: DAXContext) -> Any:
+        """WEEKDAY(date, [type]) — 1=Sunday..7=Saturday by default (type 1)."""
+        args = self._split_args(args_str)
+        d = _as_datetime(self._eval_expr(args[0].strip(), ctx))
+        if not d:
+            return None
+        wtype = 1
+        if len(args) > 1:
+            n = _as_number(self._eval_expr(args[1].strip(), ctx))
+            wtype = int(n) if n is not None else 1
+        iso = d.isoweekday()            # Mon=1 .. Sun=7
+        if wtype == 2:
+            return iso                  # Mon=1 .. Sun=7
+        if wtype == 3:
+            return iso - 1              # Mon=0 .. Sun=6
+        return iso % 7 + 1              # Sun=1 .. Sat=7
+
+    def _fn_date(self, args_str: str, ctx: DAXContext) -> Any:
+        """DATE(year, month, day) — out-of-range month/day rolls over, as DAX does."""
+        args = self._split_args(args_str)
+        if len(args) < 3:
+            return None
+        parts = [_as_number(self._eval_expr(a.strip(), ctx)) for a in args[:3]]
+        if any(p is None for p in parts):
+            return None
+        y, m, d = (int(p) for p in parts)  # type: ignore[arg-type]
+        month_zero = (m - 1)
+        year = y + month_zero // 12
+        month = month_zero % 12 + 1
+        return datetime(year, month, 1) + timedelta(days=d - 1)
+
+    def _shift_months(self, d: datetime, n: int) -> datetime:
+        month_zero = (d.month - 1) + n
+        year = d.year + month_zero // 12
+        month = month_zero % 12 + 1
+        return datetime(year, month, 1)
+
+    def _fn_edate(self, args_str: str, ctx: DAXContext) -> Any:
+        """EDATE(date, months) — the same day-of-month N months away."""
+        args = self._split_args(args_str)
+        d = _as_datetime(self._eval_expr(args[0].strip(), ctx))
+        n = _as_number(self._eval_expr(args[1].strip(), ctx)) if len(args) > 1 else 0
+        if not d or n is None:
+            return None
+        shifted = self._shift_months(d, int(n))
+        last = monthrange(shifted.year, shifted.month)[1]
+        return shifted.replace(day=min(d.day, last))
+
+    def _fn_eomonth(self, args_str: str, ctx: DAXContext) -> Any:
+        """EOMONTH(date, months) — last day of the month N months away."""
+        args = self._split_args(args_str)
+        d = _as_datetime(self._eval_expr(args[0].strip(), ctx))
+        n = _as_number(self._eval_expr(args[1].strip(), ctx)) if len(args) > 1 else 0
+        if not d or n is None:
+            return None
+        shifted = self._shift_months(d, int(n))
+        return shifted.replace(day=monthrange(shifted.year, shifted.month)[1])
 
     # DAX date format tokens -> strftime. Ordered longest-first so "MMMM" isn't
     # eaten by "MM" (dict preserves insertion order).
