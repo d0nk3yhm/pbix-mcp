@@ -357,13 +357,16 @@ def evaluate_row_context_column(
 #     return correct, fully-named rows;
 #   DISTINCT / VALUES return a ('__table__','__column__','__value__') shape
 #     that normalizes cleanly to one named column;
-#   SUMMARIZE / SUMMARIZECOLUMNS silently DROP their extension columns (the
-#     aggregated value!) and SELECTCOLUMNS / GROUPBY raise — materializing any
-#     of those would persist a silently-wrong table, so they are refused.
+#   SUMMARIZE / SUMMARIZECOLUMNS / SELECTCOLUMNS were refused here until they
+#     were fixed (extension columns were dropped, and SELECTCOLUMNS raised on a
+#     plain table) — they now round-trip faithfully, including grouping by a
+#     RELATED table's column, so they are allowed;
+#   GROUPBY and the join/index helpers below are still not implemented, and the
+#     evaluator refuses anything that reports an unsupported function anyway —
+#     they stay listed so the refusal names the function explicitly.
 _CALC_TABLE_LOSSY_FUNCS = {
-    "summarize", "summarizecolumns", "selectcolumns", "groupby",
-    "naturalinnerjoin", "naturalleftouterjoin", "substitutewithindex",
-    "addmissingitems",
+    "groupby", "naturalinnerjoin", "naturalleftouterjoin",
+    "substitutewithindex", "addmissingitems",
 }
 _CALC_TABLE_FUNC_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_\.]*)\s*\(")
 

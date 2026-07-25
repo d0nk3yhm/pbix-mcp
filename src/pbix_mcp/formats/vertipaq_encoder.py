@@ -617,7 +617,7 @@ def _encode_hidx(unique_values: list, data_type: str) -> bytes:
     hash_bin_size = 8 + 4 + local_entry_count * hash_entry_size + 4
 
     # Collect overflow entries
-    overflow_entries = []
+    overflow_entries: list = []
 
     buf = bytearray()
 
@@ -725,7 +725,7 @@ def _encode_idf(indices: list[int], bit_width: int) -> bytes:
             best_run_idx = ri
 
     primary_entries = []
-    bitpacked_values = []  # current batch for primary entry counting
+    bitpacked_values: list = []  # current batch for primary entry counting
     all_bitpacked_values = []  # ALL values for sub-segment encoding
 
     if False and best_run_len >= 3 and len(runs) > 1:  # DISABLED: RLE has encoding bugs

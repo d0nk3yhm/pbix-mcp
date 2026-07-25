@@ -2901,7 +2901,7 @@ def _register_resource(info: dict, layout: dict, data: bytes, name: str,
     # Windows — where Desktop runs) "logo.png" and "Logo.png" are one file, so
     # keeping the caller's casing would register a layout item + visual
     # reference for a part that never lands in the .pbix.
-    existing = {}
+    existing: dict = {}
     for it in _registered_resource_items(layout):
         nm = it.get("name")
         if nm:
@@ -5710,7 +5710,7 @@ def pbix_find_value(
                 cols = tdata["columns"]
                 for ci, cname in enumerate(cols):
                     count = 0
-                    samples = []
+                    samples: list = []
                     for row in tdata["rows"]:
                         val = row[ci]
                         if val is None:
@@ -10606,7 +10606,7 @@ def pbix_evaluate_rls(
 
             total = len(tbl['rows'])
             visible = 0
-            sample_rows = []
+            sample_rows: list = []
 
             for row in tbl['rows']:
                 # Build row context
