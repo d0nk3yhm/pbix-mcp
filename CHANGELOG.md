@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.32] - 2026-07-25
+
+Calculated fields now read back typed, flagged as calculated, and named.
+
+### Fixed
+- **A calculated column/table reported `DataType = "Unknown"`.** `ModelReader.schema` derived the type from `ExplicitDataType` alone, but a calculated column (and every calculated-table column) carries `ExplicitDataType = 1` "Automatic" with the real type in `InferredDataType` — Desktop's own shape — and 1 isn't a concrete type, so the lookup fell through to "Unknown". The reader now falls back to `InferredDataType` when the explicit code isn't a concrete type, so an authored `Inventory = Products[UnitPrice] * Products[StockQty]` reads `Double` and a text calc column reads `String`. Regular columns are unaffected (their two codes agree).
+- **`IsCalculated` was inverted — calculated columns read `false` and the RowNumber system column read `true`.** The check was `Column.Type == 3`, but the AMO enum is **1=Data, 2=Calculated, 3=RowNumber, 4=CalculatedTableColumn**. It is now `Type in (2, 4)`, so calculated columns *and* calculated-table columns report `true` while RowNumber correctly reports `false`.
+- **A calculated-table column read back with a NULL name**, which also crashed clients doing `columnName.startswith(...)`. Power BI Desktop leaves `ExplicitName` NULL on a calculated-table column and carries the name in `InferredName`, setting `ExplicitName` only when the user *renames* the column — verified across the public corpus (Agents_Performance 26/27, GeoSales 7/8 NULL; the non-NULL ones are renamed field parameters). The writer is therefore already Desktop-exact and is unchanged; the reader now coalesces the two, so `ColumnName` is never None and a `DISTINCT(Products[CategoryID])` calculated table reports its column as `CategoryID`, inherited from the source column, exactly as Desktop shows it. A side benefit: a calculated-table column can now be bound as a visual field (`CategoryList[CategoryID]`) — previously impossible, because a NULL name could never match.
+- **`ModelReader.dax_columns` returned an EMPTY list for every model** — an audit of the same enum turned up two more instances. It filtered on `Type = 3`, the RowNumber system column, which never carries an `Expression`, so `pbix_get_model_columns` always reported "No DAX calculated columns found" even on a model with 27 of them. Now filters `Type IN (2, 4)` and reports the real type instead of "Unknown".
+- **`ModelReader.statistics` mis-counted `ColumnCount`** — it counted `Type != 2`, which excluded calculated columns and counted the RowNumber system column, so a measure-only table reported 1 column instead of 0. Now counts `Type != 3` (data + calculated + calculated-table). Feeds `pbix_performance`, `pbix_diff` and `pbix_document`.
+
+New `tests/test_issues15.py` (18 tests).
+
 ## [0.9.31] - 2026-07-25
 
 Date-part DAX functions (they were missing entirely), predicate filter contexts, live Top-N, and calculated columns no longer leak into the partition query.
