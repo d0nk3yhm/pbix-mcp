@@ -343,6 +343,98 @@ def evaluate_row_context_column(
     return values, None
 
 
+# ---------------------------------------------------------------------------
+# Calculated-TABLE authoring support (evaluate + normalize + reliability gate)
+# ---------------------------------------------------------------------------
+# Our table functions are not uniformly faithful. Verified against the engine:
+#   TOPN / ADDCOLUMNS / DATATABLE / GENERATESERIES / a bare table reference
+#     return correct, fully-named rows;
+#   DISTINCT / VALUES return a ('__table__','__column__','__value__') shape
+#     that normalizes cleanly to one named column;
+#   SUMMARIZE / SUMMARIZECOLUMNS silently DROP their extension columns (the
+#     aggregated value!) and SELECTCOLUMNS / GROUPBY raise — materializing any
+#     of those would persist a silently-wrong table, so they are refused.
+_CALC_TABLE_LOSSY_FUNCS = {
+    "summarize", "summarizecolumns", "selectcolumns", "groupby",
+    "naturalinnerjoin", "naturalleftouterjoin", "substitutewithindex",
+    "addmissingitems",
+}
+_CALC_TABLE_FUNC_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_\.]*)\s*\(")
+
+
+def calc_table_unsupported_reason(expression: str) -> Optional[str]:
+    """Return why a calc-table expression can't be materialized, or None."""
+    e = re.sub(r"--[^\n]*|//[^\n]*", "", expression or "")
+    if not e.strip():
+        return "expression is empty"
+    for fn in _CALC_TABLE_FUNC_RE.findall(e):
+        if fn.lower() in _CALC_TABLE_LOSSY_FUNCS:
+            return (
+                f"uses '{fn.upper()}', which this engine does not reproduce "
+                f"faithfully (its extension/selected columns are dropped or it "
+                f"cannot be evaluated). Author this table in Power BI Desktop"
+            )
+    return None
+
+
+def evaluate_calc_table_expression(
+    expression: str,
+    tables: Dict[str, dict],
+    measures: Optional[Dict[str, str]] = None,
+    relationships: Optional[List[dict]] = None,
+):
+    """Evaluate a calculated-table DAX expression to ``{columns, rows}``.
+
+    Returns ``(result, error)``; ``error`` is None on success. Refuses (rather
+    than returning a partial/blank table) when the engine reports an
+    unsupported function, the result isn't a row set, the rows carry no usable
+    column names, or the column sets are inconsistent — every one of which
+    would otherwise persist a silently-wrong table.
+    """
+    from pbix_mcp.dax import engine as dax_engine
+
+    clean = re.sub(r"--[^\n]*|//[^\n]*", "", expression or "").strip()
+    engine = dax_engine.DAXEngine()
+    ctx = dax_engine.DAXContext(
+        tables, measures or {}, None, None, None, relationships or [])
+    try:
+        result = engine._eval_expr(clean, ctx)
+    except Exception as e:  # noqa: BLE001 — refuse, never persist garbage
+        return None, f"evaluation failed: {e}"
+
+    if engine.unsupported_functions:
+        return None, ("expression uses unsupported function(s): "
+                      + ", ".join(sorted(engine.unsupported_functions)))
+    if not isinstance(result, list) or not result:
+        return None, ("expression did not evaluate to a non-empty table "
+                      "(this engine cannot reproduce it)")
+    if not all(isinstance(r, dict) for r in result):
+        return None, "expression did not evaluate to a row set"
+
+    meta = {"__table__", "__column__", "__value__", "__row__"}
+    # Single-column shape produced by DISTINCT()/VALUES(). Only when the rows
+    # carry NO named columns of their own — some results (DATATABLE, SUMMARIZE)
+    # set __column__/__value__ *alongside* real named columns, and treating
+    # those as single-column would silently drop the rest.
+    if all("__value__" in r and "__column__" in r
+           and not [k for k in r if k not in meta] for r in result):
+        col = result[0].get("__column__")
+        if not col:
+            return None, "single-column result has no column name"
+        return {"columns": [col],
+                "rows": [[r.get("__value__")] for r in result]}, None
+
+    cols = [k for k in result[0].keys() if k not in meta]
+    if not cols:
+        return None, ("result rows carry no column names — this engine cannot "
+                      "reproduce the expression's shape")
+    for r in result:
+        if [k for k in r.keys() if k not in meta] != cols:
+            return None, "result rows have inconsistent columns"
+    return {"columns": cols,
+            "rows": [[r.get(c) for c in cols] for r in result]}, None
+
+
 def _topo_sort(calc_defs: dict, existing_tables: dict) -> list:
     """Topological sort of calculated tables by dependency."""
     order = []

@@ -48,6 +48,41 @@ from typing import Any, Optional
 # (which would return just the numerator).
 _NOT_APPLICABLE = object()
 
+# An aggregation call in a FILTER condition aggregates over the context rather
+# than the iterated row, so its column references must NOT be substituted with
+# the row's values (see _fn_filter).
+_AGG_CALL_RE = re.compile(
+    r"\b(SUM|SUMX|AVERAGE|AVERAGEX|MIN|MINX|MAX|MAXX|COUNT|COUNTX|COUNTA|"
+    r"COUNTROWS|COUNTBLANK|DISTINCTCOUNT|MEDIAN|MEDIANX|PRODUCT|PRODUCTX|"
+    r"STDEV\.[SP]|VAR\.[SP]|RANKX|CALCULATE|RELATED|RELATEDTABLE)\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _substitute_row_refs(expr: str, table_name: str, row_item: dict) -> str:
+    """Replace ``Table[Col]`` references with the row's literal values.
+
+    Used by FILTER to evaluate a condition against the row being iterated: a
+    bare column reference otherwise evaluates to an unresolved
+    ('Table','Column') marker and every comparison against it returns None.
+    """
+    out = expr
+    for col_name, val in row_item.items():
+        if col_name.startswith("__"):
+            continue
+        if isinstance(val, str):
+            literal = '"' + val.replace('"', '""') + '"'
+        elif val is None:
+            literal = "BLANK()"
+        elif isinstance(val, bool):
+            literal = "TRUE()" if val else "FALSE()"
+        else:
+            literal = str(val)
+        for pat in (f"'{table_name}'[{col_name}]", f"{table_name}[{col_name}]"):
+            if pat in out:
+                out = out.replace(pat, literal)
+    return out
+
 
 class DAXContext:
     """Execution context for DAX evaluation — holds table data and filter state."""
@@ -2047,6 +2082,15 @@ class DAXEngine:
         table_ref = self._eval_expr(args[0].strip(), ctx)
         if isinstance(table_ref, list):
             filtered = []
+            cond_expr = args[1].strip()
+            # A BARE column reference (`Sales[Amount] > 90`) evaluates to an
+            # unresolved ('Table','Column') marker, so the comparison yielded
+            # None and FILTER dropped every row. In a row context a bare
+            # reference IS that row's value, so substitute the row's values
+            # before evaluating. Conditions containing an aggregation
+            # (`SUM(Sales[Amount]) > 90`) must NOT be substituted — those
+            # aggregate over the context, so they keep the filter-context path.
+            substitute_row_values = not _AGG_CALL_RE.search(cond_expr)
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
                     if '__row__' in row_item:
@@ -2058,7 +2102,12 @@ class DAXEngine:
                                 continue
                             extra_filters[f"{table_name}.{col_name}"] = [val]
                         row_ctx = ctx.with_filters(extra_filters)
-                        cond = self._eval_expr(args[1].strip(), row_ctx)
+                        if substitute_row_values:
+                            row_cond = _substitute_row_refs(
+                                cond_expr, table_name, row_item)
+                        else:
+                            row_cond = cond_expr
+                        cond = self._eval_expr(row_cond, row_ctx)
                         if cond:
                             filtered.append(row_item)
                     else:

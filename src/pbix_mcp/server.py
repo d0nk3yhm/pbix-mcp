@@ -6569,6 +6569,58 @@ def _apply_calculated_column_metadata(
     return _modify_metadata_only(dm_path, _do_apply)
 
 
+def _apply_calculated_table_metadata(
+    dm_path: str, specs: list[dict]
+) -> tuple[int, int]:
+    """Flip builder-materialized static tables into calculated tables.
+
+    Each spec = {"table", "expression"}. The builder emitted the evaluated rows
+    as an ordinary imported table; a Desktop calculated table is physically the
+    same (VertiPaq storage + hierarchies) and differs only in metadata —
+    verified field-for-field against Desktop-authored calc tables in
+    test_corpus/GeoSales_Dashboard.pbix ('DiscountGroup'): Table SystemFlags=2;
+    partition Type=2 + SystemFlags=2 carrying the DAX as its QueryDefinition;
+    and every data column Type=4 with ExplicitName NULL, the name moved to
+    InferredName, SourceColumn '[Name]', ExplicitDataType 1 (Automatic) with the
+    real type left in InferredDataType, SystemFlags=2, IsAvailableInMDX=1.
+    """
+    def _do_apply(conn: sqlite3.Connection):
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        for spec in specs:
+            tname = spec["table"]
+            trow = c.execute(
+                "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
+                (tname,)).fetchone()
+            if not trow:
+                raise ValueError(f"Calculated table '{tname}' not found")
+            tid = trow["ID"]
+            c.execute("UPDATE [Table] SET SystemFlags = 2 WHERE ID = ?", (tid,))
+            c.execute(
+                "UPDATE [Partition] SET Type = 2, SystemFlags = 2, "
+                "QueryDefinition = ? WHERE TableID = ?",
+                (spec["expression"], tid))
+            # Data columns -> calc-table columns. RowNumber (Type=3) only gets
+            # the system flag, exactly as Desktop leaves it.
+            for crow in c.execute(
+                "SELECT ID, ExplicitName, Type FROM [Column] WHERE TableID = ? "
+                "ORDER BY ID", (tid,)).fetchall():
+                if crow["Type"] == 3 or (
+                        crow["ExplicitName"] or "").startswith("RowNumber"):
+                    c.execute("UPDATE [Column] SET SystemFlags = 2 WHERE ID = ?",
+                              (crow["ID"],))
+                    continue
+                name = crow["ExplicitName"]
+                c.execute(
+                    "UPDATE [Column] SET Type = 4, ExplicitName = NULL, "
+                    "InferredName = ?, SourceColumn = ?, ExplicitDataType = 1, "
+                    "SystemFlags = 2, IsAvailableInMDX = 1 WHERE ID = ?",
+                    (name, f"[{name}]", crow["ID"]))
+        conn.commit()
+
+    return _modify_metadata_only(dm_path, _do_apply)
+
+
 def _rebuild_datamodel(
     info: dict,
     table_updates: dict[str, dict] | None = None,
@@ -6578,6 +6630,7 @@ def _rebuild_datamodel(
     remove_tables: set[str] | None = None,
     remove_relationships: list[tuple[str, str, str, str]] | None = None,
     calc_authoring: bool = False,
+    restamp_calc_tables: set[str] | None = None,
 ) -> tuple[int, int]:
     """Rebuild the entire DataModel using the builder pipeline.
 
@@ -6606,6 +6659,7 @@ def _rebuild_datamodel(
     extra_relationships = extra_relationships or []
     remove_tables = remove_tables or set()
     remove_relationships = remove_relationships or []
+    restamp_calc_tables = restamp_calc_tables or set()
 
     dm_path = os.path.join(info["work_dir"], "DataModel")
     with open(dm_path, "rb") as f:
@@ -6689,9 +6743,17 @@ def _rebuild_datamodel(
                 # table_updates — pbix_datamodel_add_calculated_column
                 # re-materializes its calc columns as data and re-stamps them
                 # (Type=2 + Expression) after the rebuild.
-                calc_ok = (calc_authoring and not is_calc_table
-                           and n_type4 == 0 and n_type2 > 0
-                           and tname in table_updates)
+                #
+                # A calculated TABLE is likewise allowed when the caller names
+                # it in restamp_calc_tables — pbix_datamodel_add_calculated_table
+                # preserves its rows (Type=4 columns ARE readable) via
+                # table_updates and re-stamps the calc-table metadata afterwards.
+                calc_ok = calc_authoring and (
+                    (not is_calc_table and n_type4 == 0 and n_type2 > 0
+                     and tname in table_updates)
+                    or (is_calc_table and tname in restamp_calc_tables
+                        and tname in table_updates)
+                )
                 if not calc_ok:
                     kind = ("calculated table" if is_calc_table
                             else "table with calculated columns")
@@ -7953,6 +8015,196 @@ def pbix_datamodel_remove_relationship(
 
 
 @mcp.tool()
+def pbix_datamodel_modify_relationship(
+    alias: str,
+    from_table: str,
+    from_column: str,
+    to_table: str,
+    to_column: str,
+    cardinality: str = "",
+    cross_filter_direction: str = "",
+    is_active: str = "",
+) -> str:
+    """Change an existing relationship in place (no remove + re-add).
+
+    Every parameter is optional — empty means "leave unchanged"; at least one
+    change must be given. Toggling ``is_active`` / ``cross_filter_direction`` is
+    a metadata-only splice, so it also works on models the rebuild path refuses
+    (those containing calculated tables/columns). Changing ``cardinality``
+    re-runs the rebuild so the R$ join indexes are regenerated to match.
+
+    Args:
+        alias: The alias of the open file
+        from_table: "From" table of the existing relationship
+        from_column: Join column in the from table
+        to_table: "To" table of the existing relationship
+        to_column: Join column in the to table
+        cardinality: New cardinality — "ManyToOne", "OneToMany", "OneToOne",
+            "ManyToMany" (or "*:1", "1:*", "1:1", "*:*"). Empty = unchanged.
+        cross_filter_direction: "single" or "both". Empty = unchanged.
+        is_active: "true" or "false". Empty = unchanged.
+    """
+    try:
+        _CARD = {
+            "manytoone": (2, 1), "*:1": (2, 1), "m:1": (2, 1),
+            "onetomany": (1, 2), "1:*": (1, 2), "1:m": (1, 2),
+            "onetoone": (1, 1), "1:1": (1, 1),
+            "manytomany": (2, 2), "*:*": (2, 2), "m:m": (2, 2),
+        }
+        new_card = None
+        if cardinality:
+            key = str(cardinality).strip().lower().replace(" ", "").replace("-", "")
+            if key not in _CARD:
+                return ToolResponse.error(
+                    f"Invalid cardinality {cardinality!r}. Use one of: ManyToOne, "
+                    "OneToMany, OneToOne, ManyToMany.", "INVALID_ARGUMENT").to_text()
+            new_card = _CARD[key]
+
+        new_xf = None
+        if cross_filter_direction:
+            xf = str(cross_filter_direction).strip().lower()
+            if xf in ("single", "onedirection", "one", "1"):
+                new_xf = 1
+            elif xf in ("both", "bothdirections", "bidirectional", "2"):
+                new_xf = 2
+            else:
+                return ToolResponse.error(
+                    f"Invalid cross_filter_direction {cross_filter_direction!r}. "
+                    "Use 'single' or 'both'.", "INVALID_ARGUMENT").to_text()
+
+        new_active = None
+        if str(is_active).strip():
+            av = str(is_active).strip().lower()
+            if av in ("true", "1", "yes"):
+                new_active = True
+            elif av in ("false", "0", "no"):
+                new_active = False
+            else:
+                return ToolResponse.error(
+                    f"Invalid is_active {is_active!r}. Use 'true' or 'false'.",
+                    "INVALID_ARGUMENT").to_text()
+
+        if new_card is None and new_xf is None and new_active is None:
+            return ToolResponse.error(
+                "Nothing to change — provide cardinality, "
+                "cross_filter_direction, and/or is_active.",
+                "NOTHING_TO_CHANGE").to_text()
+
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error(
+                "No DataModel found.", DataModelCompressionError.code).to_text()
+
+        found: dict = {}
+
+        def _locate(c: sqlite3.Cursor):
+            """Find the relationship row id + current semantics."""
+            row = c.execute(
+                "SELECT r.ID, r.IsActive, r.CrossFilteringBehavior, "
+                "r.FromCardinality, r.ToCardinality "
+                "FROM Relationship r "
+                "JOIN [Table] ft ON r.FromTableID = ft.ID "
+                "JOIN [Column] fc ON r.FromColumnID = fc.ID "
+                "JOIN [Table] tt ON r.ToTableID = tt.ID "
+                "JOIN [Column] tc ON r.ToColumnID = tc.ID "
+                "WHERE ft.Name = ? AND fc.ExplicitName = ? "
+                "AND tt.Name = ? AND tc.ExplicitName = ?",
+                (from_table, from_column, to_table, to_column)).fetchone()
+            if row is None:
+                # Desktop may store the pair in the opposite orientation.
+                row = c.execute(
+                    "SELECT r.ID, r.IsActive, r.CrossFilteringBehavior, "
+                    "r.FromCardinality, r.ToCardinality "
+                    "FROM Relationship r "
+                    "JOIN [Table] ft ON r.FromTableID = ft.ID "
+                    "JOIN [Column] fc ON r.FromColumnID = fc.ID "
+                    "JOIN [Table] tt ON r.ToTableID = tt.ID "
+                    "JOIN [Column] tc ON r.ToColumnID = tc.ID "
+                    "WHERE ft.Name = ? AND fc.ExplicitName = ? "
+                    "AND tt.Name = ? AND tc.ExplicitName = ?",
+                    (to_table, to_column, from_table, from_column)).fetchone()
+                if row is not None:
+                    found["swapped"] = True
+            return row
+
+        def _do_update(conn: sqlite3.Connection):
+            c = conn.cursor()
+            row = _locate(c)
+            if row is None:
+                raise ValueError(
+                    f"Relationship {from_table}.{from_column} → "
+                    f"{to_table}.{to_column} not found")
+            rid, cur_active, cur_xf, cur_fc, cur_tc = row
+            found.update({"id": rid, "active": cur_active, "xf": cur_xf,
+                          "card": (cur_fc, cur_tc)})
+            sets, params = [], []
+            if new_active is not None:
+                sets.append("IsActive = ?")
+                params.append(1 if new_active else 0)
+            if new_xf is not None:
+                sets.append("CrossFilteringBehavior = ?")
+                params.append(new_xf)
+            if new_card is not None:
+                fcard, tcard = new_card
+                if found.get("swapped"):
+                    fcard, tcard = tcard, fcard
+                sets.append("FromCardinality = ?")
+                params.append(fcard)
+                sets.append("ToCardinality = ?")
+                params.append(tcard)
+            params.append(rid)
+            c.execute(
+                f"UPDATE Relationship SET {', '.join(sets)} WHERE ID = ?",
+                params)
+            conn.commit()
+
+        old_size, new_size = _modify_metadata_only(dm_path, _do_update)
+
+        # A cardinality change alters which side carries the join index, so
+        # regenerate the model's R$ index tables. is_active / cross-filter are
+        # pure metadata and need no rebuild (and stay usable on models the
+        # rebuild path refuses).
+        rebuilt = False
+        if new_card is not None and tuple(found["card"]) != tuple(
+                sorted(new_card) if found.get("swapped") else new_card):
+            try:
+                old_size, new_size = _rebuild_datamodel(info)
+                rebuilt = True
+            except PBIXMCPError:
+                # Model can't be rebuilt (calc tables/columns). The metadata
+                # change is applied; say so rather than failing the edit.
+                rebuilt = False
+
+        info["modified"] = True
+        _dax_cache.pop(alias, None)
+        changed = []
+        if new_active is not None:
+            changed.append(f"  IsActive: {bool(found['active'])} → {new_active}")
+        if new_xf is not None:
+            changed.append(
+                f"  CrossFilter: {'both' if found['xf'] == 2 else 'single'} → "
+                f"{'both' if new_xf == 2 else 'single'}")
+        if new_card is not None:
+            changed.append(
+                f"  Cardinality: {found['card']} → {new_card}"
+                + ("" if rebuilt else " (metadata only — join indexes NOT "
+                   "regenerated; this model can't be rebuilt)"))
+        return ToolResponse.ok(
+            f"Relationship {from_table}.{from_column} → {to_table}.{to_column} "
+            f"updated:\n" + "\n".join(changed) +
+            f"\n  DataModel: {old_size:,} → {new_size:,} bytes"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except ValueError as e:
+        return ToolResponse.error(str(e), "RELATIONSHIP_NOT_FOUND").to_text()
+    except Exception as e:
+        return ToolResponse.error(
+            f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
 def pbix_datamodel_remove_table(alias: str, table_name: str) -> str:
     """Remove a table and its measures/relationships from the DataModel.
 
@@ -8434,7 +8686,6 @@ def pbix_datamodel_add_calculated_column(
         from pbix_mcp.dax.calc_tables import calc_column_unsupported_reason
         from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
         from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
-        from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
 
         if data_type and data_type not in _CALC_TYPE_NAME_TO_AMO:
             return ToolResponse.error(
@@ -8490,69 +8741,25 @@ def pbix_datamodel_add_calculated_column(
                     f"one table breaks the Power BI service. Pick another name.",
                     "NAME_COLLIDES_MEASURE").to_text()
 
-            # Existing calc columns across the model — every one must be safely
-            # re-materializable (gate-clean) or we can't rebuild without
-            # corrupting it. Group them (and the new one) by table.
-            existing = conn.execute(
-                "SELECT t.Name AS tbl, c.ExplicitName AS col, c.Expression AS expr "
-                "FROM [Column] c JOIN [Table] t ON c.TableID = t.ID "
-                "WHERE c.Type = 2 AND t.ModelID = 1 "
-                "AND c.ExplicitName NOT LIKE 'RowNumber%'").fetchall()
-            calc_by_table: dict[str, list[dict]] = {}
-            for r in existing:
-                bad = calc_column_unsupported_reason(r["expr"] or "", r["tbl"])
-                if bad:
-                    return ToolResponse.error(
-                        f"The model already has a calculated column "
-                        f"'{r['tbl']}'[{r['col']}] this engine can't reproduce "
-                        f"({bad.split('.')[0]}). Adding another calculated "
-                        f"column would require rebuilding it and risk corrupting "
-                        f"its values, so the edit was refused.",
-                        "UNSUPPORTED_EXISTING_CALC").to_text()
-                calc_by_table.setdefault(r["tbl"], []).append(
-                    {"column": r["col"], "expression": r["expr"]})
-            # Add the new column to its table's calc list.
-            calc_by_table.setdefault(table_name, []).append(
-                {"column": column_name, "expression": dax,
-                 "data_type": data_type or None})
-
-            # Data columns (+ types) for every table that needs re-materializing.
-            data_cols_by_table: dict[str, list[dict]] = {}
-            for tn in calc_by_table:
-                trow2 = conn.execute(
-                    "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
-                    (tn,)).fetchone()
-                cols = []
-                for cr in conn.execute(
-                    "SELECT ExplicitName, ExplicitDataType, InferredDataType "
-                    "FROM [Column] WHERE TableID = ? AND Type IN (1, 3) "
-                    "AND ExplicitName NOT LIKE 'RowNumber%' ORDER BY ID",
-                    (trow2["ID"],)):
-                    edt = cr["ExplicitDataType"]
-                    # calc columns re-read as data use InferredDataType (Explicit
-                    # is 1=Automatic); regular columns use ExplicitDataType.
-                    amo = edt if edt in _AMO_TO_NAME else cr["InferredDataType"]
-                    cols.append({"name": cr["ExplicitName"],
-                                 "data_type": _AMO_TO_NAME.get(amo, "String")})
-                data_cols_by_table[tn] = cols
+            # Re-materialize everything the rebuild would otherwise lose
+            # (existing calc columns AND calc tables), plus the new column.
             rels_ctx = _get_dax_context(alias).get("relationships", [])
+            table_updates, restamp_specs, table_restamp = (
+                _plan_calc_preservation(
+                    conn, abf, meta, rels_ctx,
+                    extra_columns={table_name: [
+                        {"column": column_name, "expression": dax,
+                         "data_type": data_type or None}]}))
         finally:
             os.unlink(tmp.name)
 
-        # Materialize each affected table (data + calc columns as data values).
-        table_updates: dict[str, dict] = {}
-        restamp_specs: list[dict] = []
-        for tn, specs in calc_by_table.items():
-            td = read_table_from_abf(abf, tn, meta)
-            data_rows = [dict(zip(td["columns"], rv)) for rv in td.get("rows", [])]
-            cols_out, rows_out, restamp = _materialize_table_calc_columns(
-                tn, data_cols_by_table[tn], data_rows, specs, rels_ctx)
-            table_updates[tn] = {"columns": cols_out, "rows": rows_out}
-            restamp_specs.extend(restamp)
-
         old_size, _ = _rebuild_datamodel(
-            info, table_updates=table_updates, calc_authoring=True)
+            info, table_updates=table_updates, calc_authoring=True,
+            restamp_calc_tables={s["table"] for s in table_restamp})
         _, new_size = _apply_calculated_column_metadata(dm_path, restamp_specs)
+        if table_restamp:
+            _, new_size = _apply_calculated_table_metadata(
+                dm_path, table_restamp)
         info["modified"] = True
         global _dax_cache
         _dax_cache.pop(alias, None)
@@ -8570,6 +8777,218 @@ def pbix_datamodel_add_calculated_column(
         ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
+    except ValueError as e:
+        return ToolResponse.error(str(e), "UNSUPPORTED_EXISTING_CALC").to_text()
+    except Exception as e:
+        return ToolResponse.error(
+            f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
+
+
+def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None):
+    """Plan the re-materialization of everything a rebuild would otherwise lose.
+
+    A from-scratch rebuild drops Type=2 calculated columns (they aren't read
+    back from VertiPaq) and demotes calculated tables to plain data tables.
+    Returns ``(table_updates, column_restamp, table_restamp)`` so the caller can
+    rebuild and then re-stamp both shapes. Raises ValueError when an existing
+    calculated column can't be faithfully reproduced — refuse, never corrupt.
+
+    ``extra_columns`` = {table: [{"column", "expression", "data_type"}]} adds
+    NEW calculated columns to the same plan, so authoring a calculated column
+    and a calculated table compose in either order.
+    """
+    from pbix_mcp.dax.calc_tables import calc_column_unsupported_reason
+    from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
+
+    _AMO_TO_NAME = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime",
+                    10: "Decimal", 11: "Boolean"}
+    table_updates: dict[str, dict] = {}
+    table_restamp: list[dict] = []
+
+    # --- existing calculated TABLES (excluding field parameters, which the
+    # rebuild already detects and re-stamps on its own) ---
+    for trow in conn.execute(
+        "SELECT t.ID, t.Name FROM [Table] t JOIN [Partition] p "
+        "ON p.TableID = t.ID WHERE t.ModelID = 1 AND p.Type = 2"
+    ).fetchall():
+        tid, tname = trow["ID"], trow["Name"]
+        if _detect_field_parameter_shape(conn, tid) is not None:
+            continue
+        qd = conn.execute(
+            "SELECT QueryDefinition FROM [Partition] WHERE TableID = ?",
+            (tid,)).fetchone()[0]
+        td = read_table_from_abf(abf, tname, meta)
+        cols = td.get("columns") or []
+        rows = td.get("rows") or []
+        if not cols:
+            raise ValueError(
+                f"Calculated table '{tname}' has no readable columns, so this "
+                f"edit would lose it. Aborted.")
+        col_defs = [{"name": c,
+                     "data_type": _infer_calc_type_name([r[i] for r in rows])}
+                    for i, c in enumerate(cols)]
+        table_updates[tname] = {
+            "columns": col_defs,
+            "rows": [dict(zip(cols, r)) for r in rows],
+        }
+        table_restamp.append({"table": tname, "expression": qd})
+
+    # --- existing calculated COLUMNS: re-evaluate from their DAX ---
+    existing = conn.execute(
+        "SELECT t.Name AS tbl, c.ExplicitName AS col, c.Expression AS expr "
+        "FROM [Column] c JOIN [Table] t ON c.TableID = t.ID "
+        "WHERE c.Type = 2 AND t.ModelID = 1 "
+        "AND c.ExplicitName NOT LIKE 'RowNumber%'").fetchall()
+    calc_by_table: dict[str, list[dict]] = {}
+    for r in existing:
+        bad = calc_column_unsupported_reason(r["expr"] or "", r["tbl"])
+        if bad:
+            raise ValueError(
+                f"The model has a calculated column '{r['tbl']}'[{r['col']}] "
+                f"this engine can't reproduce ({bad.split('.')[0]}). This edit "
+                f"would rebuild it and risk corrupting its values, so it was "
+                f"refused.")
+        calc_by_table.setdefault(r["tbl"], []).append(
+            {"column": r["col"], "expression": r["expr"]})
+    for tname, specs in (extra_columns or {}).items():
+        if tname in table_updates and any(
+                s["table"] == tname for s in table_restamp):
+            raise ValueError(
+                f"'{tname}' is a calculated table — its columns come from its "
+                f"own DAX expression, so a calculated column cannot be added "
+                f"to it.")
+        calc_by_table.setdefault(tname, []).extend(specs)
+
+    column_restamp: list[dict] = []
+    for tname, specs in calc_by_table.items():
+        trow = conn.execute(
+            "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
+            (tname,)).fetchone()
+        data_cols = []
+        for cr in conn.execute(
+            "SELECT ExplicitName, ExplicitDataType, InferredDataType "
+            "FROM [Column] WHERE TableID = ? AND Type IN (1, 3) "
+            "AND ExplicitName NOT LIKE 'RowNumber%' ORDER BY ID",
+                (trow["ID"],)):
+            edt = cr["ExplicitDataType"]
+            amo = edt if edt in _AMO_TO_NAME else cr["InferredDataType"]
+            data_cols.append({"name": cr["ExplicitName"],
+                              "data_type": _AMO_TO_NAME.get(amo, "String")})
+        td = read_table_from_abf(abf, tname, meta)
+        data_rows = [dict(zip(td["columns"], rv)) for rv in td.get("rows", [])]
+        cols_out, rows_out, restamp = _materialize_table_calc_columns(
+            tname, data_cols, data_rows, specs, relationships)
+        table_updates[tname] = {"columns": cols_out, "rows": rows_out}
+        column_restamp.extend(restamp)
+
+    return table_updates, column_restamp, table_restamp
+
+
+@mcp.tool()
+def pbix_datamodel_add_calculated_table(
+    alias: str, table_name: str, dax: str
+) -> str:
+    """Add a DAX calculated table and materialize its rows.
+
+    Evaluates the table expression, stores the resulting rows in VertiPaq, and
+    stamps Desktop's calculated-table metadata (partition Type=2 carrying the
+    DAX, data columns Type=4) so the file opens with data and Power BI
+    recomputes the table on Refresh.
+
+    SCOPE: the expression must be one this engine reproduces faithfully — e.g.
+    ``DATATABLE(...)``, ``GENERATESERIES(1, 12, 1)``, ``DISTINCT(Sales[Cat])``,
+    ``VALUES(Sales[Product])``, ``FILTER(Sales, Sales[Amount] > 100)``,
+    ``TOPN(10, Sales, Sales[Amount])``, ``ADDCOLUMNS(...)``, or a bare table
+    reference. Shapes whose result this engine cannot reproduce exactly
+    (SUMMARIZE / SUMMARIZECOLUMNS / SELECTCOLUMNS / GROUPBY, or anything using
+    an unsupported function) are REFUSED with a reason rather than persisted
+    with silently-wrong rows.
+
+    Args:
+        alias: The alias of the open file
+        table_name: Name for the new calculated table
+        dax: The table-valued DAX expression
+    """
+    try:
+        from pbix_mcp.dax.calc_tables import (
+            calc_table_unsupported_reason,
+            evaluate_calc_table_expression,
+        )
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        reason = calc_table_unsupported_reason(dax)
+        if reason:
+            return ToolResponse.error(
+                f"Calculated table '{table_name}' cannot be materialized: it "
+                f"{reason}.", "UNSUPPORTED_CALC_TABLE").to_text()
+
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error(
+                "No DataModel found.", DataModelCompressionError.code).to_text()
+
+        with open(dm_path, "rb") as f:
+            abf = decompress_datamodel(f.read())
+        meta = read_metadata_sqlite(abf)
+
+        ctx = _get_dax_context(alias)
+        result, err = evaluate_calc_table_expression(
+            dax, ctx["tables"], ctx.get("measure_defs"),
+            ctx.get("relationships"))
+        if err:
+            return ToolResponse.error(
+                f"Calculated table '{table_name}' cannot be materialized: "
+                f"{err}.", "CALC_TABLE_EVAL_FAILED").to_text()
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(meta)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            conn.row_factory = sqlite3.Row
+            if conn.execute(
+                "SELECT 1 FROM [Table] WHERE lower(Name) = lower(?) "
+                "AND ModelID = 1", (table_name,)).fetchone():
+                return ToolResponse.error(
+                    f"Table '{table_name}' already exists.",
+                    "TABLE_EXISTS").to_text()
+            table_updates, col_restamp, table_restamp = _plan_calc_preservation(
+                conn, abf, meta, ctx.get("relationships") or [])
+        finally:
+            os.unlink(tmp.name)
+
+        cols, rows = result["columns"], result["rows"]
+        new_cols = [{"name": c,
+                     "data_type": _infer_calc_type_name([r[i] for r in rows])}
+                    for i, c in enumerate(cols)]
+        new_table = {"name": table_name, "columns": new_cols,
+                     "rows": [dict(zip(cols, r)) for r in rows]}
+
+        old_size, _ = _rebuild_datamodel(
+            info, table_updates=table_updates, extra_tables=[new_table],
+            calc_authoring=True,
+            restamp_calc_tables={s["table"] for s in table_restamp})
+        if col_restamp:
+            _apply_calculated_column_metadata(dm_path, col_restamp)
+        _, new_size = _apply_calculated_table_metadata(
+            dm_path, table_restamp + [{"table": table_name, "expression": dax}])
+        info["modified"] = True
+        global _dax_cache
+        _dax_cache.pop(alias, None)
+
+        return ToolResponse.ok(
+            f"Calculated table '{table_name}' added:\n"
+            f"  Expression: {dax}\n"
+            f"  Columns: {', '.join(c['name'] for c in new_cols)}\n"
+            f"  Rows materialized: {len(rows):,}\n"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except ValueError as e:
+        return ToolResponse.error(str(e), "UNSUPPORTED_EXISTING_CALC").to_text()
     except Exception as e:
         return ToolResponse.error(
             f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
@@ -9303,6 +9722,153 @@ def pbix_evaluate_dax_per_dimension(
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
+
+
+@mcp.tool()
+def pbix_evaluate_dax_grouped(
+    alias: str,
+    measures: str,
+    group_by: str,
+    filter_context: str = "",
+    max_groups: int = 3500,
+    apply_default_filters: bool = False,
+    page_index: int = -1,
+) -> str:
+    """Evaluate measures for every group key in ONE call, returning STRUCTURED rows.
+
+    The GROUP-BY entry point for chart-shaped work: instead of a separate
+    evaluation per category value (O(distinct values) round-trips), the fact
+    rows are bucketed by the propagated join key once and each bucket is
+    aggregated — so a chart bound to thousands of categories costs a single
+    call. Results come back as machine-readable data (one object per group),
+    not a formatted table, so a client can bind them directly.
+
+    Measures the fast path can't bucket (anything that isn't a simple
+    aggregation, or an ambiguous join) are still evaluated exactly, per group,
+    so values always match ``pbix_evaluate_dax``.
+
+    Args:
+        alias: The alias of the open file
+        measures: Comma-separated measure names, e.g. "Sales,Sales LY"
+        group_by: Grouping column "Table.Column". Comma-separate for a
+            composite key, e.g. "dim-Geo.Country,dim-Geo.State" (a composite
+            key evaluates per group combination — the single-column form is
+            the one with the single-pass fast path).
+        filter_context: Optional JSON base filter, e.g. '{"dim-Date.Year": [2015]}'
+        max_groups: Cap on groups returned (default 3500 — Power BI's own
+            data-reduction window). Groups beyond it are dropped and reported
+            via ``truncated``/``group_count``.
+        apply_default_filters: When filter_context is empty, apply the report's
+            persisted default slicer selections (default False = raw model).
+        page_index: Scope for those defaults: -1 merges every page, >= 0 scopes
+            to that page (service semantics).
+    """
+    try:
+        from pbix_mcp.dax import engine as dax_engine
+
+        ctx = _get_dax_context(alias)
+        rels: list = ctx.get('relationships') or []
+        measure_names = _parse_measure_names(measures, ctx['measure_defs'])
+        parsed_fc = FilterContext.from_json_str(filter_context)
+        base_fc = parsed_fc.filters
+        if not base_fc and apply_default_filters:
+            base_fc = _resolve_default_filters(ctx, page_index) or {}
+
+        refs = [g.strip() for g in (group_by or "").split(",") if g.strip()]
+        if not refs:
+            return ToolResponse.error(
+                "group_by is required, e.g. 'dim-Geo.State'.",
+                "INVALID_INPUT").to_text()
+        keys = []
+        for ref in refs:
+            try:
+                d = DimensionRef.parse(ref)
+            except ValueError as e:
+                return ToolResponse.error(
+                    getattr(e, "message", None) or str(e),
+                    getattr(e, "code", None) or "INVALID_INPUT").to_text()
+            tbl = ctx['tables'].get(d.table)
+            if not tbl:
+                return ToolResponse.error(
+                    f"Table '{d.table}' not found", "TABLE_NOT_FOUND").to_text()
+            if d.column not in tbl['columns']:
+                return ToolResponse.error(
+                    f"Column '{d.column}' not found in '{d.table}'",
+                    "COLUMN_NOT_FOUND").to_text()
+            keys.append((f"{d.table}.{d.column}", d.table, d.column,
+                         tbl['columns'].index(d.column), tbl))
+
+        # Distinct group keys, in a stable order.
+        if len(keys) == 1:
+            _ref, _t, _c, idx, tbl = keys[0]
+            uniq = list(dict.fromkeys(
+                r[idx] for r in tbl['rows'] if r[idx] is not None))
+        else:
+            if len({k[1] for k in keys}) > 1:
+                return ToolResponse.error(
+                    "A composite group_by must use columns from ONE table.",
+                    "INVALID_INPUT").to_text()
+            tbl = keys[0][4]
+            idxs = [k[3] for k in keys]
+            uniq = list(dict.fromkeys(
+                tuple(r[i] for i in idxs) for r in tbl['rows']
+                if all(r[i] is not None for i in idxs)))
+        uniq.sort(key=lambda v: tuple(str(x) for x in v)
+                  if isinstance(v, tuple) else str(v))
+        total = len(uniq)
+        capped = uniq[:max_groups]
+
+        results: list[dict] = []
+        if len(keys) == 1:
+            ref, dim_table, dim_col = keys[0][0], keys[0][1], keys[0][2]
+            fast = dax_engine.evaluate_per_dimension(
+                measure_names, ctx['tables'], ctx['measure_defs'], base_fc,
+                ref, dim_table, dim_col, capped,
+                ctx['date_table'], ctx['date_column'], rels)
+            slow = [m for m in measure_names if m not in fast]
+            for val in capped:
+                vals = {}
+                if slow:
+                    fc = dict(base_fc)
+                    fc[ref] = [val]
+                    vals = dax_engine.evaluate_measures_batch(
+                        slow, ctx['tables'], ctx['measure_defs'], fc,
+                        ctx['date_table'], ctx['date_column'], rels)
+                results.append({
+                    "key": {dim_col: val},
+                    "values": {m: (fast[m].get(val) if m in fast else
+                                   vals.get(m)) for m in measure_names},
+                })
+        else:
+            for combo in capped:
+                fc = dict(base_fc)
+                for (ref, _t, _c, _i, _tb), v in zip(keys, combo):
+                    fc[ref] = [v]
+                vals = dax_engine.evaluate_measures_batch(
+                    measure_names, ctx['tables'], ctx['measure_defs'], fc,
+                    ctx['date_table'], ctx['date_column'], rels)
+                results.append({
+                    "key": {k[2]: v for k, v in zip(keys, combo)},
+                    "values": {m: vals.get(m) for m in measure_names},
+                })
+
+        return ToolResponse.ok(
+            f"Evaluated {len(measure_names)} measure(s) across "
+            f"{len(results):,} of {total:,} group(s).",
+            data={
+                "group_by": [k[0] for k in keys],
+                "measures": measure_names,
+                "group_count": total,
+                "returned": len(results),
+                "truncated": total > len(results),
+                "groups": results,
+            },
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(
+            f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
 
 
 def _get_layout_pbir(work_dir: str) -> dict | None:
