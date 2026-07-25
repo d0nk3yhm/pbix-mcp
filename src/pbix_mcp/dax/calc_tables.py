@@ -222,6 +222,127 @@ def _evaluate_calculated_columns(
     return tables
 
 
+# ---------------------------------------------------------------------------
+# Calculated-column AUTHORING support (reliability gate + row-context evaluator)
+# ---------------------------------------------------------------------------
+# The per-row evaluator below substitutes a row's same-table column values into
+# the expression and evaluates it. That is correct ONLY for row-context
+# expressions over the column's OWN table. It SILENTLY produces wrong values for
+# aggregations (SUM(...) -> 0), context transition (CALCULATE), and relationship
+# navigation (RELATED) — none of which have a real row context here. So before
+# materializing a calculated column we gate the expression: same-table refs
+# only, and none of these functions. Anything else is refused, never stored
+# wrong (matches Power BI Desktop, which computes these server-side).
+
+_CALC_UNSAFE_FUNCS = frozenset({
+    # aggregations — need a table scan, not a single row
+    "sum", "sumx", "average", "averagex", "averagea", "min", "minx", "mina",
+    "max", "maxx", "maxa", "count", "countx", "counta", "countax", "countrows",
+    "countblank", "distinctcount", "distinctcountnoblank", "median", "medianx",
+    "percentile", "percentilex", "percentile_inc", "percentile_exc", "product",
+    "productx", "geomean", "geomeanx", "stdev_s", "stdev_p", "stdevx_s",
+    "stdevx_p", "var_s", "var_p", "varx_s", "varx_p", "rank", "rankx", "topn",
+    "sample", "concatenatex",
+    # context transition / filter / relationship / table iterators
+    "related", "relatedtable", "calculate", "calculatetable", "earlier",
+    "earliest", "all", "allexcept", "allselected", "allnoblankrow",
+    "allcrossfiltered", "removefilters", "filter", "values", "distinct",
+    "selectedvalue", "lookupvalue", "keepfilters", "summarize",
+    "summarizecolumns", "addcolumns", "groupby", "crossjoin", "union", "except",
+    "intersect", "generate", "generateall", "naturalinnerjoin",
+    "naturalleftouterjoin", "selectcolumns", "treatas", "userelationship",
+    "crossfilter", "datatable", "row", "path", "pathitem", "isinscope",
+    "isfiltered", "iscrossfiltered", "hasonevalue", "hasonefilter",
+})
+_CALC_REF_RE = re.compile(r"(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))\s*\[")
+_CALC_FUNC_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_\.]*)\s*\(")
+
+
+def calc_column_unsupported_reason(expression: str, target_table: str):
+    """Return why a calc-column expression can't be safely materialized, or None.
+
+    None = the expression is a row-context expression over ``target_table``'s
+    own columns that our per-row evaluator can reproduce faithfully. A non-None
+    string is a human-readable reason the caller should REFUSE with (rather than
+    store silently-wrong values).
+    """
+    e = re.sub(r"--[^\n]*|//[^\n]*", "", expression or "")
+    if not e.strip():
+        return "expression is empty"
+    for quoted, bare in _CALC_REF_RE.findall(e):
+        tbl = quoted or bare
+        if tbl.lower() != target_table.lower():
+            return (
+                f"references another table '{tbl}'. Only expressions over "
+                f"'{target_table}''s own columns are supported — cross-table "
+                f"navigation (RELATED/relationships) is computed by the "
+                f"service, not this engine."
+            )
+    for fn in _CALC_FUNC_RE.findall(e):
+        if fn.lower() in _CALC_UNSAFE_FUNCS:
+            return (
+                f"uses '{fn.upper()}', which needs a table scan / filter "
+                f"context this engine can't evaluate per-row. Aggregations, "
+                f"CALCULATE, RELATED and table functions are not supported in "
+                f"authored calculated columns."
+            )
+    return None
+
+
+def evaluate_row_context_column(
+    columns: List[str],
+    rows: List[list],
+    expression: str,
+    target_table: str,
+    all_tables: Dict[str, dict],
+    relationships: Optional[List[dict]] = None,
+):
+    """Evaluate a row-context calc-column expression against a table's rows.
+
+    Returns ``(values, error)``. ``error`` is None on success; otherwise a
+    string and ``values`` is None. The caller MUST have already cleared
+    ``calc_column_unsupported_reason``. Any per-row evaluation exception, or an
+    all-blank result on a non-empty table (a tell-tale of a silently unresolved
+    reference), is treated as an error so nothing wrong is materialized.
+    """
+    from pbix_mcp.dax import engine as dax_engine
+
+    clean = re.sub(r"--[^\n]*|//[^\n]*", "", expression or "").strip()
+    engine = dax_engine.DAXEngine()
+    values: list = []
+    for row in rows:
+        row_data = {cn: row[ci] for ci, cn in enumerate(columns)}
+        row_expr = clean
+        for cn, val in row_data.items():
+            for pat in (f"'{target_table}'[{cn}]", f"{target_table}[{cn}]"):
+                if pat in row_expr:
+                    if isinstance(val, str):
+                        esc = val.replace('"', '""')
+                        row_expr = row_expr.replace(pat, f'"{esc}"')
+                    elif val is None:
+                        row_expr = row_expr.replace(pat, "BLANK()")
+                    elif isinstance(val, bool):
+                        row_expr = row_expr.replace(
+                            pat, "TRUE()" if val else "FALSE()")
+                    else:
+                        row_expr = row_expr.replace(pat, str(val))
+        try:
+            ctx = dax_engine.DAXContext(
+                all_tables, {}, None, None, None, relationships or [])
+            values.append(engine._eval_expr(row_expr, ctx))
+        except Exception as e:  # noqa: BLE001 - refuse, don't store garbage
+            return None, f"row evaluation failed: {e}"
+    if engine.unsupported_functions:
+        return None, (
+            "expression uses unsupported function(s): "
+            + ", ".join(sorted(engine.unsupported_functions)))
+    if rows and all(v is None for v in values):
+        return None, (
+            "every row evaluated to blank — the expression likely references "
+            "a column or name that doesn't resolve in this engine")
+    return values, None
+
+
 def _topo_sort(calc_defs: dict, existing_tables: dict) -> list:
     """Topological sort of calculated tables by dependency."""
     order = []

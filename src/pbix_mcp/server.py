@@ -6525,6 +6525,50 @@ def _apply_field_parameter_metadata(dm_path: str, specs: list[dict]) -> tuple[in
     return _modify_metadata_only(dm_path, _do_apply)
 
 
+def _apply_calculated_column_metadata(
+    dm_path: str, specs: list[dict]
+) -> tuple[int, int]:
+    """Flip builder-materialized data columns into calculated columns.
+
+    Each spec = {"table", "column", "expression", "amo_type"}. The builder
+    encoded the values as an ordinary data column; a Desktop calculated column
+    is physically identical (ColumnStorage / hierarchy / segment data), so only
+    the metadata differs — verified field-for-field against a Desktop-authored
+    calc column (test_corpus/GeoSales_Dashboard.pbix, fct_Orders[Discount
+    Group]): Type=2, the DAX Expression, SourceColumn NULL, ExplicitDataType 1
+    (Automatic) with InferredDataType carrying the real AMO type.
+    """
+    def _do_apply(conn: sqlite3.Connection):
+        c = conn.cursor()
+        import datetime
+        epoch = datetime.datetime(1601, 1, 1)
+        filetime = int(
+            (datetime.datetime.utcnow() - epoch).total_seconds() * 10_000_000)
+        for spec in specs:
+            trow = c.execute(
+                "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
+                (spec["table"],)).fetchone()
+            if not trow:
+                raise ValueError(
+                    f"Calculated-column table '{spec['table']}' not found")
+            tid = trow[0]
+            n = c.execute(
+                "UPDATE [Column] SET Type = 2, Expression = ?, "
+                "SourceColumn = NULL, ExplicitDataType = 1, "
+                "InferredDataType = ?, ModifiedTime = ?, "
+                "StructureModifiedTime = ?, RefreshedTime = ? "
+                "WHERE TableID = ? AND ExplicitName = ?",
+                (spec["expression"], spec["amo_type"], filetime, filetime,
+                 filetime, tid, spec["column"])).rowcount
+            if n != 1:
+                raise ValueError(
+                    f"Expected to re-stamp exactly one column "
+                    f"'{spec['table']}'[{spec['column']}], updated {n}")
+        conn.commit()
+
+    return _modify_metadata_only(dm_path, _do_apply)
+
+
 def _rebuild_datamodel(
     info: dict,
     table_updates: dict[str, dict] | None = None,
@@ -6533,6 +6577,7 @@ def _rebuild_datamodel(
     extra_relationships: list[dict] | None = None,
     remove_tables: set[str] | None = None,
     remove_relationships: list[tuple[str, str, str, str]] | None = None,
+    calc_authoring: bool = False,
 ) -> tuple[int, int]:
     """Rebuild the entire DataModel using the builder pipeline.
 
@@ -6623,18 +6668,34 @@ def _rebuild_datamodel(
             prow = conn.execute(
                 "SELECT Type FROM [Partition] WHERE TableID = ? LIMIT 1", (tid,)
             ).fetchone()
-            n_calc_cols = conn.execute(
-                "SELECT COUNT(*) FROM [Column] WHERE TableID = ? AND Type IN (2, 4)",
+            n_type2 = conn.execute(
+                "SELECT COUNT(*) FROM [Column] WHERE TableID = ? AND Type = 2",
                 (tid,),
             ).fetchone()[0]
-            if ((prow is not None and prow["Type"] == 2) or n_calc_cols > 0) \
+            n_type4 = conn.execute(
+                "SELECT COUNT(*) FROM [Column] WHERE TableID = ? AND Type = 4",
+                (tid,),
+            ).fetchone()[0]
+            is_calc_table = prow is not None and prow["Type"] == 2
+            if (is_calc_table or n_type2 > 0 or n_type4 > 0) \
                     and tname not in remove_tables:
                 # A special table being REMOVED needs no reproduction — never
                 # let it block the edit (also the escape hatch for any
                 # unsupported table: pbix_datamodel_remove_table always works).
-                kind = ("calculated table" if (prow is not None and prow["Type"] == 2)
-                        else "table with calculated columns")
-                special_tables.append((tname, kind))
+                #
+                # calc-authoring mode: a NORMAL table whose only special feature
+                # is Type=2 calculated columns (not a calc TABLE, not Type=4
+                # calc-table columns) is allowed IF the caller re-supplies it via
+                # table_updates — pbix_datamodel_add_calculated_column
+                # re-materializes its calc columns as data and re-stamps them
+                # (Type=2 + Expression) after the rebuild.
+                calc_ok = (calc_authoring and not is_calc_table
+                           and n_type4 == 0 and n_type2 > 0
+                           and tname in table_updates)
+                if not calc_ok:
+                    kind = ("calculated table" if is_calc_table
+                            else "table with calculated columns")
+                    special_tables.append((tname, kind))
             tables.append({"name": tname, "columns": cols})
 
         if special_tables:
@@ -8246,6 +8307,272 @@ def pbix_datamodel_modify_column(
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
+
+
+_CALC_TYPE_NAME_TO_AMO = {
+    "String": 2, "Int64": 6, "Double": 8, "Decimal": 10,
+    "DateTime": 9, "Boolean": 11,
+}
+_CALC_COL_REF_RE = re.compile(r"(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))\s*\[\s*([^\]]+?)\s*\]")
+
+
+def _infer_calc_type_name(values: list) -> str:
+    """Best-effort AMO type NAME for a materialized calc column's values."""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return "String"
+    if all(isinstance(v, bool) for v in vals):
+        return "Boolean"
+    if all(isinstance(v, int) and not isinstance(v, bool) for v in vals):
+        return "Int64"
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in vals):
+        return "Double"
+    return "String"
+
+
+def _calc_col_refs(expression: str, table_name: str) -> set:
+    """Column names referenced as table_name[col] in an expression."""
+    out = set()
+    for quoted, bare, col in _CALC_COL_REF_RE.findall(expression or ""):
+        tbl = quoted or bare
+        if tbl.lower() == table_name.lower():
+            out.add(col)
+    return out
+
+
+def _materialize_table_calc_columns(
+    table_name: str,
+    data_columns: list[dict],
+    data_rows: list[dict],
+    calc_specs: list[dict],
+    relationships: list,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Evaluate a table's calculated columns in dependency order.
+
+    ``calc_specs`` = [{"column", "expression", "data_type"(optional)}]. Returns
+    (columns_out, rows_out, restamp_specs) where columns_out/rows_out are the
+    builder's add_table inputs (data + calc columns as plain data) and
+    restamp_specs feed _apply_calculated_column_metadata. Raises ValueError on
+    an unreliable expression, an unresolvable/circular dependency, or an eval
+    failure — the caller aborts rather than materialize wrong values.
+    """
+    from pbix_mcp.dax.calc_tables import evaluate_row_context_column
+
+    col_names = [c["name"] for c in data_columns]
+    type_by_name = {c["name"]: c.get("data_type", "String") for c in data_columns}
+    rows = [[r.get(cn) for cn in col_names] for r in data_rows]
+
+    pending = list(calc_specs)
+    restamp: list[dict] = []
+    progressed = True
+    while pending and progressed:
+        progressed = False
+        still = []
+        for spec in pending:
+            refs = _calc_col_refs(spec["expression"], table_name)
+            if not refs.issubset(set(col_names)):
+                still.append(spec)
+                continue
+            snapshot = {table_name: {"columns": list(col_names),
+                                     "rows": [list(r) for r in rows]}}
+            vals, err = evaluate_row_context_column(
+                col_names, rows, spec["expression"], table_name,
+                snapshot, relationships)
+            if err:
+                raise ValueError(
+                    f"'{table_name}'[{spec['column']}]: {err}")
+            dt = spec.get("data_type") or _infer_calc_type_name(vals)
+            col_names.append(spec["column"])
+            for i, r in enumerate(rows):
+                r.append(vals[i])
+            type_by_name[spec["column"]] = dt
+            restamp.append({
+                "table": table_name, "column": spec["column"],
+                "expression": spec["expression"],
+                "amo_type": _CALC_TYPE_NAME_TO_AMO.get(dt, 2),
+            })
+            progressed = True
+        pending = still
+    if pending:
+        raise ValueError(
+            f"calculated column(s) {[s['column'] for s in pending]} on "
+            f"'{table_name}' reference columns that don't exist (or form a "
+            f"dependency cycle)")
+
+    columns_out = [{"name": cn, "data_type": type_by_name.get(cn, "String")}
+                   for cn in col_names]
+    rows_out = [dict(zip(col_names, r)) for r in rows]
+    return columns_out, rows_out, restamp
+
+
+@mcp.tool()
+def pbix_datamodel_add_calculated_column(
+    alias: str, table_name: str, column_name: str, dax: str, data_type: str = ""
+) -> str:
+    """Add a DAX calculated column to a table and materialize its values.
+
+    Writes a Desktop-shape calculated column (Column.Type=2 + the DAX
+    expression) AND stores the evaluated values in VertiPaq, so the file opens
+    with correct data and the Power BI service recomputes it on Refresh.
+
+    SCOPE: only row-context expressions over the table's OWN columns are
+    supported — e.g. ``Margin = fct[Sales] - fct[Cost]``,
+    ``IF(t[Qty] > 0, "Yes", "No")``, ``ROUND(t[X] * 0.1, 2)``. Aggregations
+    (SUM/COUNT/…), CALCULATE, RELATED and other table/filter functions are
+    computed by the service across rows, which this engine cannot reproduce
+    per-row, so they are REFUSED with a clear reason rather than stored wrong.
+
+    Args:
+        alias: The alias of the open file
+        table_name: Table to add the column to
+        column_name: Name of the new calculated column
+        dax: The DAX expression (referencing this table's columns)
+        data_type: Optional result type (String/Int64/Double/Decimal/
+            DateTime/Boolean). Omitted = inferred from the evaluated values.
+    """
+    try:
+        from pbix_mcp.dax.calc_tables import calc_column_unsupported_reason
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
+
+        if data_type and data_type not in _CALC_TYPE_NAME_TO_AMO:
+            return ToolResponse.error(
+                f"Invalid data_type '{data_type}'. Expected one of "
+                f"{sorted(_CALC_TYPE_NAME_TO_AMO)}.", "INVALID_DATA_TYPE").to_text()
+
+        reason = calc_column_unsupported_reason(dax, table_name)
+        if reason:
+            return ToolResponse.error(
+                f"Calculated column '{table_name}'[{column_name}] cannot be "
+                f"materialized: it {reason} Author it in Power BI Desktop, or "
+                f"express it as a measure instead.", "UNSUPPORTED_CALC").to_text()
+
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
+
+        with open(dm_path, "rb") as f:
+            abf = decompress_datamodel(f.read())
+        meta = read_metadata_sqlite(abf)
+        _AMO_TO_NAME = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime",
+                        10: "Decimal", 11: "Boolean"}
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(meta)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            conn.row_factory = sqlite3.Row
+            trow = conn.execute(
+                "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
+                (table_name,)).fetchone()
+            if not trow:
+                return ToolResponse.error(
+                    f"Table '{table_name}' not found.", "TABLE_NOT_FOUND").to_text()
+            tid = trow["ID"]
+            # Name must be free on this table (no data/calc column, no measure).
+            dup_col = conn.execute(
+                "SELECT 1 FROM [Column] WHERE TableID = ? AND "
+                "lower(ExplicitName) = lower(?)", (tid, column_name)).fetchone()
+            if dup_col:
+                return ToolResponse.error(
+                    f"Column '{column_name}' already exists on '{table_name}'.",
+                    "COLUMN_EXISTS").to_text()
+            dup_meas = conn.execute(
+                "SELECT 1 FROM Measure WHERE TableID = ? AND "
+                "lower(Name) = lower(?)", (tid, column_name)).fetchone()
+            if dup_meas:
+                return ToolResponse.error(
+                    f"A measure named '{column_name}' already exists on "
+                    f"'{table_name}' — a column and measure sharing a name on "
+                    f"one table breaks the Power BI service. Pick another name.",
+                    "NAME_COLLIDES_MEASURE").to_text()
+
+            # Existing calc columns across the model — every one must be safely
+            # re-materializable (gate-clean) or we can't rebuild without
+            # corrupting it. Group them (and the new one) by table.
+            existing = conn.execute(
+                "SELECT t.Name AS tbl, c.ExplicitName AS col, c.Expression AS expr "
+                "FROM [Column] c JOIN [Table] t ON c.TableID = t.ID "
+                "WHERE c.Type = 2 AND t.ModelID = 1 "
+                "AND c.ExplicitName NOT LIKE 'RowNumber%'").fetchall()
+            calc_by_table: dict[str, list[dict]] = {}
+            for r in existing:
+                bad = calc_column_unsupported_reason(r["expr"] or "", r["tbl"])
+                if bad:
+                    return ToolResponse.error(
+                        f"The model already has a calculated column "
+                        f"'{r['tbl']}'[{r['col']}] this engine can't reproduce "
+                        f"({bad.split('.')[0]}). Adding another calculated "
+                        f"column would require rebuilding it and risk corrupting "
+                        f"its values, so the edit was refused.",
+                        "UNSUPPORTED_EXISTING_CALC").to_text()
+                calc_by_table.setdefault(r["tbl"], []).append(
+                    {"column": r["col"], "expression": r["expr"]})
+            # Add the new column to its table's calc list.
+            calc_by_table.setdefault(table_name, []).append(
+                {"column": column_name, "expression": dax,
+                 "data_type": data_type or None})
+
+            # Data columns (+ types) for every table that needs re-materializing.
+            data_cols_by_table: dict[str, list[dict]] = {}
+            for tn in calc_by_table:
+                trow2 = conn.execute(
+                    "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
+                    (tn,)).fetchone()
+                cols = []
+                for cr in conn.execute(
+                    "SELECT ExplicitName, ExplicitDataType, InferredDataType "
+                    "FROM [Column] WHERE TableID = ? AND Type IN (1, 3) "
+                    "AND ExplicitName NOT LIKE 'RowNumber%' ORDER BY ID",
+                    (trow2["ID"],)):
+                    edt = cr["ExplicitDataType"]
+                    # calc columns re-read as data use InferredDataType (Explicit
+                    # is 1=Automatic); regular columns use ExplicitDataType.
+                    amo = edt if edt in _AMO_TO_NAME else cr["InferredDataType"]
+                    cols.append({"name": cr["ExplicitName"],
+                                 "data_type": _AMO_TO_NAME.get(amo, "String")})
+                data_cols_by_table[tn] = cols
+            rels_ctx = _get_dax_context(alias).get("relationships", [])
+        finally:
+            os.unlink(tmp.name)
+
+        # Materialize each affected table (data + calc columns as data values).
+        table_updates: dict[str, dict] = {}
+        restamp_specs: list[dict] = []
+        for tn, specs in calc_by_table.items():
+            td = read_table_from_abf(abf, tn, meta)
+            data_rows = [dict(zip(td["columns"], rv)) for rv in td.get("rows", [])]
+            cols_out, rows_out, restamp = _materialize_table_calc_columns(
+                tn, data_cols_by_table[tn], data_rows, specs, rels_ctx)
+            table_updates[tn] = {"columns": cols_out, "rows": rows_out}
+            restamp_specs.extend(restamp)
+
+        old_size, _ = _rebuild_datamodel(
+            info, table_updates=table_updates, calc_authoring=True)
+        _, new_size = _apply_calculated_column_metadata(dm_path, restamp_specs)
+        info["modified"] = True
+        global _dax_cache
+        _dax_cache.pop(alias, None)
+
+        new_spec = next(s for s in restamp_specs
+                        if s["table"] == table_name and s["column"] == column_name)
+        dt_name = {v: k for k, v in _CALC_TYPE_NAME_TO_AMO.items()}.get(
+            new_spec["amo_type"], "String")
+        return ToolResponse.ok(
+            f"Calculated column '{table_name}'[{column_name}] added:\n"
+            f"  Expression: {dax}\n"
+            f"  DataType: {dt_name} "
+            f"({'explicit' if data_type else 'inferred'}), values materialized\n"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(
+            f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
 
 
 @mcp.tool()

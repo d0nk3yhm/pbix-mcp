@@ -1331,12 +1331,112 @@ class _IDAllocator:
         return val
 
 
+# M types used in a Table.TransformColumnTypes step (Desktop's "Enter data"
+# form). Text uses `type text`; the rest are the ascribable type values.
+_M_TRANSFORM_TYPES = {
+    "String": "type text",
+    "Int64": "Int64.Type",
+    "Double": "type number",
+    "Float64": "type number",
+    "Decimal": "Currency.Type",
+    "DateTime": "type datetime",
+    "Boolean": "type logical",
+}
+
+# Upper bound on the base64 "Enter data" payload we will embed in a partition's
+# M. Beyond this we fall back to a headers-only table (the historical behavior)
+# rather than emit a multi-hundred-MB literal — such a table should carry a real
+# source instead. Realistic inline/config tables are a few KB; this is generous.
+_ENTER_DATA_MAX_B64 = 12 * 1024 * 1024
+
+
+def _m_escape_field_name(name: str) -> str:
+    """Quote an M record field name (`#"..."`) when it isn't a bare identifier."""
+    if name and (name[0].isalpha() or name[0] == "_") and all(
+            c.isalnum() or c == "_" for c in name):
+        return name
+    return '#"' + name.replace('"', '""') + '"'
+
+
+def _cell_to_m_text(value: object) -> object:
+    """Serialize a cell to the text form Desktop stores in "Enter data" JSON.
+
+    All values are stored as text (or JSON null) and cast back by a following
+    TransformColumnTypes step. Returns None for null, else a str.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return repr(value)  # invariant, period decimal separator
+    return str(value)
+
+
+def _build_enter_data_m(
+    columns: list[dict], rows: list[dict]
+) -> str | None:
+    """Build Desktop's "Enter data" partition M for inline rows.
+
+    Emits ``Table.FromRows(Json.Document(Binary.Decompress(Binary.FromText(
+    "<base64>", BinaryEncoding.Base64), Compression.Deflate)), <type table>)``
+    followed by a ``TransformColumnTypes`` — the exact shape Power BI Desktop's
+    Enter Data produces — so a service/Desktop *Refresh* reproduces the same
+    rows instead of emptying the table. Returns None when there are no rows or
+    the payload would exceed ``_ENTER_DATA_MAX_B64`` (caller falls back).
+    """
+    import base64
+    import zlib
+
+    if not rows:
+        return None
+    col_names = [c["name"] for c in columns]
+    # JSON: array of rows, each an array of per-column text cells (or null).
+    matrix = [
+        [_cell_to_m_text(row.get(cn)) for cn in col_names]
+        for row in rows
+    ]
+    payload = json.dumps(matrix, ensure_ascii=False, separators=(",", ":"))
+    # Compression.Deflate == raw DEFLATE (RFC 1951), no zlib/gzip wrapper.
+    co = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    deflated = co.compress(payload.encode("utf-8")) + co.flush()
+    b64 = base64.b64encode(deflated).decode("ascii")
+    if len(b64) > _ENTER_DATA_MAX_B64:
+        return None
+
+    # type table [Col1 = _t, ...] where _t is nullable text (Desktop's form).
+    type_fields = ", ".join(
+        f"{_m_escape_field_name(c['name'])} = _t" for c in columns
+    )
+    # TransformColumnTypes {{"Col1", <type>}, ...}
+    transforms = ", ".join(
+        '{"' + c["name"].replace('"', '""') + '", '
+        + _M_TRANSFORM_TYPES.get(c.get("data_type", "String"), "type text")
+        + "}"
+        for c in columns
+    )
+    return (
+        "let\n"
+        f'    Source = Table.FromRows(Json.Document(Binary.Decompress('
+        f'Binary.FromText("{b64}", BinaryEncoding.Base64), '
+        f"Compression.Deflate)), let _t = ((type nullable text) meta "
+        f"[Serialized.Text = true]) in type table [{type_fields}]),\n"
+        f'    #"Changed Type" = Table.TransformColumnTypes(Source, '
+        f'{{{transforms}}}, "en-US")\n'
+        "in\n"
+        '    #"Changed Type"'
+    )
+
+
 def _build_m_expression(
     table_name: str,
     columns: list[dict],
     source_csv: str | None = None,
     source_db: dict | None = None,
     is_directquery: bool = False,
+    rows: list[dict] | None = None,
 ) -> str:
     """Build a valid M expression for a table partition.
 
@@ -1347,6 +1447,11 @@ def _build_m_expression(
     If source_csv is provided, the M expression reads from that CSV file.
     If source_db is provided, the M expression connects to the database.
     Clicking "Refresh" in PBI Desktop will re-import from the source.
+
+    With no external source but ``rows`` present, the rows are embedded as
+    Desktop's "Enter data" literal (Table.FromRows over a deflated+base64 JSON
+    payload) so a Refresh reproduces them — a headers-only ``#table`` would
+    empty the table (and every visual bound to it) on refresh.
     """
     # Map data types to M types
     _M_TYPES = {
@@ -1500,7 +1605,17 @@ def _build_m_expression(
                 "    Data"
             )
 
-    # Default: empty typed table (data embedded in VertiPaq)
+    # Default: no external source. If we have the rows, embed them as Desktop's
+    # "Enter data" literal so a Refresh reproduces them (a headers-only #table
+    # would EMPTY the table on refresh — the visuals bound to it go blank).
+    if rows:
+        enter_data = _build_enter_data_m(columns, rows)
+        if enter_data is not None:
+            return enter_data
+
+    # No rows (or payload too large to embed): empty typed table. Data, if any,
+    # still lives in VertiPaq for the initial open, but a Refresh empties it —
+    # such a table should be given a real source.
     field_defs = []
     for col in columns:
         m_type = _M_TYPES.get(col.get("data_type", "String"), "Text.Type")
@@ -1704,7 +1819,8 @@ def _modify_metadata_and_encode(
                 (part_id, table_id, tname,
                  _build_m_expression(tname, tdef.get("columns", []),
                                      tdef.get("source_csv"), tdef.get("source_db"),
-                                     is_directquery=is_directquery),
+                                     is_directquery=is_directquery,
+                                     rows=tdef.get("rows", [])),
                  partition_type, ps_id,
                  partition_mode,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),

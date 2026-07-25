@@ -66,7 +66,7 @@ DAX evaluation returns extended results:
 | `pbix_save` | `strip_sensitivity_label` | `False` | Removes MSIP sensitivity labels when True |
 | `pbix_close` | `force` | `False` | Refuses to close with unsaved changes |
 
-## Tool Categories (112 tools)
+## Tool Categories (113 tools)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
@@ -82,8 +82,8 @@ Measure evaluation, per-dimension evaluation, calculated columns, cache manageme
 ### DataModel Read (16)
 Schema, measures, relationships, Power Query, columns, table data, data sources, metadata, CSV export (single/all), value search, SQL-like query, table profiling, data diff.
 
-### DataModel Write (22)
-Metadata SQL read/write, measure CRUD (incl. `pbix_datamodel_set_measure_category` — set or CLEAR a measure's DataCategory without touching the expression), column modification, relationship CRUD, table removal, field parameters, calculation groups, TMDL export, PBIP export, decompress/recompress, ABF file ops, table data write, value replace.
+### DataModel Write (23)
+Metadata SQL read/write, measure CRUD (incl. `pbix_datamodel_set_measure_category` — set or CLEAR a measure's DataCategory without touching the expression), column modification, **calculated-column authoring** (`pbix_datamodel_add_calculated_column` — evaluates a row-context DAX expression, materializes the values into VertiPaq, and stamps the column `Type=2` + Expression so the service recomputes it on refresh; refuses aggregations/CALCULATE/RELATED it can't reproduce per-row rather than storing wrong values), relationship CRUD, table removal, field parameters, calculation groups, TMDL export, PBIP export, decompress/recompress, ABF file ops, table data write, value replace.
 
 ### Resources, Themes & Custom Visuals (18)
 Static resources, image / registered-resource authoring (`pbix_add_image`, `pbix_register_resource`, `pbix_set_image` — see [Image & Resource Tools](#image--resource-tools)), theme read/write, color extraction/recolor, linguistic schema, custom visual import/remove (GUID embedded into `Report/CustomVisuals/` + `publicCustomVisuals`), reference-only registration of certified AppSource visuals by GUID (`pbix_reference_public_visual` — zero file payload, e.g. Deneb), turnkey HTML/CSS/SVG visual authoring — create/view/edit plus a template renderer — and SVG data-URI image-measure codegen (`pbix_svg_measure`). Detailed contracts in [Custom Visual & HTML Tools](#custom-visual--html-tools); recipes in [rich-content.md](rich-content.md).
