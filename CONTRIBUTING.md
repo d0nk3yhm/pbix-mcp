@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast unit tests only (540 pass, 10 skip, 22 slow/integration deselected)
+# Fast unit tests only (576 pass, 10 skip, 22 slow/integration deselected)
 pytest -m "not slow"
 
 # Download public test corpus, then run integration tests
@@ -32,7 +32,7 @@ pytest --cov=src/pbix_mcp --cov-report=term-missing -m "not slow"
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (112 tools)
+  server.py              # MCP server (113 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX file builder (create from scratch with row data)
   errors.py              # Typed exceptions with stable error codes (12 classes)
