@@ -605,6 +605,7 @@ def read_table_from_abf(
     abf_bytes: bytes,
     table_name: str,
     metadata_db_bytes: bytes,
+    include_calculated: bool = False,
 ) -> dict:
     """
     Read a full table from an ABF blob.
@@ -643,11 +644,15 @@ def read_table_from_abf(
             raise ValueError(f"Table '{table_name}' not found in metadata")
         table_id = table_row["ID"]
 
-        # Get columns (Type=1 data, Type=3 legacy/calculated, Type=4 calc-table
-        # columns — Desktop field parameters and calculated tables store real
-        # VertiPaq data under Type=4 columns, so excluding them read those
-        # tables back EMPTY; RowNumber system columns have no readable store
-        # and are skipped by the file-matching below either way).
+        # AMO Column.Type: 1=Data, 2=Calculated, 3=RowNumber,
+        # 4=CalculatedTableColumn. Desktop field parameters and calculated
+        # tables store real VertiPaq data under Type=4, so excluding those read
+        # such tables back EMPTY; RowNumber has no readable store and is skipped
+        # by the file-matching below either way. Type=2 CALCULATED columns also
+        # have stored values, but they are included only on request
+        # (include_calculated) — the DataModel rebuild path re-materializes them
+        # from their DAX, so handing them back as data there would duplicate the
+        # column.
         # Also pull the DictionaryStorage encoding so we can decode VALUE-encoded
         # columns (DictionaryStorage.Type=2, no external .dictionary file):
         # BaseId + Magnitude reconstruct value = (data_id + BaseId) / Magnitude.
@@ -661,6 +666,17 @@ def read_table_from_abf(
                LEFT JOIN ColumnStorage cs ON cs.ID = c.ColumnStorageID
                LEFT JOIN DictionaryStorage ds ON ds.ID = cs.DictionaryStorageID
                WHERE c.TableID = ? AND c.Type IN (1, 3, 4)
+               ORDER BY c.ID"""
+            if not include_calculated else
+            """SELECT c.ID, c.ExplicitName, c.ExplicitDataType, c.IsHidden,
+                      c.InferredDataType, c.InferredName,
+                      c.ColumnStorageID, c.Type,
+                      ds.Type AS DSType, ds.BaseId AS DSBaseId,
+                      ds.Magnitude AS DSMagnitude
+               FROM [Column] c
+               LEFT JOIN ColumnStorage cs ON cs.ID = c.ColumnStorageID
+               LEFT JOIN DictionaryStorage ds ON ds.ID = cs.DictionaryStorageID
+               WHERE c.TableID = ? AND c.Type IN (1, 2, 3, 4)
                ORDER BY c.ID""",
             (table_id,),
         ).fetchall()
@@ -806,7 +822,7 @@ def read_table_from_abf(
             continue
 
         # Read dictionary
-        dict_values = []
+        dict_values: list = []
         if dict_entry is not None:
             dict_bytes_raw = read_abf_file(abf_bytes, dict_entry)
             try:
@@ -869,7 +885,7 @@ def read_table_from_abf(
             if dict_entry is None and ds_type == 2:
                 base = ds_base_id if ds_base_id is not None else 0
                 mag = ds_magnitude if ds_magnitude else 1.0
-                values = []
+                values: list = []
                 for idx in indices:
                     if _null_offset and idx == 0:
                         values.append(None)  # the reserved blank/NULL slot

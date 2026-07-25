@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.33] - 2026-07-26
+
+Table functions that silently dropped their aggregates now work, and calculated column values are readable.
+
+### Fixed
+- **`SUMMARIZE` / `SUMMARIZECOLUMNS` silently DROPPED their extension columns — the aggregated value vanished.** `SUMMARIZE(Sales, Sales[Category], "Total", SUM(Sales[Amount]))` returned only the group column, so any measure built on it was quietly wrong (the same class of defect as the 0.9.30 `FILTER` fix). Extension columns are now evaluated per group, in a filter context restricted to that group's key: the example returns `HW → 150`, `EL → 500`, and `SUMX(SUMMARIZE(...), [Total])` totals correctly.
+- **`SUMMARIZE` grouping by a RELATED table's column returned NOTHING.** Only group-by columns on the base table were honoured, so the canonical "group a fact by a dimension column" shape (`SUMMARIZE(Sales, Products[Category], ...)`) evaluated to an empty table. Related columns are now resolved through the engine's own relationship propagation, and combinations that don't exist in the base table are skipped — matching DAX.
+- **`SELECTCOLUMNS` raised `KeyError` on a plain table.** It unconditionally copied `__column__`/`__value__` meta keys, which a multi-column row (a bare table reference or `ALL(Table)`) doesn't carry.
+- **Calculated column values were unreadable.** `read_table_from_abf` filtered `Type IN (1, 3, 4)`, omitting `Type = 2` calculated columns whose values *are* stored — so after 0.9.32 `schema` reported a calculated column that `get_table` / `pbix_get_table_data` never returned. `ModelReader.get_table` now includes them by default (`include_calculated=True`); the DataModel rebuild path keeps the previous behavior, since it re-materializes calculated columns from their DAX and would otherwise duplicate the column.
+
+### Changed
+- **Calculated-table authoring accepts `SUMMARIZE`, `SUMMARIZECOLUMNS` and `SELECTCOLUMNS`**, which were refused while they were lossy. `GROUPBY` and the join/index helpers remain refused — they are still unimplemented, and the evaluator refuses anything reporting an unsupported function rather than persisting a wrong table.
+- **The five reporting tools that had no test coverage now have it** — `pbix_get_model_schema`, `pbix_get_model_columns`, `pbix_performance`, `pbix_diff`, `pbix_document` (new `tests/test_tool_surfaces.py`). Note `pbix_document`'s `.docx` output requires `python-docx`; without it the tool returns the markdown and says so.
+- **mypy baseline ratcheted 175 → 165** (actual: 162) after annotating twelve untyped collections, so the gate can't drift back up.
+
 ## [0.9.32] - 2026-07-25
 
 Calculated fields now read back typed, flagged as calculated, and named.

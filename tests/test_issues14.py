@@ -109,12 +109,26 @@ class TestCalcTableEvaluator:
         assert res["rows"] == [["a", 1], ["b", 2]]
 
     @pytest.mark.parametrize("expr", [
-        'SUMMARIZE(Sales, Sales[Category], "T", SUM(Sales[Amount]))',
-        'SELECTCOLUMNS(Sales, "P", Sales[Product])',
         'GROUPBY(Sales, Sales[Category])',
+        'NATURALINNERJOIN(Sales, Sales)',
     ])
-    def test_lossy_shapes_refused_by_gate(self, expr):
+    def test_unimplemented_shapes_refused_by_gate(self, expr):
         assert calc_table_unsupported_reason(expr) is not None
+
+    @pytest.mark.parametrize("expr,cols", [
+        ('SUMMARIZE(Sales, Sales[Category], "T", SUM(Sales[Amount]))',
+         ["Category", "T"]),
+        ('SUMMARIZECOLUMNS(Sales[Category], "T", SUM(Sales[Amount]))',
+         ["Category", "T"]),
+        ('SELECTCOLUMNS(Sales, "P", Sales[Product], "A", Sales[Amount])',
+         ["P", "A"]),
+    ])
+    def test_previously_lossy_shapes_now_allowed(self, expr, cols):
+        """These were refused until the engine reproduced them faithfully."""
+        assert calc_table_unsupported_reason(expr) is None
+        res, err = evaluate_calc_table_expression(expr, SALES)
+        assert err is None, err
+        assert res["columns"] == cols
 
     def test_unsupported_function_refused(self):
         res, err = evaluate_calc_table_expression(
@@ -248,15 +262,34 @@ class TestAddCalculatedTable:
         finally:
             server.pbix_close(alias)
 
-    def test_refuses_lossy_expression(self, sales_pbix):
+    def test_refuses_unimplemented_expression(self, sales_pbix):
         alias = "ct4"
         server.pbix_open(sales_pbix, alias)
         try:
             out = json.loads(server.pbix_datamodel_add_calculated_table(
-                alias, "Bad",
-                'SUMMARIZE(Sales, Sales[Category], "T", SUM(Sales[Amount]))'))
+                alias, "Bad", 'GROUPBY(Sales, Sales[Category])'))
             assert out["success"] is False
             assert out["error_code"] == "UNSUPPORTED_CALC_TABLE"
+        finally:
+            server.pbix_close(alias)
+
+    def test_summarize_calc_table_now_authorable(self, sales_pbix, tmp_path):
+        """SUMMARIZE was refused; it now materializes with its aggregate."""
+        alias = "ct7"
+        server.pbix_open(sales_pbix, alias)
+        try:
+            out = json.loads(server.pbix_datamodel_add_calculated_table(
+                alias, "ByCat",
+                'SUMMARIZE(Sales, Sales[Category], "Total", SUM(Sales[Amount]))'))
+            assert out["success"], out
+            assert _table_meta(alias, "ByCat")["partition_type"] == 2
+            saved = str(tmp_path / "sumz.pbix")
+            server.pbix_save(alias, saved, overwrite=True, backup=False)
+            td = ModelReader(saved).get_table("ByCat", max_rows=10)
+            assert sorted(td["columns"]) == ["Category", "Total"]
+            got = {r[td["columns"].index("Category")]:
+                   r[td["columns"].index("Total")] for r in td["rows"]}
+            assert got == {"HW": 150.0, "EL": 200.0}
         finally:
             server.pbix_close(alias)
 

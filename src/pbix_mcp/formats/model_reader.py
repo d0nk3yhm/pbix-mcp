@@ -343,9 +343,15 @@ class ModelReader:
         self._metadata_cache["statistics"] = result
         return result
 
-    def get_table(self, table_name: str, max_rows: int = 0) -> dict:
+    def get_table(self, table_name: str, max_rows: int = 0,
+                  include_calculated: bool = True) -> dict:
         """
         Read actual table data from the VertiPaq store.
+
+        ``include_calculated`` (default True) also returns CALCULATED columns
+        (AMO Type=2), whose values are stored in VertiPaq just like data
+        columns. They used to be omitted, so a table reported a calculated
+        column in ``schema`` that never appeared in its data.
 
         Parameters
         ----------
@@ -362,7 +368,8 @@ class ModelReader:
         from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
 
         result = read_table_from_abf(
-            self._abf_bytes, table_name, self._metadata_db_bytes
+            self._abf_bytes, table_name, self._metadata_db_bytes,
+            include_calculated=include_calculated,
         )
 
         if max_rows > 0 and len(result["rows"]) > max_rows:

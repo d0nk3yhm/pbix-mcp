@@ -279,8 +279,8 @@ class DAXContext:
         # to see the un-transitioned filter context, exactly like Desktop.
         # CALCULATE and evaluate_measure clear it (they ARE the transition).
         self._outer_ctx: Optional['DAXContext'] = None
-        self._measure_cache = {}
-        self._eval_stack = set()  # Prevent circular refs
+        self._measure_cache: dict = {}
+        self._eval_stack: set = set()  # Prevent circular refs
         # Bound total sub-expression evaluations per top-level measure so a
         # pathological/non-terminating measure degrades to BLANK instead of
         # hanging the whole tool. Reset per outermost measure in evaluate_measure.
@@ -400,7 +400,7 @@ class DAXContext:
         result_filters = []
 
         # Group filter context entries by source table
-        table_filters = {}
+        table_filters: dict = {}
         for fk, values in self.filter_context.items():
             parts = fk.split('.', 1)
             if len(parts) == 2:
@@ -1764,7 +1764,7 @@ class DAXEngine:
             if isinstance(result, list) and result:
                 first = result[0]
                 if isinstance(first, dict) and '__table__' in first:
-                    groups = {}
+                    groups: dict = {}
                     if '__row__' in first:
                         # Multi-column row dict from ALL(Table) + FILTER
                         for row_item in result:
@@ -2473,8 +2473,14 @@ class DAXEngine:
         return extended
 
     def _fn_summarize(self, args_str: str, ctx: DAXContext) -> Any:
-        """SUMMARIZE(table, groupBy1, groupBy2, ...) — group by columns.
-        Returns list of row dicts with distinct combinations of the group-by columns."""
+        """SUMMARIZE(table, groupBy..., [name, expression]...) — group + aggregate.
+
+        The trailing ``"Name", <expression>`` EXTENSION columns used to be
+        skipped entirely, so ``SUMMARIZE(Sales, Sales[Cat], "Total",
+        SUM(Sales[Amount]))`` silently returned only the group column and the
+        aggregated value vanished. Each extension is now evaluated per group,
+        in a filter context restricted to that group's key.
+        """
         args = self._split_args(args_str)
         if len(args) < 2:
             return []
@@ -2484,32 +2490,114 @@ class DAXEngine:
         if not tbl or not rows:
             return []
 
-        # Collect group-by column indices
-        group_cols = []
-        for i in range(1, len(args)):
-            ref = self._eval_expr(args[i].strip(), ctx)
+        # Split the tail into group-by column refs and (name, expression) pairs.
+        # A quoted string literal starts the extension-column section.
+        group_cols: list = []
+        remote_cols: list = []
+        extensions: list = []
+        i = 1
+        while i < len(args):
+            arg = args[i].strip()
+            if arg.startswith('"'):
+                break
+            ref = self._eval_expr(arg, ctx)
             if isinstance(ref, tuple) and len(ref) == 2:
-                col_idx = ctx._find_col_idx(tbl['columns'], ref[1])
-                if col_idx >= 0:
-                    group_cols.append((ref[1], col_idx))
+                ref_table, ref_col = ref
+                if ref_table == table_name or ref_table not in ctx.tables:
+                    col_idx = ctx._find_col_idx(tbl['columns'], ref_col)
+                    if col_idx >= 0:
+                        group_cols.append((ref_col, col_idx))
+                else:
+                    # Grouping the base table by a RELATED table's column — the
+                    # canonical "fact by dimension" shape. This used to be
+                    # dropped, so the whole result came back empty.
+                    remote_cols.append((ref_table, ref_col))
+            i += 1
+        while i + 1 < len(args):
+            name = args[i].strip().strip('"')
+            extensions.append((name, args[i + 1].strip()))
+            i += 2
 
+        if remote_cols:
+            return self._summarize_with_related(
+                table_name, tbl, group_cols, remote_cols, extensions, ctx)
         if not group_cols:
             return []
 
-        # Get distinct combinations
         seen = set()
         result = []
         for row in rows:
             key = tuple(row[idx] for _, idx in group_cols)
-            if key not in seen:
-                seen.add(key)
-                row_dict = {'__table__': table_name}
-                for col_name, col_idx in group_cols:
-                    row_dict[col_name] = row[col_idx]
-                # Use first group col as the iteration column
-                row_dict['__column__'] = group_cols[0][0]
-                row_dict['__value__'] = row[group_cols[0][1]]
-                result.append(row_dict)
+            if key in seen:
+                continue
+            seen.add(key)
+            row_dict = {'__table__': table_name}
+            for col_name, col_idx in group_cols:
+                row_dict[col_name] = row[col_idx]
+            if extensions:
+                group_ctx = ctx.with_filters({
+                    f"{table_name}.{col_name}": [row[col_idx]]
+                    for col_name, col_idx in group_cols
+                })
+                for ext_name, ext_expr in extensions:
+                    row_dict[ext_name] = self._eval_expr(ext_expr, group_ctx)
+            # Use first group col as the iteration column
+            row_dict['__column__'] = group_cols[0][0]
+            row_dict['__value__'] = row[group_cols[0][1]]
+            result.append(row_dict)
+        return result
+
+    def _summarize_with_related(self, table_name, tbl, group_cols, remote_cols,
+                                extensions, ctx: DAXContext) -> Any:
+        """SUMMARIZE where at least one group-by column lives on a RELATED table.
+
+        Each candidate group is expressed as a filter context and handed to the
+        engine's own relationship propagation, so the base rows for the group
+        are resolved exactly the way every other filtered evaluation resolves
+        them. Combinations with no base rows are skipped, matching DAX (which
+        only returns combinations present in the table).
+        """
+        import itertools
+
+        axes = []
+        for col_name, col_idx in group_cols:
+            vals = list(dict.fromkeys(
+                r[col_idx] for r in ctx.get_filtered_rows(table_name)))
+            axes.append([(f"{table_name}.{col_name}", col_name, v)
+                         for v in vals])
+        for rt, rc in remote_cols:
+            rtbl = ctx.tables.get(rt) or {}
+            ridx = ctx._find_col_idx(rtbl.get('columns', []), rc)
+            if ridx < 0:
+                return []
+            vals = list(dict.fromkeys(
+                r[ridx] for r in ctx.get_filtered_rows(rt)))
+            axes.append([(f"{rt}.{rc}", rc, v) for v in vals])
+        if not axes:
+            return []
+
+        # Guard against a combinatorial blow-up on wide group-by sets.
+        total = 1
+        for a in axes:
+            total *= max(len(a), 1)
+        if total > 100_000:
+            return []
+
+        result = []
+        for combo in itertools.product(*axes):
+            filters = {key: [val] for key, _disp, val in combo}
+            group_ctx = ctx.with_filters(filters)
+            if not group_ctx.get_filtered_rows(table_name):
+                continue  # combination doesn't exist in the base table
+            row_dict = {'__table__': table_name}
+            for _key, disp, val in combo:
+                row_dict[disp] = val
+            for ext_name, ext_expr in extensions:
+                row_dict[ext_name] = self._eval_expr(ext_expr, group_ctx)
+            first_disp, first_val = combo[0][1], combo[0][2]
+            row_dict['__column__'] = first_disp
+            row_dict['__value__'] = first_val
+            result.append(row_dict)
         return result
 
     def _fn_summarizecolumns(self, args_str: str, ctx: DAXContext) -> Any:
@@ -2528,9 +2616,16 @@ class DAXEngine:
                 break  # Rest are name/expression pairs
         if not group_refs:
             return []
-        # Use first table as base
+        # Use first table as base. Forward the trailing "Name", <expression>
+        # extension columns too — they were dropped, so the aggregated value
+        # silently disappeared from the result.
         table_name = group_refs[0][0]
-        return self._fn_summarize(f"'{table_name}', " + ", ".join(f"'{t}'[{c}]" for t, c in group_refs), ctx)
+        inner = f"'{table_name}', " + ", ".join(
+            f"'{t}'[{c}]" for t, c in group_refs)
+        tail = args[len(group_refs):]
+        if tail:
+            inner += ", " + ", ".join(a.strip() for a in tail)
+        return self._fn_summarize(inner, ctx)
 
     def _fn_selectcolumns(self, args_str: str, ctx: DAXContext) -> Any:
         """SELECTCOLUMNS(table, name, expression, ...) — select/rename columns."""
@@ -2560,9 +2655,14 @@ class DAXEngine:
                     first_val = col_val
                 i += 2
             if isinstance(row_item, dict) and '__table__' in row_item:
+                # A multi-column row (bare table ref / ALL(Table)) carries
+                # __row__ and has NO __column__/__value__; indexing them
+                # unconditionally raised KeyError, so SELECTCOLUMNS over a
+                # plain table crashed.
                 new_row['__table__'] = row_item['__table__']
-                new_row['__column__'] = row_item['__column__']
-                new_row['__value__'] = row_item['__value__']
+                for meta in ('__column__', '__value__', '__row__'):
+                    if meta in row_item:
+                        new_row[meta] = row_item[meta]
             result.append(new_row)
         return result
 
@@ -2852,7 +2952,7 @@ class DAXEngine:
         # Use int if all values are whole numbers
         use_int = (start_val == int(start_val) and end_val == int(end_val)
                    and step_val == int(step_val))
-        rows = []
+        rows: list = []
         current = start_val
         max_rows = 1000000  # safety limit
         if step_val > 0:
