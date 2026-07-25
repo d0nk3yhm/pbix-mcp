@@ -381,18 +381,53 @@ def _detect_encoding(file_path: str) -> str:
     return "utf-8"
 
 
+def _is_pbir(work_dir: str) -> bool:
+    """True when the report is stored in PBIR (Report/definition) format.
+
+    Every report authored in the Power BI SERVICE downloads in this shape: the
+    classic single ``Report/Layout`` file is absent and the report is instead a
+    tree of per-page / per-visual JSON files.
+    """
+    return os.path.exists(
+        os.path.join(work_dir, "Report", "definition", "pages", "pages.json"))
+
+
 def _get_layout(work_dir: str) -> dict | None:
-    """Read the Report/Layout JSON."""
+    """Read the report layout.
+
+    Returns the classic ``Report/Layout`` document when present. For a PBIR
+    report (which has no Report/Layout at all) the on-disk tree is converted to
+    the same legacy shape, so every consumer reads service-authored reports
+    through this one entry point instead of seeing "no layout".
+
+    The converted document is READ-ONLY: it is marked ``__pbir__`` and
+    ``_set_layout`` refuses to write it back — doing so would plant a classic
+    Report/Layout inside a PBIR file and leave two conflicting definitions.
+    """
     layout_path = os.path.join(work_dir, "Report", "Layout")
     if not os.path.exists(layout_path):
-        return None
+        return _get_layout_pbir(work_dir)
     enc = _detect_encoding(layout_path)
     with open(layout_path, "r", encoding=enc) as f:
         return json.load(f)
 
 
 def _set_layout(work_dir: str, layout: dict) -> None:
-    """Write the Report/Layout JSON back in UTF-16-LE (Power BI native)."""
+    """Write the Report/Layout JSON back in UTF-16-LE (Power BI native).
+
+    Refuses to write a PBIR report: the layout a consumer holds for such a file
+    is a SYNTHESIZED legacy view of the Report/definition tree. Every layout
+    mutation funnels through here, so this is the one place that has to hold
+    that line.
+    """
+    if layout.get("__pbir__") or _is_pbir(work_dir):
+        raise UnsupportedFormatError(
+            "This report is in PBIR format (Report/definition), which pbix-mcp "
+            "can READ but not write. The layout you hold is a synthesized "
+            "legacy view of that tree — writing it back would corrupt the file. "
+            "Edit the report in Power BI Desktop / the service, or build a new "
+            "classic report with pbix_create."
+        )
     layout_path = os.path.join(work_dir, "Report", "Layout")
     os.makedirs(os.path.dirname(layout_path), exist_ok=True)
     text = json.dumps(layout, ensure_ascii=False)
@@ -1229,6 +1264,61 @@ def pbix_close(alias: str, force: bool = False) -> str:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         raise SessionError(f"Close failed: {e}")
+
+
+@mcp.tool()
+def pbix_report_format(alias: str) -> str:
+    """Report which layout format the open file uses, and whether it is writable.
+
+    Two formats exist in the wild:
+
+    * **classic** — a single ``Report/Layout`` document. Fully readable AND
+      writable by every layout tool.
+    * **PBIR** — a ``Report/definition/`` tree of per-page / per-visual JSON.
+      This is what every report authored in the Power BI SERVICE downloads as.
+      pbix-mcp READS it (the tree is converted to the classic shape, so pages,
+      visuals, field bindings, filters and geometry all come through) but does
+      NOT write it — layout edits refuse rather than corrupt the file.
+
+    Call this before offering layout edits, so a user gets a clear explanation
+    instead of a failed write.
+
+    Args:
+        alias: The alias of the open file
+    """
+    try:
+        info = _ensure_open(alias)
+        work_dir = info["work_dir"]
+        is_pbir = _is_pbir(work_dir)
+        layout = _get_layout(work_dir)
+        sections = (layout or {}).get("sections", [])
+        pages = len(sections)
+        visuals = sum(len(s.get("visualContainers", [])) for s in sections)
+        fmt = "PBIR" if is_pbir else ("classic" if layout else "none")
+        if is_pbir:
+            writable = ("no — PBIR is read-only in pbix-mcp; edit it in "
+                        "Power BI Desktop or the service")
+        else:
+            writable = "yes" if layout else "no"
+        return ToolResponse.ok(
+            f"Report format: {fmt}\n"
+            f"  Pages: {pages}\n"
+            f"  Visuals: {visuals}\n"
+            f"  Layout readable: {'yes' if layout else 'no'}\n"
+            f"  Layout writable: {writable}",
+            data={
+                "format": fmt,
+                "is_pbir": is_pbir,
+                "readable": layout is not None,
+                "writable": bool(layout) and not is_pbir,
+                "pages": pages,
+                "visuals": visuals,
+            },
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
 @mcp.tool()
@@ -9481,9 +9571,8 @@ def _resolve_default_filters(ctx: dict, page_index: int) -> dict | None:
     reuse a possibly stale snapshot."""
     if page_index >= 0:
         work_dir = ctx.get("work_dir")
+        # _get_layout falls back to the PBIR reader itself.
         layout = _get_layout(work_dir) if work_dir else None
-        if not layout and work_dir:
-            layout = _get_layout_pbir(work_dir)
         n_pages = len((layout or {}).get("sections", []))
         if page_index >= n_pages:
             raise LayoutParseError(
@@ -9909,12 +9998,118 @@ def pbix_evaluate_dax_grouped(
             f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
 
 
-def _get_layout_pbir(work_dir: str) -> dict | None:
-    """Read PBIR-format layout as a legacy-compatible structure.
+def _pbir_alias_factory():
+    """Allocate short From-aliases per entity, the way a classic query does."""
+    aliases: dict = {}
 
-    PBIR stores each visual as a separate JSON file under
-    Report/definition/pages/<pageId>/visuals/<visualId>/visual.json.
-    We convert these into the legacy { sections: [ { visualContainers: [...] } ] } format.
+    def alias_for(entity: str) -> str:
+        if entity not in aliases:
+            base = (entity[:1] or "t").lower()
+            cand, n = base, 1
+            while cand in aliases.values():
+                n += 1
+                cand = f"{base}{n}"
+            aliases[entity] = cand
+        return aliases[entity]
+
+    return aliases, alias_for
+
+
+def _pbir_rewrite_sourcerefs(node, alias_for):
+    """Rewrite PBIR ``SourceRef.Entity`` into the classic ``SourceRef.Source``
+    alias form, preserving everything else (works for Column, Measure and
+    Aggregation shapes alike)."""
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            if k == "SourceRef" and isinstance(v, dict) and "Entity" in v:
+                out[k] = {"Source": alias_for(v["Entity"])}
+            else:
+                out[k] = _pbir_rewrite_sourcerefs(v, alias_for)
+        return out
+    if isinstance(node, list):
+        return [_pbir_rewrite_sourcerefs(x, alias_for) for x in node]
+    return node
+
+
+def _pbir_visual_to_container(vdata: dict) -> dict:
+    """Convert one PBIR ``visual.json`` into a legacy visualContainer.
+
+    Carries across everything a consumer needs to actually use the visual: its
+    NAME (so it can be addressed at all), geometry incl. z/tabOrder, the field
+    bindings as both ``projections`` and a synthesized ``prototypeQuery`` (so
+    column-vs-measure is recoverable), hidden state, and its filters.
+    """
+    visual_obj = dict(vdata.get("visual") or {})
+    query = visual_obj.pop("query", None) or {}
+
+    aliases, alias_for = _pbir_alias_factory()
+    projections: dict = {}
+    selects: list = []
+    seen_select: set = set()
+    for role, rv in (query.get("queryState") or {}).items():
+        entries = []
+        for proj in (rv.get("projections") or []):
+            qref = proj.get("queryRef")
+            entry = {"queryRef": qref}
+            if "active" in proj:
+                entry["active"] = proj["active"]
+            if proj.get("nativeQueryRef"):
+                entry["nativeQueryRef"] = proj["nativeQueryRef"]
+            entries.append(entry)
+            field = proj.get("field") or {}
+            if field and qref not in seen_select:
+                sel = _pbir_rewrite_sourcerefs(field, alias_for)
+                if isinstance(sel, dict):
+                    sel = dict(sel)
+                    sel["Name"] = qref
+                    selects.append(sel)
+                    seen_select.add(qref)
+        projections[role] = entries
+
+    if projections:
+        visual_obj["projections"] = projections
+    if selects:
+        visual_obj["prototypeQuery"] = {
+            "Version": 2,
+            "From": [{"Name": a, "Entity": e, "Type": 0}
+                     for e, a in aliases.items()],
+            "Select": selects,
+        }
+
+    pos = vdata.get("position") or {}
+    config: dict = {"name": vdata.get("name", ""), "singleVisual": visual_obj}
+    if pos:
+        config["layouts"] = [{"id": 0, "position": dict(pos)}]
+
+    container: dict = {
+        "config": json.dumps(config),
+        "x": pos.get("x", 0),
+        "y": pos.get("y", 0),
+        "z": pos.get("z", 0),
+        "width": pos.get("width", 0),
+        "height": pos.get("height", 0),
+        "tabOrder": pos.get("tabOrder", 0),
+    }
+    if vdata.get("isHidden"):
+        container["isHidden"] = True
+    vfilters = (vdata.get("filterConfig") or {}).get("filters")
+    if vfilters:
+        container["filters"] = json.dumps(vfilters)
+    return container
+
+
+def _get_layout_pbir(work_dir: str) -> dict | None:
+    """Read a PBIR report as a legacy-compatible layout structure.
+
+    PBIR (what the Power BI service produces) stores the report as a tree:
+    ``Report/definition/pages/pages.json`` for the page order plus a
+    ``page.json`` and one ``visuals/<id>/visual.json`` per visual. This
+    converts that tree into the classic ``{sections: [{visualContainers: []}]}``
+    document every other reader in pbix-mcp already understands.
+
+    The result is marked ``__pbir__`` so ``_set_layout`` can refuse to write a
+    synthesized layout back over a PBIR file.
     """
     pages_json = os.path.join(work_dir, "Report", "definition", "pages", "pages.json")
     if not os.path.exists(pages_json):
@@ -9929,7 +10124,6 @@ def _get_layout_pbir(work_dir: str) -> dict | None:
     pages_dir = os.path.dirname(pages_json)
     sections = []
 
-    # pages_meta is typically a list of page objects with 'id' or a directory listing
     page_dirs = []
     if isinstance(pages_meta, list):
         for pm in pages_meta:
@@ -9943,51 +10137,73 @@ def _get_layout_pbir(work_dir: str) -> dict | None:
         # back to a SORTED directory listing so the order is at least
         # deterministic when pageOrder is absent (os.listdir order is
         # filesystem-dependent).
-        on_disk = [pid for pid in sorted(os.listdir(pages_dir))
-                   if os.path.isdir(os.path.join(pages_dir, pid))
-                   and os.path.exists(os.path.join(pages_dir, pid, "visuals"))]
+        try:
+            on_disk = [pid for pid in sorted(os.listdir(pages_dir))
+                       if os.path.isdir(os.path.join(pages_dir, pid))]
+        except OSError:
+            on_disk = []
         page_order = pages_meta.get("pageOrder")
         if isinstance(page_order, list) and page_order:
             ordered = [pid for pid in page_order if pid in on_disk]
-            # any folder pageOrder missed still appends (deterministically)
             page_dirs = ordered + [pid for pid in on_disk if pid not in ordered]
         else:
             page_dirs = on_disk
 
+    active_page = pages_meta.get("activePageName") if isinstance(pages_meta, dict) else None
+
     for pid in page_dirs:
-        visuals_dir = os.path.join(pages_dir, pid, "visuals")
-        if not os.path.isdir(visuals_dir):
-            continue
+        page_dir = os.path.join(pages_dir, pid)
+        pdata = {}
+        page_json = os.path.join(page_dir, "page.json")
+        if os.path.exists(page_json):
+            try:
+                with open(page_json, "r", encoding="utf-8") as f:
+                    pdata = json.load(f)
+            except Exception:
+                pdata = {}
 
         containers = []
-        for vid in os.listdir(visuals_dir):
-            visual_json = os.path.join(visuals_dir, vid, "visual.json")
-            if not os.path.exists(visual_json):
-                continue
-            try:
-                with open(visual_json, "r", encoding="utf-8") as f:
-                    vdata = json.load(f)
-                # PBIR visual.json has { visual: { visualType, objects, ... } }
-                # Convert to legacy format: config = { singleVisual: { ... } }
-                visual_obj = vdata.get("visual", vdata)
-                container = {
-                    "config": json.dumps({"singleVisual": visual_obj}),
-                    "x": vdata.get("position", {}).get("x", 0),
-                    "y": vdata.get("position", {}).get("y", 0),
-                    "width": vdata.get("position", {}).get("width", 0),
-                    "height": vdata.get("position", {}).get("height", 0),
-                }
-                containers.append(container)
-            except Exception:
-                continue
+        visuals_dir = os.path.join(page_dir, "visuals")
+        if os.path.isdir(visuals_dir):
+            for vid in sorted(os.listdir(visuals_dir)):
+                visual_json = os.path.join(visuals_dir, vid, "visual.json")
+                if not os.path.exists(visual_json):
+                    continue
+                try:
+                    with open(visual_json, "r", encoding="utf-8") as f:
+                        vdata = json.load(f)
+                    container = _pbir_visual_to_container(vdata)
+                    mobile_json = os.path.join(visuals_dir, vid, "mobile.json")
+                    if os.path.exists(mobile_json):
+                        try:
+                            with open(mobile_json, "r", encoding="utf-8") as f:
+                                container["mobile"] = json.load(f)
+                        except Exception:
+                            pass
+                    containers.append(container)
+                except Exception:
+                    continue
 
-        sections.append({
-            "displayName": pid,
+        section: dict = {
+            "name": pdata.get("name", pid),
+            "displayName": pdata.get("displayName", pid),
             "visualContainers": containers,
-        })
+        }
+        for key in ("width", "height", "displayOption", "type"):
+            if key in pdata:
+                section[key] = pdata[key]
+        pfilters = (pdata.get("filterConfig") or {}).get("filters")
+        if pfilters:
+            section["filters"] = json.dumps(pfilters)
+        if pdata.get("objects"):
+            section["objects"] = pdata["objects"]
+        if active_page and pdata.get("name", pid) == active_page:
+            section["isActive"] = True
+        sections.append(section)
 
-    return {"sections": sections} if sections else None
-
+    if not sections:
+        return None
+    return {"sections": sections, "__pbir__": True}
 
 def _extract_default_filters_dict(work_dir: str, page_index: int = 0, layout: dict | None = None) -> dict:
     """Internal: extract default slicer filters as a dict for programmatic use.
@@ -9999,10 +10215,7 @@ def _extract_default_filters_dict(work_dir: str, page_index: int = 0, layout: di
     (potentially multi-MB) report layout once per page.
     """
     if layout is None:
-        layout = _get_layout(work_dir)
-        if not layout:
-            # Try PBIR format
-            layout = _get_layout_pbir(work_dir)
+        layout = _get_layout(work_dir)   # handles PBIR too
     if not layout:
         return {}
 
@@ -10108,9 +10321,7 @@ def _extract_default_filters_dict(work_dir: str, page_index: int = 0, layout: di
 
 def _get_all_default_filters(work_dir: str) -> dict:
     """Get default filters merged across all pages."""
-    layout = _get_layout(work_dir)
-    if not layout:
-        layout = _get_layout_pbir(work_dir)
+    layout = _get_layout(work_dir)   # handles PBIR too
     if not layout:
         return {}
 
@@ -12408,11 +12619,8 @@ def pbix_doctor(alias: str) -> str:
         layout = _get_layout(info["work_dir"])
         if layout:
             pages = len(layout.get("sections", []))
-            return f"{pages} pages (legacy format)"
-        pbir = _get_layout_pbir(info["work_dir"])
-        if pbir:
-            pages = len(pbir.get("sections", []))
-            return f"{pages} pages (PBIR format)"
+            fmt = "PBIR" if layout.get("__pbir__") else "legacy"
+            return f"{pages} pages ({fmt} format)"
         return "No layout found"
     _check("Report layout", check_layout)
 

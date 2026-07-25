@@ -66,10 +66,12 @@ DAX evaluation returns extended results:
 | `pbix_save` | `strip_sensitivity_label` | `False` | Removes MSIP sensitivity labels when True |
 | `pbix_close` | `force` | `False` | Refuses to close with unsaved changes |
 
-## Tool Categories (116 tools)
+## Tool Categories (117 tools)
 
-### Create & File Management (5)
-`pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
+### Create & File Management (6)
+`pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open` · `pbix_report_format`
+
+**Report formats** — a `.pbix` stores its report either as the **classic** single `Report/Layout` document, or as **PBIR** (`Report/definition/`, a tree of per-page/per-visual JSON), which is what every report authored in the Power BI *service* downloads as. Both are READ through the same entry point: a PBIR tree is converted to the classic shape (page names/size/type, visual names, geometry incl. z/tabOrder, `projections` + a synthesized `prototypeQuery` so column-vs-measure is recoverable, hidden state, filters, sync groups, mobile layout). PBIR is **read-only** — every layout write refuses with `FORMAT_UNSUPPORTED` rather than planting a classic `Report/Layout` inside a PBIR file. Call `pbix_report_format` to learn which format an open file uses and whether layout edits are possible.
 
 ### Report Layout & Visuals (22)
 Visual CRUD, visual-level sort authoring (`pbix_set_visual_sort`), page management, filters, positions, bookmarks (add/remove), settings, layout read/write, default filter extraction.
