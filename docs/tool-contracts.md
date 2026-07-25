@@ -66,7 +66,7 @@ DAX evaluation returns extended results:
 | `pbix_save` | `strip_sensitivity_label` | `False` | Removes MSIP sensitivity labels when True |
 | `pbix_close` | `force` | `False` | Refuses to close with unsaved changes |
 
-## Tool Categories (113 tools)
+## Tool Categories (116 tools)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
@@ -74,16 +74,16 @@ DAX evaluation returns extended results:
 ### Report Layout & Visuals (22)
 Visual CRUD, visual-level sort authoring (`pbix_set_visual_sort`), page management, filters, positions, bookmarks (add/remove), settings, layout read/write, default filter extraction.
 
-### DAX Engine (4)
-Measure evaluation, per-dimension evaluation, calculated columns, cache management.
+### DAX Engine (5)
+Measure evaluation, per-dimension evaluation, **grouped (GROUP-BY) evaluation** (`pbix_evaluate_dax_grouped` — evaluates measures for every group key in ONE call and returns structured per-group rows; the fact rows are bucketed by the propagated join key once instead of one evaluation per category value, so a chart bound to thousands of categories is a single call. Measures the fast path can't bucket are still evaluated exactly, per group. `max_groups` defaults to 3500 — Power BI's own data-reduction window — and truncation is reported via `group_count`/`truncated`), calculated columns, cache management.
 
 **Default-filter contract** (`pbix_evaluate_dax` / `pbix_evaluate_dax_per_dimension`): a non-empty `filter_context` always wins. With an empty `filter_context`, `apply_default_filters` controls whether the report's persisted default slicer selections are auto-applied — `pbix_evaluate_dax` defaults to **True** (historic behavior), `pbix_evaluate_dax_per_dimension` defaults to **False** (its historic raw iteration; the iterated dimension's own key is always owned by the per-value loop). Pass the flag explicitly for identical behavior across both tools. `page_index` scopes the applied defaults: `-1` (default) merges every page's slicers; `>= 0` applies only that page's — the service scopes a slicer's default selection to its own page, so pass the page a visual lives on to reproduce that visual's service number. `apply_default_filters=False` evaluates the raw, truly unfiltered model.
 
 ### DataModel Read (16)
 Schema, measures, relationships, Power Query, columns, table data, data sources, metadata, CSV export (single/all), value search, SQL-like query, table profiling, data diff.
 
-### DataModel Write (23)
-Metadata SQL read/write, measure CRUD (incl. `pbix_datamodel_set_measure_category` — set or CLEAR a measure's DataCategory without touching the expression), column modification, **calculated-column authoring** (`pbix_datamodel_add_calculated_column` — evaluates a row-context DAX expression, materializes the values into VertiPaq, and stamps the column `Type=2` + Expression so the service recomputes it on refresh; refuses aggregations/CALCULATE/RELATED it can't reproduce per-row rather than storing wrong values), relationship CRUD, table removal, field parameters, calculation groups, TMDL export, PBIP export, decompress/recompress, ABF file ops, table data write, value replace.
+### DataModel Write (25)
+Metadata SQL read/write, measure CRUD (incl. `pbix_datamodel_set_measure_category` — set or CLEAR a measure's DataCategory without touching the expression), column modification, **calculated-column authoring** (`pbix_datamodel_add_calculated_column` — evaluates a row-context DAX expression, materializes the values into VertiPaq, and stamps the column `Type=2` + Expression so the service recomputes it on refresh; refuses aggregations/CALCULATE/RELATED it can't reproduce per-row rather than storing wrong values), **calculated-table authoring** (`pbix_datamodel_add_calculated_table` — evaluates a table expression, materializes the rows, and stamps Desktop's calc-table metadata (partition `Type=2` carrying the DAX, data columns `Type=4`). Supported shapes are the ones this engine reproduces exactly: `DATATABLE`, `GENERATESERIES`, `DISTINCT`, `VALUES`, `FILTER`, `TOPN`, `ADDCOLUMNS`, a bare table reference; `SUMMARIZE`/`SUMMARIZECOLUMNS`/`SELECTCOLUMNS`/`GROUPBY` are refused because their extension columns are dropped. Calculated columns and calculated tables compose in either order — each add re-materializes the others), relationship CRUD **incl. in-place edit** (`pbix_datamodel_modify_relationship` — change cardinality / cross-filter direction / active flag without remove + re-add; `is_active` and `cross_filter_direction` are a metadata-only splice that also works on models the rebuild path refuses, while a cardinality change re-runs the rebuild so the R$ join indexes match), table removal, field parameters, calculation groups, TMDL export, PBIP export, decompress/recompress, ABF file ops, table data write, value replace.
 
 ### Resources, Themes & Custom Visuals (18)
 Static resources, image / registered-resource authoring (`pbix_add_image`, `pbix_register_resource`, `pbix_set_image` — see [Image & Resource Tools](#image--resource-tools)), theme read/write, color extraction/recolor, linguistic schema, custom visual import/remove (GUID embedded into `Report/CustomVisuals/` + `publicCustomVisuals`), reference-only registration of certified AppSource visuals by GUID (`pbix_reference_public_visual` — zero file payload, e.g. Deneb), turnkey HTML/CSS/SVG visual authoring — create/view/edit plus a template renderer — and SVG data-URI image-measure codegen (`pbix_svg_measure`). Detailed contracts in [Custom Visual & HTML Tools](#custom-visual--html-tools); recipes in [rich-content.md](rich-content.md).
