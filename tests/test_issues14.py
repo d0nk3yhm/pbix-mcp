@@ -118,8 +118,17 @@ class TestCalcTableEvaluator:
 
     def test_unsupported_function_refused(self):
         res, err = evaluate_calc_table_expression(
-            "CALENDAR(DATE(2024,1,1), DATE(2024,1,3))", SALES)
+            "MEDIANX(Sales, Sales[Amount])", SALES)
         assert res is None and "unsupported" in err
+
+    def test_calendar_date_table(self):
+        """Implementing DATE() also made CALENDAR() usable, so a real Date
+        dimension can now be authored as a calculated table."""
+        res, err = evaluate_calc_table_expression(
+            "CALENDAR(DATE(2024,1,1), DATE(2024,1,5))", SALES)
+        assert err is None, err
+        assert res["columns"] == ["Date"]
+        assert len(res["rows"]) == 5
 
     def test_empty_expression_refused(self):
         assert calc_table_unsupported_reason("") is not None
@@ -337,6 +346,278 @@ class TestEvaluateDaxGrouped:
             assert out["error_code"] == "COLUMN_NOT_FOUND"
         finally:
             server.pbix_close(alias)
+
+
+@pytest.fixture
+def pred_pbix(tmp_path):
+    p = str(tmp_path / "pred.pbix")
+    b = PBIXBuilder("Pred")
+    b.add_table("Sales", [
+        {"name": "Product", "data_type": "String"},
+        {"name": "Region", "data_type": "String"},
+        {"name": "Amount", "data_type": "Double"},
+        {"name": "Date", "data_type": "DateTime"},
+    ], rows=[
+        {"Product": "Widget", "Region": "North", "Amount": 100.0,
+         "Date": "2024-01-15T00:00:00"},
+        {"Product": "Gadget", "Region": "South", "Amount": 200.0,
+         "Date": "2024-02-20T00:00:00"},
+        {"Product": "Doohickey", "Region": "North", "Amount": 50.0,
+         "Date": "2024-03-05T00:00:00"},
+        {"Product": "Gizmo", "Region": "East", "Amount": 400.0,
+         "Date": "2024-04-10T00:00:00"},
+    ])
+    b.add_measure("Sales", "Total", "SUM(Sales[Amount])")
+    b.add_page("P")
+    b.save(p)
+    return p
+
+
+def _total(alias, fc):
+    r = json.loads(server.pbix_evaluate_dax(
+        alias, "Total", json.dumps(fc) if fc else "",
+        apply_default_filters=False))
+    return r.get("results", [{}])[0].get("value")
+
+
+class TestPredicateFilterContext:
+    """filter_context accepts structured predicates, not just In-sets."""
+
+    @pytest.mark.parametrize("fc,expected", [
+        (None, 750.0),
+        # LIST form must behave EXACTLY as before
+        ({"Sales.Region": ["North"]}, 150.0),
+        ({"Sales.Region": ["North", "South"]}, 350.0),
+        # comparisons
+        ({"Sales.Amount": {"op": ">", "value": 100}}, 600.0),
+        ({"Sales.Amount": {"op": ">=", "value": 100}}, 700.0),
+        ({"Sales.Amount": {"op": "<", "value": 100}}, 50.0),
+        ({"Sales.Amount": {"op": "<>", "value": 400}}, 350.0),
+        # range
+        ({"Sales.Amount": {"between": [100, 200]}}, 300.0),
+        # text
+        ({"Sales.Region": {"contains": "or"}}, 150.0),
+        ({"Sales.Region": {"starts_with": "S"}}, 200.0),
+        ({"Sales.Region": {"ends_with": "th"}}, 350.0),
+        ({"Sales.Region": {"in": ["North", "East"]}}, 550.0),
+        ({"Sales.Region": {"not_in": ["North"]}}, 600.0),
+        # dates
+        ({"Sales.Date": {"between": ["2024-02-01", "2024-03-31"]}}, 250.0),
+        ({"Sales.Date": {"relative_date": {
+            "last": 60, "unit": "day", "anchor": "2024-03-10"}}}, 350.0),
+        # predicate AND list together
+        ({"Sales.Amount": {"op": ">", "value": 100},
+          "Sales.Region": ["East"]}, 400.0),
+        # two predicate keys on one column are ANDed
+        ({"Sales.Amount": {"op": ">", "value": 60, "between": [0, 150]}}, 100.0),
+    ])
+    def test_predicates(self, pred_pbix, fc, expected):
+        alias = "p_" + str(abs(hash(str(fc))))[:6]
+        server.pbix_open(pred_pbix, alias)
+        try:
+            assert _total(alias, fc) == expected
+        finally:
+            server.pbix_close(alias)
+
+    def test_matcher_list_semantics_unchanged(self):
+        m = dax_engine.make_value_matcher(["a", "b"])
+        assert m("a") and m("b") and not m("c")
+        # values are compared as strings, exactly as before
+        assert dax_engine.make_value_matcher([1])("1")
+
+    def test_matcher_rejects_unknown_predicate(self):
+        with pytest.raises(ValueError):
+            dax_engine.make_value_matcher({"bogus": 1})
+
+    def test_matcher_rejects_bad_operator(self):
+        with pytest.raises(ValueError):
+            dax_engine.make_value_matcher({"op": "~", "value": 1})("x")
+
+    def test_is_blank(self):
+        m = dax_engine.make_value_matcher({"is_blank": True})
+        assert m(None) and m("") and not m("x")
+
+
+class TestGroupedTopN:
+    def test_top_n_desc(self, pred_pbix):
+        alias = "tn_d"
+        server.pbix_open(pred_pbix, alias)
+        try:
+            d = json.loads(server.pbix_evaluate_dax_grouped(
+                alias, "Total", "Sales.Product", top_n=2))["data"]
+            assert [g["key"]["Product"] for g in d["groups"]] == \
+                ["Gizmo", "Gadget"]
+            assert d["order_by"] == "Total"
+        finally:
+            server.pbix_close(alias)
+
+    def test_bottom_n_asc(self, pred_pbix):
+        alias = "tn_a"
+        server.pbix_open(pred_pbix, alias)
+        try:
+            d = json.loads(server.pbix_evaluate_dax_grouped(
+                alias, "Total", "Sales.Product", top_n=2, order="asc"))["data"]
+            assert [g["key"]["Product"] for g in d["groups"]] == \
+                ["Doohickey", "Widget"]
+        finally:
+            server.pbix_close(alias)
+
+    def test_blank_groups_sink_in_both_directions(self, pred_pbix):
+        alias = "tn_b"
+        server.pbix_open(pred_pbix, alias)
+        try:
+            fc = json.dumps({"Sales.Amount": {"op": ">", "value": 75}})
+            for order in ("asc", "desc"):
+                d = json.loads(server.pbix_evaluate_dax_grouped(
+                    alias, "Total", "Sales.Product", filter_context=fc,
+                    order_by="Total", order=order))["data"]
+                # the filtered-out group has no value and must be last
+                assert d["groups"][-1]["values"]["Total"] is None
+        finally:
+            server.pbix_close(alias)
+
+    def test_invalid_order_by(self, pred_pbix):
+        alias = "tn_i"
+        server.pbix_open(pred_pbix, alias)
+        try:
+            out = json.loads(server.pbix_evaluate_dax_grouped(
+                alias, "Total", "Sales.Product", order_by="Nope"))
+            assert out["success"] is False
+            assert out["error_code"] == "INVALID_INPUT"
+        finally:
+            server.pbix_close(alias)
+
+    def test_top_n_with_predicate_filter(self, pred_pbix):
+        alias = "tn_p"
+        server.pbix_open(pred_pbix, alias)
+        try:
+            fc = json.dumps({"Sales.Amount": {"op": ">", "value": 75}})
+            d = json.loads(server.pbix_evaluate_dax_grouped(
+                alias, "Total", "Sales.Product", filter_context=fc,
+                top_n=2))["data"]
+            assert [(g["key"]["Product"], g["values"]["Total"])
+                    for g in d["groups"]] == [("Gizmo", 400.0),
+                                              ("Gadget", 200.0)]
+        finally:
+            server.pbix_close(alias)
+
+
+class TestDatePartFunctions:
+    """YEAR/MONTH/DAY/QUARTER & co. were not implemented at all — any
+    expression using one evaluated to BLANK and reported an unsupported
+    function, which blocked date-part calculated columns entirely."""
+
+    def _ev(self, expr):
+        eng = dax_engine.DAXEngine()
+        ctx = dax_engine.DAXContext({}, {}, None, None, None, [])
+        val = eng._eval_expr(expr, ctx)
+        assert not eng.unsupported_functions, eng.unsupported_functions
+        return val
+
+    @pytest.mark.parametrize("expr,expected", [
+        ('YEAR("2024-01-15T00:00:00")', 2024),
+        ('MONTH("2024-07-05")', 7),
+        ('DAY("2024-07-05")', 5),
+        ('QUARTER("2024-01-31")', 1),
+        ('QUARTER("2024-07-05")', 3),
+        ('QUARTER("2024-12-31")', 4),
+        ('HOUR("2024-07-05 13:45:30")', 13),
+        ('MINUTE("2024-07-05 13:45:30")', 45),
+        ('SECOND("2024-07-05 13:45:30")', 30),
+        # 2024-01-15 is a Monday: type 1 -> Sun=1..Sat=7 => 2; type 2 -> Mon=1
+        ('WEEKDAY("2024-01-15")', 2),
+        ('WEEKDAY("2024-01-15",2)', 1),
+        ('WEEKDAY("2024-01-15",3)', 0),
+        ('YEAR(DATE(2024,1,15))', 2024),
+        # month overflow rolls into the next year, as DAX does
+        ('MONTH(DATE(2024,13,1))', 1),
+        ('YEAR(DATE(2024,13,1))', 2025),
+        # EOMONTH / EDATE incl. leap-year clamping
+        ('DAY(EOMONTH("2024-01-15",0))', 31),
+        ('MONTH(EOMONTH("2024-01-15",1))', 2),
+        ('DAY(EOMONTH("2024-01-15",1))', 29),
+        ('DAY(EDATE("2024-01-31",1))', 29),
+    ])
+    def test_date_parts(self, expr, expected):
+        assert self._ev(expr) == expected
+
+    def test_blank_on_non_date(self):
+        assert self._ev('YEAR("not a date")') is None
+
+
+class TestDateHierarchyRecipe:
+    """issues-14 item 4: a date drill hierarchy built from supported
+    primitives (date-part calc columns + pbix_add_hierarchy)."""
+
+    def test_end_to_end(self, tmp_path):
+        p = str(tmp_path / "dh.pbix")
+        b = PBIXBuilder("DH")
+        b.add_table("Sales", [{"name": "Date", "data_type": "DateTime"},
+                              {"name": "Amount", "data_type": "Double"}],
+                    rows=[{"Date": "2024-01-15T00:00:00", "Amount": 100.0},
+                          {"Date": "2024-07-05T00:00:00", "Amount": 300.0},
+                          {"Date": "2025-03-11T00:00:00", "Amount": 400.0}])
+        b.add_page("P")
+        b.save(p)
+        alias = "dhr"
+        server.pbix_open(p, alias)
+        try:
+            for name, dax in [("Year", "YEAR(Sales[Date])"),
+                              ("Quarter", "QUARTER(Sales[Date])"),
+                              ("Month", "MONTH(Sales[Date])"),
+                              ("Day", "DAY(Sales[Date])")]:
+                out = json.loads(server.pbix_datamodel_add_calculated_column(
+                    alias, "Sales", name, dax, "Int64"))
+                assert out["success"], out
+            levels = [{"name": n, "column": n}
+                      for n in ("Year", "Quarter", "Month", "Day")]
+            out = json.loads(server.pbix_add_hierarchy(
+                alias, "Sales", "Date Hierarchy", json.dumps(levels)))
+            assert out["success"], out
+
+            saved = str(tmp_path / "dh_out.pbix")
+            server.pbix_save(alias, saved, overwrite=True, backup=False)
+        finally:
+            server.pbix_close(alias)
+
+        # hierarchy levels in drill order, calc columns still calculated
+        with zipfile.ZipFile(saved) as z:
+            meta = read_metadata_sqlite(decompress_datamodel(z.read("DataModel")))
+        fd, tmp = tempfile.mkstemp(suffix=".db")
+        os.write(fd, meta)
+        os.close(fd)
+        try:
+            c = sqlite3.connect(tmp)
+            c.row_factory = sqlite3.Row
+            h = c.execute(
+                "SELECT h.ID, h.Name FROM Hierarchy h JOIN [Table] t "
+                "ON h.TableID = t.ID WHERE t.Name = 'Sales'").fetchone()
+            assert h["Name"] == "Date Hierarchy"
+            lv = c.execute(
+                "SELECT l.Name FROM Level l WHERE l.HierarchyID = ? "
+                "ORDER BY l.Ordinal", (h["ID"],)).fetchall()
+            assert [x["Name"] for x in lv] == ["Year", "Quarter", "Month", "Day"]
+            calc = [r["ExplicitName"] for r in c.execute(
+                "SELECT ExplicitName FROM [Column] col JOIN [Table] t "
+                "ON col.TableID = t.ID WHERE t.Name='Sales' AND col.Type=2")]
+            assert sorted(calc) == ["Day", "Month", "Quarter", "Year"]
+            c.close()
+        finally:
+            os.unlink(tmp)
+
+    def test_datetime_values_substitute_as_literals(self):
+        """A datetime cell must go into the expression QUOTED — a bare
+        2024-01-15 00:00:00 is unparseable and broke every date expression."""
+        from datetime import datetime as _dt
+
+        from pbix_mcp.dax.calc_tables import evaluate_row_context_column
+        cols = ["Date"]
+        rows = [[_dt(2024, 1, 15)], [_dt(2025, 7, 5)]]
+        tables = {"S": {"columns": cols, "rows": rows}}
+        vals, err = evaluate_row_context_column(
+            cols, rows, "YEAR(S[Date])", "S", tables, [])
+        assert err is None, err
+        assert vals == [2024, 2025]
 
 
 @pytest.fixture

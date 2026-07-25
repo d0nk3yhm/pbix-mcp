@@ -17,7 +17,11 @@ from pbix_mcp.errors import DimensionParseError
 class FilterContext(BaseModel):
     """Parsed filter context for DAX evaluation."""
 
-    filters: dict[str, list[Any]] = Field(default_factory=dict)
+    # A value is either a LIST (In-set — the historical form) or a DICT holding
+    # a structured predicate ({"op": ">", "value": 100}, {"between": [lo, hi]},
+    # {"contains": "x"}, {"relative_date": {...}}, ...) evaluated natively by
+    # the engine — see dax.engine.make_value_matcher.
+    filters: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod
     def from_json_str(cls, s: str | None) -> FilterContext:

@@ -505,6 +505,7 @@ class PBIXBuilder:
         source_csv: str | None = None,
         source_db: dict | None = None,
         mode: str = "import",
+        calc_columns: list[str] | None = None,
     ) -> "PBIXBuilder":
         """Add a table definition with optional row data.
 
@@ -535,6 +536,12 @@ class PBIXBuilder:
                   embed full VertiPaq data. DirectQuery sets Partition.Mode=1 instead
                   of Mode=0, and the M expression points to the source database.
                   Rows provide the embedded data snapshot for both modes.
+            calc_columns: Names of columns in ``columns`` that are CALCULATED.
+                  Their values are still encoded into VertiPaq, but they are
+                  left OUT of the partition's "Enter data" M literal, because
+                  Power BI recomputes a calculated column from its DAX on
+                  refresh — embedding it would ship stale values the engine
+                  ignores (Desktop's Enter-data query carries source columns only).
         """
         if mode not in ("import", "directquery"):
             raise ValueError(f"mode must be 'import' or 'directquery', got {mode!r}")
@@ -556,6 +563,7 @@ class PBIXBuilder:
             "source_csv": source_csv,
             "source_db": source_db,
             "mode": mode,
+            "calc_columns": list(calc_columns or []),
         })
         return self
 
@@ -1437,6 +1445,7 @@ def _build_m_expression(
     source_db: dict | None = None,
     is_directquery: bool = False,
     rows: list[dict] | None = None,
+    exclude_columns: list[str] | None = None,
 ) -> str:
     """Build a valid M expression for a table partition.
 
@@ -1452,6 +1461,12 @@ def _build_m_expression(
     Desktop's "Enter data" literal (Table.FromRows over a deflated+base64 JSON
     payload) so a Refresh reproduces them — a headers-only ``#table`` would
     empty the table (and every visual bound to it) on refresh.
+
+    ``exclude_columns`` names columns to leave OUT of that literal — used for
+    CALCULATED columns, whose values are materialized into VertiPaq but are
+    recomputed from DAX on refresh. Desktop's Enter-data query likewise carries
+    only source columns, so embedding a calc column would ship stale computed
+    values the engine ignores.
     """
     # Map data types to M types
     _M_TYPES = {
@@ -1609,9 +1624,14 @@ def _build_m_expression(
     # "Enter data" literal so a Refresh reproduces them (a headers-only #table
     # would EMPTY the table on refresh — the visuals bound to it go blank).
     if rows:
-        enter_data = _build_enter_data_m(columns, rows)
-        if enter_data is not None:
-            return enter_data
+        src_columns = columns
+        if exclude_columns:
+            skip = {c.lower() for c in exclude_columns}
+            src_columns = [c for c in columns if c["name"].lower() not in skip]
+        if src_columns:
+            enter_data = _build_enter_data_m(src_columns, rows)
+            if enter_data is not None:
+                return enter_data
 
     # No rows (or payload too large to embed): empty typed table. Data, if any,
     # still lives in VertiPaq for the initial open, but a Refresh empties it —
@@ -1820,7 +1840,8 @@ def _modify_metadata_and_encode(
                  _build_m_expression(tname, tdef.get("columns", []),
                                      tdef.get("source_csv"), tdef.get("source_db"),
                                      is_directquery=is_directquery,
-                                     rows=tdef.get("rows", [])),
+                                     rows=tdef.get("rows", []),
+                                     exclude_columns=tdef.get("calc_columns")),
                  partition_type, ps_id,
                  partition_mode,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP),
