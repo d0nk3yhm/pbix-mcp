@@ -99,15 +99,24 @@ class ModelReader:
         Get the data model schema -- all tables, columns, and data types.
 
         Returns list of dicts with keys: TableName, ColumnName, DataType,
-        IsHidden, Description.
+        IsCalculated, IsHidden, Description.
+
+        ``ColumnName`` is the EFFECTIVE name: a calculated-table column carries
+        its name in ``InferredName`` and leaves ``ExplicitName`` NULL (Desktop
+        sets ExplicitName only when the user renames such a column — verified
+        across the public corpus), so the two are coalesced here and the name is
+        never None. ``DataType`` likewise falls back to ``InferredDataType``
+        when the explicit type is 1 "Automatic", which is what calculated
+        columns/tables use.
         """
         if "schema" in self._metadata_cache:
             return self._metadata_cache["schema"]
 
         rows = self._query_metadata("""
             SELECT t.Name AS TableName,
-                   c.ExplicitName AS ColumnName,
+                   COALESCE(c.ExplicitName, c.InferredName) AS ColumnName,
                    c.ExplicitDataType AS DataTypeCode,
+                   c.InferredDataType AS InferredDataTypeCode,
                    c.IsHidden,
                    c.Description,
                    c.Type AS ColumnType
@@ -120,10 +129,20 @@ class ModelReader:
                      10: "Decimal", 11: "Boolean", 17: "Binary"}
 
         for row in rows:
-            row["DataType"] = _type_map.get(row.pop("DataTypeCode", 0), "Unknown")
-            # ColumnType: 1=data, 2=RowNumber, 3=calculated
+            # A CALCULATED column (and every calculated-table column) carries
+            # ExplicitDataType = 1 "Automatic" with the real type in
+            # InferredDataType — Desktop's own shape. Reading only the explicit
+            # code reported those fields as "Unknown".
+            edt = row.pop("DataTypeCode", 0)
+            idt = row.pop("InferredDataTypeCode", 0)
+            row["DataType"] = _type_map.get(
+                edt if edt in _type_map else idt, "Unknown")
+            # AMO Column.Type: 1=Data, 2=Calculated, 3=RowNumber,
+            # 4=CalculatedTableColumn. (This previously tested `ct == 3`, which
+            # reported calculated columns as NOT calculated and flagged the
+            # RowNumber system column as calculated.)
             ct = row.pop("ColumnType", 1)
-            row["IsCalculated"] = (ct == 3)
+            row["IsCalculated"] = ct in (2, 4)
 
         self._metadata_cache["schema"] = rows
         return rows
@@ -220,21 +239,33 @@ class ModelReader:
         _type_map = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime",
                      10: "Decimal", 11: "Boolean"}
 
+        # AMO Column.Type: 1=Data, 2=Calculated, 3=RowNumber,
+        # 4=CalculatedTableColumn. This filtered on `Type = 3`, i.e. the
+        # RowNumber system column — which never carries an Expression — so the
+        # property returned an EMPTY list for every model and
+        # pbix_get_model_columns always reported "no DAX calculated columns".
         rows = self._query_metadata("""
             SELECT t.Name AS TableName,
-                   c.ExplicitName AS ColumnName,
+                   COALESCE(c.ExplicitName, c.InferredName) AS ColumnName,
                    c.Expression,
                    c.ExplicitDataType AS DataTypeCode,
+                   c.InferredDataType AS InferredDataTypeCode,
                    c.FormatString,
                    c.IsHidden
             FROM [Column] c
             JOIN [Table] t ON c.TableID = t.ID
-            WHERE c.Type = 3 AND c.Expression IS NOT NULL AND c.Expression != ''
+            WHERE c.Type IN (2, 4)
+              AND c.Expression IS NOT NULL AND c.Expression != ''
             ORDER BY t.Name, c.ID
         """)
 
         for row in rows:
-            row["DataType"] = _type_map.get(row.pop("DataTypeCode", 0), "Unknown")
+            # Calculated columns are exactly the ones with ExplicitDataType = 1
+            # "Automatic", so the real type lives in InferredDataType.
+            edt = row.pop("DataTypeCode", 0)
+            idt = row.pop("InferredDataTypeCode", 0)
+            row["DataType"] = _type_map.get(
+                edt if edt in _type_map else idt, "Unknown")
 
         self._metadata_cache["dax_columns"] = rows
         return rows
@@ -257,7 +288,12 @@ class ModelReader:
         # Get table/column info from metadata, including first data column ID
         tables_meta = self._query_metadata("""
             SELECT t.ID, t.Name AS TableName,
-                   COUNT(CASE WHEN c.Type != 2 THEN 1 END) AS ColumnCount,
+                   -- Count real columns: data (1) + calculated (2) +
+                   -- calculated-table (4), excluding the RowNumber system
+                   -- column (3). This excluded Type=2 and counted RowNumber,
+                   -- so a measure-only table reported 1 column instead of 0
+                   -- and calculated columns went uncounted.
+                   COUNT(CASE WHEN c.Type != 3 THEN 1 END) AS ColumnCount,
                    MIN(CASE WHEN c.Type = 1 THEN c.ID END) AS FirstDataColID
             FROM [Table] t
             LEFT JOIN [Column] c ON c.TableID = t.ID
