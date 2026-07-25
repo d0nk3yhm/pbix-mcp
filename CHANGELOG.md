@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.34] - 2026-07-26
+
+Service-authored (PBIR) reports are now readable through the normal tool surface.
+
+### Fixed
+- **A report in PBIR format read as "no layout" at all.** `_get_layout` — the single entry point every consumer uses — only knew the classic `Report/Layout` document and returned `None` otherwise. But **every report authored in the Power BI service downloads as PBIR**: no `Report/Layout` exists, the report is a `Report/definition/` tree of per-page and per-visual JSON files (2 of the 4 files in the public test corpus are already this shape). `_get_layout` now falls back to the PBIR reader, so pages, visuals, bindings and filters come through everywhere — `pbix_get_layout_raw`, DAX default-filter resolution, `pbix_doctor`, documentation and diff all included. The three hand-rolled fallbacks at the call sites were folded into the shared path.
+- **The PBIR converter dropped nearly every semantic field**, so what it returned wasn't usable even where it was called. Two of those were hard failures: a visual carried **no name**, so it could not be addressed at all, and **no field bindings**, so it rendered empty. Now mapped: visual `name` → `config.name`; `query.queryState.<Role>.projections[]` → `singleVisual.projections` **plus a synthesized `prototypeQuery`** whose `Select` preserves the `Column` / `Measure` / `Aggregation` discriminator (entity refs rewritten to classic `From` aliases); full geometry incl. `z` and `tabOrder`; page `name`, real `displayName` (it used to emit the page GUID), `width`/`height`, `displayOption` and `type` (so a **Tooltip** page is identifiable); `isHidden`; visual and page `filterConfig`; the active page; and each visual's `mobile.json` geometry. Sync groups, already preserved, still are. Verified against the corpus: `IT_Support.pbix` reads 3 pages / 50 visuals, all named, with both Column and Measure bindings recovered.
+
+### Added
+- **`pbix_report_format`** — reports whether an open file is `classic` or `PBIR`, its page/visual counts, and explicitly whether the layout is **writable**, so a client can explain the format to a user instead of attempting an edit that cannot work. **117 tools.**
+
+### Changed
+- **PBIR reports are read-only, enforced at the choke point.** The layout a consumer holds for a PBIR file is a *synthesized* legacy view; writing it back would plant a classic `Report/Layout` inside a PBIR file and leave two conflicting definitions. Every layout mutation funnels through `_set_layout`, which now refuses with `FORMAT_UNSUPPORTED` and an explanation (the synthesized document is also tagged `__pbir__`, so it is refused even if it travels). Classic files are unaffected. New `tests/test_pbir_reader.py` (24 tests) builds a PBIR tree from scratch and pins the mapping and the refusal.
+
 ## [0.9.33] - 2026-07-26
 
 Table functions that silently dropped their aggregates now work, and calculated column values are readable.

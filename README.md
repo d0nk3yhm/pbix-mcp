@@ -8,7 +8,7 @@
 
 An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python — no templates, no skeletons, no Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026.
 
-Exposes 116 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (170 functions), RLS security, and binary format internals.
+Exposes 117 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing, visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, TMDL export, incremental refresh, DAX evaluation (170 functions), RLS security, and binary format internals.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
@@ -530,8 +530,9 @@ PBIX_TEST_SAMPLES=test_corpus pytest tests/test_cross_report.py -v
 | `test_issues14.py` | 89 | `unit` | No |
 | `test_issues15.py` | 18 | `unit` | No |
 | `test_tool_surfaces.py` | 10 | `unit` | No |
+| `test_pbir_reader.py` | 24 | `unit` | No |
 
-**From a fresh clone: 728 tests collected, 696 passed, 32 skipped, 0 failures.** All 32 skipped tests are gated on the public test corpus (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
+**From a fresh clone: 752 tests collected, 720 passed, 32 skipped, 0 failures.** All 32 skipped tests are gated on the public test corpus (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
 
 ## Architecture
 
@@ -563,7 +564,7 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (116 tools)
+  server.py              # MCP server (117 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX builder (metadata, VertiPaq, layout, relationships)
   html_templates.py      # HTML/SVG template builders (kpi_card, bar_chart, gauge, table, …)
