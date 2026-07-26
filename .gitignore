@@ -31,3 +31,4 @@ tools/
 *.dll
 *.exe
 test_data/
+.pbir_schema_cache/

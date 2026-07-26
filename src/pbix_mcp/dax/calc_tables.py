@@ -20,7 +20,7 @@ from typing import Dict, List, Optional
 def load_calculated_tables(
     pbix_path: str,
     existing_tables: Dict[str, dict],
-    relationships: List[dict] = None,
+    relationships: Optional[List[dict]] = None,
 ) -> Dict[str, dict]:
     """
     Read ABF metadata from a PBIX file, find all calculated tables,

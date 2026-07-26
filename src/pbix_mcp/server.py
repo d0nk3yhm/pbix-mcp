@@ -1602,7 +1602,9 @@ def pbix_add_page(alias: str, display_name: str, width: int = 1280, height: int 
         import uuid
         new_section = {
             "displayName": display_name,
-            "displayOption": 0,
+            # 1 = FitToPage, what Desktop stamps on a new page (0 is the
+            # deprecated dynamic mode).
+            "displayOption": 1,
             "name": str(uuid.uuid4()).replace("-", ""),
             "width": width,
             "height": height,
@@ -1646,6 +1648,355 @@ def pbix_remove_page(alias: str, page_index: int) -> str:
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
         return ToolResponse.ok(f"Removed page '{name}' (was index {page_index}). {len(sections)} pages remain.").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
+
+
+def _resolve_page(sections: list, page: str) -> int:
+    """Resolve a page reference (index or displayName) to an index."""
+    try:
+        idx = int(page)
+    except (TypeError, ValueError):
+        for i, sec in enumerate(sections):
+            if (sec.get("displayName") or "").lower() == str(page).lower():
+                return i
+        raise LayoutParseError(
+            f"Page '{page}' not found. Available: "
+            f"{[s.get('displayName') for s in sections]}")
+    if idx < 0 or idx >= len(sections):
+        raise LayoutParseError(
+            f"Page index {idx} out of range (0..{len(sections) - 1})")
+    return idx
+
+
+@mcp.tool()
+def pbix_rename_page(alias: str, page: str, new_name: str) -> str:
+    """Rename a report page.
+
+    Args:
+        alias: The alias of the open file
+        page: Page index (e.g. "0") or current displayName
+        new_name: New display name for the page
+    """
+    logger.info(f"pbix_rename_page: {alias} {page!r} -> {new_name!r}")
+    try:
+        if not new_name or not new_name.strip():
+            raise LayoutParseError("new_name must not be empty")
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError("No layout found")
+
+        sections = layout.get("sections", [])
+        idx = _resolve_page(sections, page)
+        old = sections[idx].get("displayName")
+        # The internal `name` is an identity other objects reference (bookmarks,
+        # drillthrough, page navigation), so only displayName changes.
+        sections[idx]["displayName"] = new_name
+
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Renamed page {idx} from '{old}' to '{new_name}'").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
+
+
+@mcp.tool()
+def pbix_reorder_pages(alias: str, page_order: str) -> str:
+    """Reorder the report's pages.
+
+    Args:
+        alias: The alias of the open file
+        page_order: Comma-separated page references (indices or displayNames)
+                    in the desired order, e.g. "Summary,Detail,0". Pages left
+                    out keep their relative order after the ones listed.
+    """
+    logger.info(f"pbix_reorder_pages: {alias} {page_order!r}")
+    try:
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError("No layout found")
+
+        sections = layout.get("sections", [])
+        refs = [p.strip() for p in page_order.split(",") if p.strip()]
+        if not refs:
+            raise LayoutParseError("page_order must name at least one page")
+
+        wanted: list = []
+        for ref in refs:
+            idx = _resolve_page(sections, ref)
+            if idx in wanted:
+                raise LayoutParseError(
+                    f"Page '{ref}' listed more than once in page_order")
+            wanted.append(idx)
+
+        rest = [i for i in range(len(sections)) if i not in wanted]
+        layout["sections"] = [sections[i] for i in wanted + rest]
+        # Classic Report/Layout carries an explicit ordinal per section; PBIR
+        # takes the order from the list itself.
+        for i, sec in enumerate(layout["sections"]):
+            if "ordinal" in sec:
+                sec["ordinal"] = i
+
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+        names = [s.get("displayName") for s in layout["sections"]]
+        return ToolResponse.ok(f"Page order is now: {names}").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
+
+
+@mcp.tool()
+def pbix_set_page_visibility(alias: str, page: str, hidden: bool) -> str:
+    """Show or hide a report page (hidden pages are not shown in view mode).
+
+    Args:
+        alias: The alias of the open file
+        page: Page index or displayName
+        hidden: True to hide the page, False to show it
+    """
+    logger.info(f"pbix_set_page_visibility: {alias} {page!r} hidden={hidden}")
+    try:
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError("No layout found")
+
+        sections = layout.get("sections", [])
+        idx = _resolve_page(sections, page)
+        sec = sections[idx]
+
+        # Both formats are driven through the classic shape: the section
+        # `config` JSON with 0 = AlwaysVisible, 1 = HiddenInViewMode. The PBIR
+        # writer converts it to the enum name on the way out.
+        raw = sec.get("config", "{}")
+        try:
+            cfg = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except json.JSONDecodeError:
+            cfg = {}
+        cfg["visibility"] = 1 if hidden else 0
+        sec["config"] = json.dumps(cfg, ensure_ascii=False)
+
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+        state = "hidden" if hidden else "visible"
+        return ToolResponse.ok(
+            f"Page '{sec.get('displayName')}' is now {state}").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
+
+
+@mcp.tool()
+def pbix_duplicate_page(alias: str, page: str, new_name: str = "") -> str:
+    """Duplicate a page and all of its visuals.
+
+    Args:
+        alias: The alias of the open file
+        page: Page index or displayName to copy
+        new_name: Display name for the copy (default: "<name> (copy)")
+    """
+    logger.info(f"pbix_duplicate_page: {alias} {page!r}")
+    try:
+        import uuid
+
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError("No layout found")
+
+        sections = layout.get("sections", [])
+        idx = _resolve_page(sections, page)
+        src = sections[idx]
+        copy_sec = copy.deepcopy(src)
+
+        # Every identity in the copy must be fresh, or the two pages collide:
+        # page name, PBIR folder id, and every visual name.
+        copy_sec["name"] = uuid.uuid4().hex[:20]
+        copy_sec.pop("__pbir_page__", None)
+        copy_sec.pop("isActive", None)
+        copy_sec["displayName"] = (
+            new_name.strip() or f"{src.get('displayName', 'Page')} (copy)")
+
+        renamed = 0
+        for vc in copy_sec.get("visualContainers", []) or []:
+            vc.pop("__pbir_visual__", None)
+            raw = vc.get("config", "{}")
+            try:
+                cfg = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except json.JSONDecodeError:
+                continue
+            if cfg.get("name"):
+                cfg["name"] = uuid.uuid4().hex[:20]
+                renamed += 1
+            vc["config"] = json.dumps(cfg, ensure_ascii=False)
+
+        sections.insert(idx + 1, copy_sec)
+        for i, sec in enumerate(sections):
+            if "ordinal" in sec:
+                sec["ordinal"] = i
+
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Duplicated page '{src.get('displayName')}' as "
+            f"'{copy_sec['displayName']}' at index {idx + 1} "
+            f"({renamed} visual(s) copied with new identities)").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
+
+
+@mcp.tool()
+def pbix_move_visual(alias: str, page: str, visual_index: int,
+                     x: float = -1, y: float = -1,
+                     width: float = -1, height: float = -1,
+                     z: float = -1) -> str:
+    """Move and/or resize an existing visual.
+
+    Position lives on the visual CONTAINER, not in its config JSON, so
+    pbix_set_visual_property cannot reach it.
+
+    Args:
+        alias: The alias of the open file
+        page: Page index or displayName
+        visual_index: Zero-based visual index on that page
+        x: New left position in px (-1 = leave unchanged)
+        y: New top position in px (-1 = leave unchanged)
+        width: New width in px (-1 = leave unchanged)
+        height: New height in px (-1 = leave unchanged)
+        z: New z-order (-1 = leave unchanged)
+    """
+    logger.info(f"pbix_move_visual: {alias} {page!r}[{visual_index}]")
+    try:
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError("No layout found")
+
+        sections = layout.get("sections", [])
+        idx = _resolve_page(sections, page)
+        containers = sections[idx].get("visualContainers", []) or []
+        if visual_index < 0 or visual_index >= len(containers):
+            raise LayoutParseError(
+                f"Visual index {visual_index} out of range on page "
+                f"'{sections[idx].get('displayName')}' "
+                f"(0..{len(containers) - 1})")
+
+        vc = containers[visual_index]
+        changes = {}
+        for key, val in (("x", x), ("y", y), ("width", width),
+                         ("height", height), ("z", z)):
+            if val is None or val < 0:
+                continue
+            if key in ("width", "height") and val == 0:
+                raise LayoutParseError(f"{key} must be greater than 0")
+            vc[key] = val
+            changes[key] = val
+        if not changes:
+            raise LayoutParseError(
+                "Nothing to change — pass at least one of x/y/width/height/z")
+
+        # Classic containers repeat the geometry inside config.layouts; keep the
+        # two copies consistent or Desktop renders the stale one.
+        raw = vc.get("config", "{}")
+        try:
+            cfg = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except json.JSONDecodeError:
+            cfg = {}
+        for lay in cfg.get("layouts", []) or []:
+            pos = lay.get("position")
+            if isinstance(pos, dict):
+                pos.update(changes)
+        if cfg:
+            vc["config"] = json.dumps(cfg, ensure_ascii=False)
+
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Moved visual {visual_index} on page "
+            f"'{sections[idx].get('displayName')}': {changes}").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
+
+
+@mcp.tool()
+def pbix_duplicate_visual(alias: str, page: str, visual_index: int,
+                          target_page: str = "",
+                          offset_x: float = 20, offset_y: float = 20) -> str:
+    """Copy a visual, onto the same page or another one.
+
+    Args:
+        alias: The alias of the open file
+        page: Source page index or displayName
+        visual_index: Zero-based visual index on the source page
+        target_page: Destination page (default: same page)
+        offset_x: Horizontal offset for the copy, px (same-page copies only)
+        offset_y: Vertical offset for the copy, px (same-page copies only)
+    """
+    logger.info(f"pbix_duplicate_visual: {alias} {page!r}[{visual_index}]")
+    try:
+        import uuid
+
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError("No layout found")
+
+        sections = layout.get("sections", [])
+        src_idx = _resolve_page(sections, page)
+        containers = sections[src_idx].get("visualContainers", []) or []
+        if visual_index < 0 or visual_index >= len(containers):
+            raise LayoutParseError(
+                f"Visual index {visual_index} out of range "
+                f"(0..{len(containers) - 1})")
+
+        dst_idx = (_resolve_page(sections, target_page)
+                   if target_page else src_idx)
+        vc = copy.deepcopy(containers[visual_index])
+        vc.pop("__pbir_visual__", None)
+
+        if dst_idx == src_idx:
+            # A copy landing exactly on top of the original looks like nothing
+            # happened, so nudge it.
+            vc["x"] = (vc.get("x") or 0) + offset_x
+            vc["y"] = (vc.get("y") or 0) + offset_y
+
+        raw = vc.get("config", "{}")
+        try:
+            cfg = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except json.JSONDecodeError:
+            cfg = {}
+        new_name = uuid.uuid4().hex[:20]
+        cfg["name"] = new_name
+        if dst_idx == src_idx:
+            for lay in cfg.get("layouts", []) or []:
+                pos = lay.get("position")
+                if isinstance(pos, dict):
+                    pos["x"] = (pos.get("x") or 0) + offset_x
+                    pos["y"] = (pos.get("y") or 0) + offset_y
+        vc["config"] = json.dumps(cfg, ensure_ascii=False)
+
+        sections[dst_idx].setdefault("visualContainers", []).append(vc)
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Copied visual {visual_index} from page "
+            f"'{sections[src_idx].get('displayName')}' to "
+            f"'{sections[dst_idx].get('displayName')}' as '{new_name}'"
+        ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
@@ -2623,10 +2974,6 @@ def pbix_add_bookmark(
             "explorationState": {
                 "version": "1.2",
                 "activeSection": section_name,
-                "filters": {
-                    "byExpr": [],
-                    "byColumn": [],
-                },
             },
             "options": {
                 "targetVisualNames": list(visual_states.keys()) if visual_states else [],
@@ -2640,25 +2987,26 @@ def pbix_add_bookmark(
         # it). Writing mode:"visible" made Desktop ignore the block / mishandle
         # Selection-pane state, so hidden visuals get {"display":{"mode":
         # "hidden"}} and visible ones get a bare {"singleVisual":{}} (no mode).
-        if hidden_set:
-            bookmark["explorationState"]["sections"] = {
-                section_name: {
-                    "visualContainers": {
-                        vname: (
-                            {"singleVisual": {"display": {"mode": "hidden"}}}
-                            if state["hidden"]
-                            else {"singleVisual": {}}
-                        )
-                        for vname, state in visual_states.items()
-                    }
+        # `sections` is required by the PBIR bookmark schema and is present in
+        # every Desktop-authored bookmark, so it is written unconditionally.
+        bookmark["explorationState"]["sections"] = {
+            section_name: {
+                "visualContainers": {
+                    vname: (
+                        {"singleVisual": {"display": {"mode": "hidden"}}}
+                        if state["hidden"]
+                        else {"singleVisual": {}}
+                    )
+                    for vname, state in visual_states.items()
                 }
             }
+        }
 
         # Add report-level filters if provided
         if report_filter_json:
             try:
                 filters = json.loads(report_filter_json)
-                bookmark["explorationState"]["filters"]["byExpr"] = filters
+                bookmark["explorationState"]["filters"] = {"byExpr": filters}
             except json.JSONDecodeError:
                 raise LayoutParseError("Invalid report_filter_json — must be valid JSON array")
 
@@ -2991,6 +3339,20 @@ def _ensure_content_type_default(work_dir: str, ext: str) -> bool:
 # codes. Verified against test_corpus/{Ecommerce_Conversion,IT_Support}.pbix.
 _PBIR_ITEM_TYPE = {100: "Image", 200: "ShapeMap", 201: "CustomTheme",
                    202: "BaseTheme"}
+
+# Classic Report/Layout stores a page's scaling mode as an int; PBIR page.json
+# stores the enum name. Ordering is the ordinal order of the anyOf list in
+# .../report/definition/page/2.1.0/schema.json, corroborated by the corpus:
+# every Desktop-authored classic page uses 1 and every service-authored PBIR
+# page uses "FitToPage".
+_PBIR_DISPLAY_OPTION = {
+    0: "DeprecatedDynamic",
+    1: "FitToPage",
+    2: "FitToWidth",
+    3: "ActualSize",
+    4: "ActualSizeTopLeft",
+}
+_PBIR_DISPLAY_OPTION_INV = {v: k for k, v in _PBIR_DISPLAY_OPTION.items()}
 
 
 def _is_pbir_report_config(cfg: dict) -> bool:
@@ -7383,6 +7745,40 @@ def pbix_list_tables(alias: str) -> str:
 
 # ---- Section 7b: Lightweight metadata-only modification ----
 
+def _query_metadata_rows(dm_path: str, sql: str, params: tuple = ()) -> list:
+    """Run a read-only query against the DataModel's metadata SQLite.
+
+    Returns plain tuples; the caller owns the formatting.
+    """
+    import tempfile
+
+    from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+    from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+    with open(dm_path, "rb") as f:
+        dm_bytes = f.read()
+    meta_bytes = read_metadata_sqlite(decompress_datamodel(dm_bytes))
+    if not meta_bytes:
+        raise DataModelCompressionError(
+            "Could not extract metadata.sqlitedb from ABF.")
+
+    fd, tmp = tempfile.mkstemp(suffix=".sqlitedb",
+                               dir=os.path.dirname(dm_path))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(meta_bytes)
+        conn = sqlite3.connect(tmp)
+        try:
+            return list(conn.execute(sql, params).fetchall())
+        finally:
+            conn.close()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 def _modify_metadata_only(
     dm_path: str, modifier_fn: Callable[[sqlite3.Connection], None]
 ) -> tuple[int, int]:
@@ -8714,6 +9110,133 @@ def pbix_datamodel_modify_column(
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
+
+
+@mcp.tool()
+def pbix_set_sort_by_column(
+    alias: str, table_name: str, column_name: str, sort_by_column: str = ""
+) -> str:
+    """Sort one column by the values of another (e.g. "Month Name" by "Month
+    Number"), or clear an existing sort-by.
+
+    The model stores this as a column ID, so it cannot be set by name through
+    pbix_datamodel_modify_column; this resolves the name for you and rejects
+    the combinations the engine refuses.
+
+    Args:
+        alias: The alias of the open file
+        table_name: Table holding both columns
+        column_name: Column whose display order changes
+        sort_by_column: Column supplying the order. Empty string clears the
+                        sort-by so the column sorts by its own values.
+    """
+    logger.info(
+        f"pbix_set_sort_by_column: {alias} {table_name}[{column_name}] "
+        f"by {sort_by_column!r}")
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error(
+                "No DataModel found.",
+                DataModelCompressionError.code).to_text()
+
+        if sort_by_column and sort_by_column == column_name:
+            raise ValueError(
+                f"A column cannot sort by itself ('{column_name}')")
+
+        def _do_modify(conn: sqlite3.Connection):
+            c = conn.cursor()
+
+            def _column_id(name: str):
+                c.execute(
+                    "SELECT c.ID FROM [Column] c "
+                    "JOIN [Table] t ON c.TableID = t.ID "
+                    "WHERE t.Name = ? "
+                    "  AND COALESCE(c.ExplicitName, c.InferredName) = ?",
+                    (table_name, name))
+                row = c.fetchone()
+                if not row:
+                    raise ValueError(
+                        f"Column '{name}' not found in table '{table_name}'")
+                return row[0]
+
+            target = _column_id(column_name)
+            # Desktop stores "no sort-by" as 0, not NULL — every column in a
+            # Desktop-authored model has a non-NULL SortByColumnID.
+            sort_id = _column_id(sort_by_column) if sort_by_column else 0
+
+            # Power BI refuses a sort-by cycle (A sorts by B while B sorts by
+            # A) — it would have no defined order.
+            if sort_id:
+                c.execute("SELECT SortByColumnID FROM [Column] WHERE ID = ?",
+                          (sort_id,))
+                row = c.fetchone()
+                if row and row[0] == target:
+                    raise ValueError(
+                        f"'{sort_by_column}' already sorts by "
+                        f"'{column_name}' — this would create a cycle")
+
+            c.execute("UPDATE [Column] SET SortByColumnID = ? WHERE ID = ?",
+                      (sort_id, target))
+            conn.commit()
+
+        old_size, new_size = _modify_metadata_only(dm_path, _do_modify)
+        info["modified"] = True
+        what = (f"now sorts by '{sort_by_column}'" if sort_by_column
+                else "sort-by cleared")
+        return ToolResponse.ok(
+            f"Column '{table_name}'.'{column_name}' {what}.\n"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e)).to_text()
+
+
+@mcp.tool()
+def pbix_get_sort_by_columns(alias: str) -> str:
+    """List every column that is sorted by another column.
+
+    Args:
+        alias: The alias of the open file
+    """
+    logger.info(f"pbix_get_sort_by_columns: {alias}")
+    try:
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error(
+                "No DataModel found.",
+                DataModelCompressionError.code).to_text()
+
+        rows = _query_metadata_rows(
+            dm_path,
+            # Calculated and auto-date columns carry no ExplicitName — their
+            # name lives in InferredName.
+            "SELECT t.Name, "
+            "       COALESCE(c.ExplicitName, c.InferredName), "
+            "       COALESCE(s.ExplicitName, s.InferredName) "
+            "FROM [Column] c "
+            "JOIN [Table] t ON c.TableID = t.ID "
+            "JOIN [Column] s ON c.SortByColumnID = s.ID "
+            # 0 (not NULL) is how "no sort-by" is stored.
+            "WHERE COALESCE(c.SortByColumnID, 0) <> 0 "
+            "ORDER BY t.Name, 2")
+
+        if not rows:
+            return ToolResponse.ok(
+                "No columns use a sort-by column.").to_text()
+        lines = [f"  {t}[{col}] sorts by [{by}]" for t, col, by in rows]
+        return ToolResponse.ok(
+            f"{len(rows)} sort-by column(s):\n" + "\n".join(lines),
+            data={"sort_by": [{"table": t, "column": c, "sort_by": s}
+                              for t, c, s in rows]}).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e)).to_text()
 
 
 _CALC_TYPE_NAME_TO_AMO = {
@@ -10261,6 +10784,19 @@ def _get_layout_pbir(work_dir: str) -> dict | None:
         for key in ("width", "height", "displayOption", "type"):
             if key in pdata:
                 section[key] = pdata[key]
+        # Present the classic int form so callers see one type regardless of
+        # which format the report is stored in (_pbir_patch_page inverts it).
+        if isinstance(section.get("displayOption"), str):
+            section["displayOption"] = _PBIR_DISPLAY_OPTION_INV.get(
+                section["displayOption"], section["displayOption"])
+        # PBIR puts page visibility on the page as a string enum; classic keeps
+        # it in the section `config` JSON as an int. Normalize to the classic
+        # form so one code path drives both formats.
+        if "visibility" in pdata:
+            section["config"] = json.dumps(
+                {"visibility":
+                 1 if pdata["visibility"] == "HiddenInViewMode" else 0},
+                ensure_ascii=False)
         pfilters = (pdata.get("filterConfig") or {}).get("filters")
         if pfilters:
             section["filters"] = json.dumps(pfilters)
@@ -10272,7 +10808,143 @@ def _get_layout_pbir(work_dir: str) -> dict | None:
 
     if not sections:
         return None
-    return {"sections": sections, "__pbir__": True}
+    layout = {"sections": sections, "__pbir__": True}
+    bookmarks = _pbir_read_bookmarks(work_dir)
+    if bookmarks:
+        # Classic callers (pbix_get_bookmarks, pbix_add_bookmark, ...) read
+        # bookmarks out of the layout-level `config` JSON string.
+        layout["config"] = json.dumps({"bookmarks": bookmarks},
+                                      ensure_ascii=False)
+    return layout
+
+
+# PBIR keeps each bookmark in its own file under `definition/bookmarks/`, with
+# a sibling `bookmarks.json` holding the order and any groups. See
+# https://learn.microsoft.com/power-bi/developer/projects/projects-report
+_PBIR_BOOKMARK_SCHEMA = (
+    "https://developer.microsoft.com/json-schemas/fabric/item/report/"
+    "definition/bookmark/1.0.0/schema.json")
+_PBIR_BOOKMARKS_META_SCHEMA = (
+    "https://developer.microsoft.com/json-schemas/fabric/item/report/"
+    "definition/bookmarksMetadata/1.0.0/schema.json")
+
+
+def _pbir_bookmarks_dir(work_dir: str) -> str:
+    return os.path.join(work_dir, "Report", "definition", "bookmarks")
+
+
+def _pbir_read_bookmarks(work_dir: str) -> list:
+    """Load `definition/bookmarks/` into the classic layout-config shape.
+
+    Groups become a classic bookmark whose ``children`` array holds the nested
+    bookmarks, which is how Report/Layout represents a bookmark group.
+    """
+    bdir = _pbir_bookmarks_dir(work_dir)
+    if not os.path.isdir(bdir):
+        return []
+
+    by_name: dict = {}
+    for fn in sorted(os.listdir(bdir)):
+        if not fn.endswith(".bookmark.json"):
+            continue
+        try:
+            with open(os.path.join(bdir, fn), "r", encoding="utf-8") as f:
+                doc = json.load(f)
+        except Exception:
+            continue
+        doc.pop("$schema", None)
+        name = doc.get("name") or fn[: -len(".bookmark.json")]
+        doc["name"] = name
+        # Remember the file stem so a later write lands on the same file even
+        # when it was renamed away from the default convention.
+        doc["__pbir_file__"] = fn[: -len(".bookmark.json")]
+        by_name[name] = doc
+
+    meta_path = os.path.join(bdir, "bookmarks.json")
+    order: list = []
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                order = (json.load(f) or {}).get("items") or []
+        except Exception:
+            order = []
+
+    out: list = []
+    seen: set = set()
+    for item in order:
+        if not isinstance(item, dict):
+            continue
+        if "children" in item:
+            kids = [by_name[c] for c in item.get("children", [])
+                    if c in by_name]
+            seen.update(k["name"] for k in kids)
+            out.append({"name": item.get("name", ""),
+                        "displayName": item.get("displayName", ""),
+                        "children": kids})
+        else:
+            bm = by_name.get(item.get("name", ""))
+            if bm is not None:
+                seen.add(bm["name"])
+                out.append(bm)
+    # Bookmarks present on disk but missing from bookmarks.json still belong to
+    # the report — appending them keeps a read/write cycle from dropping them.
+    out.extend(bm for name, bm in by_name.items() if name not in seen)
+    return out
+
+
+def _pbir_write_bookmarks(work_dir: str, bookmarks: list) -> None:
+    """Persist classic-shaped bookmarks back into `definition/bookmarks/`."""
+    import uuid
+
+    bdir = _pbir_bookmarks_dir(work_dir)
+    if not bookmarks:
+        # Nothing to write: drop a now-empty folder so the report matches.
+        if os.path.isdir(bdir):
+            shutil.rmtree(bdir, ignore_errors=True)
+        return
+
+    os.makedirs(bdir, exist_ok=True)
+    items: list = []
+    written: set = set()
+
+    def _write_one(bm: dict) -> str:
+        name = bm.get("name") or "Bookmark" + uuid.uuid4().hex[:20]
+        stem = bm.get("__pbir_file__") or name
+        doc = {k: v for k, v in bm.items()
+               if k not in ("__pbir_file__", "children")}
+        doc["name"] = name
+        doc.setdefault("displayName", name)
+        doc.setdefault("explorationState", {})
+        doc["$schema"] = _PBIR_BOOKMARK_SCHEMA
+        _pbir_write_json(os.path.join(bdir, f"{stem}.bookmark.json"), doc)
+        written.add(f"{stem}.bookmark.json")
+        return name
+
+    for bm in bookmarks:
+        if not isinstance(bm, dict):
+            continue
+        kids = bm.get("children")
+        if isinstance(kids, list) and kids:
+            child_names = [_write_one(k) for k in kids
+                           if isinstance(k, dict)]
+            items.append({"name": bm.get("name") or
+                          "Group" + uuid.uuid4().hex[:16],
+                          "displayName": bm.get("displayName", ""),
+                          "children": child_names})
+        else:
+            items.append({"name": _write_one(bm)})
+
+    _pbir_write_json(os.path.join(bdir, "bookmarks.json"),
+                     {"$schema": _PBIR_BOOKMARKS_META_SCHEMA, "items": items})
+
+    # Remove bookmark files the caller deleted.
+    for fn in os.listdir(bdir):
+        if fn.endswith(".bookmark.json") and fn not in written:
+            try:
+                os.remove(os.path.join(bdir, fn))
+            except OSError:
+                pass
+
 
 def _pbir_entityize(node, alias2entity: dict):
     """Inverse of _pbir_rewrite_sourcerefs: classic ``SourceRef.Source`` alias
@@ -10407,6 +11079,25 @@ def _pbir_patch_page(orig: dict, section: dict, pid: str) -> dict:
     for key in ("width", "height", "displayOption", "type"):
         if key in section:
             out[key] = section[key]
+    # PBIR requires the enum name; classic-shaped callers (and pbix_add_page)
+    # supply the int. Unknown ints fall back to the format default rather than
+    # writing a value the schema rejects.
+    dopt = out.get("displayOption")
+    if isinstance(dopt, bool) or isinstance(dopt, int):
+        out["displayOption"] = _PBIR_DISPLAY_OPTION.get(int(dopt), "FitToPage")
+    elif dopt is None:
+        out["displayOption"] = "FitToPage"
+    # Inverse of the reader: classic `config.visibility` int -> PBIR enum name.
+    raw_cfg = section.get("config")
+    if raw_cfg is not None:
+        try:
+            cfg = (json.loads(raw_cfg) if isinstance(raw_cfg, str)
+                   else raw_cfg) or {}
+        except (json.JSONDecodeError, TypeError):
+            cfg = {}
+        if isinstance(cfg, dict) and "visibility" in cfg:
+            out["visibility"] = ("HiddenInViewMode" if cfg["visibility"]
+                                 else "AlwaysVisible")
     if section.get("objects"):
         out["objects"] = section["objects"]
     filters = section.get("filters")
@@ -10524,6 +11215,19 @@ def _set_layout_pbir(work_dir: str, layout: dict) -> None:
             "https://developer.microsoft.com/json-schemas/fabric/item/report/"
             "definition/pagesMetadata/1.1.0/schema.json")
     _pbir_write_json(pages_json, meta)
+
+    # Bookmarks live outside the pages tree, in the layout-level `config`
+    # string that classic callers edit. Only touch the folder when the caller
+    # actually supplied a config, so a page-only edit can't delete bookmarks.
+    raw_config = layout.get("config")
+    if raw_config is not None:
+        try:
+            cfg = (json.loads(raw_config) if isinstance(raw_config, str)
+                   else raw_config) or {}
+        except (json.JSONDecodeError, TypeError):
+            cfg = {}
+        if isinstance(cfg, dict) and "bookmarks" in cfg:
+            _pbir_write_bookmarks(work_dir, cfg.get("bookmarks") or [])
 
 
 
