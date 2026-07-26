@@ -106,6 +106,21 @@ def layout(pbir_dir):
     return server._get_layout(pbir_dir)
 
 
+@pytest.fixture
+def pbir_pbix(tmp_path_factory):
+    """Zip the PBIR tree into a .pbix so the tools can open it."""
+    root = str(tmp_path_factory.mktemp("pbirzip"))
+    _write_pbir(root)
+    path = os.path.join(root, "report.pbix")
+    with zipfile.ZipFile(path, "w") as z:
+        for base, _dirs, files in os.walk(os.path.join(root, "Report")):
+            for fn in files:
+                full = os.path.join(base, fn)
+                z.write(full, os.path.relpath(full, root))
+        z.writestr("Version", "1.28")
+    return path
+
+
 def _visual(layout, page_idx, vis_idx=0):
     vc = layout["sections"][page_idx]["visualContainers"][vis_idx]
     return vc, json.loads(vc["config"])
@@ -150,7 +165,16 @@ class TestPageMapping:
     def test_canvas_size(self, layout):
         for s in layout["sections"]:
             assert s["width"] == 1280 and s["height"] == 720
-            assert s["displayOption"] == "FitToPage"
+
+    def test_display_option_normalized_to_classic_int(self, layout):
+        """PBIR stores the enum NAME, classic Report/Layout stores an int.
+
+        `_get_layout` promises a legacy-shaped document, so callers must see
+        one type regardless of which format the report is stored in —
+        otherwise every consumer needs a format check for this one field.
+        """
+        for s in layout["sections"]:
+            assert s["displayOption"] == 1  # 1 == "FitToPage"
 
     def test_tooltip_page_identifiable(self, layout):
         assert "type" not in layout["sections"][0]
@@ -338,19 +362,7 @@ class TestWriteBack:
 
 
 class TestToolSurface:
-    @pytest.fixture
-    def pbir_pbix(self, tmp_path_factory):
-        """Zip the PBIR tree into a .pbix so the tools can open it."""
-        root = str(tmp_path_factory.mktemp("pbirzip"))
-        _write_pbir(root)
-        path = os.path.join(root, "report.pbix")
-        with zipfile.ZipFile(path, "w") as z:
-            for base, _dirs, files in os.walk(os.path.join(root, "Report")):
-                for fn in files:
-                    full = os.path.join(base, fn)
-                    z.write(full, os.path.relpath(full, root))
-            z.writestr("Version", "1.28")
-        return path
+    pass
 
     def test_report_format_reports_pbir_and_writable(self, pbir_pbix):
         alias = "pf_" + uuid.uuid4().hex[:8]
@@ -391,3 +403,116 @@ class TestToolSurface:
 
         with zipfile.ZipFile(out_path) as z:
             assert "Report/Layout" not in z.namelist()
+
+
+class TestBookmarks:
+    """PBIR keeps bookmarks in `definition/bookmarks/`, but `_set_layout_pbir`
+    only ever wrote the pages tree. `pbix_add_bookmark` therefore reported
+    success and silently discarded the bookmark on every service-authored
+    report — the worst failure shape, because nothing surfaced the loss.
+    """
+
+    def _open(self, pbir_pbix):
+        alias = "bm_" + uuid.uuid4().hex[:8]
+        server.pbix_open(pbir_pbix, alias)
+        return alias
+
+    def test_add_bookmark_persists_to_disk(self, pbir_pbix, tmp_path):
+        out = str(tmp_path / "bm.pbix")
+        alias = self._open(pbir_pbix)
+        try:
+            r = json.loads(server.pbix_add_bookmark(alias, "My Bookmark"))
+            assert r["success"], r
+            server.pbix_save(alias, out, overwrite=True, backup=False)
+        finally:
+            server.pbix_close(alias, force=True)
+
+        with zipfile.ZipFile(out) as z:
+            names = z.namelist()
+            bfiles = [n for n in names
+                      if n.startswith("Report/definition/bookmarks/")]
+            assert any(n.endswith(".bookmark.json") for n in bfiles), bfiles
+            assert "Report/definition/bookmarks/bookmarks.json" in bfiles
+            # No classic Layout may be planted alongside the PBIR tree.
+            assert "Report/Layout" not in names
+
+            doc = json.loads(
+                z.read(next(n for n in bfiles
+                            if n.endswith(".bookmark.json"))).decode("utf-8-sig"))
+            assert doc["displayName"] == "My Bookmark"
+            # Required by the published bookmark schema.
+            assert "sections" in doc["explorationState"]
+            assert "activeSection" in doc["explorationState"]
+            assert doc["$schema"].endswith("/bookmark/1.0.0/schema.json")
+            # `byColumn` is not part of the PBIR FiltersState and appears in no
+            # Desktop-authored bookmark.
+            assert "byColumn" not in doc["explorationState"].get("filters", {})
+
+            meta = json.loads(
+                z.read("Report/definition/bookmarks/bookmarks.json")
+                .decode("utf-8-sig"))
+            assert [i["name"] for i in meta["items"]] == [doc["name"]]
+
+    def test_bookmark_round_trips_through_reader(self, pbir_pbix, tmp_path):
+        out = str(tmp_path / "bm2.pbix")
+        alias = self._open(pbir_pbix)
+        try:
+            server.pbix_add_bookmark(alias, "Round Trip")
+            server.pbix_save(alias, out, overwrite=True, backup=False)
+        finally:
+            server.pbix_close(alias, force=True)
+
+        alias2 = self._open(out)
+        try:
+            r = json.loads(server.pbix_get_bookmarks(alias2))
+            assert r["success"], r
+            assert "Round Trip" in r["message"]
+        finally:
+            server.pbix_close(alias2, force=True)
+
+    def test_page_only_edit_does_not_delete_bookmarks(self, pbir_pbix, tmp_path):
+        """A caller that never touches `config` must not lose bookmarks."""
+        step1 = str(tmp_path / "s1.pbix")
+        alias = self._open(pbir_pbix)
+        try:
+            server.pbix_add_bookmark(alias, "Keep Me")
+            server.pbix_save(alias, step1, overwrite=True, backup=False)
+        finally:
+            server.pbix_close(alias, force=True)
+
+        step2 = str(tmp_path / "s2.pbix")
+        alias2 = self._open(step1)
+        try:
+            server.pbix_add_page(alias2, "Unrelated Page")
+            server.pbix_save(alias2, step2, overwrite=True, backup=False)
+        finally:
+            server.pbix_close(alias2, force=True)
+
+        alias3 = self._open(step2)
+        try:
+            r = json.loads(server.pbix_get_bookmarks(alias3))
+            assert "Keep Me" in r["message"], r
+        finally:
+            server.pbix_close(alias3, force=True)
+
+    def test_remove_bookmark_deletes_the_file(self, pbir_pbix, tmp_path):
+        step1 = str(tmp_path / "r1.pbix")
+        alias = self._open(pbir_pbix)
+        try:
+            server.pbix_add_bookmark(alias, "Doomed")
+            server.pbix_save(alias, step1, overwrite=True, backup=False)
+        finally:
+            server.pbix_close(alias, force=True)
+
+        step2 = str(tmp_path / "r2.pbix")
+        alias2 = self._open(step1)
+        try:
+            r = json.loads(server.pbix_remove_bookmark(alias2, 0))
+            assert r["success"], r
+            server.pbix_save(alias2, step2, overwrite=True, backup=False)
+        finally:
+            server.pbix_close(alias2, force=True)
+
+        with zipfile.ZipFile(step2) as z:
+            assert not [n for n in z.namelist()
+                        if n.endswith(".bookmark.json")]

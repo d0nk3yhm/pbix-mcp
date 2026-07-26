@@ -227,7 +227,7 @@ def _dict_type_for_data_type(data_type: str) -> int:
         return DICT_TYPE_LONG
 
 
-def _element_size_for_dict_type(dict_type: int, unique_values: list = None) -> int:
+def _element_size_for_dict_type(dict_type: int, unique_values: list | None = None) -> int:
     """
     Element size in bytes for numeric dictionary vectors.
 

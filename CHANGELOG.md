@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.36] - 2026-07-26
+
+Report-editing primitives, sort-by-column, and PBIR output validated against Microsoft's own schemas.
+
+### Added
+- **Report-editing primitives (6 new tools).** `pbix_add_page` and `pbix_remove_page` existed with nothing in between, and visual geometry was readable (`pbix_get_visual_positions`) with no way to write it back — so renaming a page or nudging a visual meant hand-editing raw layout JSON. Now: `pbix_rename_page`, `pbix_reorder_pages`, `pbix_set_page_visibility`, `pbix_duplicate_page`, `pbix_move_visual`, `pbix_duplicate_visual`. All six behave identically on classic `Report/Layout` and on PBIR. Renaming preserves the internal `name`, so bookmarks and page navigation keep resolving; duplicating hands the copy — and every visual on it — fresh identities, because two objects sharing a `name` collide in bookmarks and navigation.
+- **Sort-by-column (2 new tools).** `pbix_set_sort_by_column` / `pbix_get_sort_by_columns`. The model stores this as `Column.SortByColumnID` — an ID, not a name — so it was unreachable through `pbix_datamodel_modify_column`, which sets a property to a literal value. Without it, any non-alphabetical text column (month names, weekday names, size labels) sorted wrongly in every visual. Names are resolved to IDs (including `InferredName` columns, which carry no `ExplicitName`), and self-sorts and A↔B cycles are rejected rather than written into a model that then opens broken.
+- **PBIR bookmarks are persisted.** `_set_layout_pbir` only ever wrote the pages tree, so on a service-authored report `pbix_add_bookmark` returned success and silently discarded the bookmark — the worst failure shape, because nothing surfaced the loss. Bookmarks now round-trip through `definition/bookmarks/*.bookmark.json` plus `bookmarks.json`, groups included, and a page-only edit cannot delete them.
+- **`scripts/validate_pbir_schemas.py`** validates every file in a PBIR report against the JSON schema it declares on `developer.microsoft.com` — testing the writer against the format owner's contract rather than against our own reader. Where the service stamps a version newer than the public index, it falls back to the highest published minor of the same major. Also runs as `tests/test_pbir_schema_conformance.py` (marked `integration`).
+- **`docs/capability-parity.md`** — a per-operation audit of pbix-mcp against Power BI's authoring surface, with the remaining gaps ranked.
+
+### Fixed
+- **PBIR pages were written with the classic integer `displayOption`.** PBIR requires the enum name (`"FitToPage"`), so every page added to a service-authored report carried a value the schema rejects — found by the schema validation above. `displayOption` and page `visibility` are now converted at both boundaries, so `_get_layout` returns one shape whichever format the file uses and callers never branch on format.
+- **`pbix_add_page` used `displayOption: 0`** — the deprecated dynamic mode — where Power BI Desktop writes `1` (`FitToPage`). This was wrong in classic files too.
+- **Bookmarks were emitted with a `byColumn` filter bucket that PBIR does not define, and without the required `explorationState.sections`.** Neither appears in any Desktop-authored bookmark; both are now correct in classic and PBIR alike.
+- **Clearing a sort-by writes `0`, not `NULL`** — every column in a Desktop-authored model has a non-NULL `SortByColumnID`.
+
+### Changed
+- mypy baseline ratcheted 165 → 145 (currently 144) after clearing 21 implicit-`Optional` annotations.
+
 ## [0.9.35] - 2026-07-26
 
 Service-authored (PBIR) reports are now **editable**, not just readable.

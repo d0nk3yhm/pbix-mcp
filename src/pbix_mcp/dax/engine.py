@@ -323,7 +323,7 @@ class DAXContext:
                 self._rel_adj.setdefault(ft, []).append((tt, fc, tc))
 
     @staticmethod
-    def _auto_detect_date_table(tables: dict, relationships: list = None) -> str:
+    def _auto_detect_date_table(tables: dict, relationships: list | None = None) -> str:
         """Auto-detect the date/calendar dimension table from available tables.
 
         A relationship-aware pass runs first: a table that is the ONE side
@@ -895,7 +895,7 @@ class DAXEngine:
             if self._eval_depth == 0:
                 self._deadline = None
 
-    def _eval_expr(self, expr: str, ctx: DAXContext, var_scope: dict = None) -> Any:
+    def _eval_expr(self, expr: str, ctx: DAXContext, var_scope: dict | None = None) -> Any:
         """Evaluate a DAX expression string.
 
         var_scope: dict of variable names (e.g. '_max') to their evaluated values.
@@ -1157,7 +1157,7 @@ class DAXEngine:
 
         return None
 
-    def _eval_var_return(self, expr: str, ctx: DAXContext, var_scope: dict = None) -> Any:
+    def _eval_var_return(self, expr: str, ctx: DAXContext, var_scope: dict | None = None) -> Any:
         """Parse and evaluate a VAR ... RETURN block.
 
         Extracts all VAR declarations, evaluates them in order (each can
@@ -1389,7 +1389,7 @@ class DAXEngine:
         """DAX truthiness: BLANK / 0 / '' / False are falsy; anything else truthy."""
         return not (val is None or val == 0 or val == '' or val is False)
 
-    def _eval_binary(self, expr: str, ctx: DAXContext, var_scope: dict = None) -> Any:
+    def _eval_binary(self, expr: str, ctx: DAXContext, var_scope: dict | None = None) -> Any:
         """Evaluate binary arithmetic: +, -, *, /
         In DAX, BLANK is treated as 0 in arithmetic operations."""
         # Split at lowest precedence first (+ and -)
@@ -1425,7 +1425,7 @@ class DAXEngine:
 
         return _NOT_APPLICABLE
 
-    def _eval_comparison(self, expr: str, ctx: DAXContext, var_scope: dict = None) -> Any:
+    def _eval_comparison(self, expr: str, ctx: DAXContext, var_scope: dict | None = None) -> Any:
         """Evaluate comparison operators."""
         for op_str, op_fn in [('<>', lambda a, b: a != b), ('>=', lambda a, b: a >= b),
                                ('<=', lambda a, b: a <= b), ('>', lambda a, b: a > b),
@@ -4454,18 +4454,18 @@ _engine = DAXEngine()
 
 
 def evaluate_measure(measure_name: str, tables: dict, measures: dict,
-                     filter_context: dict = None,
-                     date_table: str = None, date_column: str = None,
-                     relationships: list = None) -> Any:
+                     filter_context: dict | None = None,
+                     date_table: str | None = None, date_column: str | None = None,
+                     relationships: list | None = None) -> Any:
     """Evaluate a single DAX measure."""
     ctx = DAXContext(tables, measures, date_table, date_column, filter_context, relationships)
     return _engine.evaluate_measure(measure_name, ctx)
 
 
 def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
-                            filter_context: dict = None,
-                            date_table: str = None, date_column: str = None,
-                            relationships: list = None) -> dict:
+                            filter_context: dict | None = None,
+                            date_table: str | None = None, date_column: str | None = None,
+                            relationships: list | None = None) -> dict:
     """Evaluate multiple measures, returning { name: value }."""
     ctx = DAXContext(tables, measures, date_table, date_column, filter_context, relationships)
     results = {}
@@ -4668,8 +4668,8 @@ def _find_selectedvalue_targets(expr: str) -> list:
 
 def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
                             filter_context: dict | None = None,
-                            date_table: str = None, date_column: str = None,
-                            relationships: list = None) -> dict:
+                            date_table: str | None = None, date_column: str | None = None,
+                            relationships: list | None = None) -> dict:
     """Evaluate measures with smart fallback for SELECTEDVALUE-dependent measures.
 
     When a measure returns BLANK and its expression uses SELECTEDVALUE on a
