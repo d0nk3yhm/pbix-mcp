@@ -11092,7 +11092,58 @@ def _pbir_query_state_from_single_visual(sv: dict) -> dict:
     return state
 
 
+# Fields the PBIR schemas type as string enums, where classic Report/Layout
+# uses an int. Writing the int produces a file the Power BI service IMPORTS
+# without complaint and then refuses to open ("Unable to load report") — a
+# schema violation is a documented BLOCKING error. Checking here turns that
+# into a loud failure at save time instead.
+_PBIR_ENUM_FIELDS = {
+    "page.json": {
+        "displayOption": set(_PBIR_DISPLAY_OPTION.values()),
+        "visibility": {"AlwaysVisible", "HiddenInViewMode"},
+        "type": {"Drillthrough", "Tooltip"},
+        "howCreated": {"Default", "Copilot"},
+    },
+}
+_PBIR_REQUIRED = {
+    "page.json": ("name", "displayName", "displayOption"),
+    "visual.json": ("name",),
+}
+
+
+def _pbir_selfcheck(path: str, data: dict) -> None:
+    """Structural check of one PBIR document before it is written.
+
+    Deliberately offline and narrow: it enforces the handful of rules this
+    converter can plausibly get wrong (an enum written as the classic int, a
+    required field dropped), not the full published schema. For the full check
+    against Microsoft's own schemas see scripts/validate_pbir_schemas.py.
+    """
+    kind = os.path.basename(path)
+    for field in _PBIR_REQUIRED.get(kind, ()):
+        if data.get(field) in (None, ""):
+            raise LayoutParseError(
+                f"Refusing to write {kind}: required field '{field}' is "
+                f"missing. Power BI would import this report and then fail to "
+                f"open it.")
+    for field, allowed in _PBIR_ENUM_FIELDS.get(kind, {}).items():
+        if field not in data:
+            continue
+        value = data[field]
+        if isinstance(value, str) and value in allowed:
+            continue
+        hint = ""
+        if isinstance(value, bool) or isinstance(value, int):
+            hint = (" This looks like the classic Report/Layout integer form; "
+                    "PBIR stores the enum NAME.")
+        raise LayoutParseError(
+            f"Refusing to write {kind}: '{field}' is {value!r}, which is not "
+            f"one of {sorted(allowed)}.{hint} Power BI would import this "
+            f"report and then fail to open it.")
+
+
 def _pbir_write_json(path: str, data: dict) -> None:
+    _pbir_selfcheck(path, data)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)

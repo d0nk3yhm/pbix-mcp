@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.38] - 2026-07-26
+
+### Fixed
+- **The PBIR writer now refuses to emit a document Power BI would reject.** 0.9.35 wrote a page carrying the classic integer `displayOption` into a PBIR report. The service IMPORTED that file without complaint — both the semantic model and the report item were created — and then failed to render it with "Something went wrong / Unable to load report", because Microsoft classifies a schema violation as a *blocking* error. Nothing in the writer noticed, so the defect only surfaced on upload. `_pbir_write_json` now runs an offline structural check on every document before writing it: the fields PBIR types as string enums (`displayOption`, `visibility`, `type`, `howCreated`) must carry the enum NAME, and required fields must be present. Writing the classic int form now fails the save with a message naming the mistake, instead of producing a file that imports and then won't open. The check needs no network; `scripts/validate_pbir_schemas.py` remains the full check against Microsoft's published schemas.
+
 ## [0.9.37] - 2026-07-26
 
 Model edits work on models that contain calculated tables and columns — three of the four corpus reports that previously refused them.

@@ -516,3 +516,86 @@ class TestBookmarks:
         with zipfile.ZipFile(step2) as z:
             assert not [n for n in z.namelist()
                         if n.endswith(".bookmark.json")]
+
+
+class TestWriteSelfCheck:
+    """0.9.35 wrote a page with the classic integer `displayOption` into a PBIR
+    report. The Power BI service IMPORTED that file without complaint — the
+    semantic model and the report item were both created — and then refused to
+    render it: "Something went wrong / Unable to load report". Microsoft
+    classifies a schema violation as a BLOCKING error.
+
+    Nothing in the writer noticed, so the defect only surfaced on upload. These
+    pin the offline guard that now fails the save instead.
+    """
+
+    def _page(self, **over):
+        doc = {
+            "$schema": "https://developer.microsoft.com/json-schemas/fabric/"
+                       "item/report/definition/page/2.1.0/schema.json",
+            "name": "abc123",
+            "displayName": "A Page",
+            "displayOption": "FitToPage",
+            "width": 1280,
+            "height": 720,
+        }
+        doc.update(over)
+        return doc
+
+    def test_valid_page_is_accepted(self):
+        server._pbir_selfcheck("/x/page.json", self._page())
+
+    def test_classic_int_display_option_is_refused(self):
+        """The exact document 0.9.35 shipped."""
+        with pytest.raises(Exception) as exc:
+            server._pbir_selfcheck("/x/page.json",
+                                   self._page(displayOption=0))
+        msg = str(exc.value)
+        assert "displayOption" in msg
+        # The message must name the actual mistake, not just "invalid".
+        assert "classic" in msg.lower() and "enum" in msg.lower()
+
+    @pytest.mark.parametrize("field,bad", [
+        ("displayOption", 1),
+        ("visibility", 0),
+        ("visibility", "Nope"),
+        ("type", 0),
+        ("howCreated", 2),
+    ])
+    def test_enum_fields_reject_non_enum_values(self, field, bad):
+        with pytest.raises(Exception):
+            server._pbir_selfcheck("/x/page.json", self._page(**{field: bad}))
+
+    @pytest.mark.parametrize("field", ["name", "displayName", "displayOption"])
+    def test_required_page_fields_enforced(self, field):
+        doc = self._page()
+        doc[field] = None
+        with pytest.raises(Exception) as exc:
+            server._pbir_selfcheck("/x/page.json", doc)
+        assert field in str(exc.value)
+
+    def test_visual_requires_a_name(self):
+        """A visual with no name can't be addressed by bookmarks or filters."""
+        with pytest.raises(Exception):
+            server._pbir_selfcheck("/x/visual.json", {"position": {}})
+        server._pbir_selfcheck("/x/visual.json", {"name": "v1"})
+
+    def test_optional_enum_fields_may_be_absent(self):
+        doc = self._page()
+        assert "visibility" not in doc and "type" not in doc
+        server._pbir_selfcheck("/x/page.json", doc)
+
+    def test_guard_is_wired_into_the_writer(self, pbir_pbix, tmp_path):
+        """The check must run on the real write path, not only when called
+        directly — otherwise it protects nothing."""
+        import unittest.mock as mock
+
+        alias = "sc_" + uuid.uuid4().hex[:8]
+        server.pbix_open(pbir_pbix, alias)
+        try:
+            with mock.patch.object(server, "_pbir_selfcheck") as spy:
+                server.pbix_add_page(alias, "Guarded Page")
+            written = [c.args[0] for c in spy.call_args_list]
+            assert any(p.endswith("page.json") for p in written), written
+        finally:
+            server.pbix_close(alias, force=True)
