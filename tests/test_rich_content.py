@@ -600,13 +600,18 @@ class TestReviewRoundHardening:
                 alias, "UPDATE Partition SET Type = 2, QueryDefinition = "
                 "'DATATABLE(\"A\", INTEGER, {{1}})' WHERE Name = 'Calc'"))
             assert out["success"], out
-            # other rebuild edits refuse (calc table present) ...
+            # An unrelated rebuild edit now goes through WITH the calc table
+            # preserved, rather than being refused outright (0.9.37).
             out = json.loads(server.pbix_set_table_data(alias, "Z", json.dumps({
                 "columns": [{"name": "B", "data_type": "Int64"}],
                 "rows": [{"B": 1}]})))
-            assert out["success"] is False
-            assert out["error_code"] == "MODEL_EDIT_UNSUPPORTED"
-            # ... but REMOVING the calc table itself works
+            assert out["success"], out
+            still = json.loads(server.pbix_datamodel_query_metadata(
+                alias, "SELECT p.Type, p.QueryDefinition FROM [Partition] p "
+                       "JOIN [Table] t ON p.TableID = t.ID "
+                       "WHERE t.Name = 'Calc'"))
+            assert "DATATABLE" in still["message"], still
+            # REMOVING the calc table still works too
             out = json.loads(server.pbix_datamodel_remove_table(alias, "Calc"))
             assert out["success"], out
             # and the model is clean again
