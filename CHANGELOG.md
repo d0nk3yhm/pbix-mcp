@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.35] - 2026-07-26
+
+Service-authored (PBIR) reports are now **editable**, not just readable.
+
+### Added
+- **PBIR write support — a service-authored report can be edited.** 0.9.34 made these reports readable but refused every layout write; since every report authored in the Power BI *service* is PBIR, that left the most common kind of report analysable but not editable. Layout changes are now written back into the `Report/definition` tree: pages and visuals are added, moved, resized, renamed, hidden and removed; `pages.json` `pageOrder` / `activePageName` are kept in step; and a classic `Report/Layout` is still never planted alongside the tree.
+- **Fidelity by construction: preserve-and-patch.** Rather than regenerating the tree from the (lossy) legacy view, each page/visual is patched onto **the original file it was read from**, and only fields that actually differ from that original are written. So anything this converter doesn't model — `sortDefinition`, `howCreated`, custom-visual settings — survives an edit untouched, and **a write that changes nothing changes nothing on disk**: read + write is verified semantically byte-faithful across all 96 files of three real PBIR reports (the two in the public corpus plus a service-authored sample). Field bindings are only rewritten when the bindings actually changed, and the converter's own defaults (a missing `tabOrder`, an absent `visual` block, a `$schema` on a file that had none) are never invented into the file.
+- **Resource and custom-visual registration works on PBIR.** `pbix_register_resource`, `pbix_add_custom_visual`, `pbix_reference_public_visual` and `pbix_add_html_visual` all refused PBIR files. `resourcePackages` / `publicCustomVisuals` live in `Report/definition/report.json` for PBIR (the files themselves are under the same `Report/StaticResources` and `Report/CustomVisuals` paths), so the four tools now read and write whichever document the format uses — emitting PBIR's **flat** package shape with **string** item types (`Image`, `CustomTheme`, `BaseTheme`), verified against `test_corpus/{Ecommerce_Conversion,IT_Support}.pbix`, instead of the classic nested numeric form.
+
+### Changed
+- `pbix_report_format` now reports PBIR as **writable**. `tests/test_pbir_reader.py` grew to 29 tests, pinning the no-op fidelity guarantee, survival of unmodelled fields across an edit, page/visual add + delete, and that no classic `Report/Layout` is ever created.
+
 ## [0.9.34] - 2026-07-26
 
 Service-authored (PBIR) reports are now readable through the normal tool surface.
