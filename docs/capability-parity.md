@@ -4,7 +4,7 @@ An audit of what Power BI can author against what pbix-mcp exposes as tools,
 written for consumers (OpenBI) that need to know which operations are a single
 call, which need raw-JSON escape hatches, and which are not supported at all.
 
-Audited at **0.9.36 / 125 tools**. Re-run the inventory with:
+Audited at **0.9.37 / 125 tools**. Re-run the inventory with:
 
 ```bash
 python -c "from pbix_mcp import server; print(len([n for n in dir(server) if n.startswith('pbix_')]))"
@@ -62,7 +62,7 @@ the PBIR `Report/definition/` tree the service produces. Tools go through
 | Table data | ✅ `pbix_set_table_data`, `pbix_update_table_rows`, `pbix_replace_value` | |
 | Column properties | ✅ `pbix_datamodel_modify_column` | Any metadata property by name |
 | Remove table | ✅ `pbix_datamodel_remove_table` | |
-| **Add a data table to an existing model** | ❌ | Only `pbix_create` (new file) or `add_calculated_table`. See below |
+| Add a data table to an existing model | ✅ `pbix_set_table_data` | Creates the table when it doesn't exist. Runs the rebuild path — see "Rebuild-path edits" |
 | Sort-by-column | ✅ `pbix_set_sort_by_column`, `pbix_get_sort_by_columns` | Resolves names to IDs; rejects self-sorts and cycles |
 | **Rename table / column / measure** | ❌ | No rename tool; renaming must not orphan the DAX and layout references to the old name |
 | Report-level measures (live connect) | ❌ | PBIR `reportExtensions.json` is neither read nor written |
@@ -82,19 +82,35 @@ caller never branches on format:
 Validate what the writer emits against Microsoft's published schemas with
 `scripts/validate_pbir_schemas.py` (see `docs/development.md`).
 
+## Rebuild-path edits
+
+Some model edits (adding or replacing a table, adding or removing a
+relationship, removing a table) reconstruct the whole model rather than
+splicing metadata. A from-scratch rebuild loses Type=2 calculated columns and
+demotes calculated tables to plain data, so before 0.9.37 these edits were
+**refused outright** on any model containing either — three of the four
+reports in the public corpus.
+
+They now re-materialize the calculated objects as part of the edit: calculated
+columns are re-evaluated from their DAX, calculated tables keep their rows and
+their `Type=2` partition + `QueryDefinition`, so Power BI still recomputes both
+on refresh. All four corpus reports accept these edits with their calculated
+objects byte-identical afterwards.
+
+The refusal remains where it is the right answer: if the engine cannot
+reproduce an existing calculated column or table, the edit is refused rather
+than written with wrong values. The surgical tools
+(`pbix_datamodel_add_measure` / `modify_measure` / `remove_measure` /
+`modify_column` / `set_sort_by_column`) never rebuild and always work.
+
 ## Known gaps, in priority order
 
-1. **Add a data table to an existing model.** The asymmetry with
-   `pbix_datamodel_remove_table` is the sharpest gap. Adding a table means
-   building new VertiPaq column dictionaries, a partition and an M expression
-   into an existing ABF; `pbix_create` already does all of this for a new file,
-   so the work is to lift that path into a rebuild of an open model.
-2. **Rename model objects.** A rename has to rewrite every DAX expression and
+1. **Rename model objects.** A rename has to rewrite every DAX expression and
    layout binding that references the old name, or it silently breaks the
    report — that dependency rewrite is the actual work, not the metadata edit.
-3. **Report-level measures.** Needed for live-connect reports, where measures
+2. **Report-level measures.** Needed for live-connect reports, where measures
    live in `reportExtensions.json` rather than the model.
-4. **Visual interactions and visual groups.** Both are reachable today through
+3. **Visual interactions and visual groups.** Both are reachable today through
    `pbix_update_visual_json`; dedicated tools would remove the raw-JSON step.
 
 Nothing in this list is blocked — each is scoped work, listed in the order that

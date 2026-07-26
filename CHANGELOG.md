@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.37] - 2026-07-26
+
+Model edits work on models that contain calculated tables and columns — three of the four corpus reports that previously refused them.
+
+### Fixed
+- **Rebuild-path edits are no longer refused on models with calculated objects.** Adding or replacing a table, adding or removing a relationship, and removing a table all reconstruct the model rather than splicing metadata. A from-scratch rebuild loses `Type=2` calculated columns and demotes calculated tables to plain data, so rather than corrupt the file these edits were refused outright on any model containing either — **three of the four reports in the public corpus**, which made adding a table impossible on most real files. They now re-materialize the calculated objects as part of the edit: calculated columns are re-evaluated from their DAX, calculated tables keep their rows and their `Type=2` partition + `QueryDefinition`, so Power BI still recomputes both on Refresh. All four corpus reports now accept the edits with their calculated objects byte-identical afterwards, measures and relationships intact.
+  - The refusal remains where it is the right answer: when the engine cannot reproduce an existing calculated column or table, the edit is still refused rather than written with wrong values.
+  - When a caller replaces a table's rows, that table's calculated columns are recomputed **from the new rows**, not carried over from the old data.
+  - A table the caller is removing is excluded from the preservation plan, so it isn't resurrected by the very edit that deleted it.
+- **Relationships onto calculated-table and auto-date columns were read as `None`.** Those columns carry no `ExplicitName` — their name is in `InferredName` — so the rebuild saw an endpoint of `None` and pre-build validation rejected the model with "column does not exist". This blocked `GeoSales_Dashboard` and `Agents_Performance` entirely.
+
 ## [0.9.36] - 2026-07-26
 
 Report-editing primitives, sort-by-column, and PBIR output validated against Microsoft's own schemas.

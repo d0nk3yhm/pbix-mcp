@@ -6801,8 +6801,8 @@ def pbix_replace_value(
             for r in new_rows
         ]
 
-        old_size, new_size = _rebuild_datamodel(
-            info,
+        old_size, new_size = _rebuild_preserving_calc(
+            alias, info,
             table_updates={table_name: {"columns": columns_def, "rows": filtered_rows}},
         )
         info["modified"] = True
@@ -7314,8 +7314,14 @@ def _rebuild_datamodel(
         # one-to-one relationships back to active many-to-one (OpenBI #3).
         rels = []
         for rrow in conn.execute(
-            "SELECT ft.Name as ft, fc.ExplicitName as fc, "
-            "tt.Name as tt, tc.ExplicitName as tc, "
+            # Calculated-table and auto-date columns carry no ExplicitName —
+            # their name lives in InferredName. Reading only ExplicitName gives
+            # a relationship endpoint of None, which pre-build validation then
+            # rejects as "column does not exist".
+            "SELECT ft.Name as ft, "
+            "COALESCE(fc.ExplicitName, fc.InferredName) as fc, "
+            "tt.Name as tt, "
+            "COALESCE(tc.ExplicitName, tc.InferredName) as tc, "
             "r.IsActive, r.CrossFilteringBehavior, "
             "r.FromCardinality, r.ToCardinality, "
             "r.RelyOnReferentialIntegrity, r.JoinOnDateBehavior, "
@@ -7618,14 +7624,14 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
             os.unlink(tmp_check.name)
 
         if exists:
-            old_size, new_size = _rebuild_datamodel(
-                info,
+            old_size, new_size = _rebuild_preserving_calc(
+                alias, info,
                 table_updates={table_name: {"columns": columns, "rows": rows}},
             )
             action = "updated"
         else:
-            old_size, new_size = _rebuild_datamodel(
-                info,
+            old_size, new_size = _rebuild_preserving_calc(
+                alias, info,
                 extra_tables=[{"name": table_name, "columns": columns, "rows": rows}],
             )
             action = "created"
@@ -7705,8 +7711,8 @@ def pbix_update_table_rows(alias: str, table_name: str, rows_json: str) -> str:
                      "data_category": cr["DataCategory"]}
                     for cr in col_rows]
 
-        old_size, new_size = _rebuild_datamodel(
-            info,
+        old_size, new_size = _rebuild_preserving_calc(
+            alias, info,
             table_updates={table_name: {"columns": columns, "rows": rows}},
         )
         info["modified"] = True
@@ -8493,8 +8499,8 @@ def pbix_datamodel_add_relationship(
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
 
-        old_size, new_size = _rebuild_datamodel(
-            info,
+        old_size, new_size = _rebuild_preserving_calc(
+            alias, info,
             extra_relationships=[{
                 "from_table": from_table, "from_column": from_column,
                 "to_table": to_table, "to_column": to_column,
@@ -8550,8 +8556,8 @@ def pbix_datamodel_remove_relationship(
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
 
-        old_size, new_size = _rebuild_datamodel(
-            info,
+        old_size, new_size = _rebuild_preserving_calc(
+            alias, info,
             remove_relationships=[(from_table, from_column, to_table, to_column)],
         )
         info["modified"] = True
@@ -8772,8 +8778,8 @@ def pbix_datamodel_remove_table(alias: str, table_name: str) -> str:
         if not os.path.exists(dm_path):
             return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
 
-        old_size, new_size = _rebuild_datamodel(
-            info,
+        old_size, new_size = _rebuild_preserving_calc(
+            alias, info,
             remove_tables={table_name},
         )
         info["modified"] = True
@@ -8897,7 +8903,7 @@ def pbix_datamodel_add_field_parameter(
             ],
             "rows": rows,
         }
-        old_size, _ = _rebuild_datamodel(info, extra_tables=[extra_table])
+        old_size, _ = _rebuild_preserving_calc(alias, info, extra_tables=[extra_table])
 
         # 2) Stamp the Desktop field-parameter metadata shape on top.
         qd = _field_parameter_query_definition(norm_fields)
@@ -8970,8 +8976,8 @@ def pbix_datamodel_add_calculation_group(
         }
 
         # Create table via _rebuild_datamodel (full VertiPaq storage)
-        old_size, new_size = _rebuild_datamodel(
-            info,
+        old_size, new_size = _rebuild_preserving_calc(
+            alias, info,
             extra_tables=[extra_table],
         )
 
@@ -9462,7 +9468,8 @@ def pbix_datamodel_add_calculated_column(
             f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
 
 
-def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None):
+def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
+                            base_data=None, skip_tables=None):
     """Plan the re-materialization of everything a rebuild would otherwise lose.
 
     A from-scratch rebuild drops Type=2 calculated columns (they aren't read
@@ -9474,6 +9481,15 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None):
     ``extra_columns`` = {table: [{"column", "expression", "data_type"}]} adds
     NEW calculated columns to the same plan, so authoring a calculated column
     and a calculated table compose in either order.
+
+    ``base_data`` = {table: {"columns", "rows"}} supplies the plain data a
+    table's calculated columns should be computed FROM, instead of what is
+    currently in VertiPaq. A caller replacing a table's rows passes its new
+    rows here so the calc columns are recomputed against them rather than
+    silently carrying values derived from the old data.
+
+    ``skip_tables`` names tables the caller is deleting, so the plan does not
+    resurrect them.
     """
     from pbix_mcp.dax.calc_tables import calc_column_unsupported_reason
     from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
@@ -9482,6 +9498,8 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None):
                     10: "Decimal", 11: "Boolean"}
     table_updates: dict[str, dict] = {}
     table_restamp: list[dict] = []
+    base_data = base_data or {}
+    skip = {t.lower() for t in (skip_tables or set())}
 
     # --- existing calculated TABLES (excluding field parameters, which the
     # rebuild already detects and re-stamps on its own) ---
@@ -9491,6 +9509,8 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None):
     ).fetchall():
         tid, tname = trow["ID"], trow["Name"]
         if _detect_field_parameter_shape(conn, tid) is not None:
+            continue
+        if tname.lower() in skip:
             continue
         qd = conn.execute(
             "SELECT QueryDefinition FROM [Partition] WHERE TableID = ?",
@@ -9519,6 +9539,8 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None):
         "AND c.ExplicitName NOT LIKE 'RowNumber%'").fetchall()
     calc_by_table: dict[str, list[dict]] = {}
     for r in existing:
+        if r["tbl"].lower() in skip:
+            continue
         bad = calc_column_unsupported_reason(r["expr"] or "", r["tbl"])
         if bad:
             raise ValueError(
@@ -9552,8 +9574,16 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None):
             amo = edt if edt in _AMO_TO_NAME else cr["InferredDataType"]
             data_cols.append({"name": cr["ExplicitName"],
                               "data_type": _AMO_TO_NAME.get(amo, "String")})
-        td = read_table_from_abf(abf, tname, meta)
-        data_rows = [dict(zip(td["columns"], rv)) for rv in td.get("rows", [])]
+        override = base_data.get(tname)
+        if override:
+            # The caller is replacing this table's rows; the calc columns must
+            # be computed from the NEW data, not from what VertiPaq still holds.
+            data_cols = list(override["columns"])
+            data_rows = list(override["rows"])
+        else:
+            td = read_table_from_abf(abf, tname, meta)
+            data_rows = [dict(zip(td["columns"], rv))
+                         for rv in td.get("rows", [])]
         cols_out, rows_out, restamp = _materialize_table_calc_columns(
             tname, data_cols, data_rows, specs, relationships)
         # The calc columns' values go into VertiPaq, but must NOT be embedded in
@@ -9563,6 +9593,77 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None):
         column_restamp.extend(restamp)
 
     return table_updates, column_restamp, table_restamp
+
+
+def _rebuild_preserving_calc(alias: str, info: dict, **rebuild_kwargs):
+    """Rebuild the DataModel with calculated tables/columns carried through.
+
+    A from-scratch rebuild reconstructs the model from data, which drops Type=2
+    calculated columns and demotes calculated tables to plain data — so every
+    rebuild-path edit used to be REFUSED outright on a model containing either.
+    That is three of the four reports in the public corpus, which made adding a
+    table, adding a relationship or removing a table impossible on most real
+    files.
+
+    This plans the re-materialization first (the same plan the calc-authoring
+    tools use), runs the rebuild with it, then re-stamps the calc metadata, so
+    the edit lands with the calc objects intact. When the plan cannot reproduce
+    an existing calculated column or table, `_plan_calc_preservation` raises and
+    the edit is still refused — never corrupted.
+
+    Returns ``(old_dm_size, new_dm_size)``.
+    """
+    import tempfile
+
+    from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+    from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+    dm_path = os.path.join(info["work_dir"], "DataModel")
+    caller_updates = dict(rebuild_kwargs.pop("table_updates", None) or {})
+    remove_tables = rebuild_kwargs.get("remove_tables") or set()
+
+    with open(dm_path, "rb") as f:
+        abf = decompress_datamodel(f.read())
+    meta = read_metadata_sqlite(abf)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.write(meta)
+    tmp.close()
+    try:
+        conn = sqlite3.connect(tmp.name)
+        conn.row_factory = sqlite3.Row
+        try:
+            rels = _get_dax_context(alias).get("relationships", [])
+            planned, col_restamp, table_restamp = _plan_calc_preservation(
+                conn, abf, meta, rels,
+                base_data=caller_updates, skip_tables=remove_tables)
+        finally:
+            conn.close()
+    finally:
+        os.unlink(tmp.name)
+
+    if not planned and not col_restamp and not table_restamp:
+        # No calc objects to preserve — the plain rebuild is exact.
+        return _rebuild_datamodel(info, table_updates=caller_updates,
+                                  **rebuild_kwargs)
+
+    # The plan already folded in the caller's rows for any table it touched
+    # (via base_data); the caller's other tables pass straight through.
+    merged = dict(caller_updates)
+    merged.update(planned)
+
+    old_size, new_size = _rebuild_datamodel(
+        info, table_updates=merged, calc_authoring=True,
+        restamp_calc_tables={s["table"] for s in table_restamp},
+        **rebuild_kwargs)
+    if col_restamp:
+        _, new_size = _apply_calculated_column_metadata(dm_path, col_restamp)
+    if table_restamp:
+        _, new_size = _apply_calculated_table_metadata(dm_path, table_restamp)
+
+    global _dax_cache
+    _dax_cache.pop(alias, None)
+    return old_size, new_size
 
 
 @mcp.tool()
