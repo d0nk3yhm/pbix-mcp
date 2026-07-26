@@ -4,7 +4,7 @@ An audit of what Power BI can author against what pbix-mcp exposes as tools,
 written for consumers (OpenBI) that need to know which operations are a single
 call, which need raw-JSON escape hatches, and which are not supported at all.
 
-Audited at **0.9.37 / 125 tools**. Re-run the inventory with:
+Audited at **0.9.38 / 125 tools**. Re-run the inventory with:
 
 ```bash
 python -c "from pbix_mcp import server; print(len([n for n in dir(server) if n.startswith('pbix_')]))"
@@ -81,6 +81,13 @@ caller never branches on format:
 
 Validate what the writer emits against Microsoft's published schemas with
 `scripts/validate_pbir_schemas.py` (see `docs/development.md`).
+
+The writer also self-checks every PBIR document before writing it, offline: the
+fields PBIR types as string enums must carry the enum NAME, and required fields
+must be present. This exists because a page written with the classic integer
+`displayOption` produced a .pbix that the service **imported successfully and
+then refused to open** — the failure surfaced only on upload, with nothing in
+the local pipeline flagging it.
 
 ## Rebuild-path edits
 
