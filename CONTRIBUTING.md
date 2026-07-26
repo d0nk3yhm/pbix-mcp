@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast unit tests only (720 pass, 10 skip, 22 slow/integration deselected)
+# Fast unit tests only (725 pass, 10 skip, 22 slow/integration deselected)
 pytest -m "not slow"
 
 # Download public test corpus, then run integration tests

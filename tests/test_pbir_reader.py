@@ -226,17 +226,110 @@ class TestVisualMapping:
         assert "query" not in cfg["singleVisual"]
 
 
-class TestWriteProtection:
-    """A synthesized layout must never be written back as Report/Layout —
-    that would leave the file with two conflicting report definitions."""
+class TestWriteBack:
+    """PBIR reports are edited IN PLACE in their Report/definition tree.
 
-    def test_set_layout_refuses(self, pbir_dir, layout):
-        from pbix_mcp.errors import UnsupportedFormatError
-        with pytest.raises(UnsupportedFormatError):
-            server._set_layout(pbir_dir, layout)
-        assert not os.path.exists(os.path.join(pbir_dir, "Report", "Layout"))
+    The guarantee that makes this safe: each page/visual is patched onto the
+    ORIGINAL file it was read from, so a write that changes nothing changes
+    nothing on disk — including fields the reader doesn't model.
+    """
 
-    def test_marked_layout_refused_even_elsewhere(self, tmp_path):
+    def test_noop_write_is_byte_faithful(self, tmp_path):
+        root = str(tmp_path / "noop")
+        _write_pbir(root)
+        before = {}
+        for base, _d, files in os.walk(os.path.join(root, "Report")):
+            for fn in files:
+                full = os.path.join(base, fn)
+                with open(full, encoding="utf-8") as f:
+                    before[os.path.relpath(full, root)] = json.load(f)
+
+        lay = server._get_layout(root)
+        server._set_layout(root, lay)          # write back UNCHANGED
+
+        after = {}
+        for base, _d, files in os.walk(os.path.join(root, "Report")):
+            for fn in files:
+                full = os.path.join(base, fn)
+                with open(full, encoding="utf-8") as f:
+                    after[os.path.relpath(full, root)] = json.load(f)
+        assert set(before) == set(after)
+        for rel in before:
+            assert before[rel] == after[rel], rel
+
+    def test_unmodelled_fields_survive_an_edit(self, tmp_path):
+        """A field the converter never maps must not be lost when the caller
+        edits something else on the same visual."""
+        root = str(tmp_path / "keep")
+        _write_pbir(root)
+        vfile = os.path.join(root, "Report", "definition", "pages", "pageA",
+                             "visuals", "visA", "visual.json")
+        with open(vfile) as f:
+            raw = json.load(f)
+        raw["howCreated"] = "InsertVisualButton"          # not modelled
+        raw["visual"]["query"]["sortDefinition"] = {"isDefaultSort": True}
+        with open(vfile, "w") as f:
+            json.dump(raw, f)
+
+        lay = server._get_layout(root)
+        lay["sections"][0]["visualContainers"][0]["x"] = 999   # unrelated edit
+        server._set_layout(root, lay)
+
+        with open(vfile) as f:
+            out = json.load(f)
+        assert out["position"]["x"] == 999
+        assert out["howCreated"] == "InsertVisualButton"
+        assert out["visual"]["query"]["sortDefinition"] == {"isDefaultSort": True}
+        # and the bindings weren't rewritten either
+        assert out["visual"]["query"]["queryState"]["Values"]["projections"][0][
+            "field"]["Column"]["Expression"]["SourceRef"] == {"Entity": "Sales"}
+
+    def test_edits_persist(self, tmp_path):
+        root = str(tmp_path / "edit")
+        _write_pbir(root)
+        lay = server._get_layout(root)
+        lay["sections"][0]["displayName"] = "Renamed"
+        lay["sections"][0]["visualContainers"][0]["width"] = 640
+        server._set_layout(root, lay)
+
+        again = server._get_layout(root)
+        assert again["sections"][0]["displayName"] == "Renamed"
+        assert again["sections"][0]["visualContainers"][0]["width"] == 640
+
+    def test_removing_a_visual_deletes_its_folder(self, tmp_path):
+        root = str(tmp_path / "del")
+        _write_pbir(root)
+        vdir = os.path.join(root, "Report", "definition", "pages", "pageA",
+                            "visuals", "visA")
+        assert os.path.isdir(vdir)
+        lay = server._get_layout(root)
+        lay["sections"][0]["visualContainers"] = []
+        server._set_layout(root, lay)
+        assert not os.path.isdir(vdir)
+
+    def test_removing_a_page_deletes_it_and_updates_order(self, tmp_path):
+        root = str(tmp_path / "delpage")
+        _write_pbir(root)
+        lay = server._get_layout(root)
+        lay["sections"] = [lay["sections"][0]]
+        server._set_layout(root, lay)
+        pages = os.path.join(root, "Report", "definition", "pages")
+        assert not os.path.isdir(os.path.join(pages, "pageB"))
+        with open(os.path.join(pages, "pages.json")) as f:
+            meta = json.load(f)
+        assert meta["pageOrder"] == ["pageA"]
+        assert meta["activePageName"] == "pageA"   # was pageB, which is gone
+
+    def test_never_plants_a_classic_layout(self, tmp_path):
+        root = str(tmp_path / "noplant")
+        _write_pbir(root)
+        lay = server._get_layout(root)
+        server._set_layout(root, lay)
+        assert not os.path.exists(os.path.join(root, "Report", "Layout"))
+
+    def test_synthesized_layout_refused_without_a_tree(self, tmp_path):
+        """A PBIR-derived layout must not be written into a dir that has no
+        Report/definition tree to patch."""
         from pbix_mcp.errors import UnsupportedFormatError
         wd = str(tmp_path / "plain")
         os.makedirs(os.path.join(wd, "Report"))
@@ -250,7 +343,6 @@ class TestToolSurface:
         """Zip the PBIR tree into a .pbix so the tools can open it."""
         root = str(tmp_path_factory.mktemp("pbirzip"))
         _write_pbir(root)
-        # a DataModel isn't needed for layout-format reporting
         path = os.path.join(root, "report.pbix")
         with zipfile.ZipFile(path, "w") as z:
             for base, _dirs, files in os.walk(os.path.join(root, "Report")):
@@ -260,28 +352,42 @@ class TestToolSurface:
             z.writestr("Version", "1.28")
         return path
 
-    def test_report_format_reports_pbir(self, pbir_pbix):
+    def test_report_format_reports_pbir_and_writable(self, pbir_pbix):
         alias = "pf_" + uuid.uuid4().hex[:8]
         server.pbix_open(pbir_pbix, alias)
         try:
             out = json.loads(server.pbix_report_format(alias))
             assert out["success"], out
             d = out["data"]
-            assert d["format"] == "PBIR"
-            assert d["is_pbir"] is True
+            assert d["format"] == "PBIR" and d["is_pbir"] is True
             assert d["readable"] is True
-            assert d["writable"] is False
+            assert d["writable"] is True
             assert d["pages"] == 2 and d["visuals"] == 2
         finally:
             server.pbix_close(alias, force=True)
 
-    def test_layout_tools_refuse_to_write(self, pbir_pbix):
+    def test_layout_tools_can_edit_a_pbir_report(self, pbir_pbix, tmp_path):
         alias = "pw_" + uuid.uuid4().hex[:8]
+        out_path = str(tmp_path / "edited.pbix")
         server.pbix_open(pbir_pbix, alias)
         try:
-            out = json.loads(server.pbix_add_page(alias, "Nope"))
-            assert out["success"] is False
-            assert out["error_code"] == "FORMAT_UNSUPPORTED"
-            assert "PBIR" in out["message"]
+            added = json.loads(server.pbix_add_page(alias, "Third Page"))
+            assert added["success"], added
+            removed = json.loads(server.pbix_remove_visual(alias, 1, 0))
+            assert removed["success"], removed
+            server.pbix_save(alias, out_path, overwrite=True, backup=False)
         finally:
             server.pbix_close(alias, force=True)
+
+        alias2 = "pr_" + uuid.uuid4().hex[:8]
+        server.pbix_open(out_path, alias2)
+        try:
+            lay = server._get_layout(server._open_files[alias2]["work_dir"])
+            assert [s["displayName"] for s in lay["sections"]] == \
+                ["Page 1", "Page 2", "Third Page"]
+            assert lay["sections"][1]["visualContainers"] == []
+        finally:
+            server.pbix_close(alias2, force=True)
+
+        with zipfile.ZipFile(out_path) as z:
+            assert "Report/Layout" not in z.namelist()
