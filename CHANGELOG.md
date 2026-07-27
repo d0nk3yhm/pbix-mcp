@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.45] - 2026-07-28
+
+**Every rebuild-path edit was quietly reformatting the model. Found by building a verification file for 0.9.44 and checking the bytes I was about to hand over.**
+
+0.9.44 claimed the auto date/time tables came through "identical to Desktop". That claim was true only of the fields the check happened to compare — `Type`, `ExplicitDataType`, `InferredDataType`, `SourceColumn`, `SystemFlags`, `IsAvailableInMDX`, `Expression`. It never looked at `IsHidden` or `SummarizeBy`, and both were wrong.
+
+### Fixed — authoring properties are now carried across a rebuild
+These live as **properties on rows the builder does create**, so the 0.9.43 row-level carry-over never covered them; the builder simply wrote its defaults over them.
+
+| Property | What it cost |
+|---|---|
+| `Table.IsHidden`, `Column.IsHidden` | Every hidden table and column became **visible**. All four auto date/time tables appeared in the field list as `LocalDateTable_<guid>`. |
+| `Column.SummarizeBy` | `Year`, `MonthNo`, `QuarterNo`, `Day` went from `None` to **`Sum`** — dragging `Year` into a visual would add the years together. |
+| `Column.FormatString` | A currency, percentage or date column lost its formatting. |
+| `Column.SortByColumnID` | "Month sorted by MonthNo" reverted to **alphabetical**. |
+| `Column.DataCategory` | An `ImageUrl` or `WebUrl` column stopped rendering as an image or link. |
+| `Column.DisplayOrdinal` | Field order in the model changed. |
+| `Table.ShowAsVariationsOnly`, `Table.IsPrivate` | Auto date/time tables surfaced where Desktop hides them. |
+
+Sort-by is carried **by name**, not by ID: the rebuild renumbers every primary key, so the stored number would have pointed at an arbitrary column. Storage and type fields (`ColumnStorageID`, `InferredDataType`, `IsAvailableInMDX`, the `*ModifiedTime` stamps) are deliberately **not** carried — they describe how the rebuilt data is physically stored and must take their new values.
+
+### Verified
+Full field-by-field diff of `[Table]` and `[Column]` between an open+save control and a rebuild-path edit: **no property is reset**, where before the fix 8 column fields and 3 table fields were. The five new tests fail 5/5 against 0.9.44.
+
 ## [0.9.44] - 2026-07-28
 
 **The auto date/time ceiling is lifted, calculated columns can be removed, and DAX evaluation is twice as fast.**
@@ -16,7 +40,7 @@ The cause was one stamper overwriting the other. `_apply_calculated_table_metada
 
 Verified field-for-field against each file's own open+save control, across `Type`, `ExplicitDataType`, `InferredDataType`, `SourceColumn`, `SystemFlags`, `IsAvailableInMDX` and `Expression`, plus table and partition flags.
 
-Across the 24-report corpus: **11 edits accepted (was 6), 0 with any difference, 13 refused (was 18)** — and **none** of the remaining refusals is the auto date/time shape. They now name genuinely different causes: calculated columns using `CALCULATE`, `RELATED` or `DATEDIFF`, or referencing another table, which this engine does not reproduce.
+Across the 24-report corpus: **11 edits accepted (was 6), 0 with any difference across the fields compared, 13 refused (was 18)** — but see 0.9.45: that comparison omitted `IsHidden` and `SummarizeBy`, both of which were in fact wrong — and **none** of the remaining refusals is the auto date/time shape. They now name genuinely different causes: calculated columns using `CALCULATE`, `RELATED` or `DATEDIFF`, or referencing another table, which this engine does not reproduce.
 
 ### Fixed — every auto-date `Date` column was being retyped to text
 Found while verifying the above. The generating `CALENDAR` expression hands dates back as ISO **strings**, and the rebuild inferred each column's type from the regenerated values, so `Date` came back `InferredDataType = 2` (String) instead of `9` (DateTime). The table looked intact while its date semantics were gone. Column types are now taken from what the model already declares, falling back to inference only for genuinely new columns.
