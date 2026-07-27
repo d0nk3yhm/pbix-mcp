@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.40] - 2026-07-27
+
+### Fixed
+- **Bookmark files were rewritten on every save.** 0.9.38's bookmark support stamped its own `$schema` onto existing `.bookmark.json` files, overwriting the (newer) version the service had declared. A read/write cycle that changed nothing still rewrote all four bookmark files in `IT_Support.pbix`. The declared `$schema` is now preserved; only a NEW bookmark gets a default stamped on it — the same rule already applied to pages and visuals.
+  - Neither the 125-tool sweep nor schema validation caught this: the rewritten files were still schema-valid and the bookmarks still worked. It was found by a new test that asserts a no-op read/write cycle leaves every definition file byte-identical, run against the two real service-authored reports in the public corpus.
+
+### Added
+- `tests/test_pbir_roundtrip.py` gains fidelity tests against the **real** corpus PBIR reports (50 and 22 visuals), not just the synthetic fixture: byte-faithful no-op round-trip, container formatting preserved across an unrelated edit, report-level state preserved, and no internal bookkeeping keys leaking to disk.
+
 ## [0.9.39] - 2026-07-27
 
 **All 125 tools audited on both report formats. Thirteen were silently discarding their changes on service-authored (PBIR) reports; all are fixed and verified.**

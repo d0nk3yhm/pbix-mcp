@@ -21,6 +21,7 @@ Every test reads the SAVED bytes back, never the in-memory view.
 import base64
 import json
 import os
+import shutil
 import uuid
 import zipfile
 
@@ -142,6 +143,25 @@ def _visuals(path):
 
 def _vco(v):
     return (v.get("visual") or {}).get("visualContainerObjects") or {}
+
+
+# Internal bookkeeping the converter adds to the in-memory view. None of it may
+# ever reach disk.
+_SENTINELS = ("__pbir_sort__", "__pbir_visual__", "__pbir_page__",
+              "__pbir_file__", "__pbir_schema__", "__pbir__")
+
+# Classic-shape spellings that must never appear in a PAGE or VISUAL file.
+# They ARE legitimate inside a bookmark's explorationState, which models
+# captured visual state using the classic vocabulary, so this list is only
+# applied to page.json / visual.json.
+_CLASSIC_LEAKS = ("vcObjects", "prototypeQuery", "singleVisual")
+
+
+def _page_and_visual_text(path):
+    with zipfile.ZipFile(path) as z:
+        return "\n".join(
+            z.read(n).decode("utf-8-sig", "replace") for n in z.namelist()
+            if n.endswith("page.json") or n.endswith("visual.json"))
 
 
 class TestFixtureIsMeaningful:
@@ -362,6 +382,113 @@ class TestNoOpFidelity:
             _ok(server.pbix_duplicate_page(e.alias, "0", "Copy"))
             out = e.save()
         text = _defn(out)
-        for sentinel in ("__pbir_sort__", "__pbir_visual__", "__pbir_page__",
-                         "vcObjects", "prototypeQuery", "singleVisual"):
+        for sentinel in _SENTINELS:
             assert sentinel not in text, sentinel
+        pv = _page_and_visual_text(out)
+        for leak in _CLASSIC_LEAKS:
+            assert leak not in pv, leak
+
+
+CORPUS = os.environ.get("PBIX_TEST_SAMPLES", "test_corpus")
+CORPUS_PBIR = [os.path.join(CORPUS, n) for n in
+               ("IT_Support.pbix", "Ecommerce_Conversion.pbix")]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("sample", CORPUS_PBIR)
+class TestRealServiceReportFidelity:
+    """The synthetic fixture is small and hand-built. These are real
+    service-authored reports (50 and 22 visuals) carrying the full range of
+    PBIR features — custom visuals, registered resources, themes, container
+    formatting, sorts, drillthrough. A converter regression shows up here first.
+    """
+
+    def _skip_missing(self, sample):
+        if not os.path.exists(sample):
+            pytest.skip("needs the public test corpus "
+                        "(scripts/download_test_corpus.py)")
+
+    def test_read_write_is_byte_faithful(self, sample, tmp_path):
+        """Reading and writing back without editing anything must not change a
+        single definition file. This is the strongest guard against the reader
+        inventing state or the writer dropping it."""
+        self._skip_missing(sample)
+        work = str(tmp_path / "w.pbix")
+        shutil.copy(sample, work)
+        alias = "fid_" + uuid.uuid4().hex[:8]
+        server.pbix_open(work, alias)
+        try:
+            wd = server._open_files[alias]["work_dir"]
+            server._set_layout(wd, server._get_layout(wd))
+            out = str(tmp_path / "o.pbix")
+            server.pbix_save(alias, out, overwrite=True, backup=False)
+        finally:
+            server.pbix_close(alias, force=True)
+
+        with zipfile.ZipFile(sample) as a, zipfile.ZipFile(out) as b:
+            names = [n for n in a.namelist()
+                     if n.startswith("Report/definition") and n.endswith(".json")]
+            assert names, "fixture is not PBIR"
+            assert set(names) <= set(b.namelist()), "files were dropped"
+            for n in names:
+                assert json.loads(a.read(n).decode("utf-8-sig")) == \
+                    json.loads(b.read(n).decode("utf-8-sig")), n
+
+    def test_container_formatting_survives_an_edit(self, sample, tmp_path):
+        """These reports carry real container formatting on most visuals; an
+        unrelated page edit must not strip any of it."""
+        self._skip_missing(sample)
+        before = sum(1 for v in _visuals(sample) if _vco(v))
+        assert before > 0, "fixture carries no container formatting"
+
+        work = str(tmp_path / "w.pbix")
+        shutil.copy(sample, work)
+        alias = "fmt_" + uuid.uuid4().hex[:8]
+        server.pbix_open(work, alias)
+        try:
+            _ok(server.pbix_add_page(alias, "ZZ Unrelated"))
+            out = str(tmp_path / "o.pbix")
+            server.pbix_save(alias, out, overwrite=True, backup=False)
+        finally:
+            server.pbix_close(alias, force=True)
+        assert sum(1 for v in _visuals(out) if _vco(v)) == before
+
+    def test_no_sentinels_leak_into_a_real_report(self, sample, tmp_path):
+        """These reports have bookmarks, so they exercise the bookmark writer's
+        bookkeeping keys as well as the visual converter's."""
+        self._skip_missing(sample)
+        work = str(tmp_path / "w.pbix")
+        shutil.copy(sample, work)
+        alias = "sen_" + uuid.uuid4().hex[:8]
+        server.pbix_open(work, alias)
+        try:
+            _ok(server.pbix_add_page(alias, "ZZ Unrelated"))
+            _ok(server.pbix_add_bookmark(alias, "ZZ Bookmark"))
+            out = str(tmp_path / "o.pbix")
+            server.pbix_save(alias, out, overwrite=True, backup=False)
+        finally:
+            server.pbix_close(alias, force=True)
+        text = _defn(out)
+        for sentinel in _SENTINELS:
+            assert sentinel not in text, sentinel
+        pv = _page_and_visual_text(out)
+        for leak in _CLASSIC_LEAKS:
+            assert leak not in pv, leak
+
+    def test_report_level_state_survives_an_edit(self, sample, tmp_path):
+        self._skip_missing(sample)
+        before = _report_json(sample)
+        work = str(tmp_path / "w.pbix")
+        shutil.copy(sample, work)
+        alias = "rls_" + uuid.uuid4().hex[:8]
+        server.pbix_open(work, alias)
+        try:
+            _ok(server.pbix_add_page(alias, "ZZ Unrelated"))
+            out = str(tmp_path / "o.pbix")
+            server.pbix_save(alias, out, overwrite=True, backup=False)
+        finally:
+            server.pbix_close(alias, force=True)
+        after = _report_json(out)
+        for key in ("resourcePackages", "publicCustomVisuals",
+                    "themeCollection", "settings"):
+            assert after.get(key) == before.get(key), key

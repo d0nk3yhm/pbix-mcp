@@ -11161,12 +11161,17 @@ def _pbir_read_bookmarks(work_dir: str) -> list:
                 doc = json.load(f)
         except Exception:
             continue
-        doc.pop("$schema", None)
+        # Remember the declared $schema; the service stamps versions newer than
+        # the one we default to, and overwriting it rewrites files the caller
+        # never touched.
+        schema = doc.pop("$schema", None)
         name = doc.get("name") or fn[: -len(".bookmark.json")]
         doc["name"] = name
         # Remember the file stem so a later write lands on the same file even
         # when it was renamed away from the default convention.
         doc["__pbir_file__"] = fn[: -len(".bookmark.json")]
+        if schema:
+            doc["__pbir_schema__"] = schema
         by_name[name] = doc
 
     meta_path = os.path.join(bdir, "bookmarks.json")
@@ -11220,11 +11225,13 @@ def _pbir_write_bookmarks(work_dir: str, bookmarks: list) -> None:
         name = bm.get("name") or "Bookmark" + uuid.uuid4().hex[:20]
         stem = bm.get("__pbir_file__") or name
         doc = {k: v for k, v in bm.items()
-               if k not in ("__pbir_file__", "children")}
+               if k not in ("__pbir_file__", "__pbir_schema__", "children")}
         doc["name"] = name
         doc.setdefault("displayName", name)
         doc.setdefault("explorationState", {})
-        doc["$schema"] = _PBIR_BOOKMARK_SCHEMA
+        # Keep whatever version the file declared; only a NEW bookmark gets our
+        # default stamped on it.
+        doc["$schema"] = bm.get("__pbir_schema__") or _PBIR_BOOKMARK_SCHEMA
         _pbir_write_json(os.path.join(bdir, f"{stem}.bookmark.json"), doc)
         written.add(f"{stem}.bookmark.json")
         return name

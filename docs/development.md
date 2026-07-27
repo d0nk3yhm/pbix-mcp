@@ -44,7 +44,7 @@ PBIX_TEST_SAMPLES=test_corpus pytest -v
 | `test_sort_by_column.py` | Sort-by-column authoring (7 skip without the corpus) | 10 |
 | `test_pbir_schema_conformance.py` | PBIR output vs Microsoft's published schemas | 3 (integration) |
 | `test_calc_preservation.py` | Rebuild-path edits on models with calc tables/columns | 11 (slow, needs the corpus) |
-| `test_pbir_roundtrip.py` | PBIR state outside the pages tree (formatting, sort, resources, settings) | 23 |
+| `test_pbir_roundtrip.py` | PBIR state outside the pages tree + real-corpus fidelity | 31 (8 slow, need the corpus) |
 
 ## Public Test Corpus
 
