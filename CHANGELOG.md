@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.42] - 2026-07-27
+
+**Three DAX bugs that returned a wrong value instead of an error, a diagnostic that lied, and a tool that reported success while doing nothing.**
+
+### Fixed — silently wrong values
+These are the worst shape a bug can take: nothing surfaces them, so they propagate into materialized column data and into any answer built on it. All three were found by running the engine against real reports.
+
+- **`MIN`/`MAX` over a date or text column returned `0`.** The implementation filtered values to `(int, float)`, so `MIN(Sales[Date])` — an extremely common pattern — produced `0` rather than the earliest date. Dates and text now order correctly; numeric behaviour is unchanged, and mixed columns never compare across types.
+- **`FORMAT(<ISO date string>, "MMMM")` returned the raw timestamp** instead of `"January"`. A date reaches the formatter as a string in several ordinary paths (row context over a generated table, a `CALENDAR` result, a text column holding dates); those are now coerced when the pattern is a date pattern. A non-date string is still left alone.
+- **An unqualified `[Column]` reference in a calculated column evaluated to blank.** Only `Table[Col]` and `'Table'[Col]` resolved — but `[Date]` is the idiomatic form and the one Power BI Desktop itself generates. Bare references are now qualified against the table being materialized, surgically: already-qualified refs, string literals, and names that are not columns of that table are left untouched.
+
+### Fixed — a diagnostic that lied
+- **`pbix_doctor`'s "Rebuild-path eligibility" check now runs the real predicate** as a dry run instead of approximating it. The 0.9.41 version inferred the answer from the presence of auto date/time tables and told two corpus reports "supported" when the edit then refused for an unrelated reason. Across 24 real reports the prediction now matches reality in **24/24** cases.
+
+### Fixed — success reported for a no-op
+- **`pbix_format_visual` returned `{"success": true}` when given keys it does not recognise**, having changed nothing. Passing raw Power BI object descriptors instead of the documented human-readable form was silently accepted. It now fails with the ignored keys named and the supported ones listed.
+
+### Changed
+- Calculated-table metadata is stamped **before** calculated-column metadata. A table that is both a calculated table and a calc-column owner needs two stamps on the same table, and applying them in the old order demoted six calculated columns to plain data.
+- A calculated table that also defines calculated columns is now **refused with a clear message** rather than rebuilt. Power BI's auto date/time tables are the common case. This is a deliberate limitation, not an oversight: an attempt to support it silently dropped those columns, and a wrong model is worse than a declined edit.
+- A calculated table's data columns (`Type = 4`, whose name lives in `InferredName`) are now included in the materialization schema.
+
+### Verified
+Across all 24 corpus reports: **6 rebuild-path edits succeed with calculated objects byte-identical, 18 are refused with an accurate reason, 0 corrupted, 0 diagnostic mismatches.**
+
 ## [0.9.41] - 2026-07-27
 
 **Test corpus grown 4 -> 24 real reports, which immediately exposed a hang.**
