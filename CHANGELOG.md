@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.44] - 2026-07-28
+
+**The auto date/time ceiling is lifted, calculated columns can be removed, and DAX evaluation is twice as fast.**
+
+### The auto date/time ceiling
+A calculated table that *also* owns calculated columns was refused outright. Every Power BI auto date/time table is exactly that shape — a `Date` column from the partition's `CALENDAR` expression plus `Year`/`MonthNo`/`Month`/`QuarterNo`/`Quarter`/`Day` computed on top — so any report with auto date/time on could not take a rebuild-path edit. It accounted for **16 of the 18 corpus refusals**.
+
+The cause was one stamper overwriting the other. `_apply_calculated_table_metadata` rewrote *every* non-RowNumber column to `Type = 4, ExplicitName = NULL`, which destroyed the calculated columns **and** nulled the `ExplicitName` that the calc-column stamper looks a column up by, so the second stamp then matched nothing. The table stamper is now told which columns belong to the calc-column stamp and leaves them alone, and calculated columns on a calculated table carry `SystemFlags = 2`, matching Desktop.
+
+Verified field-for-field against each file's own open+save control, across `Type`, `ExplicitDataType`, `InferredDataType`, `SourceColumn`, `SystemFlags`, `IsAvailableInMDX` and `Expression`, plus table and partition flags.
+
+### Fixed — every auto-date `Date` column was being retyped to text
+Found while verifying the above. The generating `CALENDAR` expression hands dates back as ISO **strings**, and the rebuild inferred each column's type from the regenerated values, so `Date` came back `InferredDataType = 2` (String) instead of `9` (DateTime). The table looked intact while its date semantics were gone. Column types are now taken from what the model already declares, falling back to inference only for genuinely new columns.
+
+### Added — `pbix_datamodel_remove_calculated_column` (126 tools)
+The inverse of `pbix_datamodel_add_calculated_column`, so authoring a calculated column can be undone. Drops both halves — the `Type = 2` metadata carrying the DAX and the materialized values in VertiPaq — and re-evaluates every remaining calculated column and calculated table.
+
+It refuses, rather than corrupts, in two cases: the target is not a calculated column (naming `pbix_set_table_data` as the right tool for a data column), or another calculated column on the same table reads it (naming the dependents). Dependency detection matches all three reference forms Power BI writes — `[Col]`, `Table[Col]`, `'Table'[Col]` — case-insensitively.
+
+### Performance — DAX evaluation is 1.92x faster on a real 200k-row model
+`_split_operators`, the expression scanner, is a pure function of `(expression, operator)` but runs inside every row iteration. Profiling one `RANKX`/`FILTER` measure on `Agents_Performance.pbix` (`FactSales` = 199,999 rows) showed **95,586 calls, 48% of total runtime** — the cost was not scanning the fact table, it was re-parsing the same DAX text once per row.
+
+Memoizing it gives a **99.9% hit rate from only 300 distinct parses**, and a controlled A/B in one process (interleaved arms, median of three) measures **1.92x — 48% less wall clock**, matching the profile exactly.
+
+This answers the attribution question in handover 17: the cliff is **engine-side**. A single `evaluate_dax` call over 199,999 rows costs seconds with the model already decoded and cached, so no amount of client-side batching can rescue it. The remaining cost is the expression interpreter walking rows under filter context; that is a larger change and is not attempted here.
+
+### Also fixed
+- **`[Function]` — user-defined DAX functions — were unrecoverable.** The table was missing from the builder's schema entirely, so a rebuilt model had nowhere to put one. Added (verbatim DDL from a Desktop-authored file) and carried across rebuilds.
+- **The carry-over silently skipped any table missing from the target schema** — the exact way `[Function]` went unnoticed. It now reports instead.
+- **`pbix_set_table_data` returned `'list' object has no attribute 'get'`** when handed a bare array of rows, which is the obvious guess. It now names the expected shape.
+- **`pbix_datamodel_add_calculated_column` stamped column metadata before table metadata**, the same order that silently demoted calculated columns elsewhere. Table first now.
+
 ## [0.9.43] - 2026-07-27
 
 **A rebuild-path edit was quietly deleting parts of the model it could not rebuild. All 24 corpus reports were affected.**
