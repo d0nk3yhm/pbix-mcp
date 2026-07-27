@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.43] - 2026-07-27
+
+**A rebuild-path edit was quietly deleting parts of the model it could not rebuild. All 24 corpus reports were affected.**
+
+The from-scratch builder writes five metadata tables — `[Table]`, `[Column]`, `[Partition]`, `[Relationship]`, `[Measure]`. `metadata.sqlitedb` defines about seventy. Everything in the other sixty-five was discarded on every rebuild-path edit, and the tool returned `success: true` with an empty `warnings` list.
+
+### Fixed — model metadata is now carried across a rebuild
+Snapshotted before the rebuild with every foreign key expressed as a **name** rather than an ID (the rebuild renumbers every primary key), then re-attached afterwards:
+
+- **perspectives** (`Perspective` / `PerspectiveTable` / `PerspectiveColumn` / `PerspectiveMeasure` / `PerspectiveHierarchy`)
+- **Q&A synonyms and phrasings** (`LinguisticMetadata`) — present in **24/24** corpus reports, wiped by every edit
+- **KPI definitions on measures**
+- **dynamic format strings** (`FormatStringDefinition`)
+- **shared M expressions and query parameters** (`Expression`)
+- **declared data sources**
+- **auto date/time drill-down wiring** (`Variation`)
+- **column grouping** (`RelatedColumnDetails` / `GroupByColumn`)
+- **annotations, extended properties, changed properties**
+
+The `ObjectType` enum needed to re-resolve `(ObjectID, ObjectType)` owners was derived from the corpus rather than assumed: across 4,345 rows in 24 reports every value resolved to exactly one entity table — `1=Model, 3=Table, 4=Column, 7=Relationship, 8=Measure, 9=Hierarchy, 12=KPI, 41=Expression`.
+
+### Fixed — a drill-down hierarchy dropped without a word
+Hierarchy levels were read with `c.ExplicitName`. A calculated-table or auto-date column carries its name in `InferredName` and leaves `ExplicitName` NULL, so every level came back nameless and the hierarchy was skipped. `Agents_Performance.pbix` lost **both** of its date hierarchies to an edit that reported success. Now read with `COALESCE(ExplicitName, InferredName)` — the same defect class as the 0.9.42 `Type = 4` fix.
+
+### Changed — nothing is dropped in silence
+Anything that genuinely cannot be re-attached — because the object it referenced was deleted by the very edit being made — is now **reported in the response's `warnings`**, naming the count, the kind, and the reason. Removing a table that a perspective covers, for example, now says so instead of quietly shrinking the perspective.
+
+Warnings raised deep in an operation reach the response through a shared channel rather than being threaded through each of the ~40 mutating tools. Threading is how call sites get missed, and missed call sites are precisely where this class of bug lives.
+
+### Fail-safe by construction
+A carried row whose owner cannot be resolved is **skipped and reported**, never written with a dangling foreign key. A missing annotation is recoverable; a half-attached model is not.
+
+### Verified
+Across all 24 corpus reports: **6 rebuild-path edits accepted, 18 refused, 0 with silent loss** — previously all 6 accepted edits lost metadata without a word. The six new corpus tests fail 6/6 against 0.9.42.
+
+### Still not lifted
+The auto date/time ceiling stands: a calculated table that also owns calculated columns is refused, which is 16 of the 18 refusals. That limitation is unchanged and deliberate.
+
 ## [0.9.42] - 2026-07-27
 
 **Three DAX bugs that returned a wrong value instead of an error, a diagnostic that lied, and a tool that reported success while doing nothing.**

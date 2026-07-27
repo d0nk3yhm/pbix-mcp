@@ -11,6 +11,35 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+# Warnings raised deep inside an operation, to be attached to whatever response
+# that operation ends up returning.
+#
+# A rebuild-path edit can discover halfway through that some part of the model
+# cannot be carried across — a perspective, a drill-down hierarchy. The code
+# that knows this is many frames below the code that builds the response, and
+# threading a list through every one of ~40 mutating tools would guarantee that
+# some call site is missed. That is the failure mode this whole class of bug
+# comes from, so the channel is shared rather than threaded: every response
+# drains it, so nothing can be reported as an unqualified success.
+_pending_warnings: list[str] = []
+
+
+def add_pending_warning(message: str) -> None:
+    """Attach a warning to the response this operation eventually returns."""
+    if message and message not in _pending_warnings:
+        _pending_warnings.append(message)
+
+
+def clear_pending_warnings() -> None:
+    """Drop anything buffered — call when starting a fresh operation."""
+    _pending_warnings.clear()
+
+
+def _drain() -> list[str]:
+    out = list(_pending_warnings)
+    _pending_warnings.clear()
+    return out
+
 
 class ToolResponse(BaseModel):
     """Standard response envelope for all MCP tools."""
@@ -55,12 +84,14 @@ class ToolResponse(BaseModel):
 
     @classmethod
     def ok(cls, message: str = "", data: Any = None, **kwargs) -> ToolResponse:
-        """Create a success response."""
+        """Create a success response, carrying any warnings raised en route."""
+        kwargs["warnings"] = list(kwargs.get("warnings") or []) + _drain()
         return cls(success=True, message=message, data=data, **kwargs)
 
     @classmethod
     def error(cls, message: str, code: str = "PBIX_MCP_ERROR", **kwargs) -> ToolResponse:
         """Create an error response."""
+        kwargs["warnings"] = list(kwargs.get("warnings") or []) + _drain()
         return cls(success=False, error_code=code, message=message, **kwargs)
 
 
