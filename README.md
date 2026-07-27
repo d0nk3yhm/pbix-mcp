@@ -128,6 +128,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | DAX evaluation (170 functions) | **Stable API** | Best-effort semantic parity — stable API, practical evaluation for common DAX patterns; see accuracy notes below |
 | Metadata SQL read/write | **Stable** | Full SQLite access to tables, columns, relationships |
 | Default slicer filter extraction | **Stable** | Legacy Layout JSON and PBIR format |
+| PBIR read + write | **Stable** | Service-authored reports (`Report/definition/`) are read AND edited by the same tools as classic. All 125 tools are verified on both formats by applying the tool, saving, reopening and checking the saved bytes — see [docs/capability-parity.md](docs/capability-parity.md) |
 | Table data read | **Stable** | Native VertiPaq decoder — all materialized tables (no external dependencies) |
 | Calculated table evaluation | **Stable** | DATATABLE, GENERATESERIES, CALENDAR, field parameters |
 | XPress9 decompress/recompress | **Stable** | Byte-exact round-trip verified |
@@ -616,7 +617,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for project conventions, [SUPPORT.md](SUP
 
 - **TMDL import** — import models from TMDL files (export already implemented)
 - **Composite models** — mixed Import + DirectQuery tables in the same report
-- **PBIR layout write** — write reports in the new PBIR format alongside legacy
+- **Rename model objects** — renaming a table/column/measure has to rewrite every
+  DAX expression and layout binding that references the old name
+- **Report-level measures** — for live-connect reports, where measures live in
+  PBIR's `reportExtensions.json` rather than in the model
+
+PBIR read *and* write shipped in 0.9.35–0.9.39 and are covered by the
+verification described below.
 
 ## Architecture Notes
 

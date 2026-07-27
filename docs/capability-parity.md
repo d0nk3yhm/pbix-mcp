@@ -94,6 +94,12 @@ not applicable to the fixtures, and 0 lose their change.
 a file can be perfectly schema-valid and still be missing state a tool claimed
 to write. Persistence is verified separately, in `tests/test_pbir_roundtrip.py`.
 
+**Known coverage gap.** `pbix_set_m_code` and `pbix_set_incremental_refresh`
+operate on the `DataMashup` part, and no file in the public test corpus carries
+one — so they are exercised by unit tests but not by the end-to-end persistence
+sweep. They are reported as *not applicable* rather than *passing*, because an
+untested tool should not be counted as verified.
+
 Validate what the writer emits against Microsoft's published schemas with
 `scripts/validate_pbir_schemas.py` (see `docs/development.md`).
 
