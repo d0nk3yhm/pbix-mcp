@@ -42,6 +42,12 @@ from pbix_mcp.formats.vertipaq_encoder import (
     _align_bit_width,
 )
 
+# Ceiling on rows one .idf segment may expand to. Power BI splits an import
+# table into ~1,048,576-row segments, so sixteen times that is far above any
+# real column while still catching a run length that came from a misparsed
+# offset rather than from data.
+_MAX_SEGMENT_ROWS = 1 << 24
+
 # AMO type code to friendly name
 _AMO_TO_TYPE_NAME = {
     AMO_STRING: "String",
@@ -484,16 +490,34 @@ def _decode_idf_segment_at(
     """
     # primary_segment_size: uint64 (should be 16)
     ps_count = struct.unpack_from("<Q", buf, pos)[0]
+    # Every count below is read straight off the wire. When an offset is even
+    # slightly wrong they come back astronomically large and the loops then
+    # allocate against them: one such column grew to 3.7 GB and never finished,
+    # turning an edit into an unbounded hang. Bound each by what the buffer can
+    # physically hold, and RAISE rather than truncate — the caller already knows
+    # how to refuse an edit whose rows it cannot decode, whereas quietly short
+    # data would rebuild the table wrong.
+    if ps_count * 8 > len(buf) - pos:
+        raise ValueError(
+            f"IDF segment at byte {pos} declares {ps_count:,} primary entries, "
+            f"more than the remaining {len(buf) - pos:,} bytes can hold")
 
     # Read primary segment entries
     primary_entries = []
     p = pos + 8
+    total_rows = 0
     for _ in range(ps_count):
         dv = struct.unpack_from("<I", buf, p)[0]
         rv = struct.unpack_from("<I", buf, p + 4)[0]
         p += 8
         if dv == 0 and rv == 0:
             continue  # zero entry -- padding
+        total_rows += rv
+        if total_rows > _MAX_SEGMENT_ROWS:
+            raise ValueError(
+                f"IDF segment at byte {pos} expands to more than "
+                f"{_MAX_SEGMENT_ROWS:,} rows; a VertiPaq segment holds at most "
+                f"~1,048,576, so this run length is not real data")
         primary_entries.append((dv, rv))
 
     # Advance past full primary segment (skip any remaining padding)
@@ -501,6 +525,10 @@ def _decode_idf_segment_at(
 
     # sub_segment_size: uint64 (word count)
     ss_word_count = struct.unpack_from("<Q", buf, p)[0]
+    if ss_word_count * 8 > len(buf) - p:
+        raise ValueError(
+            f"IDF sub-segment at byte {p} declares {ss_word_count:,} words, "
+            f"more than the remaining {len(buf) - p:,} bytes can hold")
     p += 8
 
     # Read sub-segment uint64 words

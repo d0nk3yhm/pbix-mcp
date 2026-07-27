@@ -179,6 +179,63 @@ class TestExpressionScanCache:
         assert scan.cache_info().hits == 1
 
 
+class TestIdfDecodeBounds:
+    """A misparsed run length must raise, not allocate.
+
+    Lifting the auto date/time ceiling let edits reach a VertiPaq column the
+    refusal used to mask. Its run length decoded as billions of rows and the
+    decoder expanded it literally: 3.7 GB of RSS and no end after ten minutes,
+    on a 0.8 MB file. The counts come straight off the wire, so they are now
+    bounded by what the buffer can hold — and raise rather than truncate, since
+    short data would rebuild the table with silently wrong rows.
+    """
+
+    @staticmethod
+    def _segment(primary_entries, sub_words=()):
+        """A minimal .idf segment: count, (data_value, run_value) pairs, words."""
+        import struct
+        out = struct.pack("<Q", len(primary_entries))
+        for dv, rv in primary_entries:
+            out += struct.pack("<II", dv, rv)
+        out += struct.pack("<Q", len(sub_words))
+        for wd in sub_words:
+            out += struct.pack("<Q", wd)
+        return out
+
+    def test_a_sane_rle_run_still_decodes(self):
+        from pbix_mcp.formats import vertipaq_decoder as vd
+        buf = self._segment([(7, 3)])
+        indices, _pos = vd._decode_idf_segment_at(buf, 0, 0, 0)
+        assert indices == [7, 7, 7]
+
+    def test_an_absurd_run_length_raises_instead_of_allocating(self):
+        from pbix_mcp.formats import vertipaq_decoder as vd
+        buf = self._segment([(1, 0xFFFFFFF0)])
+        with pytest.raises(ValueError, match="expands to more than"):
+            vd._decode_idf_segment_at(buf, 0, 0, 0)
+
+    def test_a_primary_count_larger_than_the_buffer_raises(self):
+        import struct
+
+        from pbix_mcp.formats import vertipaq_decoder as vd
+        buf = struct.pack("<Q", 1 << 40) + b"\x00" * 16
+        with pytest.raises(ValueError, match="primary entries"):
+            vd._decode_idf_segment_at(buf, 0, 0, 0)
+
+    def test_a_sub_segment_count_larger_than_the_buffer_raises(self):
+        import struct
+
+        from pbix_mcp.formats import vertipaq_decoder as vd
+        buf = struct.pack("<Q", 1) + struct.pack("<II", 3, 1) \
+            + struct.pack("<Q", 1 << 40)
+        with pytest.raises(ValueError, match="sub-segment"):
+            vd._decode_idf_segment_at(buf, 0, 8, 0)
+
+    def test_the_ceiling_is_far_above_a_real_vertipaq_segment(self):
+        from pbix_mcp.formats import vertipaq_decoder as vd
+        assert vd._MAX_SEGMENT_ROWS > 1_048_576 * 8
+
+
 class TestRemoveCalculatedColumnGuards:
     """The refusals, which need no corpus file."""
 

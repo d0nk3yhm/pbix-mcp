@@ -16,6 +16,8 @@ The cause was one stamper overwriting the other. `_apply_calculated_table_metada
 
 Verified field-for-field against each file's own open+save control, across `Type`, `ExplicitDataType`, `InferredDataType`, `SourceColumn`, `SystemFlags`, `IsAvailableInMDX` and `Expression`, plus table and partition flags.
 
+Across the 24-report corpus: **11 edits accepted (was 6), 0 with any difference, 13 refused (was 18)** — and **none** of the remaining refusals is the auto date/time shape. They now name genuinely different causes: calculated columns using `CALCULATE`, `RELATED` or `DATEDIFF`, or referencing another table, which this engine does not reproduce.
+
 ### Fixed — every auto-date `Date` column was being retyped to text
 Found while verifying the above. The generating `CALENDAR` expression hands dates back as ISO **strings**, and the rebuild inferred each column's type from the regenerated values, so `Date` came back `InferredDataType = 2` (String) instead of `9` (DateTime). The table looked intact while its date semantics were gone. Column types are now taken from what the model already declares, falling back to inference only for genuinely new columns.
 
@@ -30,6 +32,11 @@ It refuses, rather than corrupts, in two cases: the target is not a calculated c
 Memoizing it gives a **99.9% hit rate from only 300 distinct parses**, and a controlled A/B in one process (interleaved arms, median of three) measures **1.92x — 48% less wall clock**, matching the profile exactly.
 
 This answers the attribution question in handover 17: the cliff is **engine-side**. A single `evaluate_dax` call over 199,999 rows costs seconds with the model already decoded and cached, so no amount of client-side batching can rescue it. The remaining cost is the expression interpreter walking rows under filter context; that is a larger change and is not attempted here.
+
+### Fixed — an unbounded VertiPaq decode
+Lifting the ceiling let edits reach a column the refusal used to mask. Its RLE run length decoded as billions of rows and the decoder expanded it literally: **3.7 GB of RSS and no end after ten minutes, on a 0.8 MB file**. Every count in an `.idf` segment header comes straight off the wire, so a slightly wrong offset reads as an astronomical number. Those counts are now bounded by what the buffer can physically hold, and **raise rather than truncate** — the caller already knows how to refuse an edit whose rows it cannot decode, whereas quietly short data would rebuild the table with silently wrong rows.
+
+The same file now refuses in **1.3 seconds**, naming the table and the columns.
 
 ### Also fixed
 - **`[Function]` — user-defined DAX functions — were unrecoverable.** The table was missing from the builder's schema entirely, so a rebuilt model had nowhere to put one. Added (verbatim DDL from a Desktop-authored file) and carried across rebuilds.
