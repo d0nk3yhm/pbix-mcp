@@ -110,7 +110,7 @@ class ModelReader:
         columns/tables use.
         """
         if "schema" in self._metadata_cache:
-            return self._metadata_cache["schema"]
+            return list(self._metadata_cache["schema"])
 
         rows = self._query_metadata("""
             SELECT t.Name AS TableName,
@@ -156,7 +156,7 @@ class ModelReader:
         FormatString, Description, IsHidden.
         """
         if "measures" in self._metadata_cache:
-            return self._metadata_cache["measures"]
+            return list(self._metadata_cache["measures"])
 
         rows = self._query_metadata("""
             SELECT t.Name AS TableName,

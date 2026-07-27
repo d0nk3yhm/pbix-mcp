@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast tests (778 pass, 10 skip, 25 slow/integration deselected)
+# Fast tests (814 pass, 10 skip, 44 slow/integration deselected)
 pytest -m "not slow"
 
 # With coverage
@@ -44,6 +44,7 @@ PBIX_TEST_SAMPLES=test_corpus pytest -v
 | `test_sort_by_column.py` | Sort-by-column authoring (7 skip without the corpus) | 10 |
 | `test_pbir_schema_conformance.py` | PBIR output vs Microsoft's published schemas | 3 (integration) |
 | `test_calc_preservation.py` | Rebuild-path edits on models with calc tables/columns | 11 (slow, needs the corpus) |
+| `test_pbir_roundtrip.py` | PBIR state outside the pages tree (formatting, sort, resources, settings) | 23 |
 
 ## Public Test Corpus
 
@@ -65,7 +66,7 @@ ruff check src/ tests/
 python -m mypy src/pbix_mcp/ --ignore-missing-imports
 ```
 
-mypy has 144 errors (CI baseline is 145 — see `.github/workflows/ci.yml`). CI fails if the error count exceeds 145; the baseline is ratcheted down as errors are cleaned up. Tracked for gradual cleanup.
+mypy has 137 errors (CI baseline is 140 — see `.github/workflows/ci.yml`). CI fails if the error count exceeds 140; the baseline is ratcheted down as errors are cleaned up. Tracked for gradual cleanup.
 
 ## Validating PBIR output
 

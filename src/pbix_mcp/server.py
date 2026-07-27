@@ -501,21 +501,44 @@ def _get_visual_name(config: dict) -> str:
 
 
 def _set_value_by_dot_path(obj: Any, path: str, value: Any) -> None:
-    """Set a nested value using a dot-separated path like 'a.b.c'."""
+    """Set a nested value using a dot-separated path like 'a.b.c'.
+
+    A NUMERIC segment means a list index. Power BI's formatting structures are
+    arrays of ``{properties: ...}``, so creating a missing level as a dict keyed
+    "0" produced JSON the schema rejects (``title: {"0": ...}`` instead of
+    ``title: [...]``). The next segment decides which container to create.
+    """
     keys = path.split(".")
-    for key in keys[:-1]:
+    for i, key in enumerate(keys[:-1]):
+        want_list = keys[i + 1].isdigit()
         if isinstance(obj, dict):
-            obj = obj.setdefault(key, {})
+            if obj.get(key) is None:
+                obj[key] = [] if want_list else {}
+            obj = obj[key]
         elif isinstance(obj, list):
+            if not key.isdigit():
+                raise ValueError(
+                    f"Path segment '{key}' indexes a list — it must be a number")
             idx = int(key)
+            while len(obj) <= idx:
+                obj.append([] if want_list else {})
+            if obj[idx] is None:
+                obj[idx] = [] if want_list else {}
             obj = obj[idx]
         else:
             raise ValueError(f"Cannot traverse into {type(obj)} at key '{key}'")
+
     final_key = keys[-1]
     if isinstance(obj, dict):
         obj[final_key] = value
     elif isinstance(obj, list):
-        obj[int(final_key)] = value
+        if not final_key.isdigit():
+            raise ValueError(
+                f"Path segment '{final_key}' indexes a list — it must be a number")
+        idx = int(final_key)
+        while len(obj) <= idx:
+            obj.append(None)
+        obj[idx] = value
     else:
         raise ValueError(f"Cannot set key '{final_key}' on {type(obj)}")
 
@@ -2810,14 +2833,30 @@ def pbix_set_filters(alias: str, filters_json: str, page_index: int = -1) -> str
 
 @mcp.tool()
 def pbix_get_settings(alias: str) -> str:
-    """Get report settings from Report/Settings JSON.
+    """Get report settings.
+
+    Reads ``Report/definition/report.json`` ``settings`` on a PBIR report and
+    the legacy ``Report/Settings`` part on a classic one — the authoritative
+    location differs by format, and reading the classic part on a PBIR file
+    reports "no settings" for a report that has them.
 
     Args:
         alias: The alias of the open file
     """
     try:
         info = _ensure_open(alias)
-        settings = _read_json_component(info["work_dir"], os.path.join("Report", "Settings"))
+        work_dir = info["work_dir"]
+        if _is_pbir(work_dir):
+            cfg = _get_report_config(work_dir) or {}
+            settings = cfg.get("settings")
+            if settings is None:
+                return ToolResponse.ok(
+                    "No settings found in Report/definition/report.json."
+                ).to_text()
+            return ToolResponse.ok(
+                json.dumps(settings, indent=2, ensure_ascii=False),
+                data={"settings": settings, "source": "report.json"}).to_text()
+        settings = _read_json_component(work_dir, os.path.join("Report", "Settings"))
         if settings is None:
             return ToolResponse.ok("No Settings found.").to_text()
         return ToolResponse.ok(json.dumps(settings, indent=2, ensure_ascii=False)).to_text()
@@ -2829,7 +2868,12 @@ def pbix_get_settings(alias: str) -> str:
 
 @mcp.tool()
 def pbix_set_settings(alias: str, settings_json: str) -> str:
-    """Write report settings back to Report/Settings.
+    """Write report settings.
+
+    Writes ``Report/definition/report.json`` ``settings`` on a PBIR report and
+    the legacy ``Report/Settings`` part on a classic one. Writing the classic
+    part into a PBIR report created a second, conflicting settings document
+    that Power BI ignores while the real one stayed stale.
 
     Args:
         alias: The alias of the open file
@@ -2837,11 +2881,22 @@ def pbix_set_settings(alias: str, settings_json: str) -> str:
     """
     try:
         info = _ensure_open(alias)
+        work_dir = info["work_dir"]
         try:
             settings = json.loads(settings_json)
         except json.JSONDecodeError as e:
             raise LayoutParseError(f"Invalid JSON: {e}")
-        _write_json_component(info["work_dir"], os.path.join("Report", "Settings"), settings)
+        if _is_pbir(work_dir):
+            cfg = _get_report_config(work_dir)
+            if cfg is None:
+                raise LayoutParseError(
+                    "No Report/definition/report.json found.")
+            cfg["settings"] = settings
+            _set_report_config(work_dir, cfg)
+            info["modified"] = True
+            return ToolResponse.ok(
+                "Settings updated in Report/definition/report.json.").to_text()
+        _write_json_component(work_dir, os.path.join("Report", "Settings"), settings)
         info["modified"] = True
         return ToolResponse.ok("Settings updated.").to_text()
     except PBIXMCPError as e:
@@ -3339,6 +3394,113 @@ def _ensure_content_type_default(work_dir: str, ext: str) -> bool:
 # codes. Verified against test_corpus/{Ecommerce_Conversion,IT_Support}.pbix.
 _PBIR_ITEM_TYPE = {100: "Image", 200: "ShapeMap", 201: "CustomTheme",
                    202: "BaseTheme"}
+_PBIR_ITEM_TYPE_INV = {v: k for k, v in _PBIR_ITEM_TYPE.items()}
+
+# Package-level type. Verified against the corpus: every classic Layout writes
+# 1 for RegisteredResources and 2 for SharedResources, and the matching PBIR
+# report.json writes the enum names.
+_PBIR_PACKAGE_TYPE = {1: "RegisteredResources", 2: "SharedResources"}
+_PBIR_PACKAGE_TYPE_INV = {v: k for k, v in _PBIR_PACKAGE_TYPE.items()}
+
+
+def _classic_theme_to_pbir(theme: dict, original: dict | None = None) -> dict:
+    """Classic ``config.themeCollection`` -> the PBIR report.json shape.
+
+    Only `type` differs structurally (int vs enum name). PBIR also carries
+    `reportVersionAtImport`, which the classic shape cannot express, so it is
+    preserved from ``original`` per theme slot rather than dropped.
+    """
+    original = original or {}
+    out: dict = {}
+    # PBIR requires reportVersionAtImport on every theme slot. A newly added
+    # customTheme has no original to inherit it from, so it borrows the one the
+    # report already declares.
+    fallback_version = None
+    for slot in ("baseTheme", "customTheme"):
+        v = (original.get(slot) or {}).get("reportVersionAtImport")
+        if v is not None:
+            fallback_version = v
+            break
+
+    for slot, entry in (theme or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        base = copy.deepcopy(original.get(slot, {}))
+        # The report's real baseTheme is authoritative on PBIR; the classic
+        # code substitutes a built-in default that would then contradict
+        # resourcePackages. Only the customTheme overlay is taken from the
+        # caller.
+        if slot == "baseTheme" and base:
+            out[slot] = base
+            continue
+        base.update({k: v for k, v in entry.items() if k != "type"})
+        ttype = entry.get("type", base.get("type"))
+        base["type"] = (ttype if isinstance(ttype, str)
+                        else _PBIR_PACKAGE_TYPE.get(ttype, "SharedResources"))
+        # `version` is the classic spelling; PBIR uses reportVersionAtImport.
+        base.pop("version", None)
+        if base.get("reportVersionAtImport") is None and fallback_version:
+            base["reportVersionAtImport"] = copy.deepcopy(fallback_version)
+        out[slot] = base
+    # Never drop a theme slot the report already had.
+    for slot, entry in original.items():
+        out.setdefault(slot, entry)
+    return out
+
+
+def _pbir_packages_to_classic(pkgs: list) -> list:
+    """PBIR report.json resourcePackages -> the nested classic Layout shape."""
+    out = []
+    for pkg in pkgs or []:
+        if "resourcePackage" in pkg:      # already classic
+            out.append(copy.deepcopy(pkg))
+            continue
+        inner = {
+            "name": pkg.get("name", ""),
+            "type": _PBIR_PACKAGE_TYPE_INV.get(pkg.get("type"), 1),
+            "items": [{"type": _PBIR_ITEM_TYPE_INV.get(it.get("type"), 100),
+                       "path": it.get("path", it.get("name", "")),
+                       "name": it.get("name", "")}
+                      for it in (pkg.get("items") or [])],
+            "disabled": False,
+        }
+        out.append({"resourcePackage": inner})
+    return out
+
+
+def _classic_packages_to_pbir(pkgs: list, original: list | None = None) -> list:
+    """Inverse of :func:`_pbir_packages_to_classic`.
+
+    ``original`` is the report.json list this came from; keys PBIR carries that
+    the classic shape cannot express are preserved per package/item name, so a
+    read/write cycle does not strip them.
+    """
+    orig_pkgs = {p.get("name"): p for p in (original or [])
+                 if isinstance(p, dict) and "resourcePackage" not in p}
+    out = []
+    for pkg in pkgs or []:
+        inner = pkg.get("resourcePackage", pkg)
+        name = inner.get("name", "")
+        base = copy.deepcopy(orig_pkgs.get(name, {}))
+        orig_items = {i.get("name"): i for i in (base.get("items") or [])}
+        ptype = inner.get("type")
+        base["name"] = name
+        base["type"] = (ptype if isinstance(ptype, str)
+                        else _PBIR_PACKAGE_TYPE.get(ptype, "RegisteredResources"))
+        items = []
+        for it in (inner.get("items") or []):
+            iname = it.get("name", "")
+            item = copy.deepcopy(orig_items.get(iname, {}))
+            itype = it.get("type")
+            item["name"] = iname
+            item["path"] = it.get("path", iname)
+            item["type"] = (itype if isinstance(itype, str)
+                            else _PBIR_ITEM_TYPE.get(itype, "Image"))
+            items.append(item)
+        base["items"] = items
+        base.pop("disabled", None)   # classic-only
+        out.append(base)
+    return out
 
 # Classic Report/Layout stores a page's scaling mode as an int; PBIR page.json
 # stores the enum name. Ordering is the ordinal order of the anyOf list in
@@ -10731,6 +10893,20 @@ def _pbir_visual_to_container(vdata: dict) -> dict:
     visual_obj = dict(vdata.get("visual") or {})
     query = visual_obj.pop("query", None) or {}
 
+    # Container-level formatting (title, background, border, shadow, header)
+    # lives at `visual.visualContainerObjects` in PBIR — verified against 70/70
+    # visuals in the service-authored corpus, and required there by
+    # visualConfiguration/2.3.0 (visualContainer sets additionalProperties:
+    # false and does NOT allow it at the top level). The classic spelling is
+    # singleVisual.vcObjects. Without this rename every container format read
+    # back empty, so recolor skipped container colours and format_visual's
+    # title vanished on save.
+    if "visualContainerObjects" in visual_obj:
+        visual_obj["vcObjects"] = visual_obj.pop("visualContainerObjects")
+    # Carry the PBIR sort so the writer can tell "unchanged" from "cleared".
+    if query.get("sortDefinition") is not None:
+        visual_obj["__pbir_sort__"] = query["sortDefinition"]
+
     aliases, alias_for = _pbir_alias_factory()
     projections: dict = {}
     selects: list = []
@@ -10910,12 +11086,44 @@ def _get_layout_pbir(work_dir: str) -> dict | None:
     if not sections:
         return None
     layout = {"sections": sections, "__pbir__": True}
+
+    # Report-level state lives in Report/definition/report.json on PBIR, but
+    # every classic caller reads and mutates it on the LAYOUT. Surfacing it
+    # here (and writing it back in _set_layout_pbir) is what makes image,
+    # theme and custom-visual registration work on a PBIR report at all —
+    # without it those tools mutated a throwaway dict and reported success.
+    config: dict = {}
     bookmarks = _pbir_read_bookmarks(work_dir)
     if bookmarks:
-        # Classic callers (pbix_get_bookmarks, pbix_add_bookmark, ...) read
-        # bookmarks out of the layout-level `config` JSON string.
-        layout["config"] = json.dumps({"bookmarks": bookmarks},
-                                      ensure_ascii=False)
+        config["bookmarks"] = bookmarks
+
+    rcfg = {}
+    rpath = _report_config_path(work_dir)
+    if os.path.exists(rpath):
+        try:
+            with open(rpath, "r", encoding="utf-8-sig") as f:
+                rcfg = json.load(f)
+        except Exception:
+            rcfg = {}
+    if rcfg.get("resourcePackages"):
+        layout["resourcePackages"] = _pbir_packages_to_classic(
+            rcfg["resourcePackages"])
+    if rcfg.get("publicCustomVisuals"):
+        layout["publicCustomVisuals"] = list(rcfg["publicCustomVisuals"])
+    if rcfg.get("themeCollection"):
+        config["themeCollection"] = copy.deepcopy(rcfg["themeCollection"])
+    # Report-level filters: PBIR report.json.filterConfig.filters <-> the
+    # classic layout's top-level `filters` JSON string.
+    rfilters = (rcfg.get("filterConfig") or {}).get("filters")
+    if rfilters:
+        layout["filters"] = json.dumps(rfilters, ensure_ascii=False)
+    if rcfg.get("settings"):
+        config["settings"] = copy.deepcopy(rcfg["settings"])
+    if rcfg.get("objects"):
+        config["objects"] = copy.deepcopy(rcfg["objects"])
+
+    if config:
+        layout["config"] = json.dumps(config, ensure_ascii=False)
     return layout
 
 
@@ -11149,6 +11357,55 @@ def _pbir_write_json(path: str, data: dict) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
+# Keys the reader SYNTHESIZES onto singleVisual or relocates from elsewhere in
+# visual.json. They must never be written back into the PBIR `visual` block, or
+# the file gains classic-only fields that Power BI does not model.
+_PBIR_SYNTHETIC_SV_KEYS = frozenset(
+    {"projections", "prototypeQuery", "vcObjects", "__pbir_sort__"})
+
+
+def _pbir_sort_definition(sv: dict) -> dict | None:
+    """Translate a classic ``prototypeQuery.OrderBy`` into PBIR sortDefinition.
+
+    Returns None when the caller authored no sort, so the caller can fall back
+    to whatever the original file had rather than clearing it.
+    """
+    proto = sv.get("prototypeQuery") or {}
+    order_by = proto.get("OrderBy")
+    if order_by is None:
+        return None
+
+    alias2entity = {f.get("Name"): f.get("Entity")
+                    for f in (proto.get("From") or [])}
+
+    def _entityize(node: dict) -> None:
+        ref = (node.get("Expression") or {}).get("SourceRef") or {}
+        if "Source" in ref:
+            node["Expression"]["SourceRef"] = {
+                "Entity": alias2entity.get(ref["Source"], ref["Source"])}
+
+    entries = []
+    for ob in order_by:
+        expr = copy.deepcopy(ob.get("Expression") or {})
+        inner = expr.get("Measure") or expr.get("Column")
+        if inner is None and "Aggregation" in expr:
+            agg_inner = expr["Aggregation"].get("Expression") or {}
+            inner = agg_inner.get("Column") or agg_inner.get("Measure")
+        if inner is None:
+            # Unknown shape (e.g. HierarchyLevel) — skip rather than leak an
+            # alias-based SourceRef into the PBIR.
+            continue
+        _entityize(inner)
+        entries.append({
+            "field": expr,
+            "direction": ("Ascending" if ob.get("Direction") == 1
+                          else "Descending"),
+        })
+    if entries:
+        return {"sort": entries, "isDefaultSort": False}
+    return {"sort": [], "isDefaultSort": True}
+
+
 def _pbir_patch_visual(orig: dict, container: dict) -> dict:
     """Apply a legacy visualContainer onto its ORIGINAL PBIR visual.json.
 
@@ -11182,11 +11439,26 @@ def _pbir_patch_visual(orig: dict, container: dict) -> dict:
         out["position"] = pos
 
     visual = dict(out.get("visual") or {})
-    for key in ("visualType", "objects", "syncGroup", "drillFilterOtherVisuals"):
-        if key in sv:
-            visual[key] = sv[key]
-        elif key in base_sv and key not in sv:
+    # Everything the caller left on singleVisual belongs in the PBIR `visual`
+    # block, EXCEPT the keys this converter synthesizes or relocates. A closed
+    # whitelist here silently dropped columnProperties, expansionStates,
+    # activeProjections, showAllRoles, display and howCreated — and, for a
+    # NEWLY created visual (no original to deep-copy), everything else too.
+    for key, value in sv.items():
+        if key in _PBIR_SYNTHETIC_SV_KEYS:
+            continue
+        visual[key] = value
+    for key in list(visual):
+        if (key not in sv and key in base_sv
+                and key not in _PBIR_SYNTHETIC_SV_KEYS):
             visual.pop(key, None)
+
+    # Container formatting goes back under `visual`, using the PBIR spelling.
+    if "vcObjects" in sv:
+        visual["visualContainerObjects"] = sv["vcObjects"]
+    elif "vcObjects" in base_sv:
+        visual.pop("visualContainerObjects", None)
+
     # Rewrite the query ONLY when the bindings actually changed — otherwise the
     # original query block (sortDefinition and friends) is preserved verbatim.
     if (sv.get("projections") != base_sv.get("projections")
@@ -11195,9 +11467,18 @@ def _pbir_patch_visual(orig: dict, container: dict) -> dict:
         if state:
             query = dict(visual.get("query") or {})
             query["queryState"] = state
+            # A rewritten query would otherwise lose the sort entirely, which
+            # is how an added or duplicated visual came out unsorted.
+            sort = _pbir_sort_definition(sv)
+            if sort is not None:
+                query["sortDefinition"] = sort
+            elif sv.get("__pbir_sort__") is not None:
+                query["sortDefinition"] = sv["__pbir_sort__"]
             visual["query"] = query
         else:
             visual.pop("query", None)
+    elif sv.get("__pbir_sort__") is not None and "query" in visual:
+        visual["query"].setdefault("sortDefinition", sv["__pbir_sort__"])
     # Some containers (groups/shapes) legitimately have NO visual block —
     # don't invent an empty one.
     if visual or "visual" in out:
@@ -11372,6 +11653,7 @@ def _set_layout_pbir(work_dir: str, layout: dict) -> None:
     # string that classic callers edit. Only touch the folder when the caller
     # actually supplied a config, so a page-only edit can't delete bookmarks.
     raw_config = layout.get("config")
+    cfg: dict = {}
     if raw_config is not None:
         try:
             cfg = (json.loads(raw_config) if isinstance(raw_config, str)
@@ -11380,6 +11662,51 @@ def _set_layout_pbir(work_dir: str, layout: dict) -> None:
             cfg = {}
         if isinstance(cfg, dict) and "bookmarks" in cfg:
             _pbir_write_bookmarks(work_dir, cfg.get("bookmarks") or [])
+
+    # Report-level state back into report.json, in PBIR shape. Only keys the
+    # caller actually supplied are touched, so a page-only edit cannot wipe the
+    # report's resources or theme.
+    rpath = _report_config_path(work_dir)
+    rcfg: dict = {}
+    if os.path.exists(rpath):
+        try:
+            with open(rpath, "r", encoding="utf-8-sig") as f:
+                rcfg = json.load(f)
+        except Exception:
+            rcfg = {}
+    before = json.dumps(rcfg, sort_keys=True)
+
+    if "resourcePackages" in layout:
+        rcfg["resourcePackages"] = _classic_packages_to_pbir(
+            layout["resourcePackages"], rcfg.get("resourcePackages"))
+    if "publicCustomVisuals" in layout:
+        pcv = list(layout["publicCustomVisuals"] or [])
+        if pcv:
+            rcfg["publicCustomVisuals"] = pcv
+        else:
+            rcfg.pop("publicCustomVisuals", None)
+    if isinstance(cfg, dict) and "themeCollection" in cfg:
+        rcfg["themeCollection"] = _classic_theme_to_pbir(
+            cfg["themeCollection"], rcfg.get("themeCollection"))
+    if "filters" in layout:
+        raw = layout["filters"]
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if parsed:
+            fc = dict(rcfg.get("filterConfig") or {})
+            fc["filters"] = parsed
+            rcfg["filterConfig"] = fc
+        else:
+            rcfg.pop("filterConfig", None)
+    if isinstance(cfg, dict) and "settings" in cfg:
+        rcfg["settings"] = cfg["settings"]
+    if isinstance(cfg, dict) and "objects" in cfg:
+        rcfg["objects"] = cfg["objects"]
+
+    if json.dumps(rcfg, sort_keys=True) != before:
+        _pbir_write_json(rpath, rcfg)
 
 
 
@@ -14756,16 +15083,20 @@ def _pbix_config_to_pbir_visual(config: dict, x: float, y: float, w: float, h: f
     if "objects" in single_visual:
         visual_obj["objects"] = single_visual["objects"]
 
-    # visualContainerObjects = vcObjects (title, background, border, etc.)
+    # vcObjects -> visualContainerObjects (title, background, border, ...).
+    # It belongs INSIDE `visual`: visualContainer sets additionalProperties
+    # false and does not permit it at the top level, and all 70 visuals in the
+    # service-authored corpus put it under `visual`. Emitting it at the top
+    # level produced PBIP that Power BI rejects.
+    if "vcObjects" in single_visual:
+        visual_obj["visualContainerObjects"] = single_visual["vcObjects"]
+
     result: dict = {
         "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/1.0.0/schema.json",
         "name": pbir_name,
         "position": {"x": x, "y": y, "z": z, "width": w, "height": h},
         "visual": visual_obj,
     }
-    if "vcObjects" in single_visual:
-        result["visualContainerObjects"] = single_visual["vcObjects"]
-
     return result
 
 

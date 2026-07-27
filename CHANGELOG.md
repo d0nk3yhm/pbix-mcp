@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.39] - 2026-07-27
+
+**All 125 tools audited on both report formats. Thirteen were silently discarding their changes on service-authored (PBIR) reports; all are fixed and verified.**
+
+### The audit
+
+Every tool was tested the same way: apply it to a PBIR report, save, reopen, and check the *saved bytes* — with a negative control proving the check fails on an untouched file, plus schema validation of the output. Across 125 tools: **13 LOST_ON_PBIR, 1 SILENT_NOOP, 50 PERSISTS, 59 READONLY, 2 NOT_APPLICABLE.** All 14 broken tools are fixed and re-verified; the fixes are pinned by 23 tests that fail against the previous release.
+
+### Fixed — container formatting and sort were dropped on PBIR
+`pbix_format_visual`, `pbix_set_visual_property`, `pbix_update_visual_json`, `pbix_add_visual`, `pbix_duplicate_visual`, `pbix_duplicate_page`, `pbix_set_visual_sort`, `pbix_recolor`
+
+- **`vcObjects` had no mapping to PBIR in either direction.** Container-level formatting — title, background, border, shadow, header — is `visual.visualContainerObjects` in PBIR and `singleVisual.vcObjects` in classic. The reader never translated it, so it read back empty; the writer's four-key whitelist never emitted it, so it was discarded on save. `pbix_format_visual` would report *"Formatted visual 0 on page 0: title, background"* and persist neither. `pbix_recolor` reported replacing colours while leaving every container colour untouched. Both directions are now mapped.
+  - **Placement corrected against ground truth.** The field belongs *inside* `visual`, not as a top-level sibling: 70 of 70 visuals in the service-authored corpus put it there, and `visualContainer` sets `additionalProperties: false` without permitting it at the top level. `pbix_export_pbip` had been emitting it at the top level, producing PBIP that Power BI rejects — also fixed.
+- **The writer's whitelist is gone.** It propagated only `visualType`, `objects`, `syncGroup` and `drillFilterOtherVisuals`, silently dropping `columnProperties`, `expansionStates`, `activeProjections`, `showAllRoles`, `display` and `howCreated` — and, for a *newly created* visual (no original to copy from), everything else. `pbix_update_visual_json` documents "replace the entire config JSON" and kept four keys.
+- **`prototypeQuery.OrderBy` now translates to `query.sortDefinition`.** Any newly added or duplicated visual took the query-rewrite path and came out with no sort at all, so `pbix_set_visual_sort` and `pbix_add_visual(sort_by=...)` were no-ops on PBIR.
+- **Numeric dot-path segments build arrays.** `pbix_set_visual_property` with `title.0.properties…` created `{"0": …}` where the schema requires a list — JSON Power BI rejects.
+
+### Fixed — report-level state was written to a document that is never saved
+`pbix_add_image`, `pbix_set_image`, `pbix_set_theme`, `pbix_add_html_visual`, `pbix_remove_custom_visual`, `pbix_set_filters` (report scope), `pbix_set_settings`
+
+`resourcePackages`, `publicCustomVisuals`, `themeCollection`, report filters and settings live in `Report/definition/report.json` on PBIR, but these tools mutated the synthesized *layout* and called `_set_layout`, which writes only the pages tree. `_get_layout`/`_set_layout` now round-trip all of it, so the tools are fixed without individual patches.
+
+- `pbix_add_image` wrote the PNG and the image visual but never declared the resource — Microsoft requires an entry in `report.json`, so the image never rendered.
+- `pbix_remove_custom_visual` deleted the files while leaving the registration behind: a corrupting half-apply, not merely a no-op.
+- `pbix_set_settings` created a legacy `Report/Settings` part alongside PBIR's authoritative `report.json` settings, leaving two conflicting documents; `pbix_get_settings` reported "no settings" for a PBIR report that had six.
+- `pbix_set_theme` no longer substitutes a built-in base theme that would contradict `resourcePackages`, and a new `customTheme` now carries the `reportVersionAtImport` the schema requires.
+
+### Changed
+- mypy baseline ratcheted 145 → 140 (currently 137).
+
+### Note on schema validation
+`scripts/validate_pbir_schemas.py` is necessary but **not sufficient**: every file in this audit passed schema validation, including one declaring a custom visual that was never registered. Schema-valid and semantically correct are independent properties.
+
 ## [0.9.38] - 2026-07-26
 
 ### Fixed
