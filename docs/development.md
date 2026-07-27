@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast tests (814 pass, 10 skip, 44 slow/integration deselected)
+# Fast tests (829 pass, 10 skip, 76 slow/integration deselected)
 pytest -m "not slow"
 
 # With coverage
@@ -45,19 +45,30 @@ PBIX_TEST_SAMPLES=test_corpus pytest -v
 | `test_pbir_schema_conformance.py` | PBIR output vs Microsoft's published schemas | 3 (integration) |
 | `test_calc_preservation.py` | Rebuild-path edits on models with calc tables/columns | 11 (slow, needs the corpus) |
 | `test_pbir_roundtrip.py` | PBIR state outside the pages tree + real-corpus fidelity | 31 (8 slow, need the corpus) |
+| `test_doctor_integrity.py` | Doctor report-definition checks: fires on broken, quiet on real | 39 (24 slow, need the corpus) |
 
 ## Public Test Corpus
 
-`python scripts/download_test_corpus.py` fetches four dashboards from the
-MIT-licensed [Power-BI-Design-Files](https://github.com/Dashboard-Design/Power-BI-Design-Files)
-repository (Copyright (c) 2024 Sajjad Ahmadi) into `test_corpus/`. Point
-`PBIX_TEST_SAMPLES` at that directory to run the integration tests.
+`python scripts/download_test_corpus.py` fetches **24 reports (111 MB)** into
+`test_corpus/` from two MIT-licensed sources:
 
-The tests resolve these exact filenames:
-- `GeoSales_Dashboard.pbix` (71 measures)
-- `Agents_Performance.pbix` (42 measures)
-- `Ecommerce_Conversion.pbix` (70 measures)
-- `IT_Support.pbix` (21 measures)
+- [Power-BI-Design-Files](https://github.com/Dashboard-Design/Power-BI-Design-Files)
+  (Copyright (c) 2024 Sajjad Ahmadi) — four community dashboards, two of which
+  are stored in the service's PBIR format.
+- [powerbi-desktop-samples](https://github.com/microsoft/powerbi-desktop-samples)
+  (Copyright (c) Microsoft Corporation) — the official samples, which cover
+  what the community dashboards do not: AI visuals (key influencers,
+  decomposition tree), 900+ visual pages, large DAX models, drillthrough,
+  embedded private custom visuals, and every built-in visual type.
+
+Point `PBIX_TEST_SAMPLES` at that directory to run the corpus-backed suites.
+`--core-only` restores the original four; `--all-samples` pulls every Microsoft
+sample (~200 MB).
+
+Corpus size is load-bearing, not decorative. A converter bug that only shows up
+on a decomposition tree, an embedded .pbiviz, or a 937-visual page is invisible
+against four dashboards — several defects in 0.9.39-0.9.41 were found precisely
+because the corpus grew.
 
 ## Linting & Type Checking
 

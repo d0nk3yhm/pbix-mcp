@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.41] - 2026-07-27
+
+**Test corpus grown 4 -> 24 real reports, which immediately exposed a hang.**
+
+### Fixed
+- **`pbix_set_table_data` could hang forever.** `_rebuild_preserving_calc` (0.9.37) obtained the relationship list from `_get_dax_context`, which materializes EVERY table's rows — decoding the whole model's VertiPaq data to learn which columns join. On Microsoft's Competitive Marketing sample one column segment decodes so slowly that the call never returned. A hang is worse than an error: the caller has nothing to act on. Relationships now come from metadata SQL, and the same call answers in **0.2s instead of never**. Found only because the corpus grew.
+
+### Added
+- **The test corpus is now 24 reports (111 MB)**, adding Microsoft's MIT-licensed [powerbi-desktop-samples](https://github.com/microsoft/powerbi-desktop-samples) to the four community dashboards. These cover what four dashboards cannot: AI visuals (key influencers, decomposition tree), a 937-visual page, 18-page reports, large DAX models, embedded private custom visuals, and every built-in visual type. `--core-only` restores the original four; `--all-samples` pulls everything.
+  - Verified across all 24: a no-op read/write cycle is byte-identical (**24/24**), and a matrix of 10 editing tools x 24 reports persists every change (**240/240**).
+- **`pbix_doctor` now checks report-definition integrity**, one check per defect class this audit found: registered resources declared vs present, custom visual registration (across all three registration routes), page/visual naming, bookmark references, PBIR page/visual tree consistency, PBIR naming convention, classic-shape leaks, and enum fields carrying classic ints. Failures (❌) are what Power BI rejects; warnings (⚠️) are what it tolerates. Calibrated against the corpus: **0 failures, 5 warnings** across 24 real reports, all genuine stale bookmarks in Microsoft's own samples.
+- **`Rebuild-path eligibility` check** tells you UP FRONT whether a model can take a rebuild-path edit. Auto date/time is ON by default in Desktop, so most real reports carry generated date tables whose rows cannot be reproduced — 16 of 24 corpus reports. Learning that from a diagnostic beats discovering it from a failed call.
+- The refusal message for auto date/time tables now names the cause and both workarounds (use the surgical tools, or turn off Auto date/time and re-save) instead of saying "has no readable columns".
+
+### Verified
+- Calc-object preservation across every corpus model: **6 preserved byte-identically, 0 changed, 0 corrupted, 18 refused with a reason.** Zero silent damage — the property that matters most for a tool that writes to your work files.
+
 ## [0.9.40] - 2026-07-27
 
 ### Fixed

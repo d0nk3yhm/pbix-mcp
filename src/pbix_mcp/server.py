@@ -9681,6 +9681,18 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
         cols = td.get("columns") or []
         rows = td.get("rows") or []
         if not cols:
+            if _is_auto_date_table(tname):
+                raise ValueError(
+                    f"'{tname}' is one of Power BI's AUTO DATE/TIME tables. "
+                    f"Power BI generates its rows at refresh from the model's "
+                    f"date range, so this engine cannot reproduce them and "
+                    f"refuses the edit rather than write a table that reopens "
+                    f"empty. Auto date/time is ON by default, so most reports "
+                    f"have these. Either (a) use the surgical tools, which "
+                    f"never rebuild — add_measure / modify_measure / "
+                    f"remove_measure / modify_column / set_sort_by_column — or "
+                    f"(b) turn off File > Options > Data Load > Auto date/time "
+                    f"in Desktop and re-save.")
             raise ValueError(
                 f"Calculated table '{tname}' has no readable columns, so this "
                 f"edit would lose it. Aborted.")
@@ -9757,6 +9769,45 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
     return table_updates, column_restamp, table_restamp
 
 
+def _is_auto_date_table(name: str) -> bool:
+    """Power BI's generated auto date/time tables.
+
+    `DateTableTemplate_<guid>` is the hidden template; `LocalDateTable_<guid>`
+    is the per-date-column instance. Both are machine-generated and rebuilt at
+    refresh, so their rows cannot be reproduced from the file alone.
+    """
+    return bool(re.match(r"^(LocalDateTable|DateTableTemplate)_", name or ""))
+
+
+def _relationships_from_metadata(conn) -> list:
+    """Relationships in the DAX engine's shape, straight from metadata SQL.
+
+    `_get_dax_context` would give the same list, but it materializes EVERY
+    table's rows to do it — decoding the whole model's VertiPaq data just to
+    learn which columns join. On a large model that is minutes of work for a
+    list of a dozen dicts, and on one real report (Microsoft's Competitive
+    Marketing sample) a column segment decodes so slowly that the edit never
+    returns at all.
+    """
+    rows = conn.execute(
+        "SELECT ft.Name AS ft, "
+        "       COALESCE(fc.ExplicitName, fc.InferredName) AS fc, "
+        "       tt.Name AS tt, "
+        "       COALESCE(tc.ExplicitName, tc.InferredName) AS tc, "
+        "       r.IsActive, r.CrossFilteringBehavior "
+        "FROM Relationship r "
+        "JOIN [Table] ft ON r.FromTableID = ft.ID "
+        "JOIN [Column] fc ON r.FromColumnID = fc.ID "
+        "JOIN [Table] tt ON r.ToTableID = tt.ID "
+        "JOIN [Column] tc ON r.ToColumnID = tc.ID").fetchall()
+    return [{
+        "FromTable": r["ft"] or "", "FromColumn": r["fc"] or "",
+        "ToTable": r["tt"] or "", "ToColumn": r["tc"] or "",
+        "IsActive": 1 if r["IsActive"] is None else r["IsActive"],
+        "CrossFilteringBehavior": r["CrossFilteringBehavior"] or 1,
+    } for r in rows]
+
+
 def _rebuild_preserving_calc(alias: str, info: dict, **rebuild_kwargs):
     """Rebuild the DataModel with calculated tables/columns carried through.
 
@@ -9795,9 +9846,8 @@ def _rebuild_preserving_calc(alias: str, info: dict, **rebuild_kwargs):
         conn = sqlite3.connect(tmp.name)
         conn.row_factory = sqlite3.Row
         try:
-            rels = _get_dax_context(alias).get("relationships", [])
             planned, col_restamp, table_restamp = _plan_calc_preservation(
-                conn, abf, meta, rels,
+                conn, abf, meta, _relationships_from_metadata(conn),
                 base_data=caller_updates, skip_tables=remove_tables)
         finally:
             conn.close()
@@ -14109,6 +14159,11 @@ def pbix_doctor(alias: str) -> str:
             result = fn()
             checks.append(f"  ✅ {name}: {result}")
             return True
+        except _DoctorWarning as w:
+            # Valid but suspicious — Power BI tolerates it, a human may not
+            # want it. Reported separately so a real defect is not buried.
+            checks.append(f"  ⚠️  {name}: {w}")
+            return True
         except Exception as e:
             checks.append(f"  ❌ {name}: {e}")
             return False
@@ -14438,6 +14493,16 @@ def pbix_doctor(alias: str) -> str:
             return f"MAXID={maxid} (highest ID={actual_max})"
         _check("MAXID consistency", check_maxid)
 
+        # ---- Report-definition integrity ----
+        #
+        # Each of these corresponds to a defect class found by auditing all 125
+        # tools: state that a tool wrote but that never reached disk, a
+        # reference that no longer resolves, or a classic-shaped value written
+        # into a PBIR document. A report can be perfectly schema-valid and
+        # still fail every one of them.
+        for name, fn in _report_integrity_checks(info["work_dir"]):
+            _check(name, fn)
+
     finally:
         # Clean up shared resources
         if db_conn:
@@ -14446,6 +14511,353 @@ def pbix_doctor(alias: str) -> str:
             os.unlink(db_tmp_path)
 
     return ToolResponse.ok("\n".join(checks)).to_text()
+
+
+class _DoctorWarning(Exception):
+    """Something Power BI tolerates but a human probably wants to know about.
+
+    Kept distinct from a hard failure so that a report which merely carries a
+    stale reference is not reported as broken — Microsoft's own AI sample ships
+    with bookmarks pointing at pages that were deleted.
+    """
+
+
+def _doctor_report_docs(work_dir: str) -> tuple:
+    """(layout, report_config, is_pbir) for the integrity checks."""
+    return (_get_layout(work_dir), _get_report_config(work_dir) or {},
+            _is_pbir(work_dir))
+
+
+def _report_integrity_checks(work_dir: str) -> list:
+    """Report-definition checks, as (name, callable) pairs.
+
+    Every callable returns a human-readable string on success and RAISES on a
+    problem — matching the `_check` contract in pbix_doctor.
+    """
+    layout, rcfg, is_pbir = _doctor_report_docs(work_dir)
+    sections = (layout or {}).get("sections", []) or []
+    static_root = os.path.join(work_dir, "Report", "StaticResources",
+                               "RegisteredResources")
+
+    def _declared_resources() -> set:
+        out = set()
+        for pkg in (rcfg.get("resourcePackages") or []):
+            inner = pkg.get("resourcePackage", pkg)
+            if inner.get("name") != "RegisteredResources":
+                continue
+            for item in (inner.get("items") or []):
+                out.add(item.get("path") or item.get("name") or "")
+        return {x for x in out if x}
+
+    def _on_disk_resources() -> set:
+        if not os.path.isdir(static_root):
+            return set()
+        return {f for f in os.listdir(static_root)
+                if os.path.isfile(os.path.join(static_root, f))}
+
+    def check_resources():
+        declared, on_disk = _declared_resources(), _on_disk_resources()
+        # Microsoft: "Every resource file must have a corresponding entry in
+        # the report.json file." An undeclared file simply never renders.
+        undeclared = sorted(on_disk - declared)
+        missing = sorted(declared - on_disk)
+        if undeclared or missing:
+            bits = []
+            if undeclared:
+                bits.append(f"{len(undeclared)} file(s) present but NOT "
+                            f"declared (will not render): {undeclared[:4]}")
+            if missing:
+                bits.append(f"{len(missing)} declared but MISSING from the "
+                            f"package: {missing[:4]}")
+            raise ValueError("; ".join(bits))
+        return f"{len(declared)} registered resource(s), all consistent"
+
+    def check_custom_visuals():
+        # A custom visual can be registered three ways, and a report is only
+        # broken if it uses one that is registered by NONE of them:
+        #   1. publicCustomVisuals  — AppSource visuals, by GUID
+        #   2. Report/CustomVisuals/<type>/  — a private .pbiviz embedded here
+        #   3. the tenant's organizational store — invisible in the file
+        # Checking only (1) reports every embedded private visual as broken,
+        # which is most of Microsoft's own samples.
+        declared = set(rcfg.get("publicCustomVisuals") or [])
+        cv_root = os.path.join(work_dir, "Report", "CustomVisuals")
+        embedded = set(os.listdir(cv_root)) if os.path.isdir(cv_root) else set()
+        registered = declared | embedded
+
+        used = set()
+        for sec in sections:
+            for vc in (sec.get("visualContainers") or []):
+                vt = _get_visual_type(_parse_visual_config(vc))
+                if vt and vt != "unknown":
+                    used.add(vt)
+        # Built-ins are plain camelCase; a custom visual carries a GUID-ish or
+        # timestamp suffix.
+        custom_used = {v for v in used
+                       if re.search(r"[0-9A-F]{16,}$", v, re.I)
+                       or re.search(r"_[0-9A-F]{8}(_[0-9A-F]{4}){3}_[0-9A-F]{12}$", v, re.I)
+                       or re.search(r"\d{10,}$", v)}
+        unresolved = sorted(custom_used - registered)
+        if unresolved:
+            # Could still be an org-store visual, which no file inspection can
+            # confirm — so this is a warning, not a failure.
+            raise _DoctorWarning(
+                f"{len(unresolved)} custom visual type(s) used but registered "
+                f"neither in publicCustomVisuals nor Report/CustomVisuals/ — "
+                f"they will only load if your tenant's organizational store "
+                f"provides them: {unresolved[:3]}")
+        return (f"{len(custom_used)} custom visual(s) in use, all registered "
+                f"({len(declared)} AppSource, {len(embedded)} embedded)")
+
+    def check_page_visual_names():
+        # Page names must be globally unique; VISUAL names only need to be
+        # unique within their page, because bookmarks address them as
+        # sections[<page>].visualContainers[<visual>]. Microsoft's own AI
+        # sample reuses 74 visual names across pages, which is fine.
+        seen_pages, dup_pages = set(), []
+        total_vis, dup_vis, unnamed = 0, [], 0
+        for sec in sections:
+            pn = sec.get("name")
+            if pn in seen_pages:
+                dup_pages.append(pn)
+            seen_pages.add(pn)
+            page_vis = set()
+            for vc in (sec.get("visualContainers") or []):
+                vn = _parse_visual_config(vc).get("name")
+                total_vis += 1
+                if not vn:
+                    unnamed += 1
+                    continue
+                if vn in page_vis:
+                    dup_vis.append(f"{sec.get('displayName')}:{vn}")
+                page_vis.add(vn)
+        problems = []
+        if dup_pages:
+            problems.append(f"{len(dup_pages)} duplicate page name(s) "
+                            f"{dup_pages[:3]} — bookmarks and page navigation "
+                            f"resolve by name")
+        if dup_vis:
+            problems.append(f"{len(dup_vis)} visual name(s) duplicated WITHIN "
+                            f"a page {dup_vis[:3]}")
+        if unnamed:
+            problems.append(f"{unnamed} visual(s) with no name — they cannot "
+                            f"be addressed by any tool")
+        if problems:
+            raise ValueError("; ".join(problems))
+        return (f"{len(seen_pages)} page(s), {total_vis} visual(s), "
+                f"names unique where they must be")
+
+    def check_bookmarks():
+        raw = (layout or {}).get("config") or "{}"
+        try:
+            cfg = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except (json.JSONDecodeError, TypeError):
+            cfg = {}
+        bookmarks = cfg.get("bookmarks") or []
+        if not bookmarks:
+            return "none"
+        page_names = {s.get("name") for s in sections}
+        vis_names = {_parse_visual_config(vc).get("name")
+                     for s in sections for vc in (s.get("visualContainers") or [])}
+        bad = []
+
+        def _walk(bm):
+            for child in (bm.get("children") or []):
+                _walk(child)
+            state = bm.get("explorationState") or {}
+            active = state.get("activeSection")
+            if active and active not in page_names:
+                bad.append(f"{bm.get('displayName')!r} -> missing page {active}")
+            for sec_name, sec_state in (state.get("sections") or {}).items():
+                if sec_name not in page_names:
+                    bad.append(f"{bm.get('displayName')!r} -> missing page {sec_name}")
+                for vn in (sec_state.get("visualContainers") or {}):
+                    if vn not in vis_names:
+                        bad.append(f"{bm.get('displayName')!r} -> missing visual {vn}")
+
+        for bm in bookmarks:
+            _walk(bm)
+        if bad:
+            # Power BI ignores a bookmark step that points at something gone,
+            # so this is a stale reference rather than a broken report.
+            raise _DoctorWarning(
+                f"{len(bad)} bookmark reference(s) point at a page or visual "
+                f"that no longer exists — those steps will do nothing: "
+                f"{bad[:3]}")
+        return f"{len(bookmarks)} bookmark(s), all references resolve"
+
+    def check_rebuild_eligibility():
+        """Whether the model can take a rebuild-path edit (add/replace a table,
+        add/remove a relationship, remove a table).
+
+        Worth knowing UP FRONT: auto date/time is on by default in Desktop, so
+        most real reports carry generated date tables whose rows this engine
+        cannot reproduce, and those edits are refused. Saying so here beats
+        discovering it from a failed call.
+        """
+        dm = os.path.join(work_dir, "DataModel")
+        if not os.path.exists(dm):
+            return "no DataModel (report-only file)"
+        try:
+            rows = _query_metadata_rows(
+                dm,
+                "SELECT t.Name FROM [Partition] p "
+                "JOIN [Table] t ON p.TableID = t.ID WHERE p.Type = 2")
+        except Exception as exc:
+            raise _DoctorWarning(f"could not inspect: {exc}")
+        auto = sorted({r[0] for r in rows if _is_auto_date_table(r[0])})
+        other = sorted({r[0] for r in rows if not _is_auto_date_table(r[0])})
+        if auto:
+            raise _DoctorWarning(
+                f"{len(auto)} auto date/time table(s) — rebuild-path edits "
+                f"(add/replace a table, add/remove a relationship, remove a "
+                f"table) will be REFUSED to avoid writing tables that reopen "
+                f"empty. The surgical tools still work. Turn off Auto "
+                f"date/time in Desktop to lift this: {auto[:2]}")
+        return ("rebuild-path edits supported"
+                + (f" ({len(other)} calculated table(s) preserved)" if other
+                   else ""))
+
+    checks = [
+        ("Registered resources", check_resources),
+        ("Custom visual registration", check_custom_visuals),
+        ("Page / visual naming", check_page_visual_names),
+        ("Bookmark references", check_bookmarks),
+        ("Rebuild-path eligibility", check_rebuild_eligibility),
+    ]
+    if is_pbir:
+        checks += _pbir_integrity_checks(work_dir, layout, sections)
+    return checks
+
+
+def _pbir_integrity_checks(work_dir: str, layout: dict, sections: list) -> list:
+    """Checks that only apply to the PBIR tree."""
+    pages_dir = os.path.join(work_dir, "Report", "definition", "pages")
+
+    def check_page_tree():
+        meta_path = os.path.join(pages_dir, "pages.json")
+        meta = {}
+        if os.path.exists(meta_path):
+            with open(meta_path, encoding="utf-8-sig") as f:
+                meta = json.load(f)
+        folders = {d for d in os.listdir(pages_dir)
+                   if os.path.isdir(os.path.join(pages_dir, d))}
+        order = list(meta.get("pageOrder") or [])
+        problems = []
+        missing = [p for p in order if p not in folders]
+        extra = sorted(folders - set(order))
+        if missing:
+            problems.append(f"pageOrder names {len(missing)} folder(s) that "
+                            f"do not exist: {missing[:3]}")
+        if extra:
+            problems.append(f"{len(extra)} page folder(s) absent from "
+                            f"pageOrder (they will not appear): {extra[:3]}")
+        active = meta.get("activePageName")
+        if active and active not in folders:
+            problems.append(f"activePageName {active!r} does not exist")
+        for folder in folders:
+            pj = os.path.join(pages_dir, folder, "page.json")
+            if not os.path.exists(pj):
+                problems.append(f"page folder {folder!r} has no page.json")
+                continue
+            with open(pj, encoding="utf-8-sig") as f:
+                doc = json.load(f)
+            if doc.get("name") != folder:
+                problems.append(
+                    f"page.json name {doc.get('name')!r} != folder {folder!r}")
+        if problems:
+            raise ValueError("; ".join(problems))
+        return f"{len(folders)} page folder(s), order and names consistent"
+
+    def check_visual_tree():
+        problems = []
+        count = 0
+        for folder in os.listdir(pages_dir):
+            vdir = os.path.join(pages_dir, folder, "visuals")
+            if not os.path.isdir(vdir):
+                continue
+            for vid in os.listdir(vdir):
+                vj = os.path.join(vdir, vid, "visual.json")
+                if not os.path.exists(vj):
+                    continue
+                count += 1
+                with open(vj, encoding="utf-8-sig") as f:
+                    doc = json.load(f)
+                if doc.get("name") != vid:
+                    problems.append(
+                        f"visual.json name {doc.get('name')!r} != folder {vid!r}")
+        if problems:
+            raise ValueError(
+                f"{len(problems)} mismatch(es): {problems[:3]}")
+        return f"{count} visual file(s), names match their folders"
+
+    def check_naming_convention():
+        # PBIR: "The object name and/or file/folder name must consist of one or
+        # more word characters (letters, digits, underscores) or hyphens."
+        bad = []
+        for base, dirs, _files in os.walk(
+                os.path.join(work_dir, "Report", "definition")):
+            for d in dirs:
+                if not re.fullmatch(r"[\w-]+", d):
+                    bad.append(d)
+        if bad:
+            raise ValueError(
+                f"{len(bad)} folder name(s) violate the PBIR naming rule "
+                f"(Desktop ignores them as private files): {bad[:3]}")
+        return "all folder names comply"
+
+    def check_no_classic_leaks():
+        # Classic spellings inside a PBIR page/visual mean the converter wrote
+        # the legacy shape. Legitimate inside a bookmark's explorationState,
+        # which models captured state in the classic vocabulary.
+        leaks = []
+        for base, _dirs, files in os.walk(
+                os.path.join(work_dir, "Report", "definition")):
+            for fn in files:
+                if fn not in ("page.json", "visual.json"):
+                    continue
+                p = os.path.join(base, fn)
+                with open(p, encoding="utf-8-sig") as f:
+                    text = f.read()
+                for token in ("singleVisual", "vcObjects", "prototypeQuery",
+                              "__pbir_"):
+                    if token in text:
+                        leaks.append(f"{fn}:{token}")
+        if leaks:
+            raise ValueError(
+                f"{len(leaks)} classic-shaped key(s) in PBIR files: "
+                f"{sorted(set(leaks))[:4]}")
+        return "no classic-shaped keys in page/visual files"
+
+    def check_enum_fields():
+        # The displayOption class: PBIR types these as string enums; writing
+        # the classic int produces a file that imports and then will not open.
+        bad = []
+        for base, _dirs, files in os.walk(
+                os.path.join(work_dir, "Report", "definition")):
+            for fn in files:
+                if fn != "page.json":
+                    continue
+                with open(os.path.join(base, fn), encoding="utf-8-sig") as f:
+                    doc = json.load(f)
+                for field, allowed in _PBIR_ENUM_FIELDS["page.json"].items():
+                    if field in doc and not (
+                            isinstance(doc[field], str) and doc[field] in allowed):
+                        bad.append(f"{doc.get('displayName', '?')}.{field}"
+                                   f"={doc[field]!r}")
+        if bad:
+            raise ValueError(
+                f"{len(bad)} enum field(s) carrying a non-enum value "
+                f"(Power BI will refuse to open the report): {bad[:3]}")
+        return "enum fields all carry valid enum names"
+
+    return [
+        ("PBIR page tree", check_page_tree),
+        ("PBIR visual tree", check_visual_tree),
+        ("PBIR naming convention", check_naming_convention),
+        ("PBIR classic-shape leaks", check_no_classic_leaks),
+        ("PBIR enum fields", check_enum_fields),
+    ]
 
 
 # ---- Section 10b: TMDL Export ----
