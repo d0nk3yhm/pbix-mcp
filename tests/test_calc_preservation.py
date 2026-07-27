@@ -226,3 +226,62 @@ class TestStillRefusesWhenUnsafe:
             "WHERE Type = 2 AND ExplicitName = 'Discount Group'"))
         d = json.loads(server.pbix_set_table_data(alias, "Nope", NEW_TABLE))
         assert d["success"] is False, d
+
+
+class TestRebuildDoesNotReadTheWholeModel:
+    """`_rebuild_preserving_calc` needs the relationship LIST, nothing more.
+
+    It used to obtain it from `_get_dax_context`, which materializes every
+    table's rows — decoding the entire model's VertiPaq data to learn which
+    columns join. On Microsoft's Competitive Marketing sample one column
+    segment decodes so slowly that `pbix_set_table_data` never returned at
+    all: a hang, which for a caller is worse than an error. Relationships now
+    come from metadata SQL, and the same call answers in a fraction of a
+    second.
+    """
+
+    def test_relationships_come_from_metadata_not_a_full_data_read(self):
+        import inspect
+
+        src = inspect.getsource(server._rebuild_preserving_calc)
+        assert "_get_dax_context" not in src, (
+            "_rebuild_preserving_calc must not call _get_dax_context — it "
+            "reads every table's rows just to list relationships")
+        assert "_relationships_from_metadata" in src
+
+    def test_metadata_relationships_match_the_dax_context_shape(self, model):
+        """Same keys the DAX engine expects, so the cheap path is a drop-in."""
+        import os
+        import sqlite3
+        import tempfile
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        alias, _tmp = model
+        info = server._ensure_open(alias)
+        dm = os.path.join(info["work_dir"], "DataModel")
+        with open(dm, "rb") as f:
+            abf = decompress_datamodel(f.read())
+        meta = read_metadata_sqlite(abf)
+        fd, tmp = tempfile.mkstemp(suffix=".db")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(meta)
+            conn = sqlite3.connect(tmp)
+            conn.row_factory = sqlite3.Row
+            try:
+                rels = server._relationships_from_metadata(conn)
+            finally:
+                conn.close()
+        finally:
+            os.unlink(tmp)
+
+        assert rels, "fixture has no relationships"
+        expected = {"FromTable", "FromColumn", "ToTable", "ToColumn",
+                    "IsActive", "CrossFilteringBehavior"}
+        for r in rels:
+            assert set(r) == expected, r
+            # Endpoints must resolve — calculated-table and auto-date columns
+            # carry no ExplicitName, and reading only that yields None.
+            assert r["FromColumn"] and r["ToColumn"], r

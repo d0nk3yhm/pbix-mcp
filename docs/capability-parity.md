@@ -83,12 +83,41 @@ caller never branches on format:
 | visual sort | `prototypeQuery.OrderBy` | `visual.query.sortDefinition` | `prototypeQuery.OrderBy` |
 | resources, custom visuals, theme, report filters, settings | Layout top level / `config` | `definition/report.json` | Layout shape |
 
+### Diagnostics
+
+`pbix_doctor` checks report-definition integrity alongside the model and file
+layers. Each check corresponds to a defect class this audit found — state a tool
+wrote that never reached disk, a reference that stopped resolving, or a
+classic-shaped value in a PBIR document:
+
+| check | catches |
+|---|---|
+| Registered resources | a file under `RegisteredResources/` with no `report.json` entry (it never renders), or an entry whose file is gone |
+| Custom visual registration | a visual type registered in neither `publicCustomVisuals` nor `Report/CustomVisuals/` (warns — it may come from the org store) |
+| Page / visual naming | duplicate page names, unnamed visuals, visual names duplicated **within** a page (across pages is legitimate) |
+| Bookmark references | bookmark steps pointing at a deleted page or visual (warns — Power BI tolerates it) |
+| PBIR page tree | `pageOrder` / `activePageName` / folder / `page.json` name disagreement |
+| PBIR visual tree | `visual.json` name vs its folder |
+| PBIR naming convention | folder names Desktop would ignore as private files |
+| PBIR classic-shape leaks | `singleVisual` / `vcObjects` / `prototypeQuery` written into a PBIR file |
+| PBIR enum fields | the `displayOption` class — a classic int where PBIR needs the enum name |
+
+Failures (❌) are things Power BI will reject; warnings (⚠️) are things it
+tolerates but a human probably wants to know about. The split is calibrated
+against the corpus: across 24 real reports the checks produce **0 failures and
+5 warnings**, all of them genuine stale bookmark references in Microsoft's own
+samples.
+
 ### How this is verified
 
 All 125 tools are tested on both formats by applying the tool, saving, reopening
 and checking the **saved bytes**, with a negative control proving each check
 fails on an untouched file. As of 0.9.39: 50 persist, 59 are read-only, 2 are
 not applicable to the fixtures, and 0 lose their change.
+
+Beyond that, the corpus of **24 real reports** is exercised directly: a no-op
+read/write cycle must leave every report definition byte-identical (24/24), and
+a matrix of 10 editing tools x 24 reports must persist every change (240/240).
 
 `scripts/validate_pbir_schemas.py` is a necessary but **not sufficient** check —
 a file can be perfectly schema-valid and still be missing state a tool claimed
