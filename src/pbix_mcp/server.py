@@ -2660,11 +2660,24 @@ def pbix_format_visual(
             for category, entries in new_vc_objects.items():
                 existing_vc_objects[category] = _merge_obj_entries(existing_vc_objects.get(category), entries)
 
+        applied = list(new_objects.keys()) + list(new_vc_objects.keys())
+        if not applied:
+            # Reporting success for a no-op is the worst failure shape: the
+            # caller believes the formatting landed. Name what was ignored.
+            ignored = sorted(fmt.keys()) if isinstance(fmt, dict) else []
+            raise LayoutParseError(
+                f"No formatting was applied — none of {ignored or '(empty input)'} "
+                f"is a recognised key, so the visual is unchanged. Supported "
+                f"keys include: title, subtitle, background, border, padding, "
+                f"dataLabels, legend, categoryAxis, valueAxis, dataColors, "
+                f"visualHeader, altText. Values are human-readable, e.g. "
+                f'{{"title": {{"text": "Sales", "show": true}}}} — not raw '
+                f"Power BI object descriptors.")
+
         vc["config"] = json.dumps(config, ensure_ascii=False)
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
 
-        applied = list(new_objects.keys()) + list(new_vc_objects.keys())
         return ToolResponse.ok(
             f"Formatted visual {visual_index} on page {page_index}: {', '.join(applied)}"
         ).to_text()
@@ -9438,6 +9451,39 @@ def _calc_col_refs(expression: str, table_name: str) -> set:
     return out
 
 
+_BARE_COL_RE = re.compile(r"(?<![\w\]'\"])\[([^\]\[]+)\]")
+
+
+def _qualify_bare_column_refs(expression: str, table_name: str,
+                              known_columns: list) -> str:
+    """Rewrite an unqualified ``[Column]`` to ``'Table'[Column]``.
+
+    Inside a calculated column, `[Date]` means "this table's Date" — it is the
+    idiomatic way Power BI writes them, and it is what Desktop generates for
+    auto date/time tables (`YEAR([Date])`). The evaluator only resolved the
+    qualified forms, so every such column materialized as blank and the edit
+    was refused. Only names that are actually columns of this table are
+    rewritten, so measure references are left alone, and text inside string
+    literals is never touched.
+    """
+    known = set(known_columns)
+    if not known or not expression:
+        return expression
+
+    def _rewrite(segment: str) -> str:
+        return _BARE_COL_RE.sub(
+            lambda m: (f"'{table_name}'[{m.group(1)}]"
+                       if m.group(1) in known else m.group(0)),
+            segment)
+
+    # Split on double-quoted DAX string literals and leave those untouched, so
+    # a "[Total]" inside a label is never rewritten. Single quotes delimit
+    # table names and are handled by the pattern's lookbehind, which also
+    # keeps already-qualified `T[Col]` / `'T'[Col]` refs as they are.
+    parts = re.split(r'("(?:[^"]|"")*")', expression)
+    return "".join(p if p.startswith('"') else _rewrite(p) for p in parts)
+
+
 def _materialize_table_calc_columns(
     table_name: str,
     data_columns: list[dict],
@@ -9474,8 +9520,10 @@ def _materialize_table_calc_columns(
             snapshot = {table_name: {"columns": list(col_names),
                                      "rows": [list(r) for r in rows]}}
             vals, err = evaluate_row_context_column(
-                col_names, rows, spec["expression"], table_name,
-                snapshot, relationships)
+                col_names, rows,
+                _qualify_bare_column_refs(spec["expression"], table_name,
+                                          col_names),
+                table_name, snapshot, relationships)
             if err:
                 raise ValueError(
                     f"'{table_name}'[{spec['column']}]: {err}")
@@ -9677,25 +9725,70 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
         qd = conn.execute(
             "SELECT QueryDefinition FROM [Partition] WHERE TableID = ?",
             (tid,)).fetchone()[0]
+
+        # A table that is BOTH a calculated table and the owner of calculated
+        # columns needs two metadata stamps on the same table, and the second
+        # overwrites the first — which silently demoted six calculated columns
+        # to plain data. Refuse until that double stamp is handled: a wrong
+        # model is worse than a declined edit. Power BI's auto date/time
+        # tables are the common case.
+        owns_calc_columns = conn.execute(
+            "SELECT COUNT(*) FROM [Column] WHERE TableID = ? AND Type = 2",
+            (tid,)).fetchone()[0]
+        if owns_calc_columns:
+            extra = ""
+            if _is_auto_date_table(tname):
+                extra = (" This is one of Power BI's auto date/time tables. "
+                         "Turning off File > Options > Data Load > Auto "
+                         "date/time in Desktop and re-saving removes them.")
+            raise ValueError(
+                f"'{tname}' is a calculated table that also defines "
+                f"{owns_calc_columns} calculated column(s). Rebuilding it "
+                f"would drop those columns, so the edit was refused rather "
+                f"than write a model that reopens without them.{extra} The "
+                f"surgical tools never rebuild and always work: "
+                f"add_measure / modify_measure / remove_measure / "
+                f"modify_column / set_sort_by_column.")
+
         td = read_table_from_abf(abf, tname, meta)
         cols = td.get("columns") or []
         rows = td.get("rows") or []
+        generated = False
         if not cols:
-            if _is_auto_date_table(tname):
+            # No materialized data in VertiPaq — Power BI generates this table
+            # at load. Its generating DAX is declared right here in the
+            # partition, so evaluate THAT rather than refusing outright.
+            #
+            # Only when the table owns no calculated COLUMNS of its own. A
+            # table that is both a calculated table and a calc-column owner
+            # needs two metadata stamps on the same table, and the second
+            # overwrites the first — that silently demoted six calculated
+            # columns to plain data. Refusing is the safe answer until the
+            # double stamp is handled; a wrong model is worse than no edit.
+            owns_calc_columns = conn.execute(
+                "SELECT COUNT(*) FROM [Column] WHERE TableID = ? AND Type = 2",
+                (tid,)).fetchone()[0]
+            if not owns_calc_columns:
+                generated = True
+                cols, rows, why = _evaluate_calc_table_partition(qd, abf, meta)
+            else:
+                why = (f"it also defines {owns_calc_columns} calculated "
+                       f"column(s), which this engine cannot re-stamp together "
+                       f"with the calculated-table shape")
+            if not cols:
+                hint = ""
+                if _is_auto_date_table(tname):
+                    hint = (" This is one of Power BI's auto date/time tables. "
+                            "Turning off File > Options > Data Load > Auto "
+                            "date/time in Desktop and re-saving removes them; "
+                            "the surgical tools (add_measure / modify_measure "
+                            "/ remove_measure / modify_column / "
+                            "set_sort_by_column) never rebuild and always work.")
                 raise ValueError(
-                    f"'{tname}' is one of Power BI's AUTO DATE/TIME tables. "
-                    f"Power BI generates its rows at refresh from the model's "
-                    f"date range, so this engine cannot reproduce them and "
-                    f"refuses the edit rather than write a table that reopens "
-                    f"empty. Auto date/time is ON by default, so most reports "
-                    f"have these. Either (a) use the surgical tools, which "
-                    f"never rebuild — add_measure / modify_measure / "
-                    f"remove_measure / modify_column / set_sort_by_column — or "
-                    f"(b) turn off File > Options > Data Load > Auto date/time "
-                    f"in Desktop and re-save.")
-            raise ValueError(
-                f"Calculated table '{tname}' has no readable columns, so this "
-                f"edit would lose it. Aborted.")
+                    f"Calculated table '{tname}' has no materialized data and "
+                    f"its expression could not be reproduced ({why}), so this "
+                    f"edit would write a table that reopens empty. Refused."
+                    f"{hint}")
         col_defs = [{"name": c,
                      "data_type": _infer_calc_type_name([r[i] for r in rows])}
                     for i, c in enumerate(cols)]
@@ -9703,6 +9796,12 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
             "columns": col_defs,
             "rows": [dict(zip(cols, r)) for r in rows],
         }
+        if generated:
+            # These rows came from the expression, not from VertiPaq, so the
+            # table's own calculated columns (an auto-date table's Year/Month/
+            # Quarter/Day) have nothing to compute against unless we hand them
+            # the rows we just generated.
+            base_data.setdefault(tname, table_updates[tname])
         table_restamp.append({"table": tname, "expression": qd})
 
     # --- existing calculated COLUMNS: re-evaluate from their DAX ---
@@ -9739,14 +9838,21 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
             "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
             (tname,)).fetchone()
         data_cols = []
+        # Type 1 = data, 3 = RowNumber, 4 = CalculatedTableColumn. Type 4 is
+        # the DATA column of a calculated table (an auto-date table's `Date`),
+        # and omitting it left the materializer with no schema, so every
+        # calculated column on such a table evaluated to blank. Those columns
+        # also carry their name in InferredName rather than ExplicitName.
         for cr in conn.execute(
-            "SELECT ExplicitName, ExplicitDataType, InferredDataType "
-            "FROM [Column] WHERE TableID = ? AND Type IN (1, 3) "
-            "AND ExplicitName NOT LIKE 'RowNumber%' ORDER BY ID",
+            "SELECT COALESCE(ExplicitName, InferredName) AS nm, "
+            "       ExplicitDataType, InferredDataType "
+            "FROM [Column] WHERE TableID = ? AND Type IN (1, 3, 4) "
+            "AND COALESCE(ExplicitName, InferredName) NOT LIKE 'RowNumber%' "
+            "ORDER BY ID",
                 (trow["ID"],)):
             edt = cr["ExplicitDataType"]
             amo = edt if edt in _AMO_TO_NAME else cr["InferredDataType"]
-            data_cols.append({"name": cr["ExplicitName"],
+            data_cols.append({"name": cr["nm"],
                               "data_type": _AMO_TO_NAME.get(amo, "String")})
         override = base_data.get(tname)
         if override:
@@ -9767,6 +9873,51 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
         column_restamp.extend(restamp)
 
     return table_updates, column_restamp, table_restamp
+
+
+_DAX_TABLE_REF_RE = re.compile(r"'([^']+)'\s*\[|(?<![\w'])([A-Za-z_]\w*)\s*\[")
+
+
+def _evaluate_calc_table_partition(query_definition: str, abf, meta) -> tuple:
+    """Evaluate a calculated table's own declared DAX to regenerate its rows.
+
+    Returns ``(columns, rows, reason)``; ``columns`` is empty when it could not
+    be reproduced and ``reason`` says why.
+
+    Only the tables the expression actually references are read out of the ABF.
+    Building the full DAX context here would decode the whole model's VertiPaq
+    data — minutes of work, and the source of a hang this project already had.
+    """
+    from pbix_mcp.dax.calc_tables import evaluate_calc_table_expression
+    from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
+
+    expr = (query_definition or "").strip()
+    if not expr:
+        return [], [], "the partition declares no expression"
+
+    referenced = {m.group(1) or m.group(2)
+                  for m in _DAX_TABLE_REF_RE.finditer(expr)}
+    tables: dict = {}
+    for name in referenced:
+        try:
+            td = read_table_from_abf(abf, name, meta)
+        except Exception:
+            continue
+        if td and td.get("columns"):
+            tables[name] = {"columns": td["columns"],
+                            "rows": td.get("rows") or []}
+
+    try:
+        result, err = evaluate_calc_table_expression(expr, tables, {}, [])
+    except Exception as exc:
+        return [], [], f"{type(exc).__name__}: {exc}"
+    if err or not result:
+        return [], [], (err or "no result")
+    cols = result.get("columns") or []
+    rows = result.get("rows") or []
+    if not cols or not rows:
+        return [], [], "expression produced no rows"
+    return cols, rows, ""
 
 
 def _is_auto_date_table(name: str) -> bool:
@@ -9868,10 +10019,15 @@ def _rebuild_preserving_calc(alias: str, info: dict, **rebuild_kwargs):
         info, table_updates=merged, calc_authoring=True,
         restamp_calc_tables={s["table"] for s in table_restamp},
         **rebuild_kwargs)
-    if col_restamp:
-        _, new_size = _apply_calculated_column_metadata(dm_path, col_restamp)
+    # TABLE metadata first, then COLUMN metadata. An auto-date table is both a
+    # calculated table AND the owner of calculated columns; stamping the table
+    # shape second re-wrote its columns as calc-table data columns and silently
+    # demoted the Type=2 stamps applied moments earlier — the edit "succeeded"
+    # while dropping six calculated columns.
     if table_restamp:
         _, new_size = _apply_calculated_table_metadata(dm_path, table_restamp)
+    if col_restamp:
+        _, new_size = _apply_calculated_column_metadata(dm_path, col_restamp)
 
     global _dax_cache
     _dax_cache.pop(alias, None)
@@ -14513,6 +14669,51 @@ def pbix_doctor(alias: str) -> str:
     return ToolResponse.ok("\n".join(checks)).to_text()
 
 
+def _rebuild_path_dry_run(work_dir: str) -> tuple:
+    """Would a rebuild-path edit succeed on this model?
+
+    Returns ``(ok, reason, preserved_count)``. Runs the SAME planner the edit
+    runs, so the answer cannot drift from reality — the only way to keep a
+    diagnostic honest is to make it execute the real predicate rather than a
+    restatement of it.
+    """
+    import sqlite3 as _sqlite3
+    import tempfile
+
+    from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+    from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+    dm = os.path.join(work_dir, "DataModel")
+    try:
+        with open(dm, "rb") as f:
+            abf = decompress_datamodel(f.read())
+        meta = read_metadata_sqlite(abf)
+    except Exception as exc:
+        return False, f"the DataModel could not be read ({exc}).", 0
+
+    fd, tmp = tempfile.mkstemp(suffix=".db", dir=work_dir)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(meta)
+        conn = _sqlite3.connect(tmp)
+        conn.row_factory = _sqlite3.Row
+        try:
+            planned, col_restamp, table_restamp = _plan_calc_preservation(
+                conn, abf, meta, _relationships_from_metadata(conn))
+        finally:
+            conn.close()
+    except ValueError as exc:
+        return False, str(exc), 0
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}", 0
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return True, "", len(col_restamp) + len(table_restamp)
+
+
 class _DoctorWarning(Exception):
     """Something Power BI tolerates but a human probably wants to know about.
 
@@ -14690,33 +14891,27 @@ def _report_integrity_checks(work_dir: str) -> list:
         """Whether the model can take a rebuild-path edit (add/replace a table,
         add/remove a relationship, remove a table).
 
-        Worth knowing UP FRONT: auto date/time is on by default in Desktop, so
-        most real reports carry generated date tables whose rows this engine
-        cannot reproduce, and those edits are refused. Saying so here beats
-        discovering it from a failed call.
+        Worth knowing UP FRONT rather than from a failed call — but only if it
+        is TRUE. This runs the real preservation planner as a dry run instead
+        of approximating it. An earlier version inferred the answer from the
+        presence of auto date/time tables and told two corpus reports
+        "supported" when the edit then refused for an unrelated reason; a
+        diagnostic that lies is worse than no diagnostic.
         """
         dm = os.path.join(work_dir, "DataModel")
         if not os.path.exists(dm):
             return "no DataModel (report-only file)"
-        try:
-            rows = _query_metadata_rows(
-                dm,
-                "SELECT t.Name FROM [Partition] p "
-                "JOIN [Table] t ON p.TableID = t.ID WHERE p.Type = 2")
-        except Exception as exc:
-            raise _DoctorWarning(f"could not inspect: {exc}")
-        auto = sorted({r[0] for r in rows if _is_auto_date_table(r[0])})
-        other = sorted({r[0] for r in rows if not _is_auto_date_table(r[0])})
-        if auto:
+        ok, reason, preserved = _rebuild_path_dry_run(work_dir)
+        if not ok:
             raise _DoctorWarning(
-                f"{len(auto)} auto date/time table(s) — rebuild-path edits "
-                f"(add/replace a table, add/remove a relationship, remove a "
-                f"table) will be REFUSED to avoid writing tables that reopen "
-                f"empty. The surgical tools still work. Turn off Auto "
-                f"date/time in Desktop to lift this: {auto[:2]}")
+                f"rebuild-path edits (add/replace a table, add/remove a "
+                f"relationship, remove a table) will be REFUSED — {reason} "
+                f"The surgical tools never rebuild and still work: "
+                f"add_measure / modify_measure / remove_measure / "
+                f"modify_column / set_sort_by_column.")
         return ("rebuild-path edits supported"
-                + (f" ({len(other)} calculated table(s) preserved)" if other
-                   else ""))
+                + (f" ({preserved} calculated object(s) preserved)"
+                   if preserved else ""))
 
     checks = [
         ("Registered resources", check_resources),

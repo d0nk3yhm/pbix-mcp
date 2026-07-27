@@ -1533,44 +1533,71 @@ class DAXEngine:
         rows = ctx.get_filtered_rows(table_name)
         return len(rows)
 
+    @staticmethod
+    def _comparable_values(data: Any) -> list:
+        """Values MIN/MAX can order, as one type group.
+
+        DAX MIN/MAX are not numeric-only — they order dates and text as well.
+        Filtering to (int, float) made `MIN(Sales[Date])` return 0 instead of
+        the earliest date: a silently wrong NUMBER, which is worse than an
+        error because nothing surfaces it. Numbers are preferred so existing
+        numeric behaviour is unchanged; dates and text are only used when the
+        column holds no numbers, so mixed columns never compare across types.
+        """
+        nums = [v for v in data
+                if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if nums:
+            return nums
+        dts = [v for v in data if isinstance(v, (datetime, date))]
+        if dts:
+            return dts
+        return [v for v in data if isinstance(v, str) and v != ""]
+
+    def _minmax_column(self, args, ctx, pick):
+        col = self._parse_column_ref(args[0])
+        if col is not None:
+            self._charge_eval(ctx)
+        if col is None:
+            ref = self._eval_expr(args[0].strip(), ctx)
+            col = ref if isinstance(ref, tuple) and len(ref) == 2 else None
+        if not col:
+            return None
+        values = self._comparable_values(
+            self._agg_ctx(ctx).get_column_data(*col))
+        return pick(values) if values else 0
+
+    @staticmethod
+    def _minmax_pair(a, b, pick):
+        """Two-argument form. Compares dates and text as well as numbers, but
+        never across incompatible types."""
+        for kinds in ((int, float), (datetime, date), (str,)):
+            if isinstance(a, kinds) and isinstance(b, kinds) \
+                    and not isinstance(a, bool) and not isinstance(b, bool):
+                return pick(a, b)
+        return 0
+
     def _fn_min(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
         if len(args) == 1:
-            col = self._parse_column_ref(args[0])
-            if col is not None:
-                self._charge_eval(ctx)
-            if col is None:
-                ref = self._eval_expr(args[0].strip(), ctx)
-                col = ref if isinstance(ref, tuple) and len(ref) == 2 else None
-            if col:
-                values = [v for v in self._agg_ctx(ctx).get_column_data(*col)
-                          if isinstance(v, (int, float))]
-                return min(values) if values else 0
+            got = self._minmax_column(args, ctx, min)
+            if got is not None:
+                return got
         elif len(args) == 2:
-            a = self._eval_expr(args[0].strip(), ctx)
-            b = self._eval_expr(args[1].strip(), ctx)
-            if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-                return min(a, b)
+            return self._minmax_pair(
+                self._eval_expr(args[0].strip(), ctx),
+                self._eval_expr(args[1].strip(), ctx), min)
         return 0
 
     def _fn_max(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
         if len(args) == 1:
-            col = self._parse_column_ref(args[0])
-            if col is not None:
-                self._charge_eval(ctx)
-            if col is None:
-                ref = self._eval_expr(args[0].strip(), ctx)
-                col = ref if isinstance(ref, tuple) and len(ref) == 2 else None
-            if col:
-                values = [v for v in self._agg_ctx(ctx).get_column_data(*col)
-                          if isinstance(v, (int, float))]
-                return max(values) if values else 0
+            got = self._minmax_column(args, ctx, max)
+            if got is not None:
+                return got
         elif len(args) == 2:
-            a = self._eval_expr(args[0].strip(), ctx)
-            b = self._eval_expr(args[1].strip(), ctx)
-            if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-                return max(a, b)
+            return self._minmax_pair(
+                self._eval_expr(args[0].strip(), ctx),
+                self._eval_expr(args[1].strip(), ctx), max)
         return 0
 
     def _fn_distinctcount(self, args_str: str, ctx: DAXContext) -> Any:
@@ -2140,6 +2167,16 @@ class DAXEngine:
         fmt = self._eval_expr(args[1].strip(), ctx) if len(args) > 1 else None
         if val is None:
             return ''
+        # A date can reach here as an ISO STRING rather than a datetime (row
+        # context over a generated table, a CALENDAR result, a text column
+        # holding dates). Without this, FORMAT([Date], "MMMM") returned the raw
+        # "2015-01-01T00:00:00" instead of "January" — a silently wrong value,
+        # which is worse than an error because nothing surfaces it.
+        if fmt and isinstance(val, str) and not isinstance(val, (datetime, date)):
+            if any(tok in str(fmt) for tok, _strf in self._DATE_FMT_TOKENS):
+                coerced = _as_datetime(val)
+                if coerced is not None:
+                    val = coerced
         # Datetime formatting (NOW()/TODAY()/date columns): translate the DAX
         # date pattern to strftime token by token.
         if isinstance(val, (datetime, date)) and fmt:
