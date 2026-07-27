@@ -7421,6 +7421,121 @@ _CARRY_MEANING = {
 }
 
 
+# Authoring properties on [Table] and [Column] rows. The builder DOES create
+# those rows, so the carry-over above never covered them — it only moves rows
+# the builder omits entirely — and every rebuild-path edit silently reset them
+# to defaults. What that costs a user: hidden tables and columns become visible,
+# a currency or date column loses its format string, "Month sorted by MonthNo"
+# reverts to alphabetical, an ImageUrl column stops rendering as an image, and
+# a numeric column like Year gets SummarizeBy=Sum so dragging it into a visual
+# adds the years together.
+#
+# Deliberately excluded: storage and type fields (ColumnStorageID,
+# InferredDataType, IsAvailableInMDX, AttributeHierarchyID, the *ModifiedTime
+# stamps). Those describe how the rebuilt data is physically stored and MUST
+# take their new values.
+_TABLE_PROPERTIES = (
+    "IsHidden", "IsPrivate", "ShowAsVariationsOnly", "DataCategory",
+    "Description", "ExcludeFromModelRefresh",
+)
+_COLUMN_PROPERTIES = (
+    "IsHidden", "FormatString", "SummarizeBy", "DataCategory", "DisplayOrdinal",
+    "Description", "DisplayFolder", "IsKey", "IsNullable", "IsUnique",
+    "IsDefaultLabel", "IsDefaultImage", "EncodingHint", "Alignment",
+    "KeepUniqueRows", "ErrorMessage",
+)
+
+
+def _snapshot_object_properties(conn: sqlite3.Connection) -> dict:
+    """Capture authoring properties of every table and column, keyed by NAME.
+
+    ``SortByColumnID`` is stored as the referenced column's name, because the
+    rebuild reassigns every ID and a stale number would point at whatever column
+    happens to land on it.
+    """
+    conn.row_factory = sqlite3.Row
+    have_t = {r[1] for r in conn.execute("PRAGMA table_info([Table])")}
+    have_c = {r[1] for r in conn.execute("PRAGMA table_info([Column])")}
+    tprops = [p for p in _TABLE_PROPERTIES if p in have_t]
+    cprops = [p for p in _COLUMN_PROPERTIES if p in have_c]
+
+    col_name_by_id = {
+        r["ID"]: r["nm"] for r in conn.execute(
+            "SELECT c.ID, COALESCE(c.ExplicitName, c.InferredName) AS nm "
+            "FROM [Column] c JOIN [Table] t ON c.TableID = t.ID "
+            "WHERE t.ModelID = 1")
+    }
+    tables = {
+        r["Name"]: {p: r[p] for p in tprops}
+        for r in conn.execute("SELECT * FROM [Table] WHERE ModelID = 1")
+    }
+    columns = {}
+    for r in conn.execute(
+        "SELECT c.*, t.Name AS _tbl FROM [Column] c "
+        "JOIN [Table] t ON c.TableID = t.ID WHERE t.ModelID = 1"
+    ):
+        nm = r["ExplicitName"] or r["InferredName"]
+        if not nm or nm.startswith("RowNumber"):
+            continue
+        d = {p: r[p] for p in cprops}
+        if "SortByColumnID" in have_c and r["SortByColumnID"]:
+            d["__sort_by__"] = col_name_by_id.get(r["SortByColumnID"])
+        columns[f"{r['_tbl']}\x00{nm}"] = d
+    return {"tables": tables, "columns": columns}
+
+
+def _restore_object_properties(dm_path: str, snap: dict) -> None:
+    """Re-apply snapshotted authoring properties after a rebuild.
+
+    Objects that no longer exist are skipped; the rebuild legitimately removed
+    them. A sort-by target that did not survive is cleared rather than left
+    pointing at an arbitrary column.
+    """
+    if not snap or not (snap.get("tables") or snap.get("columns")):
+        return
+
+    def _do(conn: sqlite3.Connection):
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        ids = {}
+        for r in c.execute(
+            "SELECT c.ID, t.Name AS tbl, "
+            "       COALESCE(c.ExplicitName, c.InferredName) AS nm "
+            "FROM [Column] c JOIN [Table] t ON c.TableID = t.ID "
+            "WHERE t.ModelID = 1"
+        ):
+            if r["nm"]:
+                ids[f"{r['tbl']}\x00{r['nm']}"] = r["ID"]
+
+        for name, props in (snap.get("tables") or {}).items():
+            sets = {k: v for k, v in props.items() if v is not None}
+            if not sets:
+                continue
+            c.execute(
+                f"UPDATE [Table] SET {', '.join(f'[{k}] = ?' for k in sets)} "
+                f"WHERE Name = ? AND ModelID = 1",
+                [*sets.values(), name])
+
+        for key, props in (snap.get("columns") or {}).items():
+            cid = ids.get(key)
+            if cid is None:
+                continue
+            sets = {k: v for k, v in props.items()
+                    if k != "__sort_by__" and v is not None}
+            sort_target = props.get("__sort_by__")
+            if sort_target is not None:
+                tbl = key.split("\x00", 1)[0]
+                sets["SortByColumnID"] = ids.get(f"{tbl}\x00{sort_target}", 0)
+            if not sets:
+                continue
+            c.execute(
+                f"UPDATE [Column] SET {', '.join(f'[{k}] = ?' for k in sets)} "
+                f"WHERE ID = ?", [*sets.values(), cid])
+        conn.commit()
+
+    _modify_metadata_only(dm_path, _do)
+
+
 def _identity_maps(conn: sqlite3.Connection) -> tuple[dict, dict]:
     """Build (id -> identity, identity -> id) for every referencable entity.
 
@@ -7919,6 +8034,9 @@ def _rebuild_datamodel(
         # Capture everything the builder does not emit, while the pre-rebuild
         # IDs are still meaningful.
         carry_snapshot = _snapshot_carryable_metadata(conn)
+        # …and the authoring properties on the rows it DOES emit, which it
+        # writes back as defaults.
+        property_snapshot = _snapshot_object_properties(conn)
 
         conn.close()
     finally:
@@ -8042,6 +8160,12 @@ def _rebuild_datamodel(
     if carry_snapshot:
         lost_metadata.extend(
             _restore_carryable_metadata(dm_path, carry_snapshot))
+
+    # Restore hidden-ness, format strings, sort-by targets, summarize-by,
+    # data categories and field order. The builder writes defaults for all of
+    # them, which turned every rebuild-path edit into a quiet reformatting of
+    # the model.
+    _restore_object_properties(dm_path, property_snapshot)
 
     # Re-apply RLS roles (builder doesn't support them, so splice after rebuild)
     if rls_roles:

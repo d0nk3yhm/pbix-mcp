@@ -165,6 +165,118 @@ class TestCarrySpecShape:
             assert identity, f"{tname} has no identity — it would duplicate"
 
 
+class TestObjectPropertyLists:
+    """The property allow-lists decide what survives a rebuild."""
+
+    def test_storage_and_type_fields_are_never_carried(self):
+        """Those describe how the REBUILT data is physically stored; carrying
+        them would re-attach stale storage to freshly written columns."""
+        forbidden = {"ColumnStorageID", "TableStorageID", "AttributeHierarchyID",
+                     "InferredDataType", "ExplicitDataType", "IsAvailableInMDX",
+                     "ModifiedTime", "StructureModifiedTime", "RefreshedTime",
+                     "Type", "TableID", "ID", "SystemFlags"}
+        assert not forbidden & set(server._COLUMN_PROPERTIES)
+        assert not forbidden & set(server._TABLE_PROPERTIES)
+
+    def test_the_fields_that_were_actually_being_lost_are_covered(self):
+        """Measured on the corpus before the fix: a rebuild reset these."""
+        for f in ("IsHidden", "FormatString", "SummarizeBy", "DataCategory",
+                  "DisplayOrdinal"):
+            assert f in server._COLUMN_PROPERTIES, f
+        for f in ("IsHidden", "IsPrivate", "ShowAsVariationsOnly"):
+            assert f in server._TABLE_PROPERTIES, f
+
+    def test_sort_by_is_carried_by_name_not_id(self):
+        """SortByColumnID is a foreign key; the rebuild renumbers every ID, so
+        carrying the number would point it at an arbitrary column."""
+        assert "SortByColumnID" not in server._COLUMN_PROPERTIES
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not os.path.isdir(CORPUS), reason="corpus not downloaded")
+class TestObjectPropertiesSurviveARebuild:
+    """Hidden-ness, formatting, summarize-by and sort-by are authoring choices.
+
+    They live as PROPERTIES on rows the builder does create, so the row-level
+    carry-over never covered them and every rebuild-path edit reset them to
+    defaults. What that cost: hidden tables became visible, format strings
+    vanished, "Month sorted by MonthNo" reverted to alphabetical, and a numeric
+    column like Year got SummarizeBy=Sum — so dragging it into a visual added
+    the years together.
+    """
+
+    WATCHED = ("IsHidden", "FormatString", "SummarizeBy", "DataCategory",
+               "DisplayOrdinal")
+
+    @staticmethod
+    def _props(pbix_path):
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        with zipfile.ZipFile(pbix_path) as z:
+            raw = read_metadata_sqlite(decompress_datamodel(z.read("DataModel")))
+        fd, tmp = tempfile.mkstemp(suffix=".db")
+        os.write(fd, raw)
+        os.close(fd)
+        conn = sqlite3.connect(tmp)
+        conn.row_factory = sqlite3.Row
+        try:
+            names = {r["ID"]: r["nm"] for r in conn.execute(
+                "SELECT c.ID, COALESCE(c.ExplicitName, c.InferredName) AS nm "
+                "FROM [Column] c JOIN [Table] t ON c.TableID = t.ID "
+                "WHERE t.ModelID = 1")}
+            tables = {r["Name"]: r["IsHidden"] for r in conn.execute(
+                "SELECT Name, IsHidden FROM [Table] WHERE ModelID = 1")}
+            cols = {}
+            for r in conn.execute(
+                "SELECT c.*, t.Name AS _t FROM [Column] c "
+                "JOIN [Table] t ON c.TableID = t.ID WHERE t.ModelID = 1"
+            ):
+                nm = r["ExplicitName"] or r["InferredName"]
+                if not nm or nm.startswith("RowNumber"):
+                    continue
+                d = {k: r[k] for k in TestObjectPropertiesSurviveARebuild.WATCHED}
+                d["SortBy"] = names.get(r["SortByColumnID"]) \
+                    if r["SortByColumnID"] else None
+                cols[(r["_t"], nm)] = d
+            return tables, cols
+        finally:
+            conn.close()
+            os.unlink(tmp)
+
+    def test_no_property_is_reset_by_an_edit(self, tmp_path):
+        src = os.path.join(CORPUS, "MS_Blog_DataProfiling.pbix")
+        if not os.path.exists(src):
+            pytest.skip("MS_Blog_DataProfiling.pbix not in corpus")
+        bt, bc = self._props(_save_after(src, str(tmp_path)))
+        at, ac = self._props(_save_after(src, str(tmp_path), "Numbers"))
+
+        assert any(v for v in bt.values()), "fixture has no hidden table"
+        changed_t = {k: (v, at[k]) for k, v in bt.items()
+                     if k in at and at[k] != v}
+        assert not changed_t, f"table properties reset: {changed_t}"
+
+        changed_c = {k: {f: (v[f], ac[k][f]) for f in v if ac[k][f] != v[f]}
+                     for k, v in bc.items() if k in ac and ac[k] != v}
+        assert not changed_c, f"column properties reset: {changed_c}"
+
+    def test_auto_date_tables_stay_hidden_and_non_summarizing(self, tmp_path):
+        """The two most visible consequences, asserted by name."""
+        src = os.path.join(CORPUS, "MS_Blog_DataProfiling.pbix")
+        if not os.path.exists(src):
+            pytest.skip("MS_Blog_DataProfiling.pbix not in corpus")
+        at, ac = self._props(_save_after(src, str(tmp_path), "Numbers"))
+        auto = [t for t in at if server._is_auto_date_table(t)]
+        assert auto, "fixture has no auto date/time tables"
+        for t in auto:
+            assert at[t] == 1, f"{t} is visible in the field list"
+        for (tbl, col), d in ac.items():
+            if server._is_auto_date_table(tbl):
+                assert d["IsHidden"] == 1, f"{tbl}[{col}] is visible"
+                assert d["SummarizeBy"] == 2, \
+                    f"{tbl}[{col}] would aggregate by default"
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(not os.path.isdir(CORPUS), reason="corpus not downloaded")
 class TestCorpusPreservation:
