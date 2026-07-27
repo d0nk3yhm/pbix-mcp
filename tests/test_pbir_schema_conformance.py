@@ -144,3 +144,53 @@ class TestPBIRSchemaConformance:
             for n in pages:
                 doc = json.loads(z.read(n).decode("utf-8-sig"))
                 assert doc["displayOption"] == "FitToPage", n
+
+
+class TestReportLevelWritesConform:
+    """The round-trip fixes touch report.json and visual.json in ways the
+    original sweep never schema-checked. Two real violations were found this
+    way and would otherwise have shipped:
+
+      * `set_visual_property` built `title: {"0": ...}` where the schema needs
+        an array (numeric path segments must create lists)
+      * a newly registered `customTheme` omitted `reportVersionAtImport`,
+        which the report schema marks required
+    """
+
+    def _edit(self, src, out, fn):
+        alias = "sc2_" + uuid.uuid4().hex[:8]
+        server.pbix_open(src, alias)
+        try:
+            assert json.loads(fn(alias))["success"]
+            server.pbix_save(alias, out, overwrite=True, backup=False)
+        finally:
+            server.pbix_close(alias, force=True)
+
+    @pytest.mark.parametrize("label,fn", [
+        ("format_visual", lambda a: server.pbix_format_visual(
+            a, 0, 0, json.dumps({"title": {"text": "T", "show": True}}))),
+        ("set_visual_property", lambda a: server.pbix_set_visual_property(
+            a, 0, 0,
+            "singleVisual.vcObjects.title.0.properties.text.expr.Literal.Value",
+            '"\'T\'"')),
+        ("set_theme", lambda a: server.pbix_set_theme(
+            a, json.dumps({"name": "T", "dataColors": ["#112233"]}))),
+        ("set_filters_report", lambda a: server.pbix_set_filters(
+            a, json.dumps([{"name": "F", "type": "Categorical"}]),
+            page_index=-1)),
+        ("set_settings", lambda a: server.pbix_set_settings(
+            a, json.dumps({"exportDataMode": "None"}))),
+        ("duplicate_page", lambda a: server.pbix_duplicate_page(a, "0", "C")),
+        ("duplicate_visual", lambda a: server.pbix_duplicate_visual(a, "0", 0)),
+        ("set_visual_sort", lambda a: server.pbix_set_visual_sort(
+            a, 0, 0, sort_by="Sales.Category", sort_direction="asc")),
+    ])
+    def test_output_conforms(self, validator, tmp_path, label, fn):
+        import pathlib
+
+        src = _pbir_pbix(tmp_path)
+        out = str(tmp_path / f"{label}.pbix")
+        self._edit(src, out, fn)
+        checked, errors = validator.validate_pbix(pathlib.Path(out))
+        assert checked > 0
+        assert errors == [], f"{label}:\n" + "\n".join(errors)

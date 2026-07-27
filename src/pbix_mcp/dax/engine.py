@@ -352,24 +352,24 @@ class DAXContext:
                 'year' in cols_lower or 'month' in cols_lower
                 or 'date' in tname.lower() or 'calendar' in tname.lower()
             ):
-                return tname
+                return str(tname)
 
         # Pass 1: table name contains 'date' and has a 'Date' column
         for tname, tdata in tables.items():
             if 'date' in tname.lower() and 'Date' in tdata.get('columns', []):
-                return tname
+                return str(tname)
         # Pass 2: common date-table prefixes (dimDate, DimDate, Calendar, etc.)
         for tname, tdata in tables.items():
             tlow = tname.lower().replace(' ', '').replace('-', '').replace('_', '')
             if tlow in ('dimdate', 'datetable', 'calendar', 'datekey', 'dates'):
                 for cname in tdata.get('columns', []):
                     if cname.lower() == 'date':
-                        return tname
+                        return str(tname)
         # Pass 3: any table with Date + Year/Month columns (likely a date dimension)
         for tname, tdata in tables.items():
             cols_lower = [c.lower() for c in tdata.get('columns', [])]
             if 'date' in cols_lower and ('year' in cols_lower or 'month' in cols_lower):
-                return tname
+                return str(tname)
         return 'dim-Date'  # fallback default
 
     def _find_col_idx(self, cols: list, col_name: str) -> int:

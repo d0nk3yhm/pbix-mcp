@@ -1143,7 +1143,7 @@ class PBIXBuilder:
         """Get rows for a table by name."""
         for t in self._tables:
             if t["name"] == table_name:
-                return t.get("rows", [])
+                return list(t.get("rows", []))
         return []
 
     @staticmethod
@@ -1151,7 +1151,7 @@ class PBIXBuilder:
         """Resolve a query source alias (e.g., 'o') to entity name (e.g., 'Orders')."""
         for src in from_list:
             if src.get("Name") == alias:
-                return src.get("Entity", "")
+                return str(src.get("Entity", ""))
         return ""
 
     # ------------------------------------------------------------------

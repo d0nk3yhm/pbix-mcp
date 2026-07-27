@@ -4,7 +4,7 @@ An audit of what Power BI can author against what pbix-mcp exposes as tools,
 written for consumers (OpenBI) that need to know which operations are a single
 call, which need raw-JSON escape hatches, and which are not supported at all.
 
-Audited at **0.9.38 / 125 tools**. Re-run the inventory with:
+Audited at **0.9.39 / 125 tools**. Re-run the inventory with:
 
 ```bash
 python -c "from pbix_mcp import server; print(len([n for n in dir(server) if n.startswith('pbix_')]))"
@@ -38,6 +38,7 @@ the PBIR `Report/definition/` tree the service produces. Tools go through
 | HTML / SVG visuals | ✅ `pbix_add_html_visual`, `pbix_set_html_visual`, `pbix_html_template`, `pbix_svg_measure` | |
 | Report settings | ✅ `pbix_get_settings`, `pbix_set_settings` | |
 | Group visuals | ⚠️ read-only | `pbix_get_visual_positions` resolves group offsets; creating a group needs `pbix_update_visual_json` |
+| Container formatting (title, background, border) | ✅ `pbix_format_visual`, `pbix_set_visual_property` | Round-trips on both formats (`vcObjects` ↔ `visual.visualContainerObjects`) |
 | Edit visual interactions | ⚠️ raw JSON | PBIR models this as `page.visualInteractions`; no dedicated tool |
 | Mark page as tooltip / drillthrough | ⚠️ raw JSON | Readable (`section["type"]`), no dedicated setter |
 | Sync slicers | ⚠️ raw JSON | Sync groups are read and round-tripped, not authored |
@@ -78,6 +79,20 @@ caller never branches on format:
 | `displayOption` | int (`1`) | enum name (`"FitToPage"`) | int |
 | page `visibility` | `config.visibility` int | `visibility` enum name | `config.visibility` int |
 | bookmarks | `config.bookmarks` | `definition/bookmarks/*.bookmark.json` | `config.bookmarks` |
+| container formatting | `singleVisual.vcObjects` | `visual.visualContainerObjects` | `singleVisual.vcObjects` |
+| visual sort | `prototypeQuery.OrderBy` | `visual.query.sortDefinition` | `prototypeQuery.OrderBy` |
+| resources, custom visuals, theme, report filters, settings | Layout top level / `config` | `definition/report.json` | Layout shape |
+
+### How this is verified
+
+All 125 tools are tested on both formats by applying the tool, saving, reopening
+and checking the **saved bytes**, with a negative control proving each check
+fails on an untouched file. As of 0.9.39: 50 persist, 59 are read-only, 2 are
+not applicable to the fixtures, and 0 lose their change.
+
+`scripts/validate_pbir_schemas.py` is a necessary but **not sufficient** check —
+a file can be perfectly schema-valid and still be missing state a tool claimed
+to write. Persistence is verified separately, in `tests/test_pbir_roundtrip.py`.
 
 Validate what the writer emits against Microsoft's published schemas with
 `scripts/validate_pbir_schemas.py` (see `docs/development.md`).
