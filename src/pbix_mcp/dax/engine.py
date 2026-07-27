@@ -40,6 +40,7 @@ import statistics
 import time
 from calendar import monthrange
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from typing import Any, Optional
 
 # Sentinel returned by _eval_binary to mean "this expression is NOT a binary
@@ -1291,6 +1292,25 @@ class DAXEngine:
         expressions split exactly as before (the space just lands in the part
         and is stripped by the caller); the new behaviour is that UNSPACED
         operators (`a*b`, `a=b`) now split too.
+
+        Memoized. This is a pure function of (expr, op), but it runs inside
+        every row iteration, so an iterator over a few hundred rows re-parses
+        the same expression text thousands of times — profiling one
+        RANKX/FILTER measure showed 95,586 calls here, 48% of the whole
+        evaluation. A model contains few distinct (expr, op) pairs, so caching
+        turns nearly all of those into a dict lookup. A fresh list is handed
+        back because callers treat the result as their own.
+        """
+        return list(self._split_operators_scan(expr, op))
+
+    @staticmethod
+    @lru_cache(maxsize=200_000)
+    def _split_operators_scan(expr: str, op: str) -> tuple:
+        """Character scan behind ``_split_operators``, cached by input.
+
+        A staticmethod so the cache key is (expr, op) alone. Caching a bound
+        method would put ``self`` in the key, and a fresh engine per evaluation
+        would defeat the cache completely.
         """
         parts: list = []
         cur: list = []
@@ -1335,7 +1355,7 @@ class DAXEngine:
                     parts.append(prev); cur = []; i += len(op); continue
             cur.append(ch); i += 1
         parts.append(''.join(cur))
-        return parts
+        return tuple(parts)
 
     def _make_row_context(self, row_item: dict, ctx: 'DAXContext') -> 'DAXContext':
         """Create a filter context from a row dict, filtering on ALL columns of the row.

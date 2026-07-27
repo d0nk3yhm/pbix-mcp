@@ -46,6 +46,11 @@ _SCHEMA_DDL = [
     'CREATE TABLE [Expression]( [ID] INTEGER, [ModelID] INTEGER, [Name] TEXT, [Description] TEXT, [Kind] INTEGER, [Expression] TEXT, [ModifiedTime] INTEGER, [QueryGroupID] INTEGER, [ParameterValuesColumnID] INTEGER, [MAttributes] TEXT, [LineageTag] TEXT, [SourceLineageTag] TEXT, [RemoteParameterName] TEXT, [ExpressionSourceID] INTEGER, PRIMARY KEY("ID" ASC) )',
     'CREATE TABLE [ExtendedProperty]( [ID] INTEGER, [ObjectID] INTEGER, [ObjectType] INTEGER, [Name] TEXT, [Type] INTEGER, [Value] TEXT, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
     'CREATE TABLE [FormatStringDefinition]( [ID] INTEGER, [ObjectID] INTEGER, [ObjectType] INTEGER, [Expression] TEXT, [ModifiedTime] INTEGER, [State] INTEGER, [ErrorMessage] TEXT, PRIMARY KEY("ID" ASC) )',
+    # User-defined DAX functions. Taken verbatim from a Desktop-authored file
+    # (test_corpus/Ecommerce_Conversion.pbix, UDF_TopNItems); the table was
+    # absent here entirely, so a rebuilt model had nowhere to put one and the
+    # function was lost with no way to carry it back.
+    'CREATE TABLE [Function]( [ID] INTEGER, [ModelID] INTEGER, [Name] TEXT, [Description] TEXT, [Expression] TEXT, [IsHidden] INTEGER, [State] INTEGER, [ErrorMessage] TEXT, [ModifiedTime] INTEGER, [StructureModifiedTime] INTEGER, [LineageTag] TEXT, [SourceLineageTag] TEXT, PRIMARY KEY("ID" ASC) )',
     'CREATE TABLE [GeneralSegmentMapSegmentMetadataStorage]( [ID] INTEGER, [SegmentMapStorageID] INTEGER, [RecordCount] INTEGER, [Ordinal] INTEGER, PRIMARY KEY("ID" ASC) )',
     'CREATE TABLE [GroupByColumn]( [ID] INTEGER, [RelatedColumnDetailsID] INTEGER, [GroupingColumnID] INTEGER, [ModifiedTime] INTEGER, PRIMARY KEY("ID" ASC) )',
     'CREATE TABLE [Hierarchy]( [ID] INTEGER, [TableID] INTEGER, [Name] TEXT, [Description] TEXT, [IsHidden] INTEGER, [State] INTEGER, [HierarchyStorageID] INTEGER, [ModifiedTime] INTEGER, [StructureModifiedTime] INTEGER, [RefreshedTime] INTEGER, [DisplayFolder] TEXT, [HideMembers] INTEGER, [LineageTag] TEXT, [SourceLineageTag] TEXT, PRIMARY KEY("ID" ASC) )',

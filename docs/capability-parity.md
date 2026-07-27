@@ -4,7 +4,7 @@ An audit of what Power BI can author against what pbix-mcp exposes as tools,
 written for consumers (OpenBI) that need to know which operations are a single
 call, which need raw-JSON escape hatches, and which are not supported at all.
 
-Audited at **0.9.39 / 125 tools**. Re-run the inventory with:
+Audited at **0.9.39 / 126 tools**. Re-run the inventory with:
 
 ```bash
 python -c "from pbix_mcp import server; print(len([n for n in dir(server) if n.startswith('pbix_')]))"
@@ -110,7 +110,7 @@ samples.
 
 ### How this is verified
 
-All 125 tools are tested on both formats by applying the tool, saving, reopening
+All 126 tools are tested on both formats by applying the tool, saving, reopening
 and checking the **saved bytes**, with a negative control proving each check
 fails on an untouched file. As of 0.9.39: 50 persist, 59 are read-only, 2 are
 not applicable to the fixtures, and 0 lose their change.

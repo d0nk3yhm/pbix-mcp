@@ -7244,14 +7244,26 @@ def _apply_calculated_column_metadata(
                 raise ValueError(
                     f"Calculated-column table '{spec['table']}' not found")
             tid = trow[0]
+            # SystemFlags=2 on a calculated column that lives on a calculated
+            # TABLE — Desktop stamps every object of such a table that way, and
+            # a plain 0 there is not the shape it writes (verified across all
+            # 57 corpus tables of that shape). On an ordinary table the flag
+            # stays as it was.
+            sysflags = spec.get("system_flags")
+            extra = ", SystemFlags = ?" if sysflags is not None else ""
+            params: list = [spec["expression"], spec["amo_type"], filetime,
+                            filetime, filetime]
+            if sysflags is not None:
+                params.append(sysflags)
+            params += [tid, spec["column"]]
             n = c.execute(
                 "UPDATE [Column] SET Type = 2, Expression = ?, "
                 "SourceColumn = NULL, ExplicitDataType = 1, "
                 "InferredDataType = ?, ModifiedTime = ?, "
-                "StructureModifiedTime = ?, RefreshedTime = ? "
+                "StructureModifiedTime = ?, RefreshedTime = ?"
+                f"{extra} "
                 "WHERE TableID = ? AND ExplicitName = ?",
-                (spec["expression"], spec["amo_type"], filetime, filetime,
-                 filetime, tid, spec["column"])).rowcount
+                params).rowcount
             if n != 1:
                 raise ValueError(
                     f"Expected to re-stamp exactly one column "
@@ -7292,6 +7304,15 @@ def _apply_calculated_table_metadata(
                 "UPDATE [Partition] SET Type = 2, SystemFlags = 2, "
                 "QueryDefinition = ? WHERE TableID = ?",
                 (spec["expression"], tid))
+            # Columns this table owns as CALCULATED columns are not the
+            # partition's own data columns and must survive untouched for
+            # _apply_calculated_column_metadata to find them: it looks a column
+            # up by ExplicitName, and rewriting every column to Type=4 with
+            # ExplicitName NULL both destroyed the calc columns and made that
+            # lookup miss. Power BI's auto date/time tables are exactly this
+            # shape — a Date column from the partition expression plus six
+            # calculated columns — and used to be refused outright because of it.
+            skip = {n for n in (spec.get("calc_columns") or ())}
             # Data columns -> calc-table columns. RowNumber (Type=3) only gets
             # the system flag, exactly as Desktop leaves it.
             for crow in c.execute(
@@ -7301,6 +7322,13 @@ def _apply_calculated_table_metadata(
                         crow["ExplicitName"] or "").startswith("RowNumber"):
                     c.execute("UPDATE [Column] SET SystemFlags = 2 WHERE ID = ?",
                               (crow["ID"],))
+                    continue
+                if crow["ExplicitName"] in skip:
+                    # Only the flags Desktop puts on every object of a calc
+                    # table; the calc-column stamp follows and owns the rest.
+                    c.execute(
+                        "UPDATE [Column] SET SystemFlags = 2, "
+                        "IsAvailableInMDX = 1 WHERE ID = ?", (crow["ID"],))
                     continue
                 name = crow["ExplicitName"]
                 c.execute(
@@ -7338,6 +7366,7 @@ _AMO_OBJECT_TYPE = {
 _CARRY_SPEC: list[tuple[str, dict[str, str], tuple[str, ...]]] = [
     ("Expression", {"ModelID": "model",
                     "ParameterValuesColumnID": "column?"}, ("Name",)),
+    ("Function", {"ModelID": "model"}, ("Name",)),
     ("DataSource", {"ModelID": "model"}, ("Name",)),
     ("LinguisticMetadata", {"CultureID": "culture"}, ("CultureID",)),
     ("Perspective", {"ModelID": "model"}, ("Name",)),
@@ -7388,6 +7417,7 @@ _CARRY_MEANING = {
     "Annotation": "annotations",
     "ExtendedProperty": "extended properties",
     "ChangedProperty": "changed-property bookkeeping",
+    "Function": "user-defined DAX functions",
 }
 
 
@@ -7537,8 +7567,12 @@ def _restore_carryable_metadata(dm_path: str, snap: dict) -> list[str]:
             try:
                 cols = [r[1] for r in c.execute(f"PRAGMA table_info([{tname}])")]
             except sqlite3.Error:
-                continue
+                cols = []
             if not cols:
+                # The rebuilt schema has no such table, so these rows have
+                # nowhere to go. Report it — a table missing from the schema is
+                # exactly how [Function] was lost without anyone noticing.
+                dropped[tname] = dropped.get(tname, 0) + len(rows)
                 continue
             for d in rows:
                 resolved = {}
@@ -8101,6 +8135,17 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
     try:
         info = _ensure_open(alias)
         data = json.loads(data_json)
+        if not isinstance(data, dict):
+            # A bare row list is the obvious guess and used to surface as
+            # "'list' object has no attribute 'get'" — a Python error, not an
+            # answer.
+            got = "an array of rows" if isinstance(data, list) else type(data).__name__
+            return ToolResponse.error(
+                f"data_json must be an object with 'columns' and 'rows'; got "
+                f"{got}. Expected: {{\"columns\": [{{\"name\": \"Col1\", "
+                f"\"data_type\": \"String\"}}], \"rows\": [{{\"Col1\": "
+                f"\"hello\"}}]}}. Supported data_types: String, Int64, Float64, "
+                f"DateTime, Decimal, Boolean.", ABFRebuildError.code).to_text()
         columns = data.get("columns", [])
         rows = data.get("rows", [])
         if not columns or not rows:
@@ -9981,10 +10026,13 @@ def pbix_datamodel_add_calculated_column(
         old_size, _ = _rebuild_datamodel(
             info, table_updates=table_updates, calc_authoring=True,
             restamp_calc_tables={s["table"] for s in table_restamp})
-        _, new_size = _apply_calculated_column_metadata(dm_path, restamp_specs)
+        # TABLE metadata first, then COLUMN metadata — the table stamp writes
+        # flags the column stamp then refines, and doing it the other way round
+        # is what silently demoted calculated columns to plain data elsewhere.
         if table_restamp:
             _, new_size = _apply_calculated_table_metadata(
                 dm_path, table_restamp)
+        _, new_size = _apply_calculated_column_metadata(dm_path, restamp_specs)
         info["modified"] = True
         global _dax_cache
         _dax_cache.pop(alias, None)
@@ -10009,8 +10057,150 @@ def pbix_datamodel_add_calculated_column(
             f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
 
 
+def _calc_column_dependents(conn, tid: int, table_name: str,
+                            column_name: str) -> list[str]:
+    """Calculated columns on the same table whose DAX reads ``column_name``.
+
+    Matches the three forms Power BI writes: bare ``[Col]``, ``Table[Col]`` and
+    ``'Table'[Col]``. Case-insensitive, because DAX identifiers are.
+    """
+    pat = re.compile(
+        r"(?:'" + re.escape(table_name) + r"'|" + re.escape(table_name) + r")?"
+        r"\s*\[" + re.escape(column_name) + r"\]", re.IGNORECASE)
+    out = []
+    for r in conn.execute(
+        "SELECT ExplicitName, Expression FROM [Column] WHERE TableID = ? "
+        "AND Type = 2 AND ExplicitName IS NOT NULL", (tid,)
+    ):
+        if r[0].lower() == column_name.lower():
+            continue
+        if r[1] and pat.search(r[1]):
+            out.append(r[0])
+    return out
+
+
+@mcp.tool()
+def pbix_datamodel_remove_calculated_column(
+    alias: str, table_name: str, column_name: str
+) -> str:
+    """Remove a DAX calculated column, undoing pbix_datamodel_add_calculated_column.
+
+    Drops both halves of the column: the Type=2 metadata carrying the DAX, and
+    the materialized values in VertiPaq. Every other calculated column and
+    calculated table in the model is re-evaluated and re-stamped, so the result
+    is the model as it would have been had the column never been added.
+
+    Only CALCULATED columns (Column.Type=2) can be removed this way. A plain
+    data column is part of the table's source data — use pbix_set_table_data to
+    rewrite the table without it.
+
+    Refuses when another calculated column on the same table reads this one,
+    naming the dependents, rather than leaving them evaluating against a column
+    that no longer exists.
+
+    Args:
+        alias: The alias of the open file
+        table_name: Table owning the column
+        column_name: The calculated column to remove
+    """
+    try:
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        info = _ensure_open(alias)
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error(
+                "No DataModel found.", DataModelCompressionError.code).to_text()
+
+        with open(dm_path, "rb") as f:
+            abf = decompress_datamodel(f.read())
+        meta = read_metadata_sqlite(abf)
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(meta)
+        tmp.close()
+        try:
+            conn = sqlite3.connect(tmp.name)
+            conn.row_factory = sqlite3.Row
+            trow = conn.execute(
+                "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
+                (table_name,)).fetchone()
+            if not trow:
+                return ToolResponse.error(
+                    f"Table '{table_name}' not found.",
+                    "TABLE_NOT_FOUND").to_text()
+            tid = trow["ID"]
+            crow = conn.execute(
+                "SELECT ExplicitName, Type, Expression FROM [Column] "
+                "WHERE TableID = ? AND lower(ExplicitName) = lower(?)",
+                (tid, column_name)).fetchone()
+            if not crow:
+                return ToolResponse.error(
+                    f"Column '{column_name}' not found on '{table_name}'.",
+                    "COLUMN_NOT_FOUND").to_text()
+            if crow["Type"] != 2:
+                kind = {1: "a data column", 3: "the internal row-number column",
+                        4: "a calculated TABLE's data column"}.get(
+                            crow["Type"], f"Type={crow['Type']}")
+                return ToolResponse.error(
+                    f"'{table_name}'[{crow['ExplicitName']}] is {kind}, not a "
+                    f"calculated column, so removing it here would change the "
+                    f"table's source data rather than undo an authored column. "
+                    f"Use pbix_set_table_data to rewrite the table without it.",
+                    "NOT_A_CALCULATED_COLUMN").to_text()
+
+            actual = crow["ExplicitName"]
+            dependents = _calc_column_dependents(conn, tid, table_name, actual)
+            if dependents:
+                return ToolResponse.error(
+                    f"'{table_name}'[{actual}] is read by calculated column(s) "
+                    f"{dependents} on the same table. Removing it would leave "
+                    f"them evaluating against a column that no longer exists, "
+                    f"so it was refused — remove those first.",
+                    "CALC_COLUMN_HAS_DEPENDENTS").to_text()
+
+            rels_ctx = _get_dax_context(alias).get("relationships", [])
+            table_updates, restamp_specs, table_restamp = (
+                _plan_calc_preservation(
+                    conn, abf, meta, rels_ctx,
+                    drop_columns={table_name: {actual}}))
+        finally:
+            os.unlink(tmp.name)
+
+        old_size, new_size = _rebuild_datamodel(
+            info, table_updates=table_updates, calc_authoring=True,
+            restamp_calc_tables={s["table"] for s in table_restamp})
+        if table_restamp:
+            _, new_size = _apply_calculated_table_metadata(
+                dm_path, table_restamp)
+        if restamp_specs:
+            _, new_size = _apply_calculated_column_metadata(
+                dm_path, restamp_specs)
+        info["modified"] = True
+        global _dax_cache
+        _dax_cache.pop(alias, None)
+
+        kept = len(restamp_specs)
+        return ToolResponse.ok(
+            f"Calculated column '{table_name}'[{actual}] removed:\n"
+            f"  Expression was: {crow['Expression']}\n"
+            f"  Metadata and materialized values both dropped\n"
+            f"  {kept} other calculated column(s) re-evaluated and preserved\n"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except ValueError as e:
+        return ToolResponse.error(str(e), "UNSUPPORTED_EXISTING_CALC").to_text()
+    except Exception as e:
+        return ToolResponse.error(
+            f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
+
+
 def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
-                            base_data=None, skip_tables=None):
+                            base_data=None, skip_tables=None,
+                            drop_columns=None):
     """Plan the re-materialization of everything a rebuild would otherwise lose.
 
     A from-scratch rebuild drops Type=2 calculated columns (they aren't read
@@ -10031,6 +10221,11 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
 
     ``skip_tables`` names tables the caller is deleting, so the plan does not
     resurrect them.
+
+    ``drop_columns`` = {table: {column, ...}} names calculated columns the
+    caller is deleting. They are left out of the re-materialization, which is
+    what actually removes them: a calculated column exists because the plan
+    re-creates it, so omitting it from the plan is the removal.
     """
     from pbix_mcp.dax.calc_tables import calc_column_unsupported_reason
     from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
@@ -10057,29 +10252,19 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
             "SELECT QueryDefinition FROM [Partition] WHERE TableID = ?",
             (tid,)).fetchone()[0]
 
-        # A table that is BOTH a calculated table and the owner of calculated
-        # columns needs two metadata stamps on the same table, and the second
-        # overwrites the first — which silently demoted six calculated columns
-        # to plain data. Refuse until that double stamp is handled: a wrong
-        # model is worse than a declined edit. Power BI's auto date/time
-        # tables are the common case.
-        owns_calc_columns = conn.execute(
-            "SELECT COUNT(*) FROM [Column] WHERE TableID = ? AND Type = 2",
-            (tid,)).fetchone()[0]
-        if owns_calc_columns:
-            extra = ""
-            if _is_auto_date_table(tname):
-                extra = (" This is one of Power BI's auto date/time tables. "
-                         "Turning off File > Options > Data Load > Auto "
-                         "date/time in Desktop and re-saving removes them.")
-            raise ValueError(
-                f"'{tname}' is a calculated table that also defines "
-                f"{owns_calc_columns} calculated column(s). Rebuilding it "
-                f"would drop those columns, so the edit was refused rather "
-                f"than write a model that reopens without them.{extra} The "
-                f"surgical tools never rebuild and always work: "
-                f"add_measure / modify_measure / remove_measure / "
-                f"modify_column / set_sort_by_column.")
+        # A table can be BOTH a calculated table and the owner of calculated
+        # columns — every Power BI auto date/time table is: a Date column from
+        # the partition's CALENDAR expression plus Year/MonthNo/Month/
+        # QuarterNo/Quarter/Day computed on top. That needs two metadata stamps
+        # on one table, and the calc-column stamp must not be overwritten by
+        # the calc-table stamp, so the names are handed to the table stamper to
+        # leave alone.
+        owned_calc_columns = [
+            r[0] for r in conn.execute(
+                "SELECT ExplicitName FROM [Column] WHERE TableID = ? "
+                "AND Type = 2 AND ExplicitName NOT LIKE 'RowNumber%' "
+                "ORDER BY ID", (tid,))
+            if r[0]]
 
         td = read_table_from_abf(abf, tname, meta)
         cols = td.get("columns") or []
@@ -10089,23 +10274,8 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
             # No materialized data in VertiPaq — Power BI generates this table
             # at load. Its generating DAX is declared right here in the
             # partition, so evaluate THAT rather than refusing outright.
-            #
-            # Only when the table owns no calculated COLUMNS of its own. A
-            # table that is both a calculated table and a calc-column owner
-            # needs two metadata stamps on the same table, and the second
-            # overwrites the first — that silently demoted six calculated
-            # columns to plain data. Refusing is the safe answer until the
-            # double stamp is handled; a wrong model is worse than no edit.
-            owns_calc_columns = conn.execute(
-                "SELECT COUNT(*) FROM [Column] WHERE TableID = ? AND Type = 2",
-                (tid,)).fetchone()[0]
-            if not owns_calc_columns:
-                generated = True
-                cols, rows, why = _evaluate_calc_table_partition(qd, abf, meta)
-            else:
-                why = (f"it also defines {owns_calc_columns} calculated "
-                       f"column(s), which this engine cannot re-stamp together "
-                       f"with the calculated-table shape")
+            generated = True
+            cols, rows, why = _evaluate_calc_table_partition(qd, abf, meta)
             if not cols:
                 hint = ""
                 if _is_auto_date_table(tname):
@@ -10120,8 +10290,23 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
                     f"its expression could not be reproduced ({why}), so this "
                     f"edit would write a table that reopens empty. Refused."
                     f"{hint}")
+        # Prefer the type the model already declares for the column. Inferring
+        # from the regenerated values retyped every auto-date table's `Date`
+        # column from DateTime to String, because the CALENDAR expression hands
+        # dates back as ISO strings — the table looked intact while its date
+        # semantics were gone.
+        declared = {}
+        for cr in conn.execute(
+            "SELECT COALESCE(ExplicitName, InferredName) AS nm, "
+            "       ExplicitDataType AS edt, InferredDataType AS idt "
+            "FROM [Column] WHERE TableID = ?", (tid,)
+        ):
+            amo = cr["edt"] if cr["edt"] in _AMO_TO_NAME else cr["idt"]
+            if amo in _AMO_TO_NAME:
+                declared[cr["nm"]] = _AMO_TO_NAME[amo]
         col_defs = [{"name": c,
-                     "data_type": _infer_calc_type_name([r[i] for r in rows])}
+                     "data_type": declared.get(
+                         c, _infer_calc_type_name([r[i] for r in rows]))}
                     for i, c in enumerate(cols)]
         table_updates[tname] = {
             "columns": col_defs,
@@ -10133,7 +10318,14 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
             # Quarter/Day) have nothing to compute against unless we hand them
             # the rows we just generated.
             base_data.setdefault(tname, table_updates[tname])
-        table_restamp.append({"table": tname, "expression": qd})
+        table_restamp.append({"table": tname, "expression": qd,
+                              "calc_columns": owned_calc_columns})
+
+    # Tables that are BOTH a calculated table and a calc-column owner: their
+    # calculated columns are stamped separately and must carry the calc-table
+    # system flag, which an ordinary calculated column does not.
+    calc_table_owners = {s["table"] for s in table_restamp
+                         if s.get("calc_columns")}
 
     # --- existing calculated COLUMNS: re-evaluate from their DAX ---
     existing = conn.execute(
@@ -10141,9 +10333,13 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
         "FROM [Column] c JOIN [Table] t ON c.TableID = t.ID "
         "WHERE c.Type = 2 AND t.ModelID = 1 "
         "AND c.ExplicitName NOT LIKE 'RowNumber%'").fetchall()
+    dropped = {t.lower(): {c.lower() for c in cols}
+               for t, cols in (drop_columns or {}).items()}
     calc_by_table: dict[str, list[dict]] = {}
     for r in existing:
         if r["tbl"].lower() in skip:
+            continue
+        if (r["col"] or "").lower() in dropped.get(r["tbl"].lower(), ()):
             continue
         bad = calc_column_unsupported_reason(r["expr"] or "", r["tbl"])
         if bad:
@@ -10154,6 +10350,12 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
                 f"refused.")
         calc_by_table.setdefault(r["tbl"], []).append(
             {"column": r["col"], "expression": r["expr"]})
+    # A table losing its LAST calculated column still has to be re-supplied, or
+    # the rebuild guard sees a table that carries Type=2 columns and is not in
+    # table_updates, and refuses the very edit that removes them.
+    for tname in (drop_columns or {}):
+        if tname.lower() not in skip:
+            calc_by_table.setdefault(tname, [])
     for tname, specs in (extra_columns or {}).items():
         if tname in table_updates and any(
                 s["table"] == tname for s in table_restamp):
@@ -10201,6 +10403,9 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
         # the partition's Enter-data M — Power BI recomputes them from DAX.
         table_updates[tname] = {"columns": cols_out, "rows": rows_out,
                                 "calc_columns": [r["column"] for r in restamp]}
+        if tname in calc_table_owners:
+            for spec in restamp:
+                spec["system_flags"] = 2
         column_restamp.extend(restamp)
 
     return table_updates, column_restamp, table_restamp
