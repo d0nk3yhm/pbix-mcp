@@ -49,6 +49,7 @@ from pbix_mcp.errors import (
     UnsupportedModelEditError,
 )
 from pbix_mcp.logging_config import logger
+from pbix_mcp.models import responses as _responses
 from pbix_mcp.models.requests import DimensionRef, FilterContext
 from pbix_mcp.models.responses import DAXEvalResponse, DAXResult, ToolResponse
 
@@ -7312,6 +7313,298 @@ def _apply_calculated_table_metadata(
     return _modify_metadata_only(dm_path, _do_apply)
 
 
+# AMO ObjectType, as used by [Annotation].ObjectType and friends. Derived
+# empirically rather than from documentation: across the 24-report corpus, all
+# 4,345 (ObjectID, ObjectType) pairs resolved to exactly one entity table each,
+# with no ObjectType matching two candidates and none left unmatched.
+_AMO_OBJECT_TYPE = {
+    1: "Model", 3: "Table", 4: "Column", 7: "Relationship",
+    8: "Measure", 9: "Hierarchy", 12: "KPI", 41: "Expression",
+}
+
+# Model metadata the from-scratch builder never emits. Each entry is
+# (table, {fk_column: kind}, identity_columns). ``kind`` says how to translate
+# an ID across the rebuild:
+#   "model"/"culture"  — the singleton row
+#   "table"/"column"/"measure"/"hierarchy"/"relationship"/"expression"/"kpi"
+#                      — resolved by NAME, since IDs are reassigned
+#   "object"           — an (ObjectID, ObjectType) pair; the sibling
+#                        ObjectType column names the entity
+#   "self:<Table>"     — a row carried earlier in this same pass
+# ``identity_columns`` are compared against what the rebuild already wrote, so
+# a row the builder reproduced on its own is never duplicated.
+#
+# Order matters: parents precede the children that reference them.
+_CARRY_SPEC: list[tuple[str, dict[str, str], tuple[str, ...]]] = [
+    ("Expression", {"ModelID": "model",
+                    "ParameterValuesColumnID": "column?"}, ("Name",)),
+    ("DataSource", {"ModelID": "model"}, ("Name",)),
+    ("LinguisticMetadata", {"CultureID": "culture"}, ("CultureID",)),
+    ("Perspective", {"ModelID": "model"}, ("Name",)),
+    ("PerspectiveTable", {"PerspectiveID": "self:Perspective",
+                          "TableID": "table"}, ("PerspectiveID", "TableID")),
+    ("PerspectiveColumn", {"PerspectiveTableID": "self:PerspectiveTable",
+                           "ColumnID": "column"},
+     ("PerspectiveTableID", "ColumnID")),
+    ("PerspectiveMeasure", {"PerspectiveTableID": "self:PerspectiveTable",
+                            "MeasureID": "measure"},
+     ("PerspectiveTableID", "MeasureID")),
+    ("PerspectiveHierarchy", {"PerspectiveTableID": "self:PerspectiveTable",
+                              "HierarchyID": "hierarchy"},
+     ("PerspectiveTableID", "HierarchyID")),
+    ("KPI", {"MeasureID": "measure"}, ("MeasureID",)),
+    ("RelatedColumnDetails", {"ColumnID": "column"}, ("ColumnID",)),
+    ("GroupByColumn", {"RelatedColumnDetailsID": "self:RelatedColumnDetails",
+                       "GroupingColumnID": "column"},
+     ("RelatedColumnDetailsID", "GroupingColumnID")),
+    ("Variation", {"ColumnID": "column", "RelationshipID": "relationship",
+                   "DefaultHierarchyID": "hierarchy?",
+                   "DefaultColumnID": "column?"}, ("ColumnID", "Name")),
+    ("FormatStringDefinition", {"ObjectID": "object"},
+     ("ObjectID", "ObjectType")),
+    ("Annotation", {"ObjectID": "object"}, ("ObjectID", "ObjectType", "Name")),
+    ("ExtendedProperty", {"ObjectID": "object"},
+     ("ObjectID", "ObjectType", "Name")),
+    ("ChangedProperty", {"ObjectID": "object"},
+     ("ObjectID", "ObjectType", "Property")),
+]
+
+# What each carried table means to someone using the report, for the warning
+# text. "Annotation: 130 rows" tells a user nothing.
+_CARRY_MEANING = {
+    "Expression": "shared M expressions / query parameters",
+    "DataSource": "declared data sources",
+    "LinguisticMetadata": "Q&A synonyms and phrasings",
+    "Perspective": "perspectives",
+    "PerspectiveTable": "perspectives",
+    "PerspectiveColumn": "perspectives",
+    "PerspectiveMeasure": "perspectives",
+    "PerspectiveHierarchy": "perspectives",
+    "KPI": "KPI definitions on measures",
+    "RelatedColumnDetails": "column grouping",
+    "GroupByColumn": "column grouping",
+    "Variation": "auto date/time drill-down wired to a date column",
+    "FormatStringDefinition": "dynamic format strings",
+    "Annotation": "annotations",
+    "ExtendedProperty": "extended properties",
+    "ChangedProperty": "changed-property bookkeeping",
+}
+
+
+def _identity_maps(conn: sqlite3.Connection) -> tuple[dict, dict]:
+    """Build (id -> identity, identity -> id) for every referencable entity.
+
+    A rebuild reassigns every primary key, so a carried row's foreign keys are
+    meaningless as numbers. Names survive; these maps translate between the two.
+    Columns are keyed on ``COALESCE(ExplicitName, InferredName)`` because
+    calculated-table and auto-date columns leave ExplicitName NULL.
+    """
+    fwd: dict[int, tuple] = {}
+    rev: dict[tuple, int] = {}
+
+    def _put(oid, ident):
+        if oid is None or ident is None:
+            return
+        fwd[oid] = ident
+        rev.setdefault(ident, oid)
+
+    for r in conn.execute("SELECT ID FROM [Model]"):
+        _put(r[0], ("Model",))
+    for r in conn.execute("SELECT ID FROM [Culture]"):
+        _put(r[0], ("Culture",))
+    for r in conn.execute("SELECT ID, Name FROM [Table] WHERE ModelID = 1"):
+        _put(r[0], ("Table", r[1]))
+    for r in conn.execute(
+        "SELECT c.ID, t.Name, COALESCE(c.ExplicitName, c.InferredName) "
+        "FROM [Column] c JOIN [Table] t ON c.TableID = t.ID "
+        "WHERE t.ModelID = 1"
+    ):
+        _put(r[0], ("Column", r[1], r[2]))
+    for r in conn.execute(
+        "SELECT m.ID, t.Name, m.Name FROM [Measure] m "
+        "JOIN [Table] t ON m.TableID = t.ID WHERE t.ModelID = 1"
+    ):
+        _put(r[0], ("Measure", r[1], r[2]))
+    try:
+        for r in conn.execute(
+            "SELECT h.ID, t.Name, h.Name FROM [Hierarchy] h "
+            "JOIN [Table] t ON h.TableID = t.ID WHERE t.ModelID = 1"
+        ):
+            _put(r[0], ("Hierarchy", r[1], r[2]))
+    except sqlite3.Error:
+        pass
+    try:
+        for r in conn.execute(
+            "SELECT k.ID, t.Name, m.Name FROM [KPI] k "
+            "JOIN [Measure] m ON k.MeasureID = m.ID "
+            "JOIN [Table] t ON m.TableID = t.ID"
+        ):
+            _put(r[0], ("KPI", r[1], r[2]))
+    except sqlite3.Error:
+        pass
+    try:
+        for r in conn.execute("SELECT ID, Name FROM [Expression]"):
+            _put(r[0], ("Expression", r[1]))
+    except sqlite3.Error:
+        pass
+    # A relationship has no name; its endpoints are its identity.
+    try:
+        for r in conn.execute(
+            "SELECT r.ID, ft.Name, COALESCE(fc.ExplicitName, fc.InferredName), "
+            "       tt.Name, COALESCE(tc.ExplicitName, tc.InferredName) "
+            "FROM [Relationship] r "
+            "JOIN [Column] fc ON r.FromColumnID = fc.ID "
+            "JOIN [Table] ft ON fc.TableID = ft.ID "
+            "JOIN [Column] tc ON r.ToColumnID = tc.ID "
+            "JOIN [Table] tt ON tc.TableID = tt.ID"
+        ):
+            _put(r[0], ("Relationship", r[1], r[2], r[3], r[4]))
+    except sqlite3.Error:
+        pass
+    return fwd, rev
+
+
+def _snapshot_carryable_metadata(conn: sqlite3.Connection) -> dict:
+    """Capture the model metadata a from-scratch rebuild would discard.
+
+    The builder writes only [Table], [Column], [Partition], [Relationship] and
+    [Measure]; everything else in metadata.sqlitedb is lost. Each row is stored
+    with its foreign keys already translated into name-based identities, so it
+    can be re-attached after the rebuild has renumbered every ID.
+    """
+    conn.row_factory = sqlite3.Row
+    fwd, _rev = _identity_maps(conn)
+    snap: dict[str, list[dict]] = {}
+    for tname, fks, _identity in _CARRY_SPEC:
+        try:
+            rows = conn.execute(f"SELECT * FROM [{tname}]").fetchall()
+        except sqlite3.Error:
+            continue
+        kept = []
+        for row in rows:
+            d = dict(row)
+            ok = True
+            for col, kind in fks.items():
+                if col not in d:
+                    continue
+                val = d[col]
+                if val in (None, 0):
+                    d[col] = None
+                    continue
+                if kind.startswith("self:"):
+                    d[col] = ("#self", kind[5:], val)
+                    continue
+                ident = fwd.get(val)
+                if ident is None:
+                    if kind.endswith("?"):
+                        d[col] = None
+                        continue
+                    ok = False
+                    break
+                d[col] = ("#ref",) + ident
+            if ok:
+                kept.append(d)
+        if kept:
+            snap[tname] = kept
+    return snap
+
+
+def _restore_carryable_metadata(dm_path: str, snap: dict) -> list[str]:
+    """Re-attach snapshotted metadata after a rebuild. Returns what was lost.
+
+    Fail-safe by construction: a row whose owner no longer exists (a deleted
+    table, a renamed column) is SKIPPED and reported, never written with a
+    dangling foreign key. A half-attached model is worse than a missing
+    annotation.
+    """
+    if not snap:
+        return []
+    dropped: dict[str, int] = {}
+
+    def _do(conn: sqlite3.Connection):
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        _fwd, rev = _identity_maps(conn)
+        row = c.execute(
+            "SELECT Value FROM DBPROPERTIES WHERE Name = 'MAXID'").fetchone()
+        max_id = int(row[0]) if row else 0
+        remap: dict[str, dict[int, int]] = {}
+
+        for tname, fks, identity in _CARRY_SPEC:
+            rows = snap.get(tname)
+            if not rows:
+                continue
+            try:
+                cols = [r[1] for r in c.execute(f"PRAGMA table_info([{tname}])")]
+            except sqlite3.Error:
+                continue
+            if not cols:
+                continue
+            for d in rows:
+                resolved = {}
+                ok = True
+                for col in cols:
+                    if col not in d:
+                        continue
+                    val = d[col]
+                    if isinstance(val, tuple) and val and val[0] == "#ref":
+                        new = rev.get(tuple(val[1:]))
+                        if new is None:
+                            ok = fks.get(col, "").endswith("?")
+                            if not ok:
+                                break
+                            new = None
+                        resolved[col] = new
+                    elif isinstance(val, tuple) and val and val[0] == "#self":
+                        new = remap.get(val[1], {}).get(val[2])
+                        if new is None:
+                            ok = False
+                            break
+                        resolved[col] = new
+                    else:
+                        resolved[col] = val
+                if not ok:
+                    dropped[tname] = dropped.get(tname, 0) + 1
+                    continue
+
+                # Never duplicate what the rebuild already reproduced.
+                where = " AND ".join(
+                    f"[{k}] IS ?" for k in identity if k in resolved)
+                if where:
+                    dup = c.execute(
+                        f"SELECT ID FROM [{tname}] WHERE {where}",
+                        [resolved[k] for k in identity if k in resolved],
+                    ).fetchone()
+                    if dup:
+                        remap.setdefault(tname, {})[d["ID"]] = dup["ID"]
+                        continue
+
+                max_id += 1
+                old_id = d.get("ID")
+                resolved["ID"] = max_id
+                names = [k for k in cols if k in resolved]
+                c.execute(
+                    f"INSERT INTO [{tname}] ({','.join('[' + n + ']' for n in names)}) "
+                    f"VALUES ({','.join('?' for _ in names)})",
+                    [resolved[n] for n in names],
+                )
+                if old_id is not None:
+                    remap.setdefault(tname, {})[old_id] = max_id
+
+        c.execute("UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'",
+                  (str(max_id),))
+        conn.commit()
+
+    _modify_metadata_only(dm_path, _do)
+
+    out = []
+    for tname, n in sorted(dropped.items(), key=lambda kv: -kv[1]):
+        meaning = _CARRY_MEANING.get(tname, tname)
+        out.append(f"{n} {tname} row(s) could not be re-attached ({meaning}) — "
+                   f"the object they referenced no longer exists after the edit")
+    return out
+
+
 def _rebuild_datamodel(
     info: dict,
     table_updates: dict[str, dict] | None = None,
@@ -7322,6 +7615,7 @@ def _rebuild_datamodel(
     remove_relationships: list[tuple[str, str, str, str]] | None = None,
     calc_authoring: bool = False,
     restamp_calc_tables: set[str] | None = None,
+    lost_report: list[str] | None = None,
 ) -> tuple[int, int]:
     """Rebuild the entire DataModel using the builder pipeline.
 
@@ -7351,6 +7645,12 @@ def _rebuild_datamodel(
     remove_tables = remove_tables or set()
     remove_relationships = remove_relationships or []
     restamp_calc_tables = restamp_calc_tables or set()
+    # Anything the rebuild cannot carry across is collected here and surfaced
+    # to the caller. A rebuild used to drop perspectives, Q&A metadata, dynamic
+    # format strings and shared M expressions while reporting success with an
+    # empty warnings list; silence is the part that made it dangerous.
+    lost_metadata: list[str] = []
+    _responses.clear_pending_warnings()
 
     dm_path = os.path.join(info["work_dir"], "DataModel")
     with open(dm_path, "rb") as f:
@@ -7534,7 +7834,14 @@ def _rebuild_datamodel(
         ):
             levels = []
             for lrow in conn.execute(
-                "SELECT l.Name, c.ExplicitName as ColName FROM Level l "
+                # COALESCE, not ExplicitName: a calculated-table or auto-date
+                # column carries its name in InferredName and leaves
+                # ExplicitName NULL. Reading only ExplicitName produced levels
+                # with no column, and the hierarchy was then dropped in
+                # silence — it cost Agents_Performance.pbix both of its date
+                # hierarchies on an edit that reported success.
+                "SELECT l.Name, COALESCE(c.ExplicitName, c.InferredName) "
+                "       AS ColName FROM Level l "
                 "JOIN [Column] c ON l.ColumnID = c.ID "
                 "JOIN Hierarchy h ON l.HierarchyID = h.ID "
                 "JOIN [Table] t ON h.TableID = t.ID "
@@ -7542,12 +7849,19 @@ def _rebuild_datamodel(
                 (hrow["Name"], hrow["TableName"]),
             ):
                 levels.append({"name": lrow["Name"], "column": lrow["ColName"]})
-            if levels:
+            if levels and all(lv["column"] for lv in levels):
                 user_hierarchies.append({
                     "table": hrow["TableName"],
                     "name": hrow["Name"],
                     "levels": levels,
                 })
+            else:
+                # Losing a drill-down hierarchy is visible to anyone using the
+                # report, so it is never silent.
+                lost_metadata.append(
+                    f"hierarchy '{hrow['TableName']}'[{hrow['Name']}] could not "
+                    f"be reproduced (a level references a column the rebuild "
+                    f"cannot name) — the drill-down is gone from the model")
 
         # Get existing RLS roles
         rls_roles = []
@@ -7567,6 +7881,10 @@ def _rebuild_datamodel(
                     "table_name": p["TableName"],
                     "filter_expression": p["FilterExpression"],
                 })
+
+        # Capture everything the builder does not emit, while the pre-rebuild
+        # IDs are still meaningful.
+        carry_snapshot = _snapshot_carryable_metadata(conn)
 
         conn.close()
     finally:
@@ -7683,6 +8001,14 @@ def _rebuild_datamodel(
     with open(dm_path, "wb") as f:
         f.write(new_dm)
 
+    # Re-attach the model metadata the builder does not emit (perspectives,
+    # Q&A, KPIs, dynamic format strings, shared M expressions, auto-date
+    # variations, annotations). Snapshotted before the rebuild with every
+    # foreign key expressed by name, because the rebuild renumbers every ID.
+    if carry_snapshot:
+        lost_metadata.extend(
+            _restore_carryable_metadata(dm_path, carry_snapshot))
+
     # Re-apply RLS roles (builder doesn't support them, so splice after rebuild)
     if rls_roles:
         def _restore_rls(conn: sqlite3.Connection):
@@ -7734,6 +8060,11 @@ def _rebuild_datamodel(
 
     # Clear DAX cache — rebuild changes data
     _dax_cache.clear()
+
+    if lost_report is not None:
+        lost_report.extend(lost_metadata)
+    for msg in lost_metadata:
+        _responses.add_pending_warning(msg)
 
     return len(dm_bytes), new_size
 

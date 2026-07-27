@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast tests (853 pass, 10 skip, 78 slow/integration deselected)
+# Fast tests (857 pass, 10 skip, 84 slow/integration deselected)
 pytest -m "not slow"
 
 # With coverage
@@ -47,6 +47,7 @@ PBIX_TEST_SAMPLES=test_corpus pytest -v
 | `test_pbir_roundtrip.py` | PBIR state outside the pages tree + real-corpus fidelity | 31 (8 slow, need the corpus) |
 | `test_doctor_integrity.py` | Doctor report-definition checks: fires on broken, quiet on real | 39 (24 slow, need the corpus) |
 | `test_dax_silent_wrong.py` | DAX that returned a wrong value rather than an error | 24 |
+| `test_rebuild_metadata_preservation.py` | Model metadata a rebuild must not silently destroy | 10 (6 slow, need the corpus) |
 
 ## Public Test Corpus
 
