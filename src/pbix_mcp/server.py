@@ -32,7 +32,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except ModuleNotFoundError as _exc:  # pragma: no cover - import-time guard
+    # mcp 2.0 dropped mcp.server.fastmcp (the server API is now
+    # mcp.server.mcpserver). pyproject pins mcp<2, so this only fires when the
+    # bound is overridden -- say a bare `pip install mcp -U` in an existing
+    # environment. Say which package is wrong instead of a bare
+    # "No module named 'mcp.server.fastmcp'".
+    raise ImportError(
+        "pbix-mcp requires the mcp 1.x server API (mcp.server.fastmcp), which "
+        "mcp 2.0 removed. Install a compatible version with "
+        "`pip install 'mcp>=1.0.0,<2'`."
+    ) from _exc
 
 from pbix_mcp.errors import (
     ABFRebuildError,

@@ -1004,7 +1004,14 @@ class PBIXBuilder:
                     f"CRITICAL: Measure '{m['name']}' references "
                     f"non-existent table '{m['table']}'"
                 )
-            expr = m.get("expression", "")
+            # `or ""`, not a dict default: the default only applies when the
+            # key is ABSENT, and a measure carried over from a real model can
+            # have the key present with value None. Power BI Desktop writes
+            # exactly that for a measure created but never given an expression
+            # (test_corpus/MS_Life_Expectancy.pbix has two, named "Measure" and
+            # "Measure 2"). The subsequent expr.upper() then failed the whole
+            # edit with a bare "'NoneType' object has no attribute 'upper'".
+            expr = m.get("expression") or ""
             # A VAR named after a DAX function or reserved keyword compiles in
             # our lenient engine but makes Analysis Services fail the visual in
             # the Power BI service ("Failed to resolve name 'SYNTAXERROR'").
@@ -2519,7 +2526,12 @@ def _modify_metadata_and_encode(
             m_id = alloc.next()
             m_data_type = mdef.get("data_type")
             if not m_data_type:
-                m_data_type = infer_measure_data_type(mdef["expression"])
+                # A measure Desktop created but never gave an expression has
+                # Expression NULL; inferring a type from it must not crash.
+                # The NULL itself is written through unchanged below, which is
+                # what the source model had.
+                m_data_type = infer_measure_data_type(
+                    mdef.get("expression") or "")
             c.execute(
                 """INSERT INTO [Measure] (
                     ID, TableID, Name, Description, DataType,
@@ -2538,7 +2550,10 @@ def _modify_metadata_and_encode(
                 )""",
                 (m_id, tid, mdef["name"], mdef.get("description", ""),
                  m_data_type,
-                 mdef["expression"],
+                 # NULL when the source measure had none, which is exactly what
+                 # Desktop stores for a placeholder measure. Subscripting here
+                 # raised KeyError for a spec that simply omitted the key.
+                 mdef.get("expression"),
                  mdef.get("format_string") or None,
                  _FIXED_TIMESTAMP, _FIXED_TIMESTAMP,
                  mdef.get("data_category") or None,

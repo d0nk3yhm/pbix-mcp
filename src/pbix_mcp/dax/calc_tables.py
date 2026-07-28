@@ -175,7 +175,7 @@ def _evaluate_calculated_columns(
             continue
 
         # Strip comments from expression
-        clean_expr = re.sub(r'--[^\n]*', '', expr)
+        clean_expr = strip_dax_comments(expr)
         clean_expr = re.sub(r'//[^\n]*', '', clean_expr)
         clean_expr = clean_expr.strip()
 
@@ -303,7 +303,7 @@ def calc_column_unsupported_reason(expression: str, target_table: str,
     It lets an aggregate over a misspelled column be refused instead of quietly
     answering 0; callers without the list simply lose that one check.
     """
-    e = re.sub(r"--[^\n]*|//[^\n]*", "", expression or "")
+    e = strip_dax_comments(expression)
     if not e.strip():
         return "expression is empty"
     for quoted, bare in _CALC_REF_RE.findall(e):
@@ -344,11 +344,20 @@ def calc_column_unsupported_reason(expression: str, target_table: str,
         arg = _agg_column_arg(call)
         fname = call[:call.find("(")].strip().upper()
         if arg is None:
+            # MIN/MAX also have a SCALAR overload, MIN(<expr1>, <expr2>). With
+            # no column reference anywhere inside it there is nothing for the
+            # row substitution to reach and nothing to mask, so it is just
+            # arithmetic over literals and VARs -- which is how Power BI's own
+            # binning clamps a bin number: MIN(__BinNumber, __Count - 1).
+            # A column reference inside it is the dangerous case and still goes.
+            if not _refs_any_column(call):
+                continue
             return (
                 f"'{fname}' is used with something other than a single column "
                 f"of '{target_table}'. Only the whole-column form, e.g. "
                 f"{fname}('{target_table}'[Column]), is supported — the "
-                f"two-argument scalar form and table arguments are not."
+                f"two-argument scalar form over columns and table arguments "
+                f"are not."
             )
         tbl, col = arg
         if tbl and tbl.lower() != target_table.lower():
@@ -416,6 +425,46 @@ def _agg_column_arg(call: str):
     if not m:
         return None
     return (m.group(1) or m.group(2)), m.group(3)
+
+
+def strip_dax_comments(expr: str) -> str:
+    """Remove ``--`` and ``//`` line comments and ``/* */`` blocks.
+
+    Comment markers INSIDE a string literal are left alone. Stripping with a
+    plain regex deleted the rest of the line whenever a value contained one --
+    a URL ("https://..."), an ISO range ("2024-01--2024-06"), a double dash in
+    prose -- taking whole column references with it. The expression still
+    evaluated, to a plausible wrong value, and the unresolved-reference check
+    could not help because it only ever sees the text AFTER stripping: the
+    reference was already gone.
+    """
+    text = expr or ""
+    # Locate markers on a copy whose string literals are blanked, then cut from
+    # the ORIGINAL at those offsets.
+    shadow = _STRING_LITERAL.sub(
+        lambda m: '"' + "\x01" * (len(m.group(0)) - 2) + '"', text)
+    out, i = [], 0
+    while i < len(text):
+        line_cut = None
+        for marker in ("--", "//"):
+            p = shadow.find(marker, i)
+            if p >= 0 and (line_cut is None or p < line_cut):
+                line_cut = p
+        block = shadow.find("/*", i)
+        if block >= 0 and (line_cut is None or block < line_cut):
+            end = shadow.find("*/", block + 2)
+            out.append(text[i:block])
+            i = len(text) if end < 0 else end + 2
+            continue
+        if line_cut is None:
+            out.append(text[i:])
+            break
+        nl = shadow.find("\n", line_cut)
+        out.append(text[i:line_cut])
+        if nl < 0:
+            break
+        i = nl
+    return "".join(out)
 
 
 def _agg_shadow(expr: str) -> str:
@@ -531,7 +580,7 @@ def evaluate_row_context_column(
     """
     from pbix_mcp.dax import engine as dax_engine
 
-    clean = re.sub(r"--[^\n]*|//[^\n]*", "", expression or "").strip()
+    clean = strip_dax_comments(expression).strip()
     engine = dax_engine.DAXEngine()
     values: list = []
     unresolved: set = set()
@@ -613,7 +662,7 @@ _CALC_TABLE_FUNC_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_\.]*)\s*\(")
 
 def calc_table_unsupported_reason(expression: str) -> Optional[str]:
     """Return why a calc-table expression can't be materialized, or None."""
-    e = re.sub(r"--[^\n]*|//[^\n]*", "", expression or "")
+    e = strip_dax_comments(expression)
     if not e.strip():
         return "expression is empty"
     for fn in _CALC_TABLE_FUNC_RE.findall(e):
@@ -642,7 +691,7 @@ def evaluate_calc_table_expression(
     """
     from pbix_mcp.dax import engine as dax_engine
 
-    clean = re.sub(r"--[^\n]*|//[^\n]*", "", expression or "").strip()
+    clean = strip_dax_comments(expression).strip()
     engine = dax_engine.DAXEngine()
     ctx = dax_engine.DAXContext(
         tables, measures or {}, None, None, None, relationships or [])
@@ -717,7 +766,7 @@ def _evaluate_table_expression(
     """Evaluate a single calculated table DAX expression."""
 
     # Strip comments
-    clean = re.sub(r'--[^\n]*', '', expr)
+    clean = strip_dax_comments(expr)
     clean = re.sub(r'//[^\n]*', '', clean)
     clean = clean.strip()
 

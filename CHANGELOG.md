@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.53] - 2026-07-28
+
+**Two ways an ordinary text value was silently destroyed**, both found by an adversarial review of the calculated-column path and both confirmed by three independent attempts to refute them.
+
+### A double quote in the data deleted the whole value
+
+DAX escapes a quote by **doubling** it, so `6" pipe` is written `"6"" pipe"` — four quote characters. The literal parser required exactly two, so any such value fell through the string branch and came back **BLANK**:
+
+```
+Sales[Product] = ['6" pipe', 'plain']
+Label = Sales[Product] & " x"
+
+before:  [' x',        'plain x']     <- the entire value vanished
+after:   ['6" pipe x', 'plain x']
+```
+
+Nothing surfaced it: the reference resolved, so the unresolved-reference check was silent, and other rows were non-blank, so the all-blank net never fired. Any inch mark, dimension (`10" x 4"`) or quoted phrase in a text column was affected.
+
+### `//` or `--` inside a string truncated the expression
+
+Comments were stripped with a plain regex over the raw text, with no awareness of string literals. A URL, an ISO range, or a double dash in prose therefore deleted the rest of the line — **including whole column references**:
+
+```
+'T'[A] & "https://x" & 'T'[B]
+before:  ['x', 'p']            <- the & 'T'[B] term was deleted outright
+after:   ['xhttps://xy', 'phttps://xq']
+```
+
+The unresolved-reference check was structurally unable to catch this, because it only ever sees the text *after* stripping — by which point the reference is already gone. Comment removal is now literal-aware, and handles `/* */` blocks, which were not stripped at all.
+
+### A measure with no expression failed the whole edit
+
+Power BI Desktop writes `Expression NULL` for a measure you create and never fill in — `MS_Life_Expectancy.pbix` has two, literally named `Measure` and `Measure 2`. The pre-build validator read it with `m.get("expression", "")`, whose default applies only when the **key is absent**, so a present-but-`None` value reached `.upper()` and failed the edit with a bare:
+
+```
+'NoneType' object has no attribute 'upper'
+```
+
+No file name, no measure name, nothing to act on. The builder's INSERT also subscripted the key directly, raising `KeyError` when a caller simply omitted it. Both now tolerate a missing or null expression, and the `NULL` is written through unchanged — which is what the source model had.
+
+Like the `MS_Employee_Hiring` multi-segment decode failure, this is a **pre-existing defect that became reachable** once the file's calculated columns stopped being refused, not a new one.
+
+### `pip install pbix-mcp` was broken by mcp 2.0
+
+The dependency was declared as an unbounded `mcp>=1.0.0`. **mcp 2.0.0 removed `mcp.server.fastmcp` entirely** — the server API is now `mcp.server.mcpserver` — so every fresh install after that release resolved to a version this package cannot import:
+
+```
+ModuleNotFoundError: No module named 'mcp.server.fastmcp'
+```
+
+This is what turned CI red across all eight matrix cells. Bounded to `mcp>=1.0.0,<2`, which states the truth: the code is written against the 1.x FastMCP API. Overriding the bound now raises a message naming the package and the fix rather than a bare `ModuleNotFoundError`. Porting to the 2.x API is separate work.
+
+### The narrowed aggregate gate, continued
+
+`MIN`/`MAX` also have a **scalar** overload, `MIN(<expr1>, <expr2>)`. It is now allowed when neither argument reads a column — that is just arithmetic over literals and VARs, and is how Power BI's own binning clamps a bin number (`MIN(__BinNumber, __Count - 1)`, which appears in three columns of `MS_Life_Expectancy.pbix`). With a column reference inside it, it stays refused: that is the form that returned 0 on every row.
+
 ## [0.9.52] - 2026-07-28
 
 **A blank compared against a number took the wrong branch, 11% of every model's data columns were silently dropped when read, and the calculated-column gate now allows plain aggregates.** All three found by comparing our output against Power BI Desktop's own engine over the corpus.
