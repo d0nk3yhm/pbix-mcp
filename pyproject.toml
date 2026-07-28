@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pbix-mcp"
-version = "0.9.52"
+version = "0.9.53"
 description = "MCP server for creating, reading, writing, and evaluating Power BI .pbix/.pbit files — no Power BI Desktop required"
 readme = "README.md"
 license = "MIT"
@@ -26,7 +26,13 @@ classifiers = [
 ]
 
 dependencies = [
-    "mcp>=1.0.0",
+    # The MCP server is built on FastMCP, which lives at mcp.server.fastmcp in
+    # the 1.x line. mcp 2.0 removed that module entirely (the server API is now
+    # mcp.server.mcpserver), so an unbounded ">=1.0.0" silently resolved to a
+    # release this package cannot import at all: every `pip install pbix-mcp`
+    # after mcp 2.0.0 shipped produced ModuleNotFoundError on first use. Porting
+    # to the 2.x API is real work; until then the bound states the truth.
+    "mcp>=1.0.0,<2",
     "xpress9",
     "xmhuffman>=0.3.0",
     "pydantic>=2.0",

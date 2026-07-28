@@ -75,6 +75,11 @@ def _as_number(v):
     return None
 
 
+# A whole expression that is exactly one DAX string literal. Interior quotes
+# must be DOUBLED, which is how DAX escapes them.
+_FULL_STRING_LITERAL = re.compile(r'^"(?:[^"]|"")*"$')
+
+
 def _as_date(v):
     """Best-effort date coercion from a value or ISO-ish string."""
     if isinstance(v, datetime):
@@ -1060,9 +1065,14 @@ class DAXEngine:
             if wraps_all:
                 return self._eval_expr(expr[1:-1].strip(), ctx, var_scope)
 
-        # String literal
-        if expr.startswith('"') and expr.endswith('"') and expr.count('"') == 2:
-            return expr[1:-1]
+        # String literal. DAX escapes a quote by DOUBLING it, so the literal for
+        # 6" pipe is "6"" pipe" -- four quote characters. Requiring exactly two
+        # rejected every such literal, which then fell through to be parsed as
+        # something else and came back BLANK. That silently deleted any text
+        # value containing a double quote (inches, "10\" x 4\"", a quoted
+        # phrase) when a calculated column referenced it.
+        if _FULL_STRING_LITERAL.match(expr):
+            return expr[1:-1].replace('""', '"')
 
         # Numeric literal (incl. scientific notation: 1e6, 2.5E-3)
         try:

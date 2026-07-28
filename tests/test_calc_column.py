@@ -406,3 +406,48 @@ class TestAddCalculatedColumn:
                 os.unlink(tmp)
         finally:
             server.pbix_close(alias)
+
+
+class TestMeasureWithNoExpression:
+    """Power BI Desktop writes Expression NULL for a measure never given one.
+
+    `test_corpus/MS_Life_Expectancy.pbix` has two, literally named "Measure"
+    and "Measure 2" — the placeholders Desktop creates when you click New
+    measure and click away. The pre-build validator read the expression with
+    `m.get("expression", "")`, whose default applies only when the KEY IS
+    ABSENT, so a present-but-None value reached `.upper()` and failed the whole
+    edit with a bare `'NoneType' object has no attribute 'upper'` — no file
+    name, no measure name, nothing to act on.
+
+    The file only reached the builder once its calculated columns stopped being
+    refused, so this is a pre-existing defect that became reachable rather than
+    a new one.
+    """
+
+    def _model(self):
+        b = PBIXBuilder("T")
+        b.add_table("S", [{"name": "A", "data_type": "Int64"}],
+                    [{"A": 1}, {"A": 2}])
+        return b
+
+    def test_validate_does_not_crash(self):
+        b = self._model()
+        b._measures.append({"table": "S", "name": "Measure",
+                            "expression": None})
+        assert b.validate() == []
+
+    def test_build_succeeds(self):
+        b = self._model()
+        b._measures.append({"table": "S", "name": "Measure",
+                            "expression": None})
+        assert len(b.build()) > 0
+
+    def test_an_absent_expression_key_still_works(self):
+        """The original `.get(..., "")` case must keep working."""
+        b = self._model()
+        b._measures.append({"table": "S", "name": "Measure"})
+        assert b.validate() == []
+
+    def test_infer_type_tolerates_an_empty_expression(self):
+        from pbix_mcp.builder import infer_measure_data_type
+        assert infer_measure_data_type("") in (2, 8)

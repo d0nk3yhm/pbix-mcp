@@ -479,3 +479,66 @@ class TestBlankDoesNotPropagateThroughAComparison:
         assert err is None, err
         # the blank row lands in "low" with Desktop, not "high"
         assert vals == ["low", "low", "mid", "high"]
+
+
+class TestStringLiteralsAreNotTornApart:
+    """Two ways a perfectly ordinary text value was silently destroyed.
+
+    Both were found by an adversarial review of the calculated-column path and
+    both survived 3-of-3 independent attempts to refute them.
+    """
+
+    @staticmethod
+    def _eval(cols, rows, expr, table="T"):
+        from pbix_mcp.dax.calc_tables import evaluate_row_context_column
+        tables = {table: {"columns": cols, "rows": [list(r) for r in rows]}}
+        return evaluate_row_context_column(cols, rows, expr, table, tables, [])
+
+    @pytest.mark.parametrize("expr,want", [
+        ('\'T\'[A] & "u//v" & \'T\'[B]', ["xu//vy", "pu//vq"]),
+        ('\'T\'[A] & "a--b" & \'T\'[B]', ["xa--by", "pa--bq"]),
+        ('\'T\'[A] & "https://x" & \'T\'[B]', ["xhttps://xy", "phttps://xq"]),
+    ])
+    def test_comment_markers_inside_a_string_are_not_comments(self, expr, want):
+        """`--` and `//` inside a literal deleted the rest of the expression.
+
+        Comments were stripped with a plain regex over the raw text, so a URL,
+        an ISO range, or a double dash in prose truncated the line -- taking
+        whole column references with it. The expression still evaluated, to a
+        plausible wrong value, and the unresolved-reference check could not
+        help: it only sees the text AFTER stripping, by which point the
+        reference is already gone.
+        """
+        vals, err = self._eval(["A", "B"], [["x", "y"], ["p", "q"]], expr)
+        assert err is None, err
+        assert vals == want
+
+    @pytest.mark.parametrize("expr,want", [
+        ("1 + 2 // trailing", "1 + 2 "),
+        ("1 -- note\n+ 2", "1 \n+ 2"),
+        ("/* block */ 5", " 5"),
+    ])
+    def test_real_comments_are_still_removed(self, expr, want):
+        """Guards the guard: the fix must not stop stripping actual comments."""
+        from pbix_mcp.dax.calc_tables import strip_dax_comments
+        assert strip_dax_comments(expr) == want
+
+    def test_a_double_quote_in_the_data_survives(self):
+        """DAX escapes a quote by DOUBLING it, so `6" pipe` is `"6"" pipe"`.
+
+        The literal parser required exactly two quote characters, so any such
+        value fell through and came back BLANK -- deleting inches, dimensions
+        and any quoted phrase from a calculated column that referenced it.
+        """
+        vals, err = self._eval(
+            ["Product"], [['6" pipe'], ["plain"], ['10" x 4"']],
+            '\'T\'[Product] & " x"')
+        assert err is None, err
+        assert vals == ['6" pipe x', "plain x", '10" x 4" x']
+
+    def test_a_lone_string_literal_with_escaped_quotes_evaluates(self):
+        from pbix_mcp.dax import engine as eng_mod
+        eng = eng_mod.DAXEngine()
+        c = eng_mod.DAXContext({}, {}, None, None, None, [])
+        assert eng._eval_expr('"a ""quoted"" b"', c) == 'a "quoted" b'
+        assert eng._eval_expr('"plain"', c) == "plain"
