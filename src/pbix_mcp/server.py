@@ -2149,7 +2149,19 @@ def _report_type_resolver(info: dict):
                 col_types[(r["tn"], r["cn"])] = _AMO.get(r["edt"], "String")
             conn.close()
         finally:
-            os.unlink(tmp.name)
+            # Close the SQLite handle BEFORE unlinking: Windows refuses to
+            # delete a file that still has an open handle (WinError 32), which
+            # made every calculated-column/table edit fail on the platform
+            # nearly all Power BI users are on. POSIX allows it, so CI (ubuntu)
+            # never saw this.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
     except Exception:
         col_types = {}
 
@@ -7331,11 +7343,17 @@ def _apply_calculated_table_metadata(
                         "IsAvailableInMDX = 1 WHERE ID = ?", (crow["ID"],))
                     continue
                 name = crow["ExplicitName"]
+                # Keep the model's own SourceColumn when it has one: a calc
+                # table copied from another table qualifies its columns
+                # ('DateAutoTemplate[Year]'), and a bare '[Year]' does not
+                # resolve. Fall back to the bare form only for a table we are
+                # authoring from scratch, which has no source to qualify.
+                src = (spec.get("source_columns") or {}).get(name) or f"[{name}]"
                 c.execute(
                     "UPDATE [Column] SET Type = 4, ExplicitName = NULL, "
                     "InferredName = ?, SourceColumn = ?, ExplicitDataType = 1, "
                     "SystemFlags = 2, IsAvailableInMDX = 1 WHERE ID = ?",
-                    (name, f"[{name}]", crow["ID"]))
+                    (name, src, crow["ID"]))
         conn.commit()
 
     return _modify_metadata_only(dm_path, _do_apply)
@@ -7438,11 +7456,31 @@ _TABLE_PROPERTIES = (
     "IsHidden", "IsPrivate", "ShowAsVariationsOnly", "DataCategory",
     "Description", "ExcludeFromModelRefresh",
 )
+
+# AMO PartitionSourceType: 1 = Query (names a DataMashup query), 4 = M
+# (the expression is the source). The builder emits M; a model authored by an
+# older Desktop uses Query and its partitions must keep that shape.
+_PARTITION_TYPE_QUERY = 1
 _COLUMN_PROPERTIES = (
     "IsHidden", "FormatString", "SummarizeBy", "DataCategory", "DisplayOrdinal",
     "Description", "DisplayFolder", "IsKey", "IsNullable", "IsUnique",
     "IsDefaultLabel", "IsDefaultImage", "EncodingHint", "Alignment",
     "KeepUniqueRows", "ErrorMessage",
+)
+
+# Measures and hierarchies survive a rebuild by name, but the builder writes
+# defaults for everything else about them. On a 102-measure model that meant 89
+# measures losing the DisplayFolder they were organised into, hidden helper
+# measures such as Date[_ShowValueForDates] becoming visible, and 18 measures
+# silently retyped (Boolean and Int64 both landing on Double). DataType is
+# included deliberately: unlike a column's storage type it is the measure's
+# declared result type, not a fact about how the rebuilt data is stored.
+_MEASURE_PROPERTIES = (
+    "IsHidden", "DisplayFolder", "Description", "FormatString", "DataType",
+    "DataCategory", "IsSimpleMeasure", "LineageTag",
+)
+_HIERARCHY_PROPERTIES = (
+    "IsHidden", "DisplayFolder", "Description", "HideMembers", "LineageTag",
 )
 
 
@@ -7481,7 +7519,63 @@ def _snapshot_object_properties(conn: sqlite3.Connection) -> dict:
         if "SortByColumnID" in have_c and r["SortByColumnID"]:
             d["__sort_by__"] = col_name_by_id.get(r["SortByColumnID"])
         columns[f"{r['_tbl']}\x00{nm}"] = d
-    return {"tables": tables, "columns": columns}
+
+    # Partition source, keyed by table name. The builder always emits a Type=4
+    # (M) partition holding the rows inline, which is right for a table it
+    # authored but wrong for one that already had a source: a legacy Type=1
+    # (Query) partition names a query in the DataMashup, and replacing it with
+    # inline M orphans that query. Power BI Desktop then opens the file, shows
+    # "There are pending changes in your queries that haven't been applied" and
+    # an EMPTY Data pane — the model loads with no tables at all.
+    have_p = {r[1] for r in conn.execute("PRAGMA table_info([Partition])")}
+    partitions = {}
+    if {"Type", "QueryDefinition"} <= have_p:
+        for r in conn.execute(
+            "SELECT t.Name AS tbl, p.Type, p.Mode, p.QueryDefinition "
+            "FROM [Partition] p JOIN [Table] t ON p.TableID = t.ID "
+            "WHERE t.ModelID = 1 AND t.SystemFlags = 0"
+        ):
+            # Only legacy Query partitions need carrying; an M partition the
+            # builder regenerates already matches what the rebuild wrote.
+            if r["Type"] == _PARTITION_TYPE_QUERY:
+                partitions[r["tbl"]] = {
+                    "Type": r["Type"], "Mode": r["Mode"],
+                    "QueryDefinition": r["QueryDefinition"],
+                }
+    # Measures and hierarchies, keyed "<table>\x00<name>" like the columns above.
+    measures: dict[str, dict] = {}
+    hierarchies: dict[str, dict] = {}
+    for tbl, props, out in (("Measure", _MEASURE_PROPERTIES, measures),
+                            ("Hierarchy", _HIERARCHY_PROPERTIES, hierarchies)):
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info([{tbl}])")}
+        keep = [p for p in props if p in have]
+        if not keep:
+            continue
+        for r in conn.execute(
+            f"SELECT o.*, t.Name AS _tbl FROM [{tbl}] o "
+            "JOIN [Table] t ON o.TableID = t.ID WHERE t.ModelID = 1"
+        ):
+            if r["Name"]:
+                out[f"{r['_tbl']}\x00{r['Name']}"] = {p: r[p] for p in keep}
+
+    # Hierarchy levels, keyed "<table>\x00<hierarchy>\x00<ordinal>". Only the
+    # lineage tag is carried: a level's name and column are rebuilt from the
+    # hierarchy definition, but the tag is the identity downstream tooling
+    # (TMDL/PBIP round-trips, service lineage) matches on across a save.
+    levels = {}
+    have_l = {r[1] for r in conn.execute("PRAGMA table_info([Level])")}
+    if "LineageTag" in have_l:
+        for r in conn.execute(
+            "SELECT l.Ordinal, l.LineageTag, h.Name AS hname, t.Name AS tname "
+            "FROM [Level] l JOIN [Hierarchy] h ON l.HierarchyID = h.ID "
+            "JOIN [Table] t ON h.TableID = t.ID WHERE t.ModelID = 1"
+        ):
+            if r["LineageTag"]:
+                levels[f"{r['tname']}\x00{r['hname']}\x00{r['Ordinal']}"] = \
+                    r["LineageTag"]
+
+    return {"tables": tables, "columns": columns, "partitions": partitions,
+            "measures": measures, "hierarchies": hierarchies, "levels": levels}
 
 
 def _restore_object_properties(dm_path: str, snap: dict) -> None:
@@ -7491,7 +7585,9 @@ def _restore_object_properties(dm_path: str, snap: dict) -> None:
     them. A sort-by target that did not survive is cleared rather than left
     pointing at an arbitrary column.
     """
-    if not snap or not (snap.get("tables") or snap.get("columns")):
+    if not snap or not any(snap.get(k) for k in
+                           ("tables", "columns", "partitions",
+                            "measures", "hierarchies", "levels")):
         return
 
     def _do(conn: sqlite3.Connection):
@@ -7531,6 +7627,60 @@ def _restore_object_properties(dm_path: str, snap: dict) -> None:
             c.execute(
                 f"UPDATE [Column] SET {', '.join(f'[{k}] = ?' for k in sets)} "
                 f"WHERE ID = ?", [*sets.values(), cid])
+
+        # Measures and hierarchies (see _snapshot_object_properties). Matched on
+        # (table, name); anything the rebuild legitimately dropped is skipped.
+        # A snapshotted NULL is applied rather than skipped, because for these
+        # the builder's default is the non-NULL value: Description defaults to
+        # '' and DisplayFolder to '', so treating NULL as "no opinion" would
+        # leave every measure carrying an empty folder it never had.
+        for obj, key in (("Measure", "measures"), ("Hierarchy", "hierarchies")):
+            for name, props in (snap.get(key) or {}).items():
+                tbl, oname = name.split("\x00", 1)
+                if not props:
+                    continue
+                c.execute(
+                    f"UPDATE [{obj}] SET "
+                    f"{', '.join(f'[{k}] = ?' for k in props)} "
+                    f"WHERE Name = ? AND TableID = ("
+                    f"  SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1)",
+                    [*props.values(), oname, tbl])
+
+        for key, tag in (snap.get("levels") or {}).items():
+            tbl, hname, ordinal = key.split("\x00", 2)
+            c.execute(
+                "UPDATE [Level] SET LineageTag = ? WHERE Ordinal = ? "
+                "AND HierarchyID = (SELECT h.ID FROM [Hierarchy] h "
+                "  JOIN [Table] t ON h.TableID = t.ID "
+                "  WHERE h.Name = ? AND t.Name = ? AND t.ModelID = 1)",
+                (tag, int(ordinal), hname, tbl))
+
+        # Restore legacy Query partitions (see _snapshot_object_properties).
+        for tname, pprops in (snap.get("partitions") or {}).items():
+            c.execute(
+                "UPDATE [Partition] SET Type = ?, Mode = ?, QueryDefinition = ? "
+                "WHERE TableID = (SELECT ID FROM [Table] "
+                "                 WHERE Name = ? AND ModelID = 1)",
+                (pprops["Type"], pprops["Mode"], pprops["QueryDefinition"], tname))
+
+        # A table may have at most ONE key column. The builder marks every
+        # RowNumber column IsKey (right for a table it authored), but the
+        # restore above re-applies IsKey to whichever column the author
+        # actually keyed on — a date table's Date column, or a designated
+        # business key. Both then claim the key and Power BI Desktop refuses
+        # to open the file at all:
+        #   "The table 'DateAutoTemplate' has two columns with the IsKey
+        #    property set to True."
+        # Corpus ground truth (248 RowNumber columns across 24 Desktop-authored
+        # files): IsKey is 0 for exactly the 14 whose table has another key
+        # column, and 1 for the other 234 — never two per table. IsUnique stays
+        # 1 in all 248, so only IsKey is cleared. This is not confined to
+        # auto-date system tables: Ecommerce dimDate, IT_Support dim_Date and
+        # three MS_Store_Sales tables are ordinary SystemFlags=0 tables.
+        c.execute(
+            "UPDATE [Column] SET IsKey = 0 "
+            "WHERE Type = 3 AND IsKey = 1 AND TableID IN ("
+            "  SELECT TableID FROM [Column] WHERE IsKey = 1 AND Type <> 3)")
         conn.commit()
 
     _modify_metadata_only(dm_path, _do)
@@ -8437,7 +8587,19 @@ def pbix_update_table_rows(alias: str, table_name: str, rows_json: str) -> str:
             ).fetchall()
             conn.close()
         finally:
-            os.unlink(tmp.name)
+            # Close the SQLite handle BEFORE unlinking: Windows refuses to
+            # delete a file that still has an open handle (WinError 32), which
+            # made every calculated-column/table edit fail on the platform
+            # nearly all Power BI users are on. POSIX allows it, so CI (ubuntu)
+            # never saw this.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
 
         if not col_rows:
             return ToolResponse.error(
@@ -10209,7 +10371,19 @@ def pbix_datamodel_add_calculated_column(
                         {"column": column_name, "expression": dax,
                          "data_type": data_type or None}]}))
         finally:
-            os.unlink(tmp.name)
+            # Close the SQLite handle BEFORE unlinking: Windows refuses to
+            # delete a file that still has an open handle (WinError 32), which
+            # made every calculated-column/table edit fail on the platform
+            # nearly all Power BI users are on. POSIX allows it, so CI (ubuntu)
+            # never saw this.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
 
         old_size, _ = _rebuild_datamodel(
             info, table_updates=table_updates, calc_authoring=True,
@@ -10354,7 +10528,19 @@ def pbix_datamodel_remove_calculated_column(
                     conn, abf, meta, rels_ctx,
                     drop_columns={table_name: {actual}}))
         finally:
-            os.unlink(tmp.name)
+            # Close the SQLite handle BEFORE unlinking: Windows refuses to
+            # delete a file that still has an open handle (WinError 32), which
+            # made every calculated-column/table edit fail on the platform
+            # nearly all Power BI users are on. POSIX allows it, so CI (ubuntu)
+            # never saw this.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
 
         old_size, new_size = _rebuild_datamodel(
             info, table_updates=table_updates, calc_authoring=True,
@@ -10506,8 +10692,22 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
             # Quarter/Day) have nothing to compute against unless we hand them
             # the rows we just generated.
             base_data.setdefault(tname, table_updates[tname])
+        # SourceColumn as the model already spells it. A calc table built on
+        # ANOTHER table qualifies its columns — Power BI's per-table auto-date
+        # tables all read 'DateAutoTemplate[Year]' because they are copies of
+        # that template. Synthesising a bare '[Year]' instead loses the
+        # qualifier, the engine cannot resolve the column, and Desktop refuses
+        # the whole model with "Relationship '<guid>' points to deleted column
+        # 'Date' in table 'Date'".
+        source_columns = {
+            r["nm"]: r["sc"] for r in conn.execute(
+                "SELECT COALESCE(ExplicitName, InferredName) AS nm, "
+                "       SourceColumn AS sc FROM [Column] WHERE TableID = ?",
+                (tid,))
+            if r["nm"] and r["sc"]}
         table_restamp.append({"table": tname, "expression": qd,
-                              "calc_columns": owned_calc_columns})
+                              "calc_columns": owned_calc_columns,
+                              "source_columns": source_columns})
 
     # Tables that are BOTH a calculated table and a calc-column owner: their
     # calculated columns are stamped separately and must carry the calc-table
@@ -10831,7 +11031,19 @@ def pbix_datamodel_add_calculated_table(
             table_updates, col_restamp, table_restamp = _plan_calc_preservation(
                 conn, abf, meta, ctx.get("relationships") or [])
         finally:
-            os.unlink(tmp.name)
+            # Close the SQLite handle BEFORE unlinking: Windows refuses to
+            # delete a file that still has an open handle (WinError 32), which
+            # made every calculated-column/table edit fail on the platform
+            # nearly all Power BI users are on. POSIX allows it, so CI (ubuntu)
+            # never saw this.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
 
         cols, rows = result["columns"], result["rows"]
         new_cols = [{"name": c,
@@ -12988,7 +13200,19 @@ def pbix_evaluate_calculated_columns(alias: str) -> str:
             """).fetchall()
             conn.close()
         finally:
-            os.unlink(tmp.name)
+            # Close the SQLite handle BEFORE unlinking: Windows refuses to
+            # delete a file that still has an open handle (WinError 32), which
+            # made every calculated-column/table edit fail on the platform
+            # nearly all Power BI users are on. POSIX allows it, so CI (ubuntu)
+            # never saw this.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
 
         if not calc_cols:
             return ToolResponse.ok("No calculated columns found in the data model.").to_text()
@@ -13297,7 +13521,19 @@ def pbix_evaluate_rls(
 
             return ToolResponse.ok("\n".join(lines)).to_text()
         finally:
-            os.unlink(tmp.name)
+            # Close the SQLite handle BEFORE unlinking: Windows refuses to
+            # delete a file that still has an open handle (WinError 32), which
+            # made every calculated-column/table edit fail on the platform
+            # nearly all Power BI users are on. POSIX allows it, so CI (ubuntu)
+            # never saw this.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
@@ -16306,7 +16542,19 @@ def pbix_get_incremental_refresh(alias: str) -> str:
             policies = c.fetchall()
             conn.close()
         finally:
-            os.unlink(tmp.name)
+            # Close the SQLite handle BEFORE unlinking: Windows refuses to
+            # delete a file that still has an open handle (WinError 32), which
+            # made every calculated-column/table edit fail on the platform
+            # nearly all Power BI users are on. POSIX allows it, so CI (ubuntu)
+            # never saw this.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
 
         if not policies:
             return ToolResponse.ok("No incremental refresh policies configured.").to_text()
@@ -16372,7 +16620,19 @@ def pbix_export_tmdl(alias: str, output_path: str = "") -> str:
             stats = _export_tmdl_from_sqlite(conn, output_path)
             conn.close()
         finally:
-            os.unlink(tmp.name)
+            # Close the SQLite handle BEFORE unlinking: Windows refuses to
+            # delete a file that still has an open handle (WinError 32), which
+            # made every calculated-column/table edit fail on the platform
+            # nearly all Power BI users are on. POSIX allows it, so CI (ubuntu)
+            # never saw this.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
 
         summary = (
             f"TMDL exported to: {output_path}\n"

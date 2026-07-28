@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.50] - 2026-07-28
+
+**Power BI Desktop refused to open a rebuilt file for four more reasons. All four are fixed and all three schema eras now open and answer queries in Desktop.**
+
+Issue #3 asked for the rebuild path to be verified against real Power BI Desktop on Windows, because the service only returns opaque numeric codes. Doing that found four defects that no offline check caught — our own reader parsed every one of these files happily.
+
+Verified by opening each rebuilt file in Desktop and querying the workspace Analysis Services engine it starts, so the proof is the engine returning rows rather than a window appearing:
+
+| source | level | result |
+|---|---|---|
+| `MS_Blog_DataProfiling.pbix` | 1455 | 91 Customers, 830 Orders, 3 Numbers (the edit) |
+| `Agents_Performance.pbix` | 1550 | 199,999 FactSales, 293 DimEmployee, 306 DimStore |
+| `GeoSales_Dashboard.pbix` | 1601 | 9,994 fct_Orders, 296 Returns, 793 dim_Customer |
+
+Each is compared against a CONTROL (open and save, no edit) rather than the original, so nothing the save path does on its own is blamed on the rebuild. The control is byte-clean on every metadata table.
+
+### The metadata file was sized from a stale record, so AS truncated it
+
+`splice_metadata_in_abf` updated the VirtualDirectory's size for `metadata.sqlitedb` but not the BackupLog's, and **Analysis Services sizes the file from the BackupLog**. The result was a truncated SQLite image and:
+
+```
+The database disk image is malformed. SQLite Error Code=11
+```
+
+Two separate causes: a `len(old) == len(new)` guard skipped any size whose digit count changed, and the two regions have **different encodings in the same file** — a Desktop-authored ABF stores the VirtualDirectory as UTF-8 but the BackupLog as UTF-16-LE, so searching with one encoding never found the other. The BackupLog is also identified as the last VirtualDirectory entry rather than by offset, because its UTF-16 BOM puts the recorded offset two bytes below where the tag is found.
+
+### Legacy `Query` partitions were rewritten to inline M, orphaning the DataMashup
+
+The builder always emits a `Type=4` (M) partition with the rows inline. A model authored by an older Desktop uses `Type=1` (Query), whose `QueryDefinition` names a query in the DataMashup — which the rebuild left byte-identical. Rewriting the partition orphaned that query, and Desktop opened the file with an **empty Data pane** and *"There are pending changes in your queries that haven't been applied"*. Affects 3 of 24 corpus files.
+
+### Two columns claimed to be the key, and Desktop rejected the whole model
+
+```
+The table 'DateAutoTemplate' has two columns with the IsKey property set to True.
+```
+
+The builder marks every RowNumber column `IsKey`, which is correct for a table it authored but collides with a table the author keyed on a real column. Corpus ground truth across 248 RowNumber columns in 24 Desktop-authored files: `IsKey` is 0 for exactly the 14 whose table has another key column and 1 for the other 234 — never two per table. Not confined to auto-date system tables; Ecommerce `dimDate`, IT_Support `dim_Date` and three MS_Store_Sales tables are ordinary user tables. 9 of 24 corpus files were affected.
+
+### Calculated-table columns lost their table qualifier
+
+```
+Relationship 'ed5f222c-…' points to deleted column 'Date' in table 'Date'.
+```
+
+A calculated table built on another table qualifies its columns — every per-table auto-date table reads `DateAutoTemplate[Year]` because it is a copy of that template. The stamper synthesised a bare `[Year]` instead, which does not resolve, so the engine treated the column as deleted and refused the model. The model's own `SourceColumn` is now carried through.
+
+### Measures and hierarchies kept only their name and expression
+
+The builder wrote defaults for everything else. On the 102-measure `Agents_Performance.pbix` that meant **89 measures losing the DisplayFolder they were organised into**, hidden helper measures such as `Date[_ShowValueForDates]` becoming visible, and 18 measures silently retyped (Boolean and Int64 both landing on Double). Hierarchies lost `IsHidden` and `HideMembers`; measures, hierarchies and levels lost the `LineageTag` that TMDL/PBIP round-trips and service lineage match on.
+
+`DisplayFolder`, `IsHidden`, `Description`, `FormatString`, `DataType`, `DataCategory`, `IsSimpleMeasure` and `LineageTag` are now snapshotted and restored by name alongside the table and column properties that already were. `Hierarchy.State` remains the one intentional difference: the rebuild does not materialize the hierarchy index, so it declares `CalculationNeeded` rather than claiming data it does not have.
+
+### Windows is now a first-class CI target
+
+POSIX unlinks a file that still has an open handle; Windows raises `WinError 32`. Three unclosed SQLite handles made **every calculated-column and calculated-table edit fail on Windows** — the platform nearly every Power BI user is on — while CI stayed green because it only ran Ubuntu. Fixed at nine sites, and `windows-latest` is now in the CI matrix across all four Python versions so this class of bug cannot recur silently.
+
 ## [0.9.49] - 2026-07-28
 
 **The rebuild replaced the model's encryption key while keeping data encrypted under the old one.**
