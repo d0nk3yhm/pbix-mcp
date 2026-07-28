@@ -170,6 +170,7 @@ def build_abf_clean(
     vertipaq_files: Dict[str, bytes],
     db_id: str | None = None,
     source_db_xml: bytes | None = None,
+    source_cryptkey: bytes | None = None,
 ) -> bytes:
     """Build a complete ABF archive from scratch.
 
@@ -183,6 +184,12 @@ def build_abf_clean(
         source_db_xml: db.xml of the model being rebuilt, carried through so it
             keeps its own declared compatibility level. Only the database
             name/ID is rewritten.
+        source_cryptkey: 0.CryptKey.bin of the model being rebuilt. Sensitive
+            values already in the metadata — a DataSource's ConnectionString,
+            Password, Credential — are encrypted under THAT key, so shipping the
+            generator's key instead makes Analysis Services reject the model
+            with "Failed to decrypt sensitive data. Possibly the encryption key
+            does not match".
 
     Returns:
         Complete ABF binary ready for XPress9 compression
@@ -207,7 +214,9 @@ def build_abf_clean(
     db_xml_bytes = (_rewrite_db_xml_id(source_db_xml, db_id)
                     if source_db_xml
                     else generate_db_xml(db_id, object_id, db_unique_id))
-    cryptkey_bytes = CRYPTKEY_BYTES
+    # The source's own key when rebuilding an existing model: its encrypted
+    # payloads travel with the metadata and only that key can open them.
+    cryptkey_bytes = source_cryptkey or CRYPTKEY_BYTES
 
     # ── Assign StoragePaths ─────────────────────────────────────────
     # Each file gets a random 20-char hex ID used in both VDir and BackupLog

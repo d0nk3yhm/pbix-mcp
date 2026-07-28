@@ -19,6 +19,11 @@ This checks every dimension that has actually been shown to matter:
   5. STORAGE         every StorageFile row has a matching ABF entry.
   6. DAX BINDING     calculated tables and columns still resolve.
   7. AUTO-DATE SHAPE Desktop's exact shape for auto date/time tables.
+  8. ENCRYPTION KEY  0.CryptKey.bin. A DataSource's ConnectionString is
+                     encrypted under the SOURCE's key and travels with the
+                     metadata, so shipping the generator's key instead gives
+                     "Failed to decrypt sensitive data. Possibly the encryption
+                     key does not match".
 
 The control is the SAME file opened and saved with no edit — never the original,
 because saving legitimately rewrites members on its own.
@@ -132,8 +137,11 @@ def snapshot(pbix):
             cprops[(r["_t"], nm)] = d
         sf = {r["FileName"] for r in c.execute("SELECT FileName FROM [StorageFile]")}
         abf_names = {f["FileName"] for f in list_abf_files(abf)}
+        ckf = [f for f in list_abf_files(abf) if "CryptKey" in f["FileName"]]
+        import hashlib
+        ck = hashlib.sha256(read_abf_file(abf, ckf[0])).hexdigest() if ckf else ""
         return dict(tabs=tabs, cols=cols, lvl=lvl, uid=uid, tprops=tprops,
-                    cprops=cprops, sf=sf, abf=abf_names)
+                    cprops=cprops, sf=sf, abf=abf_names, ck=ck)
     finally:
         c.close()
         os.unlink(tmp)
@@ -335,6 +343,10 @@ def check(src, workdir):
         f.append(f"5 STORAGE: {len(missing)} StorageFile rows with no ABF entry")
     for x in dax_binds(edited)[:4]:
         f.append(f"6 DAX BINDING: {x}")
+    if a["ck"] != b["ck"]:
+        f.append(f"8 ENCRYPTION KEY: CryptKey changed "
+                 f"({a['ck'][:16]} -> {b['ck'][:16]}); anything the metadata "
+                 f"already had encrypted can no longer be decrypted")
     return name, f, True
 
 

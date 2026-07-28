@@ -503,6 +503,9 @@ class PBIXBuilder:
         self._source_db_xml: bytes | None = None
         # Source model's metadata.sqlitedb, so a rebuild keeps its schema era.
         self._source_metadata: bytes | None = None
+        # Source model's 0.CryptKey.bin — the only key that can decrypt the
+        # sensitive values its metadata already carries.
+        self._source_cryptkey: bytes | None = None
 
     def add_table(
         self,
@@ -1216,7 +1219,8 @@ class PBIXBuilder:
 
         # 3-4. Build ABF binary container from scratch
         new_abf = build_abf_clean(new_sqlite_bytes, vertipaq_files,
-                                  source_db_xml=self._source_db_xml)
+                                  source_db_xml=self._source_db_xml,
+                                  source_cryptkey=self._source_cryptkey)
 
         # 5. Compress to DataModel
         datamodel_bytes = compress_datamodel(new_abf)
