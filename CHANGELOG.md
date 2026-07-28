@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.48] - 2026-07-28
+
+### Added — `pbix_doctor` now reports what an edit would cost, before you make it
+A rebuild-path edit reports what it could not carry across **afterwards**. The new **Rebuild-path cost** check says so **beforehand**, which is when the choice is still available:
+
+```
+✅ Rebuild-path eligibility: rebuild-path edits supported (6 calculated object(s) preserved)
+✅ Rebuild-path cost: a rebuild-path edit re-creates by name: annotations (106),
+   perspectives (6), dynamic format strings (6), shared M expressions (1), Q&A …
+```
+
+### Investigated — the `MS_Corporate_Spend.pbix` decode gap
+Four `Fact` columns still fail to decode (contained since 0.9.45: a 1.3 s refusal instead of a 3.7 GB allocation). The leading hypothesis was that `primary_segment_size` is a **byte** count rather than an **entry** count — the observed values are all powers of two, and the RowNumber column's run lengths sum to exactly the row count under that reading.
+
+Tested across **1,986 columns** in the corpus: the entry-count reading matches the declared row count for **1,881**, the byte-count reading for only **1,386**. **The hypothesis is wrong** and the current interpretation is correct; those four columns are a different gap. Recording this so the next attempt does not repeat it.
+
 ## [0.9.47] - 2026-07-28
 
 **Root cause of the service rejecting rebuilt models: the rebuild imposed its own metadata schema on every file.**

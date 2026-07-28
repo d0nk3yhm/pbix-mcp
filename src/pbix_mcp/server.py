@@ -15629,12 +15629,59 @@ def _report_integrity_checks(work_dir: str) -> list:
                 + (f" ({preserved} calculated object(s) preserved)"
                    if preserved else ""))
 
+    def check_rebuild_cost():
+        """What a rebuild-path edit would COST this model, before making one.
+
+        The edit reports what it could not carry AFTERWARDS; this says so
+        beforehand, which is when the choice is still available. It lists the
+        model features a rebuild has to re-create by name rather than copy —
+        the ones whose loss a user would actually notice.
+        """
+        dm = os.path.join(work_dir, "DataModel")
+        if not os.path.exists(dm):
+            return "no DataModel (report-only file)"
+        try:
+            from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+            from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+            with open(dm, "rb") as f:
+                abf = decompress_datamodel(f.read())
+            fd, tmp = tempfile.mkstemp(suffix=".db")
+            os.write(fd, read_metadata_sqlite(abf))
+            os.close(fd)
+            try:
+                conn = sqlite3.connect(tmp)
+                counts = {}
+                for tname, _fks, _ident in _CARRY_SPEC:
+                    try:
+                        n = conn.execute(
+                            f"SELECT COUNT(*) FROM [{tname}]").fetchone()[0]
+                    except sqlite3.Error:
+                        continue
+                    if n:
+                        counts[tname] = n
+                conn.close()
+            finally:
+                os.unlink(tmp)
+        except Exception as exc:
+            return f"could not inspect ({type(exc).__name__})"
+        if not counts:
+            return "a rebuild-path edit would carry nothing extra"
+        by_meaning: dict[str, int] = {}
+        for tname, n in counts.items():
+            key = _CARRY_MEANING.get(tname, tname)
+            by_meaning[key] = by_meaning.get(key, 0) + n
+        listing = ", ".join(f"{k} ({v})" for k, v in
+                            sorted(by_meaning.items(), key=lambda kv: -kv[1]))
+        return (f"a rebuild-path edit re-creates by name: {listing}. Anything "
+                f"it cannot re-attach is reported in the response warnings.")
+
     checks = [
         ("Registered resources", check_resources),
         ("Custom visual registration", check_custom_visuals),
         ("Page / visual naming", check_page_visual_names),
         ("Bookmark references", check_bookmarks),
         ("Rebuild-path eligibility", check_rebuild_eligibility),
+        ("Rebuild-path cost", check_rebuild_cost),
     ]
     if is_pbir:
         checks += _pbir_integrity_checks(work_dir, layout, sections)
