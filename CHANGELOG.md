@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.47] - 2026-07-28
+
+**Root cause of the service rejecting rebuilt models: the rebuild imposed its own metadata schema on every file.**
+
+Three files built with 0.9.45 and 0.9.46 were rejected by the Power BI service with `Failed to PublishAbf database … An error occurred when loading … .db.xml` (error `-1055653859`). Each time, a field-by-field metadata comparison had reported no differences — and each time that comparison covered a different, insufficient subset of what actually matters.
+
+### The cause
+`PBIXBuilder` created a **blank metadata database with a fixed 63-table schema** and filled it in. Measured across the corpus:
+
+| source | metadata tables |
+|---|---|
+| `MS_Blog_DataProfiling.pbix` (level 1455) | **51** |
+| the builder's blank schema | **63** |
+| `GeoSales_Dashboard.pbix` (level 1601) | **65** |
+
+**20 of the 24 corpus models are an older era than the builder emits.** Rebuilding one invented tables (`Calendar`, `QueryGroup`, `ChangedProperty`, …) and columns (`LineageTag`, `ExpressionContext`, `DirectLakeBehavior`, …) that its compatibility level never had, and Analysis Services refuses to load such a database.
+
+This was masked for a long time because **every file ever verified in the service was built from `GeoSales_Dashboard.pbix`, which is *newer* than the builder** — there we dropped two tables rather than inventing any, which the service tolerates. Lifting the auto date/time ceiling in 0.9.44 is what first let an older-era file reach this code; the defect long predates it.
+
+### The fix
+A rebuild now starts from **the source model's own `metadata.sqlitedb`**, clearing the rows it rewrites and keeping the schema. Consequences:
+
+- the schema era is preserved exactly — nothing is invented
+- the ABF's `db.xml` is carried through (only the database GUID is rewritten), so `CompatibilityLevel` and `DbUniqueId` stay the source's own instead of a hardcoded `1550`
+- INSERT and UPDATE statements naming columns an older era lacks are **narrowed to that era's columns** rather than failing or adding them
+- `Culture.LinguisticMetadataID` and `Model.DefaultMeasureID` are re-pointed at the rows the carry-over re-creates, instead of dangling
+
+### Added — `scripts/verify_rebuild_fidelity.py`
+The check that should have existed from the start. It compares a rebuild-path edit against **the same file's own open+save control** on all seven dimensions that have actually been shown to matter: schema era, compatibility level, referential integrity, authoring properties, storage consistency, DAX binding, and auto date/time shape.
+
+Across all 24 corpus reports: **11 edits accepted with 0 findings on every dimension, 13 refused with accurate reasons, 0 with any fidelity finding.** `MS_Blog_DataProfiling.pbix` — the file the service rejected three times — is among the clean ones.
+
+### Not yet confirmed in the service
+Every claim above is offline evidence. The rebuilt model has not been loaded by Analysis Services, because uploading is not something this toolchain can do. That confirmation is still outstanding.
+
 ## [0.9.46] - 2026-07-28
 
 **Reverts the one change that altered the schema Analysis Services parses.**

@@ -32,6 +32,7 @@ import tempfile
 import uuid
 import warnings
 import zipfile
+from typing import Any
 
 # AMO data-type codes used in metadata.sqlitedb
 _TYPE_NAME_TO_AMO = {
@@ -495,6 +496,13 @@ class PBIXBuilder:
         self._relationships: list[dict] = []
         self._user_hierarchies: list[dict] = []
         self._pages: list[dict] = []
+        # db.xml of the model being rebuilt, when there is one. Carried through
+        # so the rebuilt database keeps its own declared CompatibilityLevel
+        # instead of the generator's hardcoded 1550 — claiming a level the
+        # metadata was not written for is rejected by Analysis Services.
+        self._source_db_xml: bytes | None = None
+        # Source model's metadata.sqlitedb, so a rebuild keeps its schema era.
+        self._source_metadata: bytes | None = None
 
     def add_table(
         self,
@@ -1193,7 +1201,9 @@ class PBIXBuilder:
         relationships = self._relationships
 
         # 1. Create clean metadata from scratch
-        sqlite_bytes = create_empty_metadata_db()
+        # Start from the source model's own metadata when rebuilding one, so
+        # its schema era is preserved; a blank schema only for new files.
+        sqlite_bytes = self._source_metadata or create_empty_metadata_db()
 
         # 2. Populate metadata and encode VertiPaq files
         # Compression class IDs determined through binary format analysis
@@ -1205,7 +1215,8 @@ class PBIXBuilder:
         )
 
         # 3-4. Build ABF binary container from scratch
-        new_abf = build_abf_clean(new_sqlite_bytes, vertipaq_files)
+        new_abf = build_abf_clean(new_sqlite_bytes, vertipaq_files,
+                                  source_db_xml=self._source_db_xml)
 
         # 5. Compress to DataModel
         datamodel_bytes = compress_datamodel(new_abf)
@@ -1672,6 +1683,185 @@ def _get_max_id_across_tables(conn: sqlite3.Connection) -> int:
     return max_id
 
 
+# Metadata tables the builder itself populates. When rebuilding an EXISTING
+# model we start from that model's own metadata.sqlitedb rather than a blank
+# one, so the database keeps its own schema era; these are the tables whose
+# rows the rebuild replaces, and only they are cleared.
+#
+# Why this matters: the blank schema is a fixed 63 tables. 20 of the 24 corpus
+# models are an OLDER era than that -- one is 51 tables -- so rebuilding them
+# from a blank schema invented tables and columns their compatibility level
+# never had, and Analysis Services rejected the result outright ("Failed to
+# PublishAbf database ... error loading ... .db.xml"). Everything the builder
+# does not own -- Model, Culture, DBPROPERTIES, and any table belonging to a
+# newer or older era -- is now left exactly as the source had it.
+# Kept as-is when rebuilding from a source model: singletons describing the
+# database itself, which carry no reference to the objects being rewritten.
+_PRESERVED_TABLES = frozenset({"Model", "Culture", "DBPROPERTIES"})
+
+
+def _clear_builder_owned_rows(conn: sqlite3.Connection) -> None:
+    """Empty every table the rebuild rewrites, leaving the SCHEMA intact.
+
+    Everything except the database-level singletons is cleared, because a
+    rebuild reassigns every primary key: any row left behind would point at an
+    object that no longer exists, and a dangling reference is what makes
+    Analysis Services refuse to load a model. Rows worth keeping are re-created
+    afterwards by the metadata carry-over, which re-resolves their references
+    by NAME.
+
+    The row content therefore matches what a blank-schema rebuild produced; the
+    difference is that the SCHEMA is now the source model's own era.
+    """
+    c = conn.cursor()
+    names = [r[0] for r in c.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")]
+    for name in names:
+        if name in _PRESERVED_TABLES or name.startswith("sqlite_"):
+            continue
+        try:
+            c.execute(f"DELETE FROM [{name}]")
+        except sqlite3.Error:
+            pass
+    conn.commit()
+
+
+
+_UPDATE_RE = re.compile(
+    r"^\s*UPDATE\s+\[?(\w+)\]?\s+SET\s+(.*?)(\s+WHERE\s.*)?$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_INSERT_RE = re.compile(
+    r"^\s*INSERT\s+INTO\s+\[?(\w+)\]?\s*\(([^)]*)\)\s*VALUES\s*\((.*)\)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+class _SchemaAwareCursor:
+    """Cursor that drops INSERT columns the target schema does not have.
+
+    A rebuild now starts from the SOURCE model's metadata, which may be an
+    older compatibility level than the builder was written against -- one
+    corpus model has 51 tables where the builder's blank schema has 63, and
+    columns like ExcludeFromModelRefresh or ExpressionContext simply do not
+    exist there. Rather than add them (which is what made Analysis Services
+    reject the rebuilt model in the first place), the insert is narrowed to the
+    columns that era actually has.
+
+    Only INSERT ... (cols) VALUES (...) is rewritten; every other statement is
+    passed straight through.
+    """
+
+    def __init__(self, cursor: Any):
+        self._c = cursor
+        self._cols: dict[str, set[str]] = {}
+
+    def _known(self, table: str) -> set[str]:
+        if table not in self._cols:
+            try:
+                self._cols[table] = {
+                    r[1] for r in self._c.execute(f"PRAGMA table_info([{table}])")
+                }
+            except sqlite3.Error:
+                self._cols[table] = set()
+        return self._cols[table]
+
+    def execute(self, sql, params=()):
+        u = _UPDATE_RE.match(sql)
+        if u:
+            return self._execute_update(sql, params, u)
+        m = _INSERT_RE.match(sql)
+        if not m:
+            return self._c.execute(sql, params)
+        table, collist, vallist = m.group(1), m.group(2), m.group(3)
+        known = self._known(table)
+        if not known:
+            return self._c.execute(sql, params)
+        cols = [x.strip().strip("[]") for x in collist.split(",")]
+        vals = [x.strip() for x in _split_top_level_commas(vallist)]
+        if len(cols) != len(vals):
+            return self._c.execute(sql, params)
+        keep = [i for i, name in enumerate(cols) if name in known]
+        if len(keep) == len(cols):
+            return self._c.execute(sql, params)
+        # Re-map the positional parameters: only placeholders in kept slots.
+        seq = list(params)
+        pidx, new_params = 0, []
+        for i, v in enumerate(vals):
+            n = v.count("?")
+            if i in keep:
+                new_params.extend(seq[pidx:pidx + n])
+            pidx += n
+        new_sql = (f"INSERT INTO [{table}] "
+                   f"({', '.join('[' + cols[i] + ']' for i in keep)}) "
+                   f"VALUES ({', '.join(vals[i] for i in keep)})")
+        return self._c.execute(new_sql, tuple(new_params))
+
+    def _execute_update(self, sql, params, m):
+        """Drop SET clauses naming columns this era does not have."""
+        table, setlist = m.group(1), m.group(2)
+        rest = m.group(3) or ""
+        known = self._known(table)
+        if not known:
+            return self._c.execute(sql, params)
+        parts = [x.strip() for x in _split_top_level_commas(setlist)]
+        seq = list(params)
+        keep, new_params, pidx = [], [], 0
+        for part in parts:
+            name = part.split("=", 1)[0].strip().strip("[]")
+            n = part.count("?")
+            if name in known:
+                keep.append(part)
+                new_params.extend(seq[pidx:pidx + n])
+            pidx += n
+        if len(keep) == len(parts):
+            return self._c.execute(sql, params)
+        if not keep:
+            # Nothing left to set; the WHERE clause params are irrelevant.
+            return self._c
+        new_params.extend(seq[pidx:])
+        return self._c.execute(
+            f"UPDATE [{table}] SET {', '.join(keep)}{rest}", tuple(new_params))
+
+    def executemany(self, sql, seq):
+        return self._c.executemany(sql, seq)
+
+    def fetchone(self):
+        return self._c.fetchone()
+
+    def fetchall(self):
+        return self._c.fetchall()
+
+    def __iter__(self):
+        return iter(self._c)
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+
+def _split_top_level_commas(s: str) -> list:
+    """Split on commas not nested in parentheses or quotes."""
+    out, cur, depth, q = [], [], 0, None
+    for ch in s:
+        if q:
+            cur.append(ch)
+            if ch == q:
+                q = None
+            continue
+        if ch in "'\"":
+            q = ch; cur.append(ch); continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur)); cur = []; continue
+        cur.append(ch)
+    out.append("".join(cur))
+    return out
+
+
 def _modify_metadata_and_encode(
     sqlite_bytes: bytes,
     tables: list[dict],
@@ -1704,6 +1894,15 @@ def _modify_metadata_and_encode(
         conn = sqlite3.connect(tmp_path)
         conn.row_factory = sqlite3.Row
 
+        # Rebuilding an existing model: its metadata is the starting point, so
+        # clear what we are about to rewrite and keep everything else.
+        try:
+            populated = conn.execute("SELECT COUNT(*) FROM [Table]").fetchone()[0]
+        except sqlite3.Error:
+            populated = 0
+        if populated:
+            _clear_builder_owned_rows(conn)
+
         # Find max ID across ALL tables for global counter.
         # Add a large gap (1000) because the AS engine's internal ID counter
         # starts at max_existing_ID + 1. When PBI Desktop opens the file,
@@ -1729,7 +1928,9 @@ def _modify_metadata_and_encode(
         # }
         col_storage_info: dict[str, dict[str, dict]] = {}
 
-        c = conn.cursor()
+        # Schema-aware: the source model's era may lack columns the builder
+        # names, and inventing them is what the service rejected.
+        c: Any = _SchemaAwareCursor(conn.cursor())
 
         # ============================================================
         # INSERT Tables

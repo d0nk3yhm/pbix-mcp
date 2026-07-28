@@ -147,10 +147,29 @@ _ADDITIONAL_LOG = '<Property><ProductName>Default</ProductName></Property>'.enco
 _PARTITIONS = '<Partitions/>'.encode("utf-16")
 
 
+def _rewrite_db_xml_id(db_xml: bytes, db_id: str) -> bytes:
+    """Point a carried db.xml at the new database GUID, changing nothing else.
+
+    <Name> and <ID> must match the database GUID the ABF is laid out under.
+    Everything else — CompatibilityLevel, DbUniqueId, Language, collation — is
+    the source's own declaration and is left exactly as Desktop wrote it.
+    """
+    import re
+
+    enc = "utf-16-le" if db_xml[:2] in (b"\xff\xfe", b"<\x00") else "utf-8"
+    text = db_xml.decode(enc, "replace")
+    old = re.search(r"<Name>([^<]*)</Name>", text)
+    if old:
+        text = text.replace(f"<Name>{old.group(1)}</Name>", f"<Name>{db_id}</Name>")
+        text = text.replace(f"<ID>{old.group(1)}</ID>", f"<ID>{db_id}</ID>")
+    return text.encode(enc)
+
+
 def build_abf_clean(
     metadata_sqlite: bytes,
     vertipaq_files: Dict[str, bytes],
     db_id: str | None = None,
+    source_db_xml: bytes | None = None,
 ) -> bytes:
     """Build a complete ABF archive from scratch.
 
@@ -161,6 +180,9 @@ def build_abf_clean(
         metadata_sqlite: Raw SQLite metadata bytes
         vertipaq_files: Dict mapping relative paths to VertiPaq file bytes
         db_id: Optional database GUID (auto-generated if None)
+        source_db_xml: db.xml of the model being rebuilt, carried through so it
+            keeps its own declared compatibility level. Only the database
+            name/ID is rewritten.
 
     Returns:
         Complete ABF binary ready for XPress9 compression
@@ -174,7 +196,17 @@ def build_abf_clean(
     now = _windows_filetime_now()
 
     # ── Generate system files ───────────────────────────────────────
-    db_xml_bytes = generate_db_xml(db_id, object_id, db_unique_id)
+    # Prefer the SOURCE db.xml. The generated one hardcodes
+    # CompatibilityLevel 1550 and adds a ddl800:DbUniqueId, so rebuilding a
+    # model authored at 1455 handed Analysis Services a database claiming a
+    # level its metadata was never written for; the service rejected it with
+    # "Failed to PublishAbf database ... An error occurred when loading
+    # ... .db.xml". Every file verified in the service before this happened to
+    # come from a source at 1601, which AS tolerated being described as 1550,
+    # so the mismatch stayed invisible.
+    db_xml_bytes = (_rewrite_db_xml_id(source_db_xml, db_id)
+                    if source_db_xml
+                    else generate_db_xml(db_id, object_id, db_unique_id))
     cryptkey_bytes = CRYPTKEY_BYTES
 
     # ── Assign StoragePaths ─────────────────────────────────────────
