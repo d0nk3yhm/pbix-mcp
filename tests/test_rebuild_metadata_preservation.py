@@ -165,6 +165,127 @@ class TestCarrySpecShape:
             assert identity, f"{tname} has no identity — it would duplicate"
 
 
+class TestSchemaEraPreservation:
+    """A rebuild must keep the source model's metadata SCHEMA, not impose one.
+
+    The builder's blank schema is a fixed 63 tables. 20 of the 24 corpus models
+    are an OLDER compatibility level than that — one has 51 tables — so
+    rebuilding them from a blank schema invented tables and columns their level
+    never had. The Power BI service rejected the result outright with "Failed to
+    PublishAbf database ... An error occurred when loading ... .db.xml", three
+    times, while a field-by-field metadata comparison reported no differences.
+    """
+
+    def test_only_database_singletons_survive_the_clear(self):
+        """Anything else left behind would point at a reassigned primary key."""
+        from pbix_mcp import builder
+        assert builder._PRESERVED_TABLES == {"Model", "Culture", "DBPROPERTIES"}
+
+    def test_the_builder_starts_from_source_metadata_when_given_it(self):
+        from pbix_mcp.builder import PBIXBuilder
+        b = PBIXBuilder()
+        assert b._source_metadata is None, "a NEW file must use the blank schema"
+        assert b._source_db_xml is None
+
+    def test_insert_of_an_unknown_column_is_narrowed_not_rejected(self):
+        """The 1455 era has no Column.ExpressionContext; naming it must not
+        fail the rebuild, and must not add the column either."""
+        import sqlite3
+
+        from pbix_mcp.builder import _SchemaAwareCursor
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE [T] (ID INTEGER, Name TEXT)")
+        c = _SchemaAwareCursor(conn.cursor())
+        c.execute("INSERT INTO T (ID, Name, ExpressionContext) VALUES (?, ?, ?)",
+                  (1, "a", 99))
+        assert conn.execute("SELECT ID, Name FROM T").fetchall() == [(1, "a")]
+        assert "ExpressionContext" not in {
+            r[1] for r in conn.execute("PRAGMA table_info([T])")}
+
+    def test_insert_keeps_literals_aligned_with_placeholders(self):
+        """Several builder inserts mix literals into VALUES; dropping a column
+        has to drop the right parameter, not shift them all."""
+        import sqlite3
+
+        from pbix_mcp.builder import _SchemaAwareCursor
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE [T] (A INTEGER, C INTEGER, D TEXT)")
+        c = _SchemaAwareCursor(conn.cursor())
+        c.execute("INSERT INTO T (A, B, C, D) VALUES (?, ?, 42, ?)",
+                  (1, 999, "keep"))
+        assert conn.execute("SELECT A, C, D FROM T").fetchall() == [(1, 42, "keep")]
+
+    def test_update_of_an_unknown_column_is_narrowed(self):
+        """DictionaryStorage.Size does not exist at 1455 and is UPDATEd."""
+        import sqlite3
+
+        from pbix_mcp.builder import _SchemaAwareCursor
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE [T] (ID INTEGER, Keep TEXT)")
+        conn.execute("INSERT INTO T VALUES (1, 'before')")
+        c = _SchemaAwareCursor(conn.cursor())
+        c.execute("UPDATE T SET Size = ?, Keep = ? WHERE ID = ?", (5, "after", 1))
+        assert conn.execute("SELECT Keep FROM T").fetchone()[0] == "after"
+
+    def test_update_with_no_surviving_columns_is_a_no_op(self):
+        import sqlite3
+
+        from pbix_mcp.builder import _SchemaAwareCursor
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE [T] (ID INTEGER)")
+        conn.execute("INSERT INTO T VALUES (1)")
+        c = _SchemaAwareCursor(conn.cursor())
+        c.execute("UPDATE T SET Size = ? WHERE ID = ?", (5, 1))
+        assert conn.execute("SELECT COUNT(*) FROM T").fetchone()[0] == 1
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not os.path.isdir(CORPUS), reason="corpus not downloaded")
+class TestSchemaEraOnRealFiles:
+    """The regression, on the file the service actually rejected."""
+
+    @staticmethod
+    def _schema(pbix):
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+        with zipfile.ZipFile(pbix) as z:
+            raw = read_metadata_sqlite(decompress_datamodel(z.read("DataModel")))
+        fd, tmp = tempfile.mkstemp(suffix=".db")
+        os.write(fd, raw)
+        os.close(fd)
+        conn = sqlite3.connect(tmp)
+        try:
+            tabs = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            cols = {}
+            for n in tabs:
+                cols[n] = {r[1] for r in conn.execute(f"PRAGMA table_info([{n}])")}
+            return tabs, cols
+        finally:
+            conn.close()
+            os.unlink(tmp)
+
+    @pytest.mark.parametrize("fname,table", [
+        ("MS_Blog_DataProfiling.pbix", "Numbers"),   # 1455 — the rejected one
+        ("GeoSales_Dashboard.pbix", "People"),       # 1601 — always worked
+    ])
+    def test_rebuild_invents_no_table_or_column(self, fname, table, tmp_path):
+        src = os.path.join(CORPUS, fname)
+        if not os.path.exists(src):
+            pytest.skip(f"{fname} not in corpus")
+        control, err = _save_after(src, str(tmp_path)), ""
+        assert control, err
+        edited = _save_after(src, str(tmp_path), table)
+        assert edited, "edit was refused"
+        ct, cc = self._schema(control)
+        et, ec = self._schema(edited)
+        assert not et - ct, f"invented tables: {sorted(et - ct)}"
+        invented = {n: sorted(ec[n] - cc[n]) for n in cc
+                    if n in ec and ec[n] - cc[n]}
+        assert not invented, f"invented columns: {invented}"
+
+
 class TestObjectPropertyLists:
     """The property allow-lists decide what survives a rebuild."""
 

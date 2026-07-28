@@ -7620,6 +7620,23 @@ def _snapshot_carryable_metadata(conn: sqlite3.Connection) -> dict:
     conn.row_factory = sqlite3.Row
     fwd, _rev = _identity_maps(conn)
     snap: dict[str, list[dict]] = {}
+    # Singleton tables are kept verbatim across a rebuild, but two of their
+    # columns point INTO tables the rebuild clears, so they would be left
+    # dangling. Captured by identity here and repaired after the restore.
+    snap["__singletons__"] = {}
+    try:
+        r = conn.execute("SELECT ID, LinguisticMetadataID FROM [Culture]").fetchone()
+        if r and r["LinguisticMetadataID"]:
+            snap["__singletons__"]["culture_lm"] = r["LinguisticMetadataID"]
+    except sqlite3.Error:
+        pass
+    try:
+        r = conn.execute("SELECT DefaultMeasureID FROM [Model]").fetchone()
+        if r and r["DefaultMeasureID"]:
+            snap["__singletons__"]["default_measure"] = fwd.get(r["DefaultMeasureID"])
+    except sqlite3.Error:
+        pass
+
     for tname, fks, _identity in _CARRY_SPEC:
         try:
             rows = conn.execute(f"SELECT * FROM [{tname}]").fetchall()
@@ -7739,6 +7756,25 @@ def _restore_carryable_metadata(dm_path: str, snap: dict) -> list[str]:
                 )
                 if old_id is not None:
                     remap.setdefault(tname, {})[old_id] = max_id
+
+        # Re-point the singleton references at the rows just re-created.
+        singles = snap.get("__singletons__") or {}
+        if "culture_lm" in singles:
+            new_lm = remap.get("LinguisticMetadata", {}).get(singles["culture_lm"])
+            if new_lm is None:
+                row = c.execute("SELECT ID FROM [LinguisticMetadata] "
+                                "LIMIT 1").fetchone()
+                new_lm = row["ID"] if row else 0
+            try:
+                c.execute("UPDATE [Culture] SET LinguisticMetadataID = ?", (new_lm,))
+            except sqlite3.Error:
+                pass
+        if singles.get("default_measure"):
+            try:
+                c.execute("UPDATE [Model] SET DefaultMeasureID = ?",
+                          (rev.get(tuple(singles["default_measure"]), 0),))
+            except sqlite3.Error:
+                pass
 
         c.execute("UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'",
                   (str(max_id),))
@@ -8044,6 +8080,26 @@ def _rebuild_datamodel(
 
     # Build new DataModel via builder
     builder = PBIXBuilder()
+    # Carry the source model's db.xml so the rebuilt database keeps its own
+    # declared CompatibilityLevel. The generator hardcodes 1550, which told
+    # Analysis Services that a model authored at 1455 was a 1550 database and
+    # made it refuse to load the file at all.
+    try:
+        from pbix_mcp.formats.abf_rebuild import list_abf_files, read_abf_file
+        _dbx = [f for f in list_abf_files(abf)
+                if f.get("FileName", "").endswith(".db.xml")]
+        if _dbx:
+            builder._source_db_xml = read_abf_file(abf, _dbx[0])
+        # …and the model's own metadata.sqlitedb, so the rebuild keeps its
+        # schema era instead of imposing the builder's fixed 63-table one.
+        # 20 of the 24 corpus models are an older era than that; rebuilding
+        # them from a blank schema invented tables their compatibility level
+        # never had, and the service refused to load the result.
+        builder._source_metadata = meta_bytes
+    except Exception:
+        # Falling back to the generated db.xml is the pre-existing behaviour;
+        # never fail an edit over this.
+        pass
 
     # Add existing tables (with optional row updates), skip removed tables
     for tinfo in tables:
