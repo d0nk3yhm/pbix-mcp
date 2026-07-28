@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.46] - 2026-07-28
+
+**Reverts the one change that altered the schema Analysis Services parses.**
+
+A file built with 0.9.45 was rejected by the Power BI service on upload:
+
+```
+Failed to PublishAbf database '…': An error occurred when loading … .db.xml
+Power BI Semantic Model Error Code -1055653859
+```
+
+Structural verification had passed it at 0 differences, so the defect is something a field-by-field metadata comparison cannot see. Ruled out by inspection: the ABF storage inventory (identical entry sets, same segment counts), foreign-key integrity (every reference resolves), and DAX binding (every calculated-table and calculated-column expression resolves to a real table and column). Everything the carry-over inserts binds by **name** — `LinguisticMetadata` uses `"ConceptualEntity": "fct_Orders"` — with no IDs from the old model embedded anywhere.
+
+Building the same edit on the same file with **v0.9.41** — the last release confirmed loading in the service — and diffing showed exactly one structural change beyond added rows: 0.9.44 added `CREATE TABLE [Function]` to the builder's schema, taking the metadata database from **63 tables to 64**.
+
+Adding rows to a table Desktop already writes is a different risk class from adding a table Desktop's own files do not contain. That change shipped in the version whose output was rejected, and its benefit was one row in one corpus file. It is reverted. User-defined DAX functions are now **reported as uncarryable** rather than carried, which is the behaviour every release before 0.9.44 had.
+
+This is a containment measure, not a confirmed root cause — the service is the only thing that can confirm it, and this release is what makes that test possible.
+
 ## [0.9.45] - 2026-07-28
 
 **Every rebuild-path edit was quietly reformatting the model. Found by building a verification file for 0.9.44 and checking the bytes I was about to hand over.**
