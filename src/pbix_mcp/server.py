@@ -8096,6 +8096,14 @@ def _rebuild_datamodel(
         # them from a blank schema invented tables their compatibility level
         # never had, and the service refused to load the result.
         builder._source_metadata = meta_bytes
+        # …and its encryption key. Carrying the metadata without the key left
+        # DataSource connection strings encrypted under a key the file no
+        # longer contained, and the service refused the model with "Failed to
+        # decrypt sensitive data".
+        _ck = [f for f in list_abf_files(abf)
+               if "CryptKey" in f.get("FileName", "")]
+        if _ck:
+            builder._source_cryptkey = read_abf_file(abf, _ck[0])
     except Exception:
         # Falling back to the generated db.xml is the pre-existing behaviour;
         # never fail an edit over this.

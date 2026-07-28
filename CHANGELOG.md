@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.49] - 2026-07-28
+
+**The rebuild replaced the model's encryption key while keeping data encrypted under the old one.**
+
+The 0.9.47 artifact was rejected by the service with a **different** error from the three before it:
+
+```
+before:  An error occurred when loading … .db.xml     code -1055653859
+now:     Failed to decrypt sensitive data. Possibly
+         the encryption key does not match             code -1054474227
+```
+
+`build_abf_clean` writes a **hardcoded 144-byte `0.CryptKey.bin`**. That was harmless while a rebuild started from a blank schema, because the result contained no encrypted values. 0.9.47 began preserving the source's metadata — including `DataSource` rows whose `ConnectionString` is a ~4 KB blob encrypted under **the source's** key — so the model then carried ciphertext it no longer had the key for.
+
+```
+source CryptKey    8c6bb6ca…   (its own)
+rebuilt CryptKey   3331be84…   = the builder's constant
+DataSource rows    3 × ~4 KB encrypted ConnectionString, carried verbatim
+```
+
+**24 of 24 corpus files have a CryptKey different from the builder's constant**, so this affected every model with a data source, not just the one tested.
+
+The source's `0.CryptKey.bin` is now carried through the rebuild, exactly as `db.xml` and the metadata schema already were. A newly created file still gets the generated key, since it has nothing encrypted.
+
+### Added — eighth dimension in `scripts/verify_rebuild_fidelity.py`
+Encryption-key identity. Every failure mode found becomes a standing check; this one would have been caught before the upload.
+
+Across all 24 corpus reports: **11 edits accepted with 0 findings on all eight dimensions, 13 refused with accurate reasons.**
+
 ## [0.9.48] - 2026-07-28
 
 ### Added — `pbix_doctor` now reports what an edit would cost, before you make it

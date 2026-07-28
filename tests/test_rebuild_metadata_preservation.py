@@ -186,6 +186,19 @@ class TestSchemaEraPreservation:
         b = PBIXBuilder()
         assert b._source_metadata is None, "a NEW file must use the blank schema"
         assert b._source_db_xml is None
+        assert b._source_cryptkey is None
+
+    def test_the_source_encryption_key_is_used_when_supplied(self):
+        """A DataSource's ConnectionString is encrypted under the SOURCE's key
+        and travels with the metadata. Shipping the generator's key instead
+        makes the service refuse with "Failed to decrypt sensitive data"."""
+        import inspect
+
+        from pbix_mcp.builder_v2 import CRYPTKEY_BYTES, build_abf_clean
+        sig = inspect.signature(build_abf_clean)
+        assert "source_cryptkey" in sig.parameters
+        src = bytes(range(144))
+        assert src != CRYPTKEY_BYTES
 
     def test_insert_of_an_unknown_column_is_narrowed_not_rejected(self):
         """The 1455 era has no Column.ExpressionContext; naming it must not
