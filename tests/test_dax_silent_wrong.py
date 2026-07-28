@@ -174,3 +174,156 @@ class TestQualifierRewriteIsSurgical:
     def test_no_known_columns_is_a_no_op(self):
         assert server._qualify_bare_column_refs("YEAR([Date])", "T", []) == \
             "YEAR([Date])"
+
+
+class TestDateDiffCountsBoundariesNotElapsedTime:
+    """DATEDIFF returns interval BOUNDARIES crossed, not elapsed time.
+
+    The obvious implementation — floor the elapsed difference — is wrong on
+    every boundary, and wrong quietly: it returns a plausible number one lower.
+    Against the twelve rows below, taken live from Power BI Desktop's own
+    engine, ``(end - start).days // 7`` disagrees on five of ten distinct
+    dates, so this class of mistake would have shipped unnoticed.
+
+    Ground truth: Power BI Desktop was opened on test_corpus/
+    MS_Regional_Sales.pbix and its workspace Analysis Services engine queried
+    directly for Opportunities[Weeks Open], whose expression is
+
+        ABS(DATEDIFF(
+            Opportunities[Opportunity Created On],
+            IF(ISBLANK(Opportunities[CloseDate]) = TRUE(),
+               TODAY(), Opportunities[CloseDate]),
+            WEEK))
+
+    Rows with a blank CloseDate are excluded because TODAY() makes them
+    time-dependent.
+    """
+
+    # (close date, weeks Power BI Desktop computed) from a 2021-11-09 start.
+    DESKTOP = [
+        ("2022-01-23", 11), ("2022-01-30", 12), ("2022-02-02", 12),
+        ("2022-02-11", 13), ("2022-02-21", 15), ("2022-02-27", 16),
+        ("2022-03-03", 16), ("2022-03-23", 19), ("2022-04-02", 20),
+        ("2022-04-10", 22),
+    ]
+
+    @pytest.mark.parametrize("close,weeks", DESKTOP)
+    def test_matches_power_bi_desktop(self, ctx, close, weeks):
+        eng, c = ctx
+        got = eng._eval_expr(
+            f'DATEDIFF("2021-11-09", "{close}", WEEK)', c)
+        assert got == weeks, f"2021-11-09 -> {close}: expected {weeks}, got {got}"
+
+    def test_the_naive_implementation_would_disagree(self):
+        """Guards the guard: if this ever stops failing, the cases above are
+        no longer discriminating and need replacing with harder ones."""
+        start = datetime.date(2021, 11, 9)
+        naive_wrong = sum(
+            1 for close, weeks in self.DESKTOP
+            if (datetime.date.fromisoformat(close) - start).days // 7 != weeks)
+        assert naive_wrong >= 4, (
+            "elapsed-time DATEDIFF now agrees on almost every case; pick "
+            "dates that straddle more week boundaries")
+
+    @pytest.mark.parametrize("expr,want,why", [
+        ('DATEDIFF(DATE(2023,12,31), DATE(2024,1,1), YEAR)', 1,
+         "one day apart, but one year boundary"),
+        ('DATEDIFF(DATE(2024,1,1), DATE(2024,12,31), YEAR)', 0,
+         "same calendar year"),
+        ('DATEDIFF(DATE(2024,1,31), DATE(2024,2,1), MONTH)', 1,
+         "one day apart, but one month boundary"),
+        ('DATEDIFF(DATE(2024,1,1), DATE(2024,1,31), MONTH)', 0, "same month"),
+        ('DATEDIFF(DATE(2024,3,31), DATE(2024,4,1), QUARTER)', 1, "Q1 -> Q2"),
+        ('DATEDIFF(DATE(2024,1,1), DATE(2024,3,31), QUARTER)', 0, "both Q1"),
+        ('DATEDIFF(DATE(2024,1,6), DATE(2024,1,7), WEEK)', 1,
+         "Saturday -> Sunday: a DAX week starts on Sunday"),
+        ('DATEDIFF(DATE(2024,1,7), DATE(2024,1,13), WEEK)', 0,
+         "Sunday..Saturday is one week"),
+        ('DATEDIFF(DATE(2024,1,1), DATE(2024,1,15), DAY)', 14, "plain days"),
+        ('DATEDIFF(DATE(2024,1,15), DATE(2024,1,1), DAY)', -14,
+         "reversed arguments give a negative, not an error"),
+    ])
+    def test_boundary_semantics_per_interval(self, ctx, expr, want, why):
+        eng, c = ctx
+        assert eng._eval_expr(expr, c) == want, why
+
+    def test_datediff_is_not_reported_unsupported(self, ctx):
+        """The gate refuses any expression naming an unsupported function, so a
+        registered-but-unlisted DATEDIFF would still block every file."""
+        eng, c = ctx
+        eng._eval_expr('DATEDIFF(DATE(2024,1,1), DATE(2024,2,1), DAY)', c)
+        assert not eng.unsupported_functions
+
+
+class TestRoundingDirectionOnNegativeNumbers:
+    """INT floors; TRUNC and ROUNDDOWN truncate. They differ only below zero.
+
+    Every value below was read from Power BI Desktop's own engine. Python's
+    ``int()`` truncates, so using it for INT was off by one for every negative
+    number -- and off by a whole bin in the binning idiom ``INT(x / 5) * 5``
+    that Power BI's own "New group" feature generates. It returned a plausible
+    number, never an error.
+    """
+
+    @pytest.mark.parametrize("expr,desktop", [
+        ("INT(-1.5)", -2),
+        ("INT(-0.1)", -1),
+        ("INT(-2.0)", -2),
+        ("INT(1.5)", 1),
+        # Truncating instead of flooring puts these in the NEXT bin up.
+        ("INT(-1612/5)*5", -1615),
+        ("INT(-1608/5)*5", -1610),
+        ("INT(77/5)*5", 75),
+    ])
+    def test_int_floors(self, ctx, expr, desktop):
+        eng, c = ctx
+        assert eng._eval_expr(expr, c) == desktop
+
+    @pytest.mark.parametrize("expr,desktop", [
+        ("TRUNC(-1.5)", -1),
+        ("ROUNDDOWN(-1.5,0)", -1),
+        ("ROUNDDOWN(-2.7,0)", -2),
+        ("ROUNDDOWN(1.9,0)", 1),
+        ("ROUNDDOWN(3.14159,2)", 3.14),
+        ("ROUNDDOWN(-3.14159,2)", -3.14),
+        ("ROUNDUP(1.1,0)", 2),
+        ("ROUNDUP(-1.1,0)", -2),
+    ])
+    def test_rounddown_and_roundup_go_relative_to_zero(self, ctx, expr, desktop):
+        eng, c = ctx
+        assert eng._eval_expr(expr, c) == pytest.approx(desktop)
+
+    def test_int_and_rounddown_disagree_below_zero(self, ctx):
+        """The whole point: if these ever agree, one of them is wrong."""
+        eng, c = ctx
+        assert eng._eval_expr("INT(-1.5)", c) != eng._eval_expr(
+            "ROUNDDOWN(-1.5,0)", c)
+
+
+class TestWeekNumStartsTheYearAtWeekOne:
+    """WEEKNUM is not ISO: the week containing January 1 is always week 1.
+
+    ``date.isocalendar()[1]`` gives 2024-01-01 week 1 but 2021-01-01 week 53,
+    because ISO assigns early-January days to the previous year. DAX never
+    does. Values below are from Power BI Desktop.
+    """
+
+    @pytest.mark.parametrize("expr,desktop", [
+        ("WEEKNUM(DATE(2024,1,1))", 1),
+        ("WEEKNUM(DATE(2024,1,6))", 1),     # Saturday, still week 1
+        ("WEEKNUM(DATE(2024,1,7))", 2),     # Sunday starts week 2
+        ("WEEKNUM(DATE(2024,12,31))", 53),
+        ("WEEKNUM(DATE(2021,1,1))", 1),     # ISO would say 53
+        ("WEEKNUM(DATE(2021,1,2))", 1),
+        ("WEEKNUM(DATE(2021,1,3))", 2),
+        ("WEEKNUM(DATE(2024,1,1),2)", 1),   # type 2: week starts Monday
+        ("WEEKNUM(DATE(2024,1,7),2)", 1),
+        ("WEEKNUM(DATE(2024,1,8),2)", 2),
+    ])
+    def test_matches_power_bi_desktop(self, ctx, expr, desktop):
+        eng, c = ctx
+        assert eng._eval_expr(expr, c) == desktop
+
+    def test_iso_week_would_disagree(self):
+        """2021-01-01 is the case that separates DAX from ISO."""
+        assert datetime.date(2021, 1, 1).isocalendar()[1] == 53

@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.51] - 2026-07-28
+
+**`INT` was off by one for every negative number, and DATEDIFF / WEEKNUM / ROUNDDOWN / ROUNDUP now exist.** Progress on issue #4.
+
+Every value in this release was checked against Power BI Desktop's own Analysis Services engine, queried directly over ADOMD while Desktop had the file open — not against documentation and not against our own expectations.
+
+### `INT` truncated instead of flooring
+
+```
+INT(-1.5)      Desktop -2      we returned -1
+INT(-0.1)      Desktop -1      we returned  0
+```
+
+DAX `INT` rounds toward **negative infinity**; `TRUNC` and `ROUNDDOWN` round toward **zero**. They differ only below zero, and Python's `int()` does the wrong one. This never raised — it returned a plausible number one step off.
+
+It mattered most in the binning idiom Power BI's own "New group" feature generates, `INT(x / 5) * 5`, where being off by one puts the row in the **wrong bin**:
+
+```
+INT(-1612/5)*5    Desktop -1615     we returned -1610
+```
+
+`test_corpus/MS_Regional_Sales.pbix` has exactly this shape in `Opportunities[Days Remaining In Pipeline (bins)]`, over a column that is negative for every past date.
+
+### DATEDIFF
+
+Counts interval **boundaries crossed**, not elapsed time — `DATEDIFF(DATE(2023,12,31), DATE(2024,1,1), YEAR)` is 1 despite the dates being a day apart. The obvious implementation (floor the elapsed difference) disagrees with Desktop on **five of ten** real rows from `Opportunities[Weeks Open]`, so it would have shipped silently wrong.
+
+`WEEK` was the subtle one: a DAX week starts on **Sunday**. Verified against twelve rows read live from Desktop's engine. `YEAR`, `QUARTER`, `MONTH`, `WEEK`, `DAY`, `HOUR`, `MINUTE` and `SECOND` are all boundary counts; reversed arguments give a negative rather than an error.
+
+### WEEKNUM
+
+Not ISO. The week containing January 1 is always week 1, where `date.isocalendar()` puts 2021-01-01 in week 53 of the previous year. Return types 1 (Sunday-start, the default) and 2 (Monday-start) both verified against Desktop.
+
+### ROUNDDOWN / ROUNDUP
+
+Both round relative to zero, so `ROUNDDOWN(-1.5, 0)` is -1 where `INT(-1.5)` is -2.
+
+### A refusal heuristic that blocked a whole file
+
+A calculated column whose every row evaluated to blank was refused outright, as a tell-tale of a reference that silently failed to resolve. Reasonable, but it has a false positive: a column whose expression is literally `BLANK()` is legitimately blank on every row, and one such column in `MS_Regional_Sales.pbix` blocked every edit to that file.
+
+The real condition is now detected directly instead of guessed at. After the per-row substitution, any column reference still present in the expression belongs to another table or to nothing — the engine reads it as blank, which is exactly how a wrong value gets materialized. Those are named in the refusal:
+
+```
+before:  every row evaluated to blank — the expression likely references
+         a column or name that doesn't resolve in this engine
+now:     references a column this engine cannot resolve in row context: [Date]
+```
+
+The all-blank guard is kept for expressions that do read a column, where it is still the right signal.
+
 ## [0.9.50] - 2026-07-28
 
 **Power BI Desktop refused to open a rebuilt file for four more reasons. All four are fixed and all three schema eras now open and answer queries in Desktop.**

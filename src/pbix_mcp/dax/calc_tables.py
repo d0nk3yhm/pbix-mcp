@@ -289,6 +289,37 @@ def calc_column_unsupported_reason(expression: str, target_table: str):
     return None
 
 
+# A column reference: optional 'Table' or Table qualifier then [Name]. Applied
+# only after string literals are blanked, so a bracket inside "text [like this]"
+# is never mistaken for one.
+_COLUMN_REF = re.compile(r"(?:'[^']+'|\b\w+)?\[[^\]]+\]")
+_STRING_LITERAL = re.compile(r'"(?:[^"]|"")*"')
+
+
+def _strip_strings(expr: str) -> str:
+    return _STRING_LITERAL.sub('""', expr or "")
+
+
+def _unresolved_refs(row_expr: str) -> set:
+    """Column references still present after per-row substitution.
+
+    Every reference to the target table's own columns has been replaced by a
+    literal by this point, so whatever is left points at another table or at
+    nothing. Both evaluate to blank rather than raising, which is exactly how a
+    calculated column ends up materialized with wrong values.
+    """
+    return set(_COLUMN_REF.findall(_strip_strings(row_expr)))
+
+
+def _refs_any_column(expr: str) -> bool:
+    """Whether the expression reads any column at all.
+
+    A constant expression such as BLANK() cannot be blank *because* a reference
+    failed to resolve, so the all-blank heuristic must not fire on it.
+    """
+    return bool(_COLUMN_REF.search(_strip_strings(expr)))
+
+
 def evaluate_row_context_column(
     columns: List[str],
     rows: List[list],
@@ -310,6 +341,7 @@ def evaluate_row_context_column(
     clean = re.sub(r"--[^\n]*|//[^\n]*", "", expression or "").strip()
     engine = dax_engine.DAXEngine()
     values: list = []
+    unresolved: set = set()
     for row in rows:
         row_data = {cn: row[ci] for ci, cn in enumerate(columns)}
         row_expr = clean
@@ -332,6 +364,7 @@ def evaluate_row_context_column(
                             pat, '"' + val.isoformat() + '"')
                     else:
                         row_expr = row_expr.replace(pat, str(val))
+        unresolved |= _unresolved_refs(row_expr)
         try:
             ctx = dax_engine.DAXContext(
                 all_tables, {}, None, None, None, relationships or [])
@@ -342,7 +375,18 @@ def evaluate_row_context_column(
         return None, (
             "expression uses unsupported function(s): "
             + ", ".join(sorted(engine.unsupported_functions)))
-    if rows and all(v is None for v in values):
+    # A reference the substitution above did not replace belongs to another
+    # table (or does not exist). The engine reads it as blank, so the column
+    # would materialize as silently wrong rather than fail. Name it and refuse.
+    if unresolved:
+        return None, (
+            "references a column this engine cannot resolve in row context: "
+            + ", ".join(sorted(unresolved)))
+    # All-blank used to be refused outright as a tell-tale of an unresolved
+    # reference. That is now detected directly above, and the guess had a false
+    # positive that blocked a whole file: a column whose expression is literally
+    # BLANK() is legitimately blank on every row.
+    if rows and all(v is None for v in values) and _refs_any_column(clean):
         return None, (
             "every row evaluated to blank — the expression likely references "
             "a column or name that doesn't resolve in this engine")
