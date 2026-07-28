@@ -844,8 +844,21 @@ def read_table_from_abf(
         if len(seg_meta_list) > 1:
             row_count = sum(s["records"] for s in seg_meta_list)
 
-        if meta_info["is_row_number"]:
-            # RowNumber column -- skip
+        # Skip the RowNumber system column, decided from the MODEL METADATA
+        # (AMO Column.Type 3, or the reserved name) rather than from the
+        # IDFMETA's `is_row_number`.
+        #
+        # That flag is inferred from a uint64 the encoder writes as 1 for a data
+        # column, but Power BI Desktop leaves it 0 on plenty of ordinary
+        # columns, so it does not mean "this is a RowNumber". Trusting it
+        # dropped the column ENTIRELY and silently, because a None-valued
+        # column is filtered out at the end of this function. Measured across
+        # the 24-file corpus: 126 of 1121 user data columns (11.2%) were
+        # discarded this way, including key columns that relationships depend
+        # on -- IT_Support dim_Date[Date], dim_Clusters[Cluster_ID],
+        # fact_IT_Support[Similarity_Score] -- in a file every existing check
+        # reported as clean. The metadata is authoritative and free of guesses.
+        if col["Type"] == 3 or col_name.startswith("RowNumber"):
             col_data.append((col_name, data_type, None))
             continue
 

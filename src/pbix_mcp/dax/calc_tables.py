@@ -234,15 +234,46 @@ def _evaluate_calculated_columns(
 # only, and none of these functions. Anything else is refused, never stored
 # wrong (matches Power BI Desktop, which computes these server-side).
 
-_CALC_UNSAFE_FUNCS = frozenset({
-    # aggregations — need a table scan, not a single row
-    "sum", "sumx", "average", "averagex", "averagea", "min", "minx", "mina",
-    "max", "maxx", "maxa", "count", "countx", "counta", "countax", "countrows",
-    "countblank", "distinctcount", "distinctcountnoblank", "median", "medianx",
-    "percentile", "percentilex", "percentile_inc", "percentile_exc", "product",
-    "productx", "geomean", "geomeanx", "stdev_s", "stdev_p", "stdevx_s",
-    "stdevx_p", "var_s", "var_p", "varx_s", "varx_p", "rank", "rankx", "topn",
-    "sample", "concatenatex",
+# A plain aggregate over the target table's OWN column is deterministic in a
+# calculated column: a calc column has no filter context beyond its own row, so
+# MIN('Date'[Year]) really is the minimum of the whole column, every row. These
+# are allowed -- but ONLY when no filter-context function appears anywhere in
+# the expression, because inside CALCULATE the same call means something else.
+#
+# Deliberately SMALL. Every name here has been checked against Power BI
+# Desktop's own engine; a function is not added until its result matches.
+# Excluded on purpose:
+#   COUNTROWS  -- takes a TABLE, not a column, so the "own column" argument
+#                 check below cannot vet it and COUNTROWS(OtherTable) would
+#                 silently return 0;
+#   DISTINCTCOUNT / COUNT / COUNTA / COUNTBLANK -- our implementations disagree
+#                 with DAX on how BLANK and the empty string are counted
+#                 (DISTINCTCOUNT drops BLANK, i.e. it is really
+#                 DISTINCTCOUNTNOBLANK), so they would be off by one;
+#   MEDIAN / PRODUCT / GEOMEAN / STDEV / VAR -- simply not verified yet.
+_CALC_SELF_AGG_FUNCS = frozenset({
+    "sum", "average", "min", "max",
+})
+
+# Iterators are NOT in the set above: they take a table argument and a row
+# expression, so reproducing them needs a real iteration context.
+#
+# Statistical functions are spelled with a DOT in DAX (STDEV.S, VAR.P,
+# PERCENTILE.INC, STDEVX.P, PERCENTILEX.INC). Listing only the underscore
+# spellings left the real names matching neither set, so they were refused by
+# nothing -- and `_CALC_FUNC_RE` accepts dots, so both spellings are listed.
+_CALC_CONTEXT_FUNCS = frozenset({
+    "sumx", "averagex", "minx", "maxx", "countx", "countax", "medianx",
+    "percentile", "percentilex", "percentile_inc", "percentile_exc",
+    "percentile.inc", "percentile.exc", "percentilex.inc", "percentilex.exc",
+    "productx", "geomeanx", "stdevx_s", "stdevx_p", "varx_s", "varx_p",
+    "stdevx.s", "stdevx.p", "varx.s", "varx.p",
+    # Not allowed above, so they must be refused explicitly.
+    "countrows", "count", "counta", "countblank", "distinctcount",
+    "distinctcountnoblank", "median", "product", "geomean", "averagea",
+    "mina", "maxa", "stdev_s", "stdev_p", "var_s", "var_p",
+    "stdev.s", "stdev.p", "var.s", "var.p",
+    "rank", "rankx", "topn", "sample", "concatenatex",
     # context transition / filter / relationship / table iterators
     "related", "relatedtable", "calculate", "calculatetable", "earlier",
     "earliest", "all", "allexcept", "allselected", "allnoblankrow",
@@ -254,17 +285,23 @@ _CALC_UNSAFE_FUNCS = frozenset({
     "crossfilter", "datatable", "row", "path", "pathitem", "isinscope",
     "isfiltered", "iscrossfiltered", "hasonevalue", "hasonefilter",
 })
+_CALC_UNSAFE_FUNCS = _CALC_SELF_AGG_FUNCS | _CALC_CONTEXT_FUNCS
 _CALC_REF_RE = re.compile(r"(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))\s*\[")
 _CALC_FUNC_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_\.]*)\s*\(")
 
 
-def calc_column_unsupported_reason(expression: str, target_table: str):
+def calc_column_unsupported_reason(expression: str, target_table: str,
+                                   columns=None):
     """Return why a calc-column expression can't be safely materialized, or None.
 
     None = the expression is a row-context expression over ``target_table``'s
     own columns that our per-row evaluator can reproduce faithfully. A non-None
     string is a human-readable reason the caller should REFUSE with (rather than
     store silently-wrong values).
+
+    ``columns`` is the target table's column names when the caller knows them.
+    It lets an aggregate over a misspelled column be refused instead of quietly
+    answering 0; callers without the list simply lose that one check.
     """
     e = re.sub(r"--[^\n]*|//[^\n]*", "", expression or "")
     if not e.strip():
@@ -278,14 +315,55 @@ def calc_column_unsupported_reason(expression: str, target_table: str):
                 f"navigation (RELATED/relationships) is computed by the "
                 f"service, not this engine."
             )
-    for fn in _CALC_FUNC_RE.findall(e):
-        if fn.lower() in _CALC_UNSAFE_FUNCS:
+    # Name every offending function, in the order they appear. Reporting only
+    # the first alphabetically told the author about ALL when what they wrote
+    # was RANKX.
+    # Scan the SHADOW so a function name occurring inside a string or inside a
+    # COLUMN NAME is not read as a call: a column legitimately named
+    # "Total Count (n)" was refused for "using COUNT".
+    seen: list[str] = []
+    for fn in _CALC_FUNC_RE.findall(_agg_shadow(e)):
+        up = fn.upper()
+        if fn.lower() in _CALC_CONTEXT_FUNCS and up not in seen:
+            seen.append(up)
+    if seen:
+        return (
+            f"uses {', '.join(repr(f) for f in seen)}, which need a table scan "
+            f"/ filter context this engine can't evaluate per-row. CALCULATE, "
+            f"RELATED, the X-iterators and table functions are not supported "
+            f"in authored calculated columns."
+        )
+
+    # Each allowed aggregate must take exactly ONE column of this table.
+    # `MIN(x, y)` is DAX's scalar overload, not an aggregate at all, and
+    # `COUNTROWS(Other)` names a table no other check here can see -- both
+    # would otherwise evaluate with no row context and store 0 on every row.
+    # When `columns` is known, the column must also exist: `MIN([Yeer])` is a
+    # typo the engine would answer 0 to rather than fail.
+    for call in _iter_aggregate_calls(e):
+        arg = _agg_column_arg(call)
+        fname = call[:call.find("(")].strip().upper()
+        if arg is None:
             return (
-                f"uses '{fn.upper()}', which needs a table scan / filter "
-                f"context this engine can't evaluate per-row. Aggregations, "
-                f"CALCULATE, RELATED and table functions are not supported in "
-                f"authored calculated columns."
+                f"'{fname}' is used with something other than a single column "
+                f"of '{target_table}'. Only the whole-column form, e.g. "
+                f"{fname}('{target_table}'[Column]), is supported — the "
+                f"two-argument scalar form and table arguments are not."
             )
+        tbl, col = arg
+        if tbl and tbl.lower() != target_table.lower():
+            return (
+                f"'{fname}' aggregates a column of another table '{tbl}'. Only "
+                f"'{target_table}''s own columns are supported."
+            )
+        if columns is not None and col not in columns:
+            return (
+                f"'{fname}' aggregates '[{col}]', which is not a column of "
+                f"'{target_table}'."
+            )
+    # Plain aggregates survive only on their own. Inside a filter-context
+    # function the same MIN means something different, and that case is
+    # already refused by the loop above.
     return None
 
 
@@ -309,6 +387,121 @@ def _unresolved_refs(row_expr: str) -> set:
     calculated column ends up materialized with wrong values.
     """
     return set(_COLUMN_REF.findall(_strip_strings(row_expr)))
+
+
+_AGG_CALL_RE = re.compile(
+    r"\b(" + "|".join(sorted(_CALC_SELF_AGG_FUNCS)) + r")\s*\(", re.IGNORECASE)
+_AGG_MASK = "\x00AGG{}\x00"
+# The ONLY argument shape treated as a whole-column aggregate: exactly one
+# column reference, optionally table-qualified. Anything else -- a second
+# argument, a bare table name, an expression -- is not this.
+_AGG_SOLE_COLUMN_RE = re.compile(
+    r"^\s*(?:'([^']+)'|([A-Za-z_]\w*))?\s*\[([^\]]+)\]\s*$")
+
+
+def _agg_column_arg(call: str):
+    """(table_or_None, column) if `call` is AGG(<one column reference>), else None.
+
+    MIN and MAX have a SECOND, scalar overload -- ``MIN(<expr1>, <expr2>)`` --
+    that is not an aggregate at all. Treating ``MIN('T'[Amount], 0)`` as one
+    hid its column reference from the per-row substitution, and the engine then
+    evaluated a bare reference with no row context: 0 on every row, reported as
+    success. Requiring a single column argument rejects that, and also rejects
+    ``COUNTROWS(OtherTable)``, whose bare table name no other guard can see.
+    """
+    open_paren = call.find("(")
+    if open_paren < 0 or not call.endswith(")"):
+        return None
+    m = _AGG_SOLE_COLUMN_RE.match(call[open_paren + 1:-1])
+    if not m:
+        return None
+    return (m.group(1) or m.group(2)), m.group(3)
+
+
+def _agg_shadow(expr: str) -> str:
+    """`expr` with string literals and bracketed identifiers blanked in place.
+
+    Same length as the original, so match offsets still index into `expr`.
+    Two things must not be scanned for aggregate names:
+      * a STRING containing one, e.g. IF(T[Cat] = "MIN(", T[A], T[B]) -- that
+        masked from inside the literal to the end of the expression, hiding
+        T[A] and T[B] from both the row substitution and the reference check;
+      * a COLUMN NAMED after one, e.g. [Total Count (n)] or [Max (temp)] --
+        scanning the raw text chopped the name in half.
+    """
+    out = _STRING_LITERAL.sub(
+        lambda m: '"' + "\x01" * (len(m.group(0)) - 2) + '"', expr)
+    return re.sub(r"\[[^\]]*\]",
+                  lambda m: "[" + "\x01" * (len(m.group(0)) - 2) + "]", out)
+
+
+def _scan_aggregate_calls(expr: str):
+    """Yield (start, end) of every aggregate call in `expr`."""
+    shadow = _agg_shadow(expr)
+    i = 0
+    while True:
+        m = _AGG_CALL_RE.search(shadow, i)
+        if not m:
+            return
+        # Walk the SHADOW to the matching close paren: its string literals are
+        # blanked, so a '(' or ')' inside one cannot unbalance the count.
+        depth, j = 0, m.end() - 1
+        while j < len(shadow):
+            ch = shadow[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            j += 1
+        yield m.start(), j
+        i = j
+
+
+def _iter_aggregate_calls(expr: str):
+    """Every aggregate call in `expr`, as source text.
+
+    Shares the scanner with _mask_aggregate_calls so the gate and the evaluator
+    can never disagree about what counts as an aggregate call.
+    """
+    return [expr[a:b] for a, b in _scan_aggregate_calls(expr)]
+
+
+def _mask_aggregate_calls(expr: str) -> "tuple[str, list[str]]":
+    """Hide whole aggregate calls so per-row substitution cannot reach inside.
+
+    The row loop replaces every reference to the target table's columns with
+    that row's literal value. Applied to ``MIN('Date'[Year])`` that yields
+    ``MIN(2015)`` -- the current row's year rather than the column minimum, and
+    a different wrong answer on every row. Masking the whole call first leaves
+    it for the engine, which evaluates it against the table snapshot.
+    """
+    out: list[str] = []
+    spans: list[str] = []
+    i = 0
+    for a, b in _scan_aggregate_calls(expr):
+        out.append(expr[i:a])
+        call = expr[a:b]
+        # Only a single-column argument is a whole-column aggregate. Anything
+        # else (the two-argument scalar MIN/MAX, a bare table, an expression)
+        # is left in place so the row substitution treats it normally and the
+        # gate can refuse it.
+        if _agg_column_arg(call) is None:
+            out.append(call)
+        else:
+            out.append(_AGG_MASK.format(len(spans)))
+            spans.append(call)
+        i = b
+    out.append(expr[i:])
+    return "".join(out), spans
+
+
+def _unmask_aggregate_calls(expr: str, spans: "list[str]") -> str:
+    for k, span in enumerate(spans):
+        expr = expr.replace(_AGG_MASK.format(k), span)
+    return expr
 
 
 def _refs_any_column(expr: str) -> bool:
@@ -342,9 +535,11 @@ def evaluate_row_context_column(
     engine = dax_engine.DAXEngine()
     values: list = []
     unresolved: set = set()
+    # Aggregate calls are row-independent, so mask them once rather than per row.
+    masked, agg_spans = _mask_aggregate_calls(clean)
     for row in rows:
         row_data = {cn: row[ci] for ci, cn in enumerate(columns)}
-        row_expr = clean
+        row_expr = masked
         for cn, val in row_data.items():
             for pat in (f"'{target_table}'[{cn}]", f"{target_table}[{cn}]"):
                 if pat in row_expr:
@@ -365,6 +560,7 @@ def evaluate_row_context_column(
                     else:
                         row_expr = row_expr.replace(pat, str(val))
         unresolved |= _unresolved_refs(row_expr)
+        row_expr = _unmask_aggregate_calls(row_expr, agg_spans)
         try:
             ctx = dax_engine.DAXContext(
                 all_tables, {}, None, None, None, relationships or [])

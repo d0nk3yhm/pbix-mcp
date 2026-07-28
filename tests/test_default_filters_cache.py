@@ -12,6 +12,7 @@ time, so:
 """
 
 import json
+import os
 
 import pytest
 
@@ -194,5 +195,43 @@ def test_unchanged_layout_reuses_cached_default_filters(tmp_path, monkeypatch):
             server.pbix_evaluate_dax(alias, "Total")
         # Layout never changed -> no full re-derivation across the 5 evaluations.
         assert calls["n"] == 0, f"expected cached reuse, re-derived {calls['n']} times"
+    finally:
+        server.pbix_close(alias, force=True)
+
+
+def test_same_size_edit_in_one_mtime_tick_is_not_served_from_cache(tmp_path):
+    """The layout change-stamp must not rely on file metadata alone.
+
+    Changing a slicer's selected value from "A" to "B" rewrites the layout to
+    the SAME byte length. If the two writes also land in one filesystem
+    timestamp tick -- routine on Windows, whose granularity is coarse -- then
+    (mtime, size) is byte-identical across a real change and the next evaluate
+    serves the PREVIOUS slicer's number.
+
+    This reproduced only intermittently in CI (one matrix cell of eight), so the
+    tick is forced here with os.utime rather than raced for.
+    """
+    path = str(tmp_path / "m.pbix")
+    _make_model(path)
+    alias = "df_tick"
+    server.pbix_open(path, alias)
+    try:
+        work_dir = server._ensure_open(alias)["work_dir"]
+        layout_file = os.path.join(work_dir, "Report", "Layout")
+
+        _write_slicer(alias, "A")
+        assert _total(alias) == pytest.approx(40.0)
+        st_a = os.stat(layout_file)
+
+        _write_slicer(alias, "B")
+        st_b = os.stat(layout_file)
+        # Precondition: the edit really is the same length.
+        assert st_a.st_size == st_b.st_size
+        # Force both writes into the same timestamp tick.
+        os.utime(layout_file, ns=(st_a.st_atime_ns, st_a.st_mtime_ns))
+
+        assert _total(alias) == pytest.approx(20.0), (
+            "stale slicer result served: the change-stamp did not notice a "
+            "same-size edit inside one mtime tick")
     finally:
         server.pbix_close(alias, force=True)

@@ -13,6 +13,7 @@ The last one matters most: `[Date]` is how Power BI itself writes calculated
 columns, including every auto date/time table it generates.
 """
 import datetime
+import os
 
 import pytest
 
@@ -327,3 +328,154 @@ class TestWeekNumStartsTheYearAtWeekOne:
     def test_iso_week_would_disagree(self):
         """2021-01-01 is the case that separates DAX from ISO."""
         assert datetime.date(2021, 1, 1).isocalendar()[1] == 53
+
+
+CORPUS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      "test_corpus")
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not os.path.isdir(CORPUS), reason="corpus not downloaded")
+class TestAggregateInACalculatedColumnUsesTheWholeColumn:
+    """`([Year] - MIN([Year])) * 12 + [MonthNumber]` on a real model.
+
+    A calculated column has no filter context beyond its own row, so MIN() here
+    is the minimum of the ENTIRE column -- the same number on every row. The
+    per-row evaluator substitutes each reference to the target table's columns
+    with that row's literal, which would turn MIN([Year]) into MIN(2015): the
+    row's own year, a different wrong answer per row, written into VertiPaq
+    with nothing reporting it.
+
+    Ground truth read live from Power BI Desktop's Analysis Services engine on
+    test_corpus/MS_Employee_Hiring.pbix: MIN(Year) is 2010, so 2015-11 is
+    (2015-2010)*12+11 = 71. Collapsing the aggregate to the row would give 11.
+    """
+
+    # (Year, MonthNumber) -> MonthIncrementNumber, as Desktop computed it.
+    DESKTOP = {
+        (2010, 1): 1, (2015, 11): 71, (2015, 12): 72, (2016, 1): 73,
+        (2016, 2): 74, (2016, 3): 75, (2016, 4): 76, (2016, 5): 77,
+        (2016, 6): 78, (2016, 7): 79, (2016, 9): 81, (2016, 10): 82,
+        (2016, 11): 83,
+    }
+
+    def test_matches_power_bi_desktop_on_the_real_model(self):
+        import zipfile
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
+
+        src = os.path.join(CORPUS, "MS_Employee_Hiring.pbix")
+        if not os.path.exists(src):
+            pytest.skip("MS_Employee_Hiring.pbix not in corpus")
+        with zipfile.ZipFile(src) as z:
+            abf = decompress_datamodel(z.read("DataModel"))
+        meta = read_metadata_sqlite(abf)
+        td = read_table_from_abf(abf, "Date", meta)
+        cols, rows = td["columns"], td["rows"]
+        # Guards the guard: these two were among the columns the decoder used
+        # to drop, which made this expression unevaluatable in the first place.
+        assert "Year" in cols and "MonthNumber" in cols
+
+        numeric = {"Year", "MonthNumber", "PeriodNumber", "QtrNumber", "Day"}
+        col_defs = [{"name": c,
+                     "data_type": "Int64" if c in numeric else "String"}
+                    for c in cols]
+        data_rows = [dict(zip(cols, r)) for r in rows]
+        _, out_rows, _ = server._materialize_table_calc_columns(
+            "Date", col_defs, data_rows,
+            [{"column": "MonthIncrementNumber",
+              "expression": "([Year]-MIN([Year]))*12 +[MonthNumber]"}], [])
+
+        seen = {}
+        for r in out_rows:
+            seen.setdefault((r["Year"], r["MonthNumber"]),
+                            r["MonthIncrementNumber"])
+        wrong = {k: (want, seen.get(k)) for k, want in self.DESKTOP.items()
+                 if seen.get(k) != want}
+        assert wrong == {}, f"disagrees with Power BI Desktop: {wrong}"
+
+    def test_collapsing_the_aggregate_would_disagree(self):
+        """If MIN were taken per row, 2015-11 would be 11 rather than 71."""
+        assert self.DESKTOP[(2015, 11)] != 11
+
+
+class TestBlankDoesNotPropagateThroughAComparison:
+    """DAX coerces BLANK to the ZERO of the other operand's type, then compares.
+
+    Returning BLANK (None) from the comparison instead made every test against
+    a blank fall to the ELSE branch. On a bucketing expression -- the shape
+    Power BI's own binning and countless hand-written columns use --
+
+        IF(T[x] < 30, 20, IF(T[x] < 45, 30, IF(T[x] < 60, 45, 80)))
+
+    every blank row scored 80 where Desktop scores it 20. A plausible number,
+    never an error, materialized into VertiPaq.
+
+    Measured on test_corpus/MS_Life_Expectancy.pbix before the fix:
+    Indicators[Basic drinking water services (% of population)] disagreed with
+    Desktop on 70,562 of 72,645 rows.
+
+    Every expectation below was read live from Power BI Desktop's engine.
+    """
+
+    @pytest.mark.parametrize("expr,desktop", [
+        # numeric: BLANK -> 0
+        ('IF(BLANK() < 50, 1, 0)', 1),
+        ('IF(BLANK() >= 50, 1, 0)', 0),
+        ('IF(BLANK() = 0, 1, 0)', 1),
+        ('IF(BLANK() > -1, 1, 0)', 1),
+        ('IF(BLANK() < -1, 1, 0)', 0),
+        ('IF(BLANK() <> 50, 1, 0)', 1),
+        # text: BLANK -> ""
+        ('IF(BLANK() = "", 1, 0)', 1),
+        ('IF(BLANK() <> "", 1, 0)', 0),
+        ('IF(BLANK() < "a", 1, 0)', 1),
+        # boolean: BLANK -> FALSE
+        ('IF(BLANK() = FALSE(), 1, 0)', 1),
+        ('IF(BLANK() = TRUE(), 1, 0)', 0),
+        # date: BLANK -> the zero date, 1899-12-30
+        ('IF(BLANK() < DATE(2024,1,1), 1, 0)', 1),
+        ('IF(BLANK() > DATE(2024,1,1), 1, 0)', 0),
+        ('IF(BLANK() = DATE(1899,12,30), 1, 0)', 1),
+        # blank vs blank
+        ('IF(BLANK() = BLANK(), 1, 0)', 1),
+        ('IF(BLANK() <> BLANK(), 1, 0)', 0),
+        ('IF(BLANK() <= BLANK(), 1, 0)', 1),
+        ('IF(BLANK() >= BLANK(), 1, 0)', 1),
+        ('IF(BLANK() < BLANK(), 1, 0)', 0),
+    ])
+    def test_matches_power_bi_desktop(self, ctx, expr, desktop):
+        eng, c = ctx
+        assert eng._eval_expr(expr, c) == desktop
+
+    def test_the_bucketing_shape_that_was_wrong(self, ctx):
+        """The exact idiom, on a blank input: Desktop says 20, we said 80."""
+        eng, c = ctx
+        assert eng._eval_expr(
+            "IF(BLANK()<30,20,IF(BLANK()<45,30,IF(BLANK()<60,45,80)))", c) == 20
+
+    @pytest.mark.parametrize("expr,want", [
+        ("BLANK() + 5", 5),
+        ("BLANK() * 5", 0),
+        ('BLANK() & "x"', "x"),
+    ])
+    def test_arithmetic_is_untouched(self, ctx, expr, want):
+        """Only COMPARISONS coerce; this guards against over-reaching."""
+        eng, c = ctx
+        assert eng._eval_expr(expr, c) == want
+
+    def test_a_blank_column_value_buckets_like_desktop(self, ctx):
+        """Through the row-context evaluator, not just literal BLANK()."""
+        from pbix_mcp.dax.calc_tables import evaluate_row_context_column
+        cols = ["v"]
+        rows = [[None], [10.0], [55.0], [95.0]]
+        tables = {"T": {"columns": cols, "rows": [list(r) for r in rows]}}
+        vals, err = evaluate_row_context_column(
+            cols, rows,
+            'IF(T[v] < 50, "low", IF(T[v] < 90, "mid", "high"))',
+            "T", tables, [])
+        assert err is None, err
+        # the blank row lands in "low" with Desktop, not "high"
+        assert vals == ["low", "low", "mid", "high"]

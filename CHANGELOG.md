@@ -5,6 +5,83 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.52] - 2026-07-28
+
+**A blank compared against a number took the wrong branch, 11% of every model's data columns were silently dropped when read, and the calculated-column gate now allows plain aggregates.** All three found by comparing our output against Power BI Desktop's own engine over the corpus.
+
+### BLANK did not compare like DAX, so bucketing columns took the wrong branch
+
+DAX does not propagate BLANK through a comparison — it coerces it to the **zero of the other operand's type** and compares that. We returned BLANK, so every test against a blank was neither true nor false and fell through to the ELSE branch.
+
+On the bucketing shape that Power BI's own binning feature and countless hand-written columns use:
+
+```
+IF(T[x] < 30, 20, IF(T[x] < 45, 30, IF(T[x] < 60, 45, 80)))
+```
+
+every blank row scored **80** where Desktop scores it **20**. A plausible number, never an error, materialized into VertiPaq and inherited by every downstream answer.
+
+Measured on `test_corpus/MS_Life_Expectancy.pbix`: `Indicators[Basic drinking water services (% of population)]` disagreed with Desktop on **70,562 of 72,645 rows**. Four columns in that file were affected. After the fix all of them match Desktop exactly.
+
+The full rule, every line read live from Desktop's engine:
+
+```
+BLANK() < 50           TRUE     BLANK() = 0                  TRUE
+BLANK() >= 50          FALSE    BLANK() = ""                 TRUE
+BLANK() <> ""          FALSE    BLANK() = FALSE()            TRUE
+BLANK() < "a"          TRUE     BLANK() = DATE(1899,12,30)   TRUE
+BLANK() = BLANK()      TRUE     BLANK() < DATE(2024,1,1)     TRUE
+```
+
+Arithmetic is untouched — only comparisons coerce, so `BLANK() + 5` is still 5 and `BLANK() * 5` is still 0.
+
+### A tenth of every model's columns vanished on read, with no error
+
+`read_table_from_abf` skipped any column whose IDFMETA reported `is_row_number`. That flag is inferred from a uint64 our own encoder writes as 1 for a data column — but **Power BI Desktop leaves it 0 on plenty of ordinary columns**, so it does not mean "this is a RowNumber". A skipped column was stored as `None` and then filtered out at the end of the function, so it disappeared without an error, a warning, or a trace.
+
+Measured across the 24-file corpus: **126 of 1121 user data columns (11.2%)** were discarded. A rebuild-path edit then wrote the table without them.
+
+```
+IT_Support.pbix   dim_Date[Date]                  <- the column its relationships JOIN on
+                  dim_Clusters[Cluster_ID]
+                  fact_IT_Support[Similarity_Score]
+```
+
+`IT_Support.pbix` is a file every existing check reported as clean, including `verify_rebuild_fidelity.py` at 0 findings.
+
+The RowNumber column is now identified from the model metadata (AMO `Column.Type == 3`, or the reserved name), which is authoritative and involves no guessing. After the fix, **0 declared data columns are missing anywhere in the corpus**. Recovered values were checked against Power BI Desktop's own engine — `dim_Date` gives 521 rows, 521 distinct dates, 2024-01-01 through 2025-06-04, matching exactly.
+
+The same flag was also consulted in `model_reader.py` to choose which column to read a table's row count from; when it misfired on every column of a table, the table reported 0 rows.
+
+### Plain aggregates over the table's own columns are no longer refused
+
+A calculated column has no filter context beyond its own row, so `MIN('Date'[Year])` really is the minimum of the whole column, on every row. These were refused wholesale, which blocked real files whose only obstacle was an expression of the shape:
+
+```
+Date[MonthIncrementNumber] = ([Year] - MIN([Year])) * 12 + [MonthNumber]
+```
+
+Only **`MIN`, `MAX`, `SUM` and `AVERAGE`** are allowed, only **with a single argument that is one column of the target table**, and only when no filter-context function appears anywhere in the expression — inside `CALCULATE` the same call means something else.
+
+The narrowness is deliberate. An adversarial review of the first, broader cut found six ways it would have written wrong values, each demonstrated end to end, and each is now refused:
+
+| shape | what it did |
+|---|---|
+| `MIN(T[Amount], 0)` | DAX's **two-argument scalar** overload, not an aggregate — masking hid its column reference and the engine returned 0 on every row |
+| `COUNTROWS(Other)` | a bare **table** name is invisible to the cross-table check, which only sees `Name[` — returned 0 on every row |
+| `MIN([Yeer])` | a typo'd column answers 0 rather than failing, so the check now requires the column to exist |
+| `DISTINCTCOUNT`, `COUNT`, `COUNTA`, `COUNTBLANK` | our implementations disagree with DAX about how BLANK and `""` are counted — off by one |
+| `STDEV.P`, `VAR.S`, `PERCENTILEX.INC` | DAX spells these with a **dot**; listing only the underscore spellings left the real names refused by nothing |
+| `[Total Count (n)]` | a column *named* after an aggregate had its name chopped in half by the scanner |
+
+`IF(T[D] = MIN(T[D]), 1, 0)` — the standard "earliest record" flag — also scored 0 on every row: row substitution writes a DateTime as a quoted ISO string while the aggregate returns a native datetime, so the two never compared equal. Comparisons now match a date against its ISO text.
+
+**This required more than relaxing the gate.** The per-row evaluator substitutes every reference to the target table's columns with *that row's* literal value. Applied naively to `MIN('Date'[Year])` that yields `MIN(2015)` — the current row's year rather than the column minimum, a different wrong answer on every row, written into VertiPaq with nothing reporting it. Aggregate calls are now masked out before substitution and restored afterwards.
+
+Verified against Power BI Desktop on `MS_Employee_Hiring.pbix`: `MIN(Year)` is 2010, so 2015-11 is 71 and 2016-11 is 83. All 13 sampled `(Year, MonthNumber)` pairs match exactly. Collapsing the aggregate to the row would have given 11 instead of 71.
+
+The masker searches a copy of the expression with string literals blanked out, so an aggregate name **inside a string** is never mistaken for a call. Without that, `IF(T[Cat] = "MIN(", T[A], T[B])` masked from the `"MIN("` inside the literal to the end of the expression, hiding `T[A]` and `T[B]` from both the substitution and the unresolved-reference check — they then evaluated to blank, silently.
+
 ## [0.9.51] - 2026-07-28
 
 **`INT` was off by one for every negative number, and DATEDIFF / WEEKNUM / ROUNDDOWN / ROUNDUP now exist.** Progress on issue #4.

@@ -327,10 +327,15 @@ class ModelReader:
                     continue
                 try:
                     meta_bytes = read_abf_file(self._abf_bytes, entry)
-                    meta_info = decode_idfmeta(meta_bytes)
-                    if not meta_info["is_row_number"]:
-                        row_count = meta_info["row_count"]
-                        break
+                    # Any non-RowNumber column of the table carries the table's
+                    # row count, and RowNumber is already excluded by path
+                    # above. The IDFMETA's `is_row_number` was consulted here
+                    # too, but it is a misreading of a field Desktop leaves 0 on
+                    # ordinary columns (see vertipaq_decoder.read_table_from_abf)
+                    # -- when it misfired on every column of a table, the table
+                    # reported 0 rows.
+                    row_count = decode_idfmeta(meta_bytes)["row_count"]
+                    break
                 except Exception:
                     continue
 
