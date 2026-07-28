@@ -674,6 +674,8 @@ class DAXEngine:
             'DIVIDE': self._fn_divide,
             'ABS': self._fn_abs,
             'ROUND': self._fn_round,
+            'ROUNDDOWN': self._fn_rounddown,
+            'ROUNDUP': self._fn_roundup,
             'INT': self._fn_int,
             'CEILING': self._fn_ceiling,
             'FLOOR': self._fn_floor,
@@ -755,9 +757,11 @@ class DAXEngine:
             'MINUTE': self._fn_minute,
             'SECOND': self._fn_second,
             'WEEKDAY': self._fn_weekday,
+            'WEEKNUM': self._fn_weeknum,
             'DATE': self._fn_date,
             'EDATE': self._fn_edate,
             'EOMONTH': self._fn_eomonth,
+            'DATEDIFF': self._fn_datediff,
             'UTCNOW': self._fn_utcnow,
             'CONCATENATE': self._fn_concatenate,
             'LEFT': self._fn_left,
@@ -1660,9 +1664,76 @@ class DAXEngine:
         digits = int(self._eval_expr(args[1].strip(), ctx)) if len(args) > 1 else 0
         return round(val, digits) if isinstance(val, (int, float)) else None
 
+    def _fn_rounddown(self, args_str: str, ctx: DAXContext) -> Any:
+        """ROUNDDOWN(number, digits) — toward ZERO, not toward -infinity.
+
+        ROUNDDOWN(-1.5, 0) is -1, where INT(-1.5) is -2. Using floor here would
+        be wrong for every negative value, and calendar tables are full of them
+        (a "days relative to today" column is negative for the whole past).
+        """
+        return self._round_directed(args_str, ctx, up=False)
+
+    def _fn_roundup(self, args_str: str, ctx: DAXContext) -> Any:
+        """ROUNDUP(number, digits) — away from zero."""
+        return self._round_directed(args_str, ctx, up=True)
+
+    def _round_directed(self, args_str: str, ctx: DAXContext, up: bool) -> Any:
+        args = self._split_args(args_str)
+        val = _as_number(self._eval_expr(args[0].strip(), ctx))
+        if val is None:
+            return None
+        digits = 0
+        if len(args) > 1:
+            n = _as_number(self._eval_expr(args[1].strip(), ctx))
+            digits = int(n) if n is not None else 0
+        scale = 10.0 ** digits
+        scaled = val * scale
+        # math.floor/ceil on the ABSOLUTE value keeps the direction relative to
+        # zero rather than to the number line.
+        mag = math.ceil(abs(scaled) - 1e-9) if up else math.floor(abs(scaled) + 1e-9)
+        out = math.copysign(mag, scaled) / scale
+        return int(out) if digits <= 0 and float(out).is_integer() else out
+
+    def _fn_weeknum(self, args_str: str, ctx: DAXContext) -> Any:
+        """WEEKNUM(date, [return_type]) — week of year, 1-based.
+
+        Return type 1 (the DAX default) starts the week on SUNDAY and puts
+        January 1 in week 1; type 2 starts it on Monday. Both count the week
+        containing Jan 1 as week 1, which is NOT the ISO rule, so
+        ``date.isocalendar()`` cannot be used.
+        """
+        args = self._split_args(args_str)
+        d = _as_datetime(self._eval_expr(args[0].strip(), ctx))
+        if not d:
+            return None
+        rtype = 1
+        if len(args) > 1:
+            n = _as_number(self._eval_expr(args[1].strip(), ctx))
+            rtype = int(n) if n is not None else 1
+        jan1 = date(d.year, 1, 1)
+        # How far into its own week Jan 1 falls, so the partial first week is
+        # counted as week 1. Sunday-start (type 1) vs Monday-start (type 2).
+        if rtype == 2:
+            first_offset = jan1.weekday()            # Mon=0 .. Sun=6
+        else:
+            first_offset = (jan1.weekday() + 1) % 7  # Sun=0 .. Sat=6
+        return ((d.date() - jan1).days + first_offset) // 7 + 1
+
     def _fn_int(self, args_str: str, ctx: DAXContext) -> Any:
+        """INT(number) — rounds toward NEGATIVE INFINITY, not toward zero.
+
+        Power BI Desktop gives INT(-1.5) = -2, where TRUNC(-1.5) and
+        ROUNDDOWN(-1.5, 0) both give -1. Python's int() truncates, so this was
+        off by one for every negative value and returned a plausible number
+        rather than an error. It is not a corner case: binning expressions of
+        the form INT(x / 5) * 5 are common, and any negative x -- a "days
+        relative to today" column is negative for the whole past -- landed in
+        the wrong bin.
+        """
         val = self._eval_expr(args_str.strip(), ctx)
-        return int(val) if isinstance(val, (int, float)) else None
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return None
+        return math.floor(val)
 
     def _fn_if(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
@@ -2172,6 +2243,55 @@ class DAXEngine:
             return None
         shifted = self._shift_months(d, int(n))
         return shifted.replace(day=monthrange(shifted.year, shifted.month)[1])
+
+    def _fn_datediff(self, args_str: str, ctx: DAXContext) -> Any:
+        """DATEDIFF(start, end, interval) — interval BOUNDARIES crossed.
+
+        Not elapsed time. DATEDIFF(DATE(2023,12,31), DATE(2024,1,1), YEAR) is
+        1, because one year boundary is crossed, even though the dates are one
+        day apart. Computing it as a truncated elapsed difference would give 0
+        and be silently wrong on every year/quarter/month boundary.
+
+        WEEK counts week boundaries, and a DAX week starts on SUNDAY. Python's
+        ordinal 1 is a Monday, so Sundays are exactly the ordinals divisible by
+        7 and ``ordinal // 7`` is the Sunday-started week index.
+
+        The interval is a bare keyword (``WEEK``, not ``"WEEK"``), so it is read
+        as a literal token rather than evaluated — evaluating it would hit the
+        DAY/MONTH/YEAR/QUARTER/HOUR/MINUTE/SECOND functions of the same names.
+        """
+        args = self._split_args(args_str)
+        if len(args) < 3:
+            return None
+        start = _as_datetime(self._eval_expr(args[0].strip(), ctx))
+        end = _as_datetime(self._eval_expr(args[1].strip(), ctx))
+        if start is None or end is None:
+            return None
+        interval = args[2].strip().strip('"\'').upper()
+
+        if interval == 'YEAR':
+            return end.year - start.year
+        if interval == 'QUARTER':
+            return ((end.year * 4 + (end.month - 1) // 3)
+                    - (start.year * 4 + (start.month - 1) // 3))
+        if interval == 'MONTH':
+            return (end.year * 12 + end.month) - (start.year * 12 + start.month)
+        if interval == 'WEEK':
+            return end.date().toordinal() // 7 - start.date().toordinal() // 7
+        if interval == 'DAY':
+            return (end.date() - start.date()).days
+        if interval in ('HOUR', 'MINUTE', 'SECOND'):
+            unit = {'HOUR': 3600, 'MINUTE': 60, 'SECOND': 1}[interval]
+            # Floor BOTH ends to the unit before subtracting, so this stays a
+            # boundary count: 10:59:59 -> 11:00:01 is one HOUR, not zero. The
+            # epoch is the DAX/Excel zero date and lands on midnight, so hour,
+            # minute and second boundaries all align to it.
+            epoch = datetime(1899, 12, 30)
+            e = int((end - epoch).total_seconds())
+            s = int((start - epoch).total_seconds())
+            return e // unit - s // unit
+        self.unsupported_functions.add(f"DATEDIFF interval {interval}")
+        return None
 
     # DAX date format tokens -> strftime. Ordered longest-first so "MMMM" isn't
     # eaten by "MM" (dict preserves insertion order).
