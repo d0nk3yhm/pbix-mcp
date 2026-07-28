@@ -13,6 +13,10 @@ import re
 
 from pbix_mcp.formats.abf_rebuild import list_abf_files
 
+# The BackupLogHeader occupies the first page (signature + header XML). The
+# BackupLog *file* lives past it; both use <BackupLog> as their root element.
+_HEADER_PAGE = 0x1000
+
 
 def splice_metadata_in_abf(abf_bytes: bytes, new_sqlite: bytes) -> bytes:
     """Replace metadata.sqlitedb via binary splice — no ABF rebuild.
@@ -90,19 +94,54 @@ def splice_metadata_in_abf(abf_bytes: bytes, new_sqlite: bytes) -> bytes:
     else:
         raise ValueError("Cannot find VirtualDirectory in ABF")
 
-    # Helper: find and replace a decimal value in XML text within buf
-    def patch_xml_value(region_start, region_end, tag, old_val, new_val):
-        """Replace <tag>old_val</tag> with <tag>new_val</tag> in buf[region_start:region_end]."""
-        old_str = f"<{tag}>{old_val}</{tag}>".encode(xml_encoding)
-        new_str = f"<{tag}>{new_val}</{tag}>".encode(xml_encoding)
-        region = bytes(buf[region_start:region_end])
-        pos = region.find(old_str)
-        if pos >= 0 and len(old_str) == len(new_str):
-            # Same byte length — safe in-place replace
-            abs_pos = region_start + pos
-            buf[abs_pos:abs_pos + len(old_str)] = new_str
-            return True
-        return False
+    def _replace_size_near(region: str, anchor: str, old_val: int, new_val: int) -> str:
+        """Replace the <Size> belonging to `anchor`'s entry, anywhere in `region`.
+
+        Targets the <Size> nearest the anchor (a StoragePath / Path) so the right
+        entry is hit even when several files share a byte size."""
+        old_s = f"<Size>{old_val}</Size>"
+        new_s = f"<Size>{new_val}</Size>"
+        if old_s == new_s:
+            return region
+        idx = region.find(anchor) if anchor else -1
+        if idx >= 0:
+            lo, hi = max(0, idx - 600), min(len(region), idx + 600)
+            near = region[lo:hi]
+            if old_s in near:
+                return region[:lo] + near.replace(old_s, new_s, 1) + region[hi:]
+        return region.replace(old_s, new_s, 1)
+
+    # ---- BackupLog: the metadata entry's <Size> ------------------------------
+    # Done BEFORE the VirtualDirectory/header so their offsets can absorb any
+    # length change here. Analysis Services sizes the metadata file from THIS
+    # value: leaving it stale ships a SQLite image AS truncates, and Desktop
+    # reports "The database disk image is malformed. SQLite Error Code=11".
+    #
+    # The BackupLog has its OWN encoding: Desktop-authored files store the
+    # VirtualDirectory as UTF-8 but the BackupLog as UTF-16-LE. Reusing the
+    # VDir's encoding here meant the size was never found, so it stayed stale on
+    # exactly the files users bring. Skip the BackupLogHeader (bytes 72..4096),
+    # whose root element is also <BackupLog>.
+    blog_diff = 0
+    _vd_probe = buf.rfind("<VirtualDirectory>".encode(xml_encoding))
+    _vd_probe = _vd_probe if _vd_probe >= 0 else len(buf)
+    blog_start, blog_end, blog_enc = -1, -1, ""
+    for enc in ("utf-16-le", "utf-8"):
+        s = buf.rfind("<BackupLog".encode(enc), _HEADER_PAGE, _vd_probe)
+        if s < 0:
+            continue
+        e = buf.find("</BackupLog>".encode(enc), s)
+        if e < 0:
+            continue
+        blog_start, blog_end, blog_enc = s, e + len("</BackupLog>".encode(enc)), enc
+        break
+    if blog_start >= 0 and blog_enc:
+        region = buf[blog_start:blog_end].decode(blog_enc, errors="replace")
+        new_region = _replace_size_near(region, storage_path, old_size, len(new_sqlite))
+        if new_region != region:
+            nb = new_region.encode(blog_enc)
+            blog_diff = len(nb) - (blog_end - blog_start)
+            buf[blog_start:blog_end] = nb
 
     # Find VirtualDirectory region in the (shifted) buffer
     vdir_tag = "<VirtualDirectory>".encode(xml_encoding)
@@ -111,67 +150,58 @@ def splice_metadata_in_abf(abf_bytes: bytes, new_sqlite: bytes) -> bytes:
     vdir_end = buf.find(vdir_end_tag, vdir_start) + len(vdir_end_tag) if vdir_start >= 0 else -1
 
     if vdir_start >= 0 and vdir_end >= 0:
-        # Update the Size for metadata's StoragePath entry
-        old_size_tag = f"<Size>{old_size}</Size>".encode(xml_encoding)
-        new_size_tag = f"<Size>{len(new_sqlite)}</Size>".encode(xml_encoding)
-
-        # Find the specific entry by StoragePath proximity
-        sp_marker = storage_path.encode(xml_encoding)
-        sp_pos = buf.find(sp_marker, vdir_start, vdir_end)
-        if sp_pos >= 0:
-            # Find the <Size> tag near this StoragePath
-            size_pos = buf.find(old_size_tag, sp_pos - 200, sp_pos + 200)
-            if size_pos >= 0:
-                # Only replace if the new tag is the same length (pad/truncate if needed)
-                if len(old_size_tag) == len(new_size_tag):
-                    buf[size_pos:size_pos + len(old_size_tag)] = new_size_tag
-                else:
-                    # Different length — do string replace in the VDir XML
-                    vdir_xml = buf[vdir_start:vdir_end].decode(xml_encoding)
-                    # Replace size for this specific entry (near StoragePath)
-                    sp_idx = vdir_xml.find(storage_path)
-                    if sp_idx >= 0:
-                        # Find Size near this StoragePath
-                        old_s = f"<Size>{old_size}</Size>"
-                        new_s = f"<Size>{len(new_sqlite)}</Size>"
-                        near_start = max(0, sp_idx - 100)
-                        near_end = min(len(vdir_xml), sp_idx + 200)
-                        near = vdir_xml[near_start:near_end]
-                        near = near.replace(old_s, new_s, 1)
-                        new_vdir_xml = vdir_xml[:near_start] + near + vdir_xml[near_end:]
-                        new_vdir_bytes = new_vdir_xml.encode(xml_encoding)
-                        # Replace VDir in buffer (may change total size)
-                        vdir_size_diff = len(new_vdir_bytes) - (vdir_end - vdir_start)
-                        buf[vdir_start:vdir_end] = new_vdir_bytes
-                        vdir_end += vdir_size_diff
-
-        # Shift every file offset that sits after the metadata by size_diff.
+        # Rewrite the VirtualDirectory ONE <BackupFile> ENTRY AT A TIME.
         #
-        # This MUST be a single left-to-right rewrite of the decoded VDir text
-        # (re.sub), never a per-match `buf.find(old)+replace` loop. The old loop
-        # re-scanned the mutating buffer for each value: when two entries' offsets
-        # differed by exactly size_diff — near-certain when a page-aligned
-        # metadata grows (e.g. +8192) — `find` matched the entry just rewritten to
-        # that value, double-shifting it and leaving the real one stale. The stale
-        # offset then overlapped its neighbour and Power BI failed to load the
-        # VertiPaq segment ("DBCC failed while checking the data segments").
-        # re.sub scans the original string once and never re-matches replacements,
-        # and rewriting the whole region also tolerates offsets that gain/lose
-        # digits (the old `len(old)==len(new)` guard silently skipped those).
-        vdir_region = buf[vdir_start:vdir_end].decode(xml_encoding)
+        # Each entry's offset and size are recomputed from the entry's own
+        # values, so nothing depends on scanning a mutating buffer and a value
+        # that gains or loses digits is handled. Two silent-corruption bugs came
+        # from the previous per-value approaches:
+        #   * a `buf.find(old)+replace` loop re-matched a value it had just
+        #     written when two offsets differed by exactly size_diff (near-certain
+        #     for page-aligned growth), double-shifting one entry and leaving
+        #     another stale -> overlapping segments -> "DBCC failed while checking
+        #     the data segments";
+        #   * a `len(old)==len(new)` guard skipped any size whose digit count
+        #     changed, so the BackupLog kept a stale metadata size -> AS truncated
+        #     the SQLite image -> "The database disk image is malformed.
+        #     SQLite Error Code=11".
+        # `blog_diff` is the byte-length change of the BackupLog patched above;
+        # the log's own entry is identified by its offset, not by a name.
+        vdir_xml = buf[vdir_start:vdir_end].decode(xml_encoding)
+        # The BackupLog is the LAST VirtualDirectory entry — that is how the
+        # reader identifies it (abf_rebuild.list_abf_files). Matching it by byte
+        # offset instead would miss: a UTF-16 BackupLog starts with a BOM, so its
+        # recorded offset is 2 bytes below where "<BackupLog" is found.
+        _n_entries = len(re.findall(r"<BackupFile>", vdir_xml))
+        _seen = [0]
 
-        def _shift_offset(m):
-            v = int(m.group(1))
-            if v > old_offset:
-                v += size_diff
-            return f"<m_cbOffsetHeader>{v}</m_cbOffsetHeader>"
+        def _fix_entry(m: "re.Match[str]") -> str:
+            entry = m.group(0)
+            _seen[0] += 1
+            is_last = _seen[0] == _n_entries
+            om = re.search(r"<m_cbOffsetHeader>(\d+)</m_cbOffsetHeader>", entry)
+            sm = re.search(r"<Size>(\d+)</Size>", entry)
+            if not om or not sm:
+                return entry
+            off, size = int(om.group(1)), int(sm.group(1))
+            new_off = off + size_diff if off > old_offset else off
+            if off == old_offset and size == old_size:
+                new_size = len(new_sqlite)          # the metadata file itself
+            elif blog_diff and is_last:
+                new_size = size + blog_diff         # the BackupLog we just resized
+            else:
+                new_size = size
+            entry = entry.replace(om.group(0),
+                                  f"<m_cbOffsetHeader>{new_off}</m_cbOffsetHeader>", 1)
+            entry = entry.replace(sm.group(0), f"<Size>{new_size}</Size>", 1)
+            return entry
 
-        new_vdir_region = re.sub(
-            r"<m_cbOffsetHeader>(\d+)</m_cbOffsetHeader>", _shift_offset, vdir_region)
-        if new_vdir_region != vdir_region:
-            new_vdir_bytes = new_vdir_region.encode(xml_encoding)
-            buf[vdir_start:vdir_end] = new_vdir_bytes
-            vdir_end = vdir_start + len(new_vdir_bytes)
+        new_vdir_xml = re.sub(r"<BackupFile>.*?</BackupFile>", _fix_entry,
+                              vdir_xml, flags=re.DOTALL)
+        if new_vdir_xml != vdir_xml:
+            nb = new_vdir_xml.encode(xml_encoding)
+            buf[vdir_start:vdir_end] = nb
+            vdir_end = vdir_start + len(nb)
 
     # Patch BackupLogHeader (bytes 72-4096) — update VDir offset and size
     # Header is always UTF-16-LE
@@ -181,7 +211,9 @@ def splice_metadata_in_abf(abf_bytes: bytes, new_sqlite: bytes) -> bytes:
     hdr_offset_match = re.search(r"<m_cbOffsetHeader>(\d+)</m_cbOffsetHeader>", hdr_xml)
     if hdr_offset_match:
         old_hdr_offset = int(hdr_offset_match.group(1))
-        new_hdr_offset = old_hdr_offset + size_diff
+        # The VirtualDirectory sits after both the metadata and the BackupLog,
+        # so it moves by BOTH deltas.
+        new_hdr_offset = old_hdr_offset + size_diff + blog_diff
         new_hdr_xml = hdr_xml.replace(
             hdr_offset_match.group(0),
             f"<m_cbOffsetHeader>{new_hdr_offset}</m_cbOffsetHeader>", 1
@@ -209,19 +241,6 @@ def splice_metadata_in_abf(abf_bytes: bytes, new_sqlite: bytes) -> bytes:
             padded = new_hdr_bytes + b"\x00" * (available - len(new_hdr_bytes))
             buf[72:4096] = padded
 
-    # Patch BackupLog — update Size for metadata entry
-    blog_tag = "<BackupLog".encode(xml_encoding)
-    blog_end_tag = "</BackupLog>".encode(xml_encoding)
-    blog_start = buf.rfind(blog_tag, 0, vdir_start if vdir_start >= 0 else len(buf))
-    if blog_start >= 0:
-        blog_end = buf.find(blog_end_tag, blog_start)
-        if blog_end >= 0:
-            blog_end += len(blog_end_tag)
-            blog_region = buf[blog_start:blog_end].decode(xml_encoding, errors="replace")
-            old_s = f"<Size>{old_size}</Size>"
-            new_s = f"<Size>{len(new_sqlite)}</Size>"
-            if old_s in blog_region and len(old_s) == len(new_s):
-                new_blog = blog_region.replace(old_s, new_s, 1)
-                buf[blog_start:blog_end] = new_blog.encode(xml_encoding)
-
+    # (The BackupLog was patched above, before the VirtualDirectory, so its
+    # length change could be folded into the VDir entry and the header offset.)
     return bytes(buf)

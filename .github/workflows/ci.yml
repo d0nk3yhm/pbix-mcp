@@ -8,9 +8,16 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Power BI is a Windows product and that is where nearly every user runs
+    # this, so Windows is a first-class CI target. Testing only on Linux hid a
+    # whole class of bug: POSIX happily unlinks a file that still has an open
+    # handle, Windows raises WinError 32. Three unclosed SQLite handles made
+    # every calculated-column/table edit fail on Windows while CI stayed green.
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
@@ -44,6 +51,7 @@ jobs:
         run: python -m build
 
       - name: Verify wheel installs cleanly
+        shell: bash
         run: |
           pip install dist/*.whl --force-reinstall --no-deps
           python -c "from pbix_mcp.server import mcp; print('Import OK')"

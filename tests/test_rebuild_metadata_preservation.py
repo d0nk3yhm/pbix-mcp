@@ -461,3 +461,149 @@ class TestCorpusPreservation:
         assert edited["PerspectiveColumn"] == control["PerspectiveColumn"]
         assert edited["FormatStringDefinition"] == control["FormatStringDefinition"]
         assert edited["LinguisticMetadata"] == control["LinguisticMetadata"]
+
+
+def _meta_conn(pbix_path):
+    """Open the metadata.sqlitedb inside a .pbix. Caller closes + unlinks."""
+    from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+    from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+    with zipfile.ZipFile(pbix_path) as z:
+        raw = read_metadata_sqlite(decompress_datamodel(z.read("DataModel")))
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.write(fd, raw)
+    os.close(fd)
+    conn = sqlite3.connect(tmp)
+    conn.row_factory = sqlite3.Row
+    return conn, tmp
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not os.path.isdir(CORPUS), reason="corpus not downloaded")
+class TestRebuildOpensInPowerBI:
+    """Four ways a rebuilt file was rejected by Power BI Desktop itself.
+
+    Each of these produced a file our own reader parsed happily, so only
+    Desktop caught them. All four are asserted against the CONTROL (open +
+    save, no edit) rather than the original, so a difference the save path
+    causes on its own is never blamed on the rebuild.
+    """
+
+    def test_legacy_query_partitions_keep_their_shape(self, tmp_path):
+        """A Type=1 (Query) partition names a query in the DataMashup.
+
+        The builder always emits Type=4 (M) with the rows inline. Rewriting a
+        legacy partition that way orphaned the DataMashup query that was still
+        sitting in the file: Desktop opened MS_Blog_DataProfiling with an EMPTY
+        Data pane and "There are pending changes in your queries that haven't
+        been applied".
+        """
+        src = os.path.join(CORPUS, "MS_Blog_DataProfiling.pbix")
+        if not os.path.exists(src):
+            pytest.skip("MS_Blog_DataProfiling.pbix not in corpus")
+
+        def parts(path):
+            conn, tmp = _meta_conn(path)
+            try:
+                return {r["tn"]: (r["Type"], r["QueryDefinition"])
+                        for r in conn.execute(
+                            "SELECT t.Name AS tn, p.Type, p.QueryDefinition "
+                            "FROM [Partition] p JOIN [Table] t ON p.TableID = t.ID "
+                            "WHERE t.ModelID = 1 AND t.SystemFlags = 0")}
+            finally:
+                conn.close()
+                os.unlink(tmp)
+
+        control = parts(_save_after(src, str(tmp_path)))
+        edited = parts(_save_after(src, str(tmp_path), "Numbers"))
+        legacy = {t for t, (ty, _) in control.items() if ty == 1}
+        assert legacy, "fixture no longer representative: no Query partitions"
+        for t in legacy:
+            assert edited[t][0] == 1, f"{t}: Query partition rewritten to M"
+            assert edited[t][1] == control[t][1], f"{t}: QueryDefinition changed"
+
+    def test_no_table_ends_up_with_two_key_columns(self, tmp_path):
+        """Desktop refuses the whole model when a table has two IsKey columns.
+
+        The builder marks every RowNumber column IsKey, which is right for a
+        table it authored but collides with a table the author keyed on a real
+        column. Desktop: "The table 'DateAutoTemplate' has two columns with the
+        IsKey property set to True."
+        """
+        src = os.path.join(CORPUS, "Agents_Performance.pbix")
+        if not os.path.exists(src):
+            pytest.skip("Agents_Performance.pbix not in corpus")
+        conn, tmp = _meta_conn(_save_after(src, str(tmp_path), "Top-Bottom-N"))
+        try:
+            doubled = [r["tn"] for r in conn.execute(
+                "SELECT t.Name AS tn, COUNT(*) AS n FROM [Column] c "
+                "JOIN [Table] t ON c.TableID = t.ID "
+                "WHERE c.IsKey = 1 GROUP BY t.ID HAVING n > 1")]
+            assert doubled == [], f"tables with two key columns: {doubled}"
+        finally:
+            conn.close()
+            os.unlink(tmp)
+
+    def test_calc_table_columns_keep_their_qualified_source(self, tmp_path):
+        """An auto-date table's columns read 'DateAutoTemplate[Year]'.
+
+        The stamper synthesised a bare '[Year]', which does not resolve, and
+        Desktop rejected the model with "Relationship '<guid>' points to
+        deleted column 'Date' in table 'Date'".
+        """
+        src = os.path.join(CORPUS, "Agents_Performance.pbix")
+        if not os.path.exists(src):
+            pytest.skip("Agents_Performance.pbix not in corpus")
+
+        def sources(path):
+            conn, tmp = _meta_conn(path)
+            try:
+                return {f"{r['tn']}.{r['cn']}": r["sc"] for r in conn.execute(
+                    "SELECT t.Name AS tn, "
+                    "  COALESCE(c.ExplicitName, c.InferredName) AS cn, "
+                    "  c.SourceColumn AS sc FROM [Column] c "
+                    "JOIN [Table] t ON c.TableID = t.ID "
+                    "WHERE t.Name = 'Date' AND c.Type = 4")}
+            finally:
+                conn.close()
+                os.unlink(tmp)
+
+        control = sources(_save_after(src, str(tmp_path)))
+        edited = sources(_save_after(src, str(tmp_path), "Top-Bottom-N"))
+        qualified = {k: v for k, v in control.items()
+                     if v and not v.startswith("[")}
+        assert qualified, "fixture no longer representative: no qualified sources"
+        for k, v in qualified.items():
+            assert edited.get(k) == v, f"{k}: SourceColumn {edited.get(k)!r} != {v!r}"
+
+    def test_measures_keep_folder_visibility_and_type(self, tmp_path):
+        """The builder wrote defaults for everything but name and expression.
+
+        On this 102-measure model that flattened 89 DisplayFolders, unhid
+        Date[_ShowValueForDates], and retyped 18 measures onto Double.
+        """
+        src = os.path.join(CORPUS, "Agents_Performance.pbix")
+        if not os.path.exists(src):
+            pytest.skip("Agents_Performance.pbix not in corpus")
+
+        def measures(path):
+            conn, tmp = _meta_conn(path)
+            try:
+                return {f"{r['tn']}.{r['Name']}":
+                        (r["DisplayFolder"], r["IsHidden"], r["DataType"])
+                        for r in conn.execute(
+                            "SELECT t.Name AS tn, m.Name, m.DisplayFolder, "
+                            "  m.IsHidden, m.DataType FROM [Measure] m "
+                            "JOIN [Table] t ON m.TableID = t.ID "
+                            "WHERE t.ModelID = 1")}
+            finally:
+                conn.close()
+                os.unlink(tmp)
+
+        control = measures(_save_after(src, str(tmp_path)))
+        edited = measures(_save_after(src, str(tmp_path), "Top-Bottom-N"))
+        foldered = [k for k, v in control.items() if v[0]]
+        assert len(foldered) > 50, "fixture no longer representative"
+        wrong = {k: (control[k], edited.get(k)) for k in control
+                 if k in edited and edited[k] != control[k]}
+        assert wrong == {}, f"{len(wrong)} measure(s) changed: {list(wrong)[:5]}"
