@@ -259,3 +259,127 @@ def test_corpus_matches_pbixray():
                 assert all(eq(a, b) for a, b in zip(got, truth)), f"{tname}.{cname}"
                 checked += 1
     assert checked > 0
+
+
+CORPUS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      "test_corpus")
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not os.path.isdir(CORPUS), reason="corpus not downloaded")
+class TestEveryDeclaredColumnComesBack:
+    """A declared data column must never vanish from a decoded table.
+
+    ``read_table_from_abf`` used to skip any column whose IDFMETA reported
+    ``is_row_number``. That flag is inferred from a uint64 our encoder writes
+    as 1 for a data column -- but Power BI Desktop leaves it 0 on plenty of
+    ordinary columns, so it does not mean "this is a RowNumber". A skipped
+    column is stored as None and then filtered out at the end of the function,
+    so it disappeared **silently**: no error, no warning, just a narrower table.
+
+    Measured across the 24-file corpus before the fix: 126 of 1121 user data
+    columns (11.2%) were discarded, including key columns relationships depend
+    on. A rebuild-path edit would then write the table without them.
+
+    The RowNumber column is now identified from the model metadata (AMO
+    Column.Type 3 / the reserved name), which is authoritative.
+    """
+
+    # Columns Desktop stores that were silently dropped. IT_Support is the
+    # sharp case: every existing check reported that file as clean, while
+    # dim_Date lost the very column its relationships join on.
+    KNOWN_VICTIMS = [
+        ("IT_Support.pbix", "dim_Date", "Date"),
+        ("IT_Support.pbix", "dim_Clusters", "Cluster_ID"),
+        ("IT_Support.pbix", "fact_IT_Support", "Similarity_Score"),
+        ("MS_Employee_Hiring.pbix", "Date", "Year"),
+        ("MS_Employee_Hiring.pbix", "Date", "MonthNumber"),
+        ("MS_Employee_Hiring.pbix", "Date", "Day"),
+    ]
+
+    @staticmethod
+    def _read(fname, table):
+        import zipfile
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
+
+        path = os.path.join(CORPUS, fname)
+        if not os.path.exists(path):
+            pytest.skip(f"{fname} not in corpus")
+        with zipfile.ZipFile(path) as z:
+            abf = decompress_datamodel(z.read("DataModel"))
+        meta = read_metadata_sqlite(abf)
+        return read_table_from_abf(abf, table, meta)
+
+    @pytest.mark.parametrize("fname,table,column", KNOWN_VICTIMS)
+    def test_previously_dropped_column_is_present(self, fname, table, column):
+        td = self._read(fname, table)
+        assert column in td["columns"], (
+            f"{table}[{column}] vanished from the decoded table")
+        idx = td["columns"].index(column)
+        assert any(r[idx] is not None for r in td["rows"]), (
+            f"{table}[{column}] came back but is entirely blank")
+
+    def test_it_support_dim_date_matches_power_bi_desktop(self):
+        """Recovered values, not just a recovered column name.
+
+        Read live from Desktop's engine on the same file: 521 rows, 521
+        distinct dates, 2024-01-01 through 2025-06-04.
+        """
+        td = self._read("IT_Support.pbix", "dim_Date")
+        idx = td["columns"].index("Date")
+        vals = [r[idx] for r in td["rows"]]
+        assert len(vals) == 521
+        assert len(set(vals)) == 521
+        assert str(min(vals)) == "2024-01-01 00:00:00"
+        assert str(max(vals)) == "2025-06-04 00:00:00"
+
+    def test_no_declared_data_column_is_missing_anywhere_in_the_corpus(self):
+        """The general invariant, over every user table in every corpus file."""
+        import glob
+        import sqlite3
+        import tempfile
+        import zipfile
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
+
+        missing = []
+        for path in sorted(glob.glob(os.path.join(CORPUS, "*.pbix"))):
+            try:
+                with zipfile.ZipFile(path) as z:
+                    abf = decompress_datamodel(z.read("DataModel"))
+                meta = read_metadata_sqlite(abf)
+            except Exception:
+                continue
+            fd, tmp = tempfile.mkstemp(suffix=".db")
+            os.write(fd, meta)
+            os.close(fd)
+            conn = sqlite3.connect(tmp)
+            try:
+                tables = [r[0] for r in conn.execute(
+                    "SELECT Name FROM [Table] WHERE ModelID = 1 AND SystemFlags = 0")]
+                for t in tables:
+                    declared = [r[0] for r in conn.execute(
+                        "SELECT COALESCE(c.ExplicitName, c.InferredName) "
+                        "FROM [Column] c JOIN [Table] tt ON tt.ID = c.TableID "
+                        "WHERE tt.Name = ? AND c.Type = 1", (t,))]
+                    if not declared:
+                        continue
+                    try:
+                        got = read_table_from_abf(abf, t, meta)["columns"]
+                    except Exception:
+                        continue
+                    if not got:
+                        continue
+                    missing += [f"{os.path.basename(path)}:{t}[{c}]"
+                                for c in declared if c not in got]
+            finally:
+                conn.close()
+                os.unlink(tmp)
+        assert missing == [], (
+            f"{len(missing)} declared data column(s) silently dropped: "
+            f"{missing[:10]}")

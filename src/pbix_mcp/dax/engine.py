@@ -109,6 +109,69 @@ def _as_datetime(v):
     return None
 
 
+def _blank_zero_of(other):
+    """The value BLANK takes on when compared against `other`.
+
+    DAX does not propagate BLANK through a comparison — it coerces it to the
+    ZERO of the other operand's type and compares that. Verified against Power
+    BI Desktop's engine:
+
+        BLANK() < 50            TRUE     BLANK() = 0                  TRUE
+        BLANK() >= 50           FALSE    BLANK() = ""                 TRUE
+        BLANK() = FALSE()       TRUE     BLANK() = DATE(1899,12,30)   TRUE
+        BLANK() <> ""           FALSE    BLANK() < DATE(2024,1,1)     TRUE
+
+    Returning None instead made every comparison against a blank fall to the
+    ELSE branch, so a bucketing expression of the shape
+    ``IF(T[x] < 30, 20, IF(T[x] < 45, 30, 80))`` scored every blank row 80
+    where Desktop scores it 20 — a plausible number, never an error.
+    """
+    if isinstance(other, bool):
+        return False
+    if isinstance(other, datetime):
+        return datetime(1899, 12, 30)
+    if isinstance(other, date):
+        return date(1899, 12, 30)
+    if isinstance(other, str):
+        return ""
+    if isinstance(other, (int, float)):
+        return 0
+    return None
+
+
+def _coerce_blanks_for_compare(left, right):
+    """Make two operands comparable the way DAX compares them.
+
+    BLANK takes the zero of the other side's type (see _blank_zero_of); two
+    blanks compare as equal (0 vs 0), which is what Desktop reports for ``=``,
+    ``<=`` and ``>=`` and the negation of for ``<>`` and ``<``.
+
+    A date is also matched against its ISO text. That is not cosmetic: the
+    calculated-column evaluator substitutes a row's DateTime as a QUOTED ISO
+    string (a bare timestamp is not parseable DAX), while an aggregate over the
+    same column is evaluated against the table snapshot and yields a native
+    datetime. Comparing the two as str-vs-datetime is never equal, so the
+    standard "earliest record" flag ``IF(T[D] = MIN(T[D]), 1, 0)`` scored 0 on
+    every row instead of marking the earliest.
+    """
+    if left is None and right is None:
+        return 0, 0
+    if left is None:
+        return _blank_zero_of(right), right
+    if right is None:
+        return left, _blank_zero_of(left)
+    if isinstance(left, str) != isinstance(right, str):
+        text, other = (left, right) if isinstance(left, str) else (right, left)
+        if isinstance(other, (datetime, date)):
+            as_dt = _as_datetime(text)
+            if as_dt is not None:
+                other_dt = other if isinstance(other, datetime) else \
+                    datetime(other.year, other.month, other.day)
+                return (as_dt, other_dt) if isinstance(left, str) \
+                    else (other_dt, as_dt)
+    return left, right
+
+
 def _compare(cell, op: str, target) -> bool:
     """Compare a cell against a target — numerically when both are numbers, by
     date when both parse as dates, else as text."""
@@ -1458,10 +1521,14 @@ class DAXEngine:
             if len(parts) == 2:
                 left = self._eval_expr(parts[0].strip(), ctx, var_scope)
                 right = self._eval_expr(parts[1].strip(), ctx, var_scope)
+                # BLANK does not propagate through a comparison in DAX; it
+                # takes the zero of the other operand's type. See
+                # _blank_zero_of for the Desktop-verified table.
+                left, right = _coerce_blanks_for_compare(left, right)
                 if left is not None and right is not None:
                     try:
                         return op_fn(left, right)
-                    except:
+                    except TypeError:
                         return None
         return None
 

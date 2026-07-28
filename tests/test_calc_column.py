@@ -40,16 +40,145 @@ class TestGate:
         assert calc_column_unsupported_reason(expr, "Sales") is None
 
     @pytest.mark.parametrize("expr,frag", [
-        ("SUM(Sales[Amount])", "SUM"),
         ("CALCULATE(SUM(Sales[Amount]))", "CALCULATE"),
         ("RANKX(ALL(Sales), Sales[Amount])", "RANKX"),
         ("RELATED(Products[Name])", "another table"),
         ("Sales[Amount] + Other[Y]", "another table"),
+        ("SUMX(Sales, Sales[Amount])", "SUMX"),
         ("", "empty"),
     ])
     def test_refused(self, expr, frag):
         reason = calc_column_unsupported_reason(expr, "Sales")
         assert reason is not None and frag in reason
+
+    @pytest.mark.parametrize("expr", [
+        "SUM(Sales[Amount])",
+        "MIN(Sales[Amount])",
+        "MAX( 'Sales'[Amount] )",
+        "(Sales[Amount] - MIN(Sales[Amount])) * 2",
+    ])
+    def test_plain_aggregate_over_own_column_is_allowed(self, expr):
+        """A calculated column has no filter context beyond its own row, so
+        MIN('T'[C]) really is the minimum of the whole column on every row.
+        Refusing these blocked real files whose only obstacle was an
+        expression of the form ([Year] - MIN([Year])) * 12 + [MonthNumber]."""
+        assert calc_column_unsupported_reason(expr, "Sales") is None
+
+    @pytest.mark.parametrize("expr,why", [
+        # MIN/MAX have a SECOND, scalar overload. Masking it as an aggregate
+        # hid its column reference from the row substitution and the engine
+        # evaluated a bare reference with no row context: 0 on every row.
+        ("MIN(Sales[Amount], 0)", "two-argument scalar MIN"),
+        ("MAX(Sales[Amount], 0)", "two-argument scalar MAX"),
+        # A bare TABLE argument is invisible to the cross-table check (which
+        # only sees `Name[`), to _unresolved_refs and to _refs_any_column.
+        ("COUNTROWS(Products)", "table argument, another table"),
+        ("COUNTROWS(Sales)", "table argument"),
+        # Our implementations disagree with DAX about BLANK/'' counting.
+        ("DISTINCTCOUNT(Sales[Amount])", "blank counting differs"),
+        ("COUNT(Sales[Amount])", "blank counting differs"),
+        # DAX spells these with a DOT; the underscore spellings alone left the
+        # real names matching neither set, so nothing refused them.
+        ("STDEV.P(Sales[Amount])", "dotted statistical name"),
+        ("VAR.S(Sales[Amount])", "dotted statistical name"),
+        ("PERCENTILEX.INC(Sales, Sales[Amount], 0.5)", "dotted X-iterator"),
+        # An aggregate over a column that does not exist answers 0, not an error.
+        ("MIN(Sales[Nope])", "column does not exist"),
+        ("MIN('Other'[Amount])", "column of another table"),
+    ])
+    def test_aggregate_shapes_that_would_store_zeros_are_refused(self, expr, why):
+        """Each of these was ACCEPTED by the first cut of the relaxation and
+        materialized 0 (or the else-branch) on every row, reporting success."""
+        reason = calc_column_unsupported_reason(
+            expr, "Sales", ["Amount", "Cost", "Cat", "Product"])
+        assert reason is not None, f"{expr} should be refused ({why})"
+
+    def test_a_column_named_after_an_aggregate_is_not_mistaken_for_one(self):
+        """`[Total Count (n)]` is a legal column name, not a COUNT( call.
+
+        Scanning the raw text chopped the name in half, which either refused a
+        perfectly good expression or -- with an unbalanced paren inside the
+        name -- swallowed the closing ']' and blinded the reference check.
+        """
+        from pbix_mcp.dax.calc_tables import _mask_aggregate_calls
+        expr = "'Sales'[Amount] + 'Sales'[Total Count (n)]"
+        _, spans = _mask_aggregate_calls(expr)
+        assert spans == []
+        assert calc_column_unsupported_reason(
+            expr, "Sales", ["Amount", "Total Count (n)"]) is None
+
+    def test_a_date_column_compares_equal_to_an_aggregate_of_itself(self):
+        """The "earliest record" flag, a standard calc-column idiom.
+
+        Row substitution writes a DateTime as a quoted ISO string while the
+        masked aggregate returns a native datetime, so the comparison was never
+        equal and the flag was 0 on every row.
+        """
+        import datetime as _dt
+        cols = ["D"]
+        rows = [[_dt.datetime(2020, 1, 5)], [_dt.datetime(2021, 6, 9)],
+                [_dt.datetime(2019, 3, 1)]]
+        tables = {"T": {"columns": cols, "rows": [list(r) for r in rows]}}
+        vals, err = evaluate_row_context_column(
+            cols, rows, "IF('T'[D] = MIN('T'[D]), 1, 0)", "T", tables, [])
+        assert err is None, err
+        assert vals == [0, 0, 1]
+
+
+    @pytest.mark.parametrize("expr", [
+        'IF(T[A]="MIN(", 1, 2)',
+        'CONCATENATE("SUM(x)", T[B])',
+        '"a ""SUM("" b"',
+        'IF(T[Cat] = "MIN(", T[A], T[B])',
+    ])
+    def test_aggregate_name_inside_a_string_is_not_a_call(self, expr):
+        """A literal containing an aggregate name must not be masked.
+
+        The masker searched the raw text, so `IF(T[Cat] = "MIN(", T[A], T[B])`
+        masked from the "MIN(" inside the string to the end of the expression.
+        That hid T[A] and T[B] from BOTH the per-row substitution and the
+        unresolved-reference check, so they evaluated to blank with nothing
+        reporting it — a silent wrong value.
+        """
+        from pbix_mcp.dax.calc_tables import _mask_aggregate_calls
+        _, spans = _mask_aggregate_calls(expr)
+        assert spans == [], f"masked a string literal as a call: {spans}"
+
+    def test_string_literal_holding_an_aggregate_name_evaluates_correctly(self):
+        cols = ["Cat", "A", "B"]
+        rows = [["x", 1, 10], ["MIN(", 2, 20], ["y", 3, 30]]
+        tables = {"T": {"columns": cols, "rows": [list(r) for r in rows]}}
+        vals, err = evaluate_row_context_column(
+            cols, rows, 'IF(T[Cat] = "MIN(", T[A], T[B])', "T", tables, [])
+        assert err is None, err
+        assert vals == [10, 2, 30]
+
+    def test_parenthesis_inside_a_string_does_not_unbalance_the_mask(self):
+        from pbix_mcp.dax.calc_tables import (
+            _mask_aggregate_calls,
+            _unmask_aggregate_calls,
+        )
+        expr = 'MIN(T[A]) & "text )with paren("'
+        masked, spans = _mask_aggregate_calls(expr)
+        assert spans == ["MIN(T[A])"]
+        assert _unmask_aggregate_calls(masked, spans) == expr
+
+    def test_aggregate_is_not_collapsed_to_the_current_row(self):
+        """The trap this must not fall into.
+
+        Per-row substitution rewrites references to the target table's columns
+        as that row's literal. Reaching inside the aggregate turns
+        MIN(Sales[Amount]) into MIN(100) -- the row's own value, a different
+        wrong answer on every row, silently."""
+        cols = ["Amount"]
+        rows = [[100.0], [200.0], [50.0]]
+        tables = {"Sales": {"columns": cols, "rows": [list(r) for r in rows]}}
+        vals, err = evaluate_row_context_column(
+            cols, rows, "Sales[Amount] - MIN(Sales[Amount])", "Sales",
+            tables, [])
+        assert err is None, err
+        # minimum is 50 for every row, not the row's own Amount
+        assert vals == [50.0, 150.0, 0.0]
 
     def test_evaluator_values(self):
         cols = ["Amount", "Cost"]
@@ -181,9 +310,9 @@ class TestAddCalculatedColumn:
             server.pbix_close(alias)
 
     @pytest.mark.parametrize("expr,code", [
-        ("SUM(Sales[Amount])", "UNSUPPORTED_CALC"),
         ("RELATED(Products[X])", "UNSUPPORTED_CALC"),
         ("CALCULATE(SUM(Sales[Amount]))", "UNSUPPORTED_CALC"),
+        ("SUMX(Sales, Sales[Amount])", "UNSUPPORTED_CALC"),
     ])
     def test_refuses_unsupported(self, sales_model, expr, code):
         alias = "cc_ref"
@@ -194,7 +323,25 @@ class TestAddCalculatedColumn:
             assert out["success"] is False
             assert out["error_code"] == code
         finally:
-            server.pbix_close(alias)
+            server.pbix_close(alias, force=True)
+
+    def test_aggregate_over_own_table_is_written_with_the_column_total(
+            self, sales_model):
+        """SUM over the column, not the row -- the same value on every row."""
+        alias = "cc_agg"
+        server.pbix_open(sales_model, alias)
+        try:
+            out = json.loads(server.pbix_datamodel_add_calculated_column(
+                alias, "Sales", "TotalAmount", "SUM(Sales[Amount])", "Double"))
+            assert out["success"], out
+            server.pbix_save(alias, sales_model, overwrite=True, backup=False)
+        finally:
+            server.pbix_close(alias, force=True)
+        cols, rows = _read_all_columns(sales_model, "Sales")
+        amt = [r[cols.index("Amount")] for r in rows]
+        tot = [r[cols.index("TotalAmount")] for r in rows]
+        assert tot == [sum(amt)] * len(rows), (
+            f"expected the column total {sum(amt)} on every row, got {tot}")
 
     def test_refuses_duplicate_column(self, sales_model):
         alias = "cc_dup"

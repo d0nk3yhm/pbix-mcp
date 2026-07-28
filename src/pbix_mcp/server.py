@@ -413,6 +413,19 @@ def _get_layout(work_dir: str) -> dict | None:
         return json.load(f)
 
 
+# Bumped by every layout write, and folded into _layout_stamp. File metadata
+# alone cannot see two edits that land in the same filesystem timestamp tick AND
+# produce the same byte length -- changing a slicer's selected value from "A" to
+# "B" is exactly that. On Windows, whose timestamp granularity is coarse, the
+# next evaluate then served the PREVIOUS slicer's result from cache. Counting
+# our own writes is exact and free; mtime+size still covers external edits.
+_layout_writes: dict[str, int] = {}
+
+
+def _note_layout_write(work_dir: str) -> None:
+    _layout_writes[work_dir] = _layout_writes.get(work_dir, 0) + 1
+
+
 def _set_layout(work_dir: str, layout: dict) -> None:
     """Persist a layout — classic ``Report/Layout`` or a PBIR tree.
 
@@ -422,6 +435,7 @@ def _set_layout(work_dir: str, layout: dict) -> None:
     Report/definition tree, each page/visual patched onto the original file it
     was read from so unmodelled fields survive.
     """
+    _note_layout_write(work_dir)
     if _is_pbir(work_dir):
         # A PBIR report is edited IN PLACE in its Report/definition tree — each
         # page/visual is patched onto the original file it was read from. Never
@@ -10226,7 +10240,10 @@ def _materialize_table_calc_columns(
     an unreliable expression, an unresolvable/circular dependency, or an eval
     failure — the caller aborts rather than materialize wrong values.
     """
-    from pbix_mcp.dax.calc_tables import evaluate_row_context_column
+    from pbix_mcp.dax.calc_tables import (
+        calc_column_unsupported_reason,
+        evaluate_row_context_column,
+    )
 
     col_names = [c["name"] for c in data_columns]
     type_by_name = {c["name"]: c.get("data_type", "String") for c in data_columns}
@@ -10245,10 +10262,18 @@ def _materialize_table_calc_columns(
                 continue
             snapshot = {table_name: {"columns": list(col_names),
                                      "rows": [list(r) for r in rows]}}
+            qualified = _qualify_bare_column_refs(
+                spec["expression"], table_name, col_names)
+            # Re-run the gate now that the column list is known. Only here can
+            # it tell MIN('T'[Year]) from MIN('T'[Yeer]) -- the engine answers 0
+            # for the misspelling rather than failing, so without this the
+            # column would materialize as zeros and report success.
+            why = calc_column_unsupported_reason(qualified, table_name,
+                                                 col_names)
+            if why:
+                raise ValueError(f"'{table_name}'[{spec['column']}]: {why}")
             vals, err = evaluate_row_context_column(
-                col_names, rows,
-                _qualify_bare_column_refs(spec["expression"], table_name,
-                                          col_names),
+                col_names, rows, qualified,
                 table_name, snapshot, relationships)
             if err:
                 raise ValueError(
@@ -13010,7 +13035,12 @@ def _layout_stamp(work_dir: str | None):
         except OSError:
             continue
         parts.append((rel, st.st_mtime_ns, st.st_size))
-    return tuple(parts) if parts else None
+    if not parts:
+        return None
+    # See _layout_writes: mtime+size cannot distinguish two same-length edits
+    # inside one timestamp tick, which is precisely what changing a slicer's
+    # selected value looks like.
+    return (_layout_writes.get(work_dir, 0), tuple(parts))
 
 
 def _get_default_filters_current(ctx: dict) -> dict:
