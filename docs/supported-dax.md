@@ -1,6 +1,6 @@
 # Supported DAX Functions
 
-156 functions across 10 categories. The engine is **best-effort** — it produces correct results for common patterns but does not aim for semantic parity with Analysis Services.
+174 functions across 10 categories. The engine is **best-effort** — it produces correct results for common patterns but does not aim for semantic parity with Analysis Services.
 
 ## Aggregation (10)
 `SUM`, `AVERAGE`, `COUNT`, `COUNTROWS`, `MIN`, `MAX`, `DISTINCTCOUNT`, `PRODUCT`, `MEDIAN`, `COUNTBLANK`

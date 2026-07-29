@@ -308,8 +308,9 @@ Notes for pure-Python callers:
 
 - No external network/resources (sandbox) — inline everything, base64 images only.
 - Content measure < ~32,000 characters.
-- Legacy `Report/Layout` PBIX only (the PBIR `Report/definition` format isn't
-  supported for embedding yet).
+- Works on both layout formats (since 0.9.39): legacy `Report/Layout` AND PBIR
+  `Report/definition` files — on PBIR the visual is written in place and
+  `publicCustomVisuals` is synced into `Report/definition/report.json`.
 - `category_field` cross-filtering needs the bound column to be related (through the
   model) to the visuals you want to filter — same as any native visual.
 

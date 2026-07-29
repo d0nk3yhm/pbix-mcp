@@ -8,7 +8,7 @@
 
 An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python — no templates, no skeletons, no Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026.
 
-Exposes 126 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing (rename / reorder / hide / duplicate pages, move & copy visuals — identically on classic `Report/Layout` and service-authored **PBIR**), visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, sort-by-column, TMDL export, incremental refresh, DAX evaluation (170 functions), RLS security, and binary format internals.
+Exposes 126 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing (rename / reorder / hide / duplicate pages, move & copy visuals — identically on classic `Report/Layout` and service-authored **PBIR**), visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, sort-by-column, TMDL export, incremental refresh, DAX evaluation (174 functions), RLS security, and binary format internals.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
@@ -125,7 +125,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Color extraction & recolor | **Stable** | `pbix_extract_colors` scans themes + all visuals. `pbix_recolor` replaces hex + ThemeDataColor refs, auto-extends palette, injects per-series/category chart colors, generates themed table rows, strips borders and pie/donut backgrounds, hides card titles (shows categoryLabels), fixes text contrast (WCAG 2.0) including theme foreground, chart axis/legend/labels, table rows, and card calloutValue |
 | Visual property editing | **Stable** | Dot-path and full JSON |
 | DAX measure CRUD | **Stable** | Add, modify, remove via binary splice (PBI Desktop files) or full builder rebuild. Sequential adds supported with automatic MAXID tracking |
-| DAX evaluation (170 functions) | **Stable API** | Best-effort semantic parity — stable API, practical evaluation for common DAX patterns; see accuracy notes below |
+| DAX evaluation (174 functions) | **Stable API** | Best-effort semantic parity — stable API, practical evaluation for common DAX patterns; see accuracy notes below |
 | Metadata SQL read/write | **Stable** | Full SQLite access to tables, columns, relationships |
 | Default slicer filter extraction | **Stable** | Legacy Layout JSON and PBIR format |
 | PBIR read + write | **Stable** | Service-authored reports (`Report/definition/`) are read AND edited by the same tools as classic. All 126 tools are verified on both formats by applying the tool, saving, reopening and checking the saved bytes — see [docs/capability-parity.md](docs/capability-parity.md) |
@@ -174,22 +174,22 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 - **Full DataModel rebuild** — `set_table_data`, `update_table_rows`, `add/remove_relationship`, `remove_table` trigger a full DataModel rebuild via the builder pipeline. Most other tools (`add_measure`, `modify_measure`, `modify_column`, `set_rls_role`, `add_perspective`, `add_culture`, `add_translations`, `update_data_source`, etc.) use a lightweight metadata-only path.
 
 
-## Tools (112)
+## Tools (126)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
 
-### Report Layout & Visuals (22)
-`pbix_add_visual` · `pbix_remove_visual` · `pbix_format_visual` · `pbix_set_visual_sort` · `pbix_get_pages` · `pbix_add_page` · `pbix_remove_page` · `pbix_get_page_visuals` · `pbix_get_visual_detail` · `pbix_get_visual_positions` · `pbix_set_visual_property` · `pbix_update_visual_json` · `pbix_get_layout_raw` · `pbix_set_layout_raw` · `pbix_get_filters` · `pbix_set_filters` · `pbix_get_default_filters` · `pbix_get_settings` · `pbix_set_settings` · `pbix_get_bookmarks` · `pbix_add_bookmark` · `pbix_remove_bookmark`
+### Report Layout & Visuals (29)
+`pbix_add_visual` · `pbix_remove_visual` · `pbix_duplicate_visual` · `pbix_move_visual` · `pbix_format_visual` · `pbix_set_visual_sort` · `pbix_get_pages` · `pbix_add_page` · `pbix_remove_page` · `pbix_rename_page` · `pbix_duplicate_page` · `pbix_reorder_pages` · `pbix_set_page_visibility` · `pbix_get_page_visuals` · `pbix_get_visual_detail` · `pbix_get_visual_positions` · `pbix_set_visual_property` · `pbix_update_visual_json` · `pbix_get_layout_raw` · `pbix_set_layout_raw` · `pbix_report_format` · `pbix_get_filters` · `pbix_set_filters` · `pbix_get_default_filters` · `pbix_get_settings` · `pbix_set_settings` · `pbix_get_bookmarks` · `pbix_add_bookmark` · `pbix_remove_bookmark`
 
-### DAX Engine (4)
-`pbix_evaluate_dax` · `pbix_evaluate_dax_per_dimension` · `pbix_evaluate_calculated_columns` · `pbix_clear_dax_cache`
+### DAX Engine (5)
+`pbix_evaluate_dax` · `pbix_evaluate_dax_per_dimension` · `pbix_evaluate_dax_grouped` · `pbix_evaluate_calculated_columns` · `pbix_clear_dax_cache`
 
-### DataModel Read (16)
-`pbix_get_model_schema` · `pbix_get_model_measures` · `pbix_get_model_relationships` · `pbix_get_model_power_query` · `pbix_get_model_columns` · `pbix_get_table_data` · `pbix_list_tables` · `pbix_get_metadata` · `pbix_list_data_sources` · `pbix_update_data_source` · `pbix_export_table_csv` · `pbix_export_all_tables_csv` · `pbix_find_value` · `pbix_query_table` · `pbix_table_stats` · `pbix_data_diff`
+### DataModel Read (17)
+`pbix_get_model_schema` · `pbix_get_model_measures` · `pbix_get_model_relationships` · `pbix_get_model_power_query` · `pbix_get_model_columns` · `pbix_get_sort_by_columns` · `pbix_get_table_data` · `pbix_list_tables` · `pbix_get_metadata` · `pbix_list_data_sources` · `pbix_update_data_source` · `pbix_export_table_csv` · `pbix_export_all_tables_csv` · `pbix_find_value` · `pbix_query_table` · `pbix_table_stats` · `pbix_data_diff`
 
-### DataModel Write (22)
-`pbix_datamodel_query_metadata` · `pbix_datamodel_modify_metadata` · `pbix_datamodel_add_measure` · `pbix_datamodel_modify_measure` · `pbix_datamodel_set_measure_category` · `pbix_datamodel_remove_measure` · `pbix_datamodel_modify_column` · `pbix_datamodel_add_relationship` · `pbix_datamodel_remove_relationship` · `pbix_datamodel_remove_table` · `pbix_datamodel_decompress` · `pbix_datamodel_recompress` · `pbix_datamodel_replace_file` · `pbix_datamodel_extract_file` · `pbix_datamodel_list_abf_files` · `pbix_set_table_data` · `pbix_update_table_rows` · `pbix_datamodel_add_field_parameter` · `pbix_datamodel_add_calculation_group` · `pbix_export_tmdl` · `pbix_export_pbip` · `pbix_replace_value`
+### DataModel Write (27)
+`pbix_datamodel_query_metadata` · `pbix_datamodel_modify_metadata` · `pbix_datamodel_add_measure` · `pbix_datamodel_modify_measure` · `pbix_datamodel_set_measure_category` · `pbix_datamodel_remove_measure` · `pbix_datamodel_modify_column` · `pbix_datamodel_add_calculated_column` · `pbix_datamodel_remove_calculated_column` · `pbix_datamodel_add_calculated_table` · `pbix_set_sort_by_column` · `pbix_datamodel_add_relationship` · `pbix_datamodel_modify_relationship` · `pbix_datamodel_remove_relationship` · `pbix_datamodel_remove_table` · `pbix_datamodel_decompress` · `pbix_datamodel_recompress` · `pbix_datamodel_replace_file` · `pbix_datamodel_extract_file` · `pbix_datamodel_list_abf_files` · `pbix_set_table_data` · `pbix_update_table_rows` · `pbix_datamodel_add_field_parameter` · `pbix_datamodel_add_calculation_group` · `pbix_export_tmdl` · `pbix_export_pbip` · `pbix_replace_value`
 
 ### Resources, Themes & Custom Visuals (18)
 `pbix_list_resources` · `pbix_add_image` · `pbix_set_image` · `pbix_register_resource` · `pbix_get_theme` · `pbix_set_theme` · `pbix_extract_colors` · `pbix_recolor` · `pbix_get_linguistic_schema` · `pbix_set_linguistic_schema` · `pbix_add_custom_visual` · `pbix_reference_public_visual` · `pbix_remove_custom_visual` · `pbix_add_html_visual` · `pbix_get_html_visual` · `pbix_set_html_visual` · `pbix_html_template` · `pbix_svg_measure`
@@ -451,7 +451,7 @@ Every component of the VertiPaq columnar storage engine is independently impleme
 
 ## DAX Engine
 
-156 functions across 10 categories. This is a **best-effort evaluator** — it produces correct results for common patterns but does not aim for semantic parity with Analysis Services.
+174 functions across 10 categories. This is a **best-effort evaluator** — it produces correct results for common patterns but does not aim for semantic parity with Analysis Services.
 
 | Category | Functions |
 |----------|-----------|
@@ -511,6 +511,8 @@ python scripts/download_test_corpus.py --output-dir test_corpus
 PBIX_TEST_SAMPLES=test_corpus pytest tests/test_cross_report.py -v
 ```
 
+A representative subset of the test suites — the largest suites include:
+
 | Suite | Tests | Marker | Needs PBIX? |
 |-------|-------|--------|-------------|
 | `test_dax_engine.py` | 70 | `unit` | 6 skip without the public test corpus |
@@ -526,14 +528,14 @@ PBIX_TEST_SAMPLES=test_corpus pytest tests/test_cross_report.py -v
 | `test_zip_safety.py` | 10 | `unit` | No |
 | `test_perf_per_dimension.py` | 14 | `unit` | No |
 | `test_measure_collision_datatype.py` | 83 | `unit` | No |
-| `test_enter_data_m.py` | 12 | `unit` | No |
-| `test_calc_column.py` | 24 | `unit` | No |
+| `test_enter_data_m.py` | 15 | `unit` | No |
+| `test_calc_column.py` | 53 | `unit` | No |
 | `test_issues14.py` | 89 | `unit` | No |
 | `test_issues15.py` | 18 | `unit` | No |
 | `test_tool_surfaces.py` | 10 | `unit` | No |
-| `test_pbir_reader.py` | 29 | `unit` | No |
+| `test_pbir_reader.py` | 47 | `unit` | No |
 
-**From a fresh clone: 757 tests collected, 725 passed, 32 skipped, 0 failures.** All 32 skipped tests are gated on the public test corpus (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
+**From a fresh clone: 1202 tests collected.** Tests gated on the public test corpus are skipped when it is absent (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
 
 ## Architecture
 
@@ -575,7 +577,7 @@ src/pbix_mcp/
   errors.py              # Typed exceptions with stable error codes
   logging_config.py      # Diagnostic logging (normal/debug/trace)
   dax/
-    engine.py            # DAX evaluator (156 functions, best-effort)
+    engine.py            # DAX evaluator (174 functions, best-effort)
     calc_tables.py       # Calculated table support
   formats/
     abf_rebuild.py       # ABF archive reader and rebuilder
