@@ -8007,7 +8007,16 @@ def _restore_carryable_metadata(dm_path: str, snap: dict) -> list[str]:
             try:
                 c.execute("UPDATE [Table] SET CalculationGroupID = ? "
                           "WHERE ID = ?", (g["ID"], g["TableID"]))
-                c.execute("UPDATE [Partition] SET Type = 7 WHERE TableID = ?",
+                # QueryDefinition MUST be cleared, not just left behind. The
+                # rebuild writes an Enter-data M query for every partition, and
+                # Power BI rejects the whole file on open with "Partition 'X'
+                # in table 'X' has the QueryDefinition property set which is
+                # not a valid field for this partition type." Metadata-level
+                # checks all passed -- referential integrity clean, every other
+                # field byte-identical to an authored calculation group -- and
+                # only opening the file in Desktop surfaced it.
+                c.execute("UPDATE [Partition] SET Type = 7, "
+                          "QueryDefinition = NULL WHERE TableID = ?",
                           (g["TableID"],))
             except sqlite3.Error:
                 pass
