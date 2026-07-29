@@ -6,13 +6,36 @@ on:
       - "v*"
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  # A tag used to go straight to build-and-publish with NO gates: a tag cut
+  # from a commit that failed CI (or never ran it) still shipped to PyPI.
+  # Run the same gates CI runs, on one representative cell, before building.
+  gate:
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install package and dev dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Lint with ruff
+        run: ruff check src/ tests/
+
+      - name: Run unit tests
+        run: pytest -m "not slow and not integration" -q --tb=short
+
+  build:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -23,7 +46,7 @@ jobs:
         run: python -m build
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -36,7 +59,7 @@ jobs:
       id-token: write
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
@@ -45,15 +68,17 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
 
   github-release:
-    needs: build
+    # After publish-pypi, deliberately: a rejected PyPI publish used to still
+    # produce a public GitHub release, leaving the two out of step.
+    needs: [build, publish-pypi]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
@@ -62,4 +87,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          # A glob matching nothing used to log a warning and create an
+          # EMPTY release, green. Make it fail instead.
+          fail_on_unmatched_files: true
           generate_release_notes: true

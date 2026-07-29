@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pbix-mcp"
-version = "0.9.54"
+version = "0.9.55"
 description = "MCP server for creating, reading, writing, and evaluating Power BI .pbix/.pbit files — no Power BI Desktop required"
 readme = "README.md"
 license = "MIT"
@@ -22,6 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries",
 ]
 
