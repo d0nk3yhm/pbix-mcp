@@ -137,22 +137,69 @@ DataModel-edit tools come in two flavors:
 rebuild tools work on the very common "measures table + import tables" model
 shape.
 
-The rebuild tools still can't reproduce **calculated tables** (a `DATATABLE` /
-`GENERATESERIES` / DAX-defined table) or **calculated columns** (`Column.Type`
-2 or 4 — a DAX column on a normal table, or a calc-table column): Power BI
-computes their VertiPaq data from a DAX expression, and the builder can't
-recompute it — a rebuild would reopen those tables empty or drop the calculated
-column. Rather than corrupt the file, a rebuild tool **refuses with a clear
-error** (`MODEL_EDIT_UNSUPPORTED`) that names the offending tables and points at
-the surgical tools (which work on all models). Two carve-outs: **field
-parameters** (a calculated table whose partition holds a
-`{("d", NAMEOF('T'[C]), n)}` tuple set) ARE preserved — the rebuild rebuilds
-their static rows and re-stamps the Desktop metadata shape — and a special
-table being **removed** never blocks the edit (`pbix_datamodel_remove_table`
-always works). Full support for editing models
-with **calculated** tables/columns needs verbatim VertiPaq preservation (copying
-the computed column bytes through untouched, rather than re-encoding them) and is
-a tracked follow-up.
+### Calculated columns across a rebuild
+
+A rebuild regenerates VertiPaq from scratch, so a **calculated column**
+(`Column.Type` 2 or 4) has to be RE-EVALUATED from its DAX. The evaluator is
+deliberately narrow, and the rule is absolute: an expression it cannot
+reproduce **exactly** is REFUSED, naming the reason, never materialised with a
+guess. A wrong value stored in VertiPaq is invisible — the file opens fine and
+every number is quietly wrong — which is worse than an error.
+
+Reproduced exactly (each verified against the values Power BI Desktop itself
+stored in the corpus files, which is exact ground truth):
+
+- row-context expressions over the table's **own** columns —
+  `fct[Sales] - fct[Cost]`, `IF(t[Qty] > 0, "Yes", "No")`, `ROUND(t[X], 2)`,
+  `VAR ... RETURN ...`;
+- plain whole-column aggregates over the table's own column (`SUM`, `MIN`,
+  `MAX`, `AVERAGE`) — a calculated column has no filter context beyond its own
+  row, so these really are the whole-column value on every row;
+- the auto date/time accessor `X.[Date]` (the date part of X). The other
+  variation parts (`.[Year]`, `.[Month]`, `.[Quarter]`, `.[Day]`, `.[MonthNo]`)
+  map to locale-dependent display strings and are refused;
+- **`LOOKUPVALUE`** — including a multi-column search, an alternate result, and
+  a self-lookup. String matching is case-insensitive, matching Power BI's
+  default collation. Rows that match with DIFFERENT values are an error in DAX,
+  so the column is refused rather than picking one;
+- **`RELATED`** — many-to-one only, across ACTIVE relationships, when exactly
+  ONE path exists. Two paths (ambiguous without `USERELATIONSHIP`), no path,
+  the wrong direction, an inactive relationship, or a bare `RELATED([Col])`
+  that does not name its table are each refused;
+- **`CALCULATE(<aggregate>, FILTER(<own table>, <predicate>))`**, where the
+  predicate is a conjunction of comparisons against the table's own columns.
+  `EARLIER` is supported. In a calculated column CALCULATE performs context
+  transition and a FILTER over that same table replaces it, so this means
+  "aggregate every row satisfying the predicate". The predicate is COMPILED
+  into a hash index (equality terms) or a prefix aggregate over a sorted key
+  (one inequality), so a 1.7M-row table costs one lookup per row rather than a
+  table scan.
+
+Still refused: the X-iterators (`SUMX`, `RANKX`, …), `PATH`/`PATHITEM`, `OR`
+(`||`) inside a FILTER predicate, more than one inequality, `KEEPFILTERS`, an
+aggregate over a DIFFERENT table, and `DISTINCTCOUNT`/`COUNT` outside the
+compiled CALCULATE path.
+
+**Calculated tables** are preserved rather than recomputed where their shape is
+reproducible (`DATATABLE`, `GENERATESERIES`, `DISTINCT`, `VALUES`, `FILTER`,
+`TOPN`, `ADDCOLUMNS`, a bare table reference); **field parameters** (a calc
+table whose partition holds a `{("d", NAMEOF('T'[C]), n)}` tuple set) are
+rebuilt and re-stamped. A rebuild that meets a shape it cannot reproduce
+refuses with `MODEL_EDIT_UNSUPPORTED`, naming the offending column and pointing
+at the surgical tools (which work on all models). Removing a special table
+never blocks the edit — `pbix_datamodel_remove_table` always works.
+
+**Calculation groups, translations and detail-rows** are carried across a
+rebuild, along with named sets, query groups, aggregation wiring, refresh
+policies and calendars. A calculation group is wired from both ends, so the
+`[Table].CalculationGroupID` back-reference and the `Type=7` partition (which
+must carry NO `QueryDefinition`) are restored too — verified by opening the
+rebuilt file in Power BI Desktop and querying `INFO.CALCULATIONGROUPS()`.
+
+**Known precision limit:** DateTime columns decode to a Python `datetime`
+(microsecond resolution) while VertiPaq stores a double serial, so scaling a
+timestamp to milliseconds (`[Timestamp] * 86400000`) can differ from Desktop in
+the sub-microsecond digits.
 
 ### Other builder notes
 - Fixed RowNumber GUID: 2662979B-1795-4F74-8F37-6A1BA8059B61
