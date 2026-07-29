@@ -136,18 +136,48 @@ Fix: `_decode_idf_segment_at` stops consuming entries once the segment's rows
 are complete; per-segment record counts are threaded through for multi-segment
 columns.
 
-**Offline verification** (Desktop was in use, so this was not GUI-confirmed):
+**Offline verification:**
 * structural — run lengths sum to exactly the row count on all 16 columns;
 * referential — 6 of 7 `Fact` relationships resolve with **0 orphans**;
 * semantic — ages 14..96, 2 genders, dates in range.
+
+**GUI-CONFIRMED 2026-07-29 (this was the outstanding gap; it is now closed).**
+Both files opened in Power BI Desktop and its own engine queried over ADOMD.
+Every value matches our decode exactly:
+
+`MS_Corporate_Spend` `Fact` — all 8 agree, including the full-precision sum:
+rows 166,216 · SUM 4203674047.3179 · MIN -68,912,000 · MAX 58,173,000 ·
+DISTINCTCOUNT Value 35,807 / Department 410 / Cost Element ID 240 / Scenario 5.
+
+`MS_Employee_Hiring` `Employee` (1,290,259 rows) — all 9 agree:
+DISTINCTCOUNT Gender 2 · FP 2 · date 48 · EmplID 61,843 · Age 14..96 ·
+date range 2011-01-01..2014-12-01.
+
+And, because equal aggregates can still hide unequal data, a **value-level**
+check on the three columns the bug actually corrupted:
+
+| column | Desktop | ours |
+|---|---|---|
+| Gender | C 590,639 · D 699,620 | identical |
+| FP | F 631,127 · P 659,132 | identical |
+| date (6 earliest) | 18,972 / 19,075 / 19,287 / 19,547 / 19,845 / 20,177 | identical |
+| Age | SUM 50,965,422 · AVG 39.5001484198134 · COUNT 1,290,259 | identical |
+
+`Gender` is the column that summed to 93,629,586,803 rows before the fix.
+
+Note on the modal: Desktop opens both files behind the "Enter your email
+address" prompt, which blocks the model load indefinitely. Dismiss with
+**Cancel** (never sign in). The click must be guarded — verify
+`WindowFromPoint` belongs to the PBIDesktop process before pressing, or a
+synthetic click can land in whatever window happens to be in front.
 
 The 7th relationship (`Fact[Cost Element ID]`) orphans because the **model
 itself** declares it String while `Cost Element[Cost Element ID]` is Double — a
 type mismatch in the source file, not a decode fault. Confirmed from metadata.
 
-**Still worth doing:** open `MS_Corporate_Spend.pbix` and `MS_Employee_Hiring.pbix`
-in Desktop and compare `SUM(Fact[Value])`, `DISTINCTCOUNT` etc. against our
-decode. Queries are ready at `scratchpad/q_cs.dax` and `scratchpad/q_eh.dax`.
+**DONE** — the queries at `scratchpad/q_cs.dax` / `q_eh.dax` (plus
+`q_eh_vals.dax` for the value-level breakdown) were run against Desktop's live
+engine on 2026-07-29; results above. Nothing outstanding on #5.
 
 ## What is left
 
