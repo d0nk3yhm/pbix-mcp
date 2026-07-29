@@ -169,3 +169,94 @@ class TestVarReturnIsNotATableReference:
         why = calc_column_unsupported_reason(
             "'Return'[Col] + 1", "E", ["Index"])
         assert why and "another table 'Return'" in why
+
+
+REL = [{"FromTable": "Product", "FromColumn": "Category",
+        "ToTable": "Table", "ToColumn": "Category", "IsActive": 1}]
+PROD = {"columns": ["Category", "Name"],
+        "rows": [["Bikes", "B1"], ["Parts", "P1"], ["Zzz", "Q"]]}
+DIM = {"columns": ["Category", "Sorting"],
+       "rows": [["Bikes", 1], ["Parts", 2]]}
+
+
+def _rel_snap():
+    return {"Product": {"columns": list(PROD["columns"]),
+                        "rows": [list(r) for r in PROD["rows"]]},
+            "Table": {"columns": list(DIM["columns"]),
+                      "rows": [list(r) for r in DIM["rows"]]}}
+
+
+class TestRelated:
+    """RELATED walks many-to-one only, and refuses anything ambiguous.
+
+    Ground truth: MS_AdventureWorks_Sales Product[Sorting] =
+    RELATED('Table'[Sorting]) matches Desktop's stored values on all 397 rows.
+    """
+
+    def test_single_hop_resolves_and_misses_are_blank(self):
+        snap = _rel_snap()
+        e = "RELATED('Table'[Sorting])"
+        assert calc_column_unsupported_reason(
+            e, "Product", PROD["columns"], _known(snap), REL) is None
+        vals, err = evaluate_row_context_column(
+            PROD["columns"], [list(r) for r in PROD["rows"]], e, "Product",
+            snap, REL)
+        assert err is None
+        assert vals == [1, 2, None]
+
+    def test_multi_hop_chain_resolves(self):
+        rels = REL + [{"FromTable": "Table", "FromColumn": "GroupId",
+                       "ToTable": "Grp", "ToColumn": "Id", "IsActive": 1}]
+        snap = _rel_snap()
+        snap["Table"] = {"columns": ["Category", "Sorting", "GroupId"],
+                         "rows": [["Bikes", 1, 7], ["Parts", 2, 8]]}
+        snap["Grp"] = {"columns": ["Id", "Label"],
+                       "rows": [[7, "Wheels"], [8, "Bits"]]}
+        e = "RELATED(Grp[Label])"
+        assert calc_column_unsupported_reason(
+            e, "Product", PROD["columns"], _known(snap), rels) is None
+        vals, err = evaluate_row_context_column(
+            PROD["columns"], [list(r) for r in PROD["rows"]], e, "Product",
+            snap, rels)
+        assert err is None
+        assert vals == ["Wheels", "Bits", None]
+
+    def test_two_paths_are_refused_not_picked(self):
+        rels = REL + [{"FromTable": "Product", "FromColumn": "Name",
+                       "ToTable": "Table", "ToColumn": "Sorting",
+                       "IsActive": 1}]
+        why = calc_column_unsupported_reason(
+            "RELATED('Table'[Sorting])", "Product", PROD["columns"],
+            _known(_rel_snap()), rels)
+        assert why and "more than one active relationship path" in why
+
+    def test_inactive_relationship_is_not_a_path(self):
+        rels = [dict(REL[0], IsActive=0)]
+        why = calc_column_unsupported_reason(
+            "RELATED('Table'[Sorting])", "Product", PROD["columns"],
+            _known(_rel_snap()), rels)
+        assert why and "no active many-to-one relationship path" in why
+
+    def test_wrong_direction_is_not_a_path(self):
+        """RELATED goes many->one; the one side cannot reach the many side."""
+        why = calc_column_unsupported_reason(
+            "RELATED(Product[Name])", "Table", DIM["columns"],
+            _known(_rel_snap()), REL)
+        assert why and "no active many-to-one relationship path" in why
+
+    def test_bare_column_is_refused_rather_than_guessed(self):
+        why = calc_column_unsupported_reason(
+            "RELATED([Sorting])", "Product", PROD["columns"],
+            _known(_rel_snap()), REL)
+        assert why and "does not name its table" in why
+
+    def test_without_the_relationship_graph_it_stays_refused(self):
+        why = calc_column_unsupported_reason(
+            "RELATED('Table'[Sorting])", "Product", PROD["columns"],
+            _known(_rel_snap()))
+        assert why and "another table 'Table'" in why
+
+    def test_table_names_are_discoverable_for_lazy_loading(self):
+        from pbix_mcp.dax.calc_tables import related_table_names
+        assert related_table_names(
+            "RELATED('Table'[Sorting]) + RELATED(Grp[X])") == {"Table", "Grp"}
