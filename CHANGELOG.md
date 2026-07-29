@@ -5,6 +5,111 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.54] - 2026-07-29
+
+Closes issues **#4**, **#5** and **#7**. The theme is the same throughout: a wrong
+value stored in VertiPaq is invisible — the file opens and every number is quietly
+wrong — so anything this engine cannot reproduce EXACTLY is refused with a reason
+rather than materialized with a guess.
+
+Everything below was verified against **the values Power BI Desktop itself stored**.
+The corpus files were authored in Desktop, so a calculated column's stored VertiPaq
+values *are* Desktop's answer; recomputing from the DAX and diffing them is exact
+ground truth over hundreds of thousands of rows. That method found four
+silent-wrong-value bugs the entire unit suite missed.
+
+### #5 — columns that failed to decode (`primary_segment_size` is capacity, not count)
+
+`primary_segment_size` in an IDF segment is the **allocated capacity** of the primary
+array, not the number of entries in use. It is always a power of two while the used
+entries are far fewer; the slots past the end are sub-segment bytes that read as
+nonsensical `(data_value, repeat)` pairs. Summing those garbage run lengths overshot
+the row count — `Gender` on the 1,290,259-row `Employee` table summed to
+**93,629,586,803 rows**. Decoding now stops once the segment's rows are complete, and
+per-segment record counts are threaded through for multi-segment columns.
+
+Also drops the `is_row_number` skip in `read_table_from_abf` in favour of the metadata
+`Type == 3`: Desktop leaves that flag 0 on ordinary columns, so **126 of 1121 user
+columns across the corpus were silently discarded on read** — including
+`IT_Support` `dim_Date[Date]`, the column its relationships join on.
+
+### #4 — calculated columns that blocked a rebuild
+
+- **Auto date/time accessor** `X.[Date]` → `DATE(YEAR(X), MONTH(X), DAY(X))`, applied in
+  both the gate and the evaluator so they cannot disagree. The other variation parts
+  (`.[Year]`, `.[Month]`, …) map to locale-dependent display strings and are refused.
+- **`LOOKUPVALUE`** — multi-column search, alternate result, self-lookup. String
+  matching is case-insensitive (Power BI's default collation). Rows matching with
+  DIFFERENT values are an error in DAX, so the column is refused rather than picking one.
+- **`RELATED`** — many-to-one only, across ACTIVE relationships, when exactly one path
+  exists. Two paths, no path, the wrong direction, an inactive relationship, or a bare
+  `RELATED([Col])` are each refused.
+- **`CALCULATE(<aggregate>, FILTER(<own table>, <predicate>))`**, including `EARLIER`.
+  In a calculated column CALCULATE performs context transition and a FILTER over that
+  same table replaces it, so this means "aggregate every row satisfying the predicate".
+  The predicate is **compiled** — equality terms to a hash index, one inequality to a
+  prefix aggregate over a sorted key — so `MS_Covid_Tracking`'s **1,740,185-row** table
+  costs one lookup per row instead of a table scan.
+- `VAR … RETURN [Col]` was refused as *"references another table 'RETURN'"* — the bare
+  word before `[` was read as a table name, rejecting the most common modern DAX idiom.
+
+**Corpus: PENDING_SWEEP files now rebuild** (was 11 at the start of this work).
+
+### Four silent-wrong-value bugs in the DAX engine
+
+1. **`-` and `/` were right-associative.** `10 - 3 - 2` gave 9 instead of 5;
+   `20 / 4 / 5` gave 25 instead of 1. Every measure and calculated column with a
+   repeated subtraction or division was affected. Found because
+   `Date[Rolling Period]` disagreed with Desktop on 1096 of 6209 rows.
+2. **`&` rendered every FALSY value as empty** (`str(v or '')`), so the zero-padding
+   idiom `RIGHT("0" & n, 2)` lost its pad on exactly the rows where n was 0 —
+   `'P-00'` became `'P-0'`.
+3. **A DATE is a number in DAX** (days since 1899-12-30), but `_as_number` returned
+   None for one, so `[Timestamp] * 86400000` was BLANK on every row. `_as_datetime`
+   also truncated fractional seconds, rounding timestamps to the whole second.
+4. **FORMAT** ignored leading-zero pictures (`FORMAT(1, "000")` → `"1"`, which changes
+   sort order, not just display) and recognised only lower-case date tokens, so
+   `FORMAT(d, "YYYY-MM-DD")` returned the literal `"YYYY-01-DD"`.
+
+Plus: an unresolved column reference inside a LOOKUPVALUE search value or a FILTER
+right-hand side reads as blank and matches nothing, materializing BLANK instead of
+failing — `Events[ParentIndex]` was blank on 102 of 117 rows where Desktop had a value.
+Both paths now refuse.
+
+### #7 — calculation groups, translations and detail-rows survive a rebuild
+
+No corpus file exercises any of this, so the path had never run. Authoring a
+calculation group with this project's own `pbix_datamodel_add_calculation_group` and
+then editing a table dropped `CalculationGroup`, `CalculationItem`,
+`[Table].CalculationGroupID` and the Type=7 partition **to zero** — with
+`success: true` and an empty warnings list.
+
+All 14 tables from the issue are now carried: `QueryGroup`, `CalculationGroup`,
+`CalculationItem`, `CalculationExpression`, `Set`, `PerspectiveSet`,
+`ObjectTranslation`, `DetailRowsDefinition`, `AlternateOf`, `RefreshPolicy`,
+`Calendar`, `TimeUnitColumnAssociation`, `CalendarColumnReference`,
+`AnalyticsAIMetadata`.
+
+A calculation group is wired from **both** ends, so the `[Table].CalculationGroupID`
+back-reference and the `Type=7` partition are restored too — and that partition must
+carry **no `QueryDefinition`**, or Power BI rejects the whole file on open. Every
+metadata-level check passed (referential integrity clean, no dangling keys, doctor
+reporting nothing new) and the file still would not load; only opening it in Desktop
+surfaced it. Verified against Desktop's own engine: `INFO.CALCULATIONGROUPS()` and
+`INFO.CALCULATIONITEMS()` answer 1 group and 2 items after a rebuild.
+
+### Performance
+
+Calculated-column evaluation caches ISO-date string coercion (~12x on that path).
+Dates reach the evaluator as ISO strings, so a wide table re-parsed the same handful
+of dates millions of times.
+
+### Known limitation
+
+DateTime columns decode to a Python `datetime` (microsecond resolution) while VertiPaq
+stores a double serial, so scaling a timestamp to milliseconds can differ from
+Desktop in the sub-microsecond digits.
+
 ## [0.9.53] - 2026-07-28
 
 **Two ways an ordinary text value was silently destroyed**, both found by an adversarial review of the calculated-column path and both confirmed by three independent attempts to refute them.
