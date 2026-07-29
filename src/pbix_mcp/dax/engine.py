@@ -142,6 +142,212 @@ def _concat_str(v):
     return str(v)
 
 
+# ---------------------------------------------------------------------------
+# Compiled expression plans (issue #6)
+# ---------------------------------------------------------------------------
+# _eval_expr used to re-run its whole dispatch chain -- comment stripping,
+# literal regexes, operator splitting, branch checks -- on every call, and
+# iterators call it once per row WITH THE SAME TEXT. Profiling one
+# RANKX/FILTER measure showed the interpreter's string analysis dominating the
+# runtime. The analysis is a pure function of the expression text, so it is
+# done ONCE here and cached as a "plan": an ordered tuple of steps, almost
+# always a single terminal one. Evaluation code is unchanged -- the plan only
+# records WHICH branch of the old chain applies, plus its precomputed splits.
+#
+# Two branches are decided at runtime, not analysis, and stay conditional:
+#   * a bare identifier may be a VAR in the current scope, else it falls
+#     through to the bare-table tail;
+#   * a syntactically-matched comparison can evaluate to None (a blank side),
+#     and the old chain then FELL THROUGH to concat/minus/function -- so the
+#     plan keeps a fallthrough step after the comparison.
+_P_NONE = 0       # empty expression -> BLANK
+_P_VARRET = 1     # VAR ... RETURN block
+_P_PAREN = 2      # ( inner )
+_P_CONST = 3      # string/number/bool literal, value precomputed
+_P_MAYBEVAR = 4   # bare identifier: var_scope hit or fall through
+_P_BRACKET1 = 5   # [Name] with exactly one bracket pair
+_P_TCOL = 6       # Table[Column]
+_P_BRACKET2 = 7   # [Name], the permissive late variant
+_P_NOT = 8        # NOT <inner>
+_P_LOGICAL = 9    # || / && with precomputed parts
+_P_BINARY = 10    # + - * / with precomputed parts
+_P_CMP = 11       # comparison chain; may return None -> fall through
+_P_CONCAT = 12    # & with precomputed parts
+_P_NEG = 13       # unary minus
+_P_FUNC = 14      # FUNC(args), name + args text precomputed
+_P_TAIL = 15      # bare table name / final BLANK
+
+_PLAN_CACHE: dict = {}
+
+_SCI_NUM_RE = re.compile(r'^[+-]?\d+(?:\.\d+)?[eE][+-]?\d+$')
+_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+_BRACKET2_RE = re.compile(r'^\[[^\]]+\]$')
+_NOT_PREFIX_RE = re.compile(r'(?i)^not\s+(.+)$')
+_FUNC_CALL_RE = re.compile(r'([A-Za-z_]\w*)\s*\(')
+_TCOL_RE = re.compile(r"(?:'([^'\[\]]+)'|([^\W\d][\w .]*))\s*\[([^\]]+)\]$")
+_VAR_KW_RE = re.compile(r'\bVAR\b', re.IGNORECASE)
+_RETURN_KW_RE = re.compile(r'\bRETURN\b', re.IGNORECASE)
+
+
+def _strip_line_comments(expr):
+    """Strip // and -- comments, respecting string literals. Verbatim from the
+    old _eval_expr body -- the plan cache hoists it out of the per-call path."""
+    lines = expr.split('\n')
+    clean_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('//') or stripped.startswith('--'):
+            continue
+        in_str = False
+        result_chars = []
+        i = 0
+        while i < len(stripped):
+            ch = stripped[i]
+            if ch == '"':
+                in_str = not in_str
+            if not in_str:
+                if stripped[i:i+2] == '//' or stripped[i:i+2] == '--':
+                    break
+            result_chars.append(ch)
+            i += 1
+        stripped = ''.join(result_chars).rstrip()
+        if stripped:
+            clean_lines.append(stripped)
+    return ' '.join(clean_lines).strip()
+
+
+def _analyze_expr(raw):
+    """Pure syntactic analysis of one expression -> a plan (tuple of steps).
+
+    Mirrors the old _eval_expr dispatch chain exactly, in the same order; every
+    check here depends only on the text, never on the context. Runtime-dependent
+    decisions become CONDITIONAL steps followed by their fallthrough.
+    """
+    expr = raw.strip()
+    if not expr:
+        return ((_P_NONE, None),)
+    expr = _strip_line_comments(expr)
+    if not expr:
+        return ((_P_NONE, None),)
+
+    if _VAR_KW_RE.search(expr) and _RETURN_KW_RE.search(expr):
+        return ((_P_VARRET, expr),)
+
+    if expr.startswith('(') and expr.endswith(')'):
+        depth = 0
+        wraps_all = True
+        for i, ch in enumerate(expr):
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            if depth == 0 and i < len(expr) - 1:
+                wraps_all = False
+                break
+        if wraps_all:
+            return ((_P_PAREN, expr[1:-1].strip()),)
+
+    if _FULL_STRING_LITERAL.match(expr):
+        return ((_P_CONST, expr[1:-1].replace('""', '"')),)
+
+    try:
+        if _SCI_NUM_RE.match(expr):
+            return ((_P_CONST, float(expr)),)
+        if '.' in expr:
+            return ((_P_CONST, float(expr)),)
+        return ((_P_CONST, int(expr)),)
+    except ValueError:
+        pass
+
+    if expr.upper() == 'TRUE':
+        return ((_P_CONST, True),)
+    if expr.upper() == 'FALSE':
+        return ((_P_CONST, False),)
+
+    if _IDENT_RE.match(expr):
+        # A bare identifier: only a var-scope hit or the bare-table tail can
+        # resolve it -- no later branch of the chain matches an identifier.
+        return ((_P_MAYBEVAR, expr), (_P_TAIL, expr))
+
+    if (expr.startswith('[') and expr.endswith(']')
+            and expr.count('[') == 1 and expr.count(']') == 1):
+        return ((_P_BRACKET1, expr[1:-1]),)
+
+    # NOTE the old chain also demanded `'(' not in expr` here. The regex is
+    # anchored at both ends, so when it matches, ANY paren is inside the quoted
+    # table name or the bracketed column name -- both legal. The guard rejected
+    # every reference to a column like [People using ... (% of population)],
+    # which then fell through to the bare-table tail and read as BLANK: a
+    # silently wrong value on real Microsoft sample files.
+    col_match = _TCOL_RE.match(expr)
+    if col_match and col_match.end() == len(expr):
+        return ((_P_TCOL, ((col_match.group(1) or col_match.group(2)).strip(),
+                           col_match.group(3).strip())),)
+
+    if _BRACKET2_RE.match(expr):
+        return ((_P_BRACKET2, expr[1:-1]),)
+
+    # Top-level split order IS operator precedence: split at the LOOSEST
+    # operator first, so it becomes the root of the parse. The old chain split
+    # arithmetic before comparison and before `&`, which mis-parsed
+    # `a - b < 0` as `a - (b < 0)` -- the blank comparison then became 0, the
+    # whole condition collapsed to `a`, always truthy, and Employee[TenureDays]
+    # materialized SIGN-FLIPPED on 1.25M rows. Verified against Power BI
+    # Desktop's own engine, loosest to tightest:
+    #     ||   &&   NOT   comparisons   &   + -   * /
+    #     (10 - 3 < 0 is FALSE;  "a" & 1 + 2 is "a3";  "x" & 2 < 1 errors,
+    #      so & binds tighter than a comparison;  NOT FALSE() && FALSE() is
+    #      FALSE, so NOT binds tighter than &&;  NOT 1 = 2 is TRUE, so NOT
+    #      binds looser than a comparison.)
+    for lop in ('||', '&&'):
+        parts = DAXEngine._split_operators_scan(expr, lop)
+        if len(parts) > 1:
+            return ((_P_LOGICAL, (lop, tuple(p.strip() for p in parts))),)
+
+    m = _NOT_PREFIX_RE.match(expr)
+    if m:
+        return ((_P_NOT, m.group(1).strip()),)
+
+    steps = []
+    for op in ('<>', '>=', '<=', '>', '<', '='):
+        if len(DAXEngine._split_operators_scan(expr, op)) == 2:
+            # Conditional: a comparison with a non-comparable side evaluates
+            # to None at runtime and falls through to the next-tighter level.
+            steps.append((_P_CMP, expr))
+            break
+
+    if '&' in expr:
+        parts = DAXEngine._split_toplevel_scan(expr, '&')
+        if len(parts) > 1:
+            steps.append((_P_CONCAT, tuple(p.strip() for p in parts)))
+            return tuple(steps)
+
+    for op in ('+', '-'):
+        parts = DAXEngine._split_operators_scan(expr, op)
+        if len(parts) > 1:
+            steps.append((_P_BINARY, (op, tuple(p.strip() for p in parts))))
+            return tuple(steps)
+    for op in ('*', '/'):
+        parts = DAXEngine._split_operators_scan(expr, op)
+        if len(parts) > 1:
+            steps.append((_P_BINARY, (op, tuple(p.strip() for p in parts))))
+            return tuple(steps)
+
+    if expr.startswith('-'):
+        steps.append((_P_NEG, expr[1:].strip()))
+        return tuple(steps)
+
+    fm = _FUNC_CALL_RE.match(expr)
+    if fm:
+        args_str = DAXEngine._extract_args_scan(expr[fm.end() - 1:])
+        if args_str is not None:
+            steps.append((_P_FUNC, (fm.group(1).upper(), args_str[1:-1])))
+            return tuple(steps)
+
+    steps.append((_P_TAIL, expr))
+    return tuple(steps)
+
+
 def _as_date(v):
     """Best-effort date coercion from a value or ISO-ish string."""
     if isinstance(v, datetime):
@@ -404,6 +610,14 @@ class DAXContext:
         self.date_column = date_column or 'Date'
         self.filter_context = filter_context or {}
         self.relationships = relationships or []
+        # Filtered column values, cached per (table, column). Safe because a
+        # context's filter state is COPY-ON-MODIFY -- filter_context is only
+        # ever assigned at construction, never mutated in place -- and no
+        # caller mutates the returned list (audited: they wrap it in list(),
+        # sorted() or a comprehension). This is the issue-#6 _minmax_column
+        # win: a measure like MIN(T[Col]) under one outer context rebuilt the
+        # same filtered list on every one of thousands of per-row calls.
+        self._column_data_cache: dict = {}
         # Auto-detect date table if not provided (relationship-aware).
         if date_table:
             self.date_table = date_table
@@ -703,7 +917,18 @@ class DAXContext:
         return []
 
     def get_column_data(self, table_name: str, column_name: str) -> list:
-        """Get all values for a column, respecting current filter context."""
+        """Get all values for a column, respecting current filter context.
+
+        Cached per context -- do NOT mutate the returned list."""
+        _ck = (table_name, column_name)
+        _hit: list | None = self._column_data_cache.get(_ck)
+        if _hit is not None:
+            return _hit
+        out = self._get_column_data_uncached(table_name, column_name)
+        self._column_data_cache[_ck] = out
+        return out
+
+    def _get_column_data_uncached(self, table_name: str, column_name: str) -> list:
         tbl = self.tables.get(table_name)
         if not tbl:
             return []
@@ -1076,225 +1301,100 @@ class DAXEngine:
             merged.update(var_scope)
             var_scope = merged
 
-        expr = expr.strip()
-        if not expr:
-            return None
+        # Compiled plan fast path (issue #6): the whole syntactic dispatch --
+        # comment stripping, literal regexes, operator splits, branch checks --
+        # is a pure function of the text, analyzed once and cached. Iterators
+        # re-evaluate the SAME text once per row, so per row this is one dict
+        # hit plus the branch body that would have run anyway.
+        plan = _PLAN_CACHE.get(expr)
+        if plan is None:
+            if len(_PLAN_CACHE) > 200_000:
+                _PLAN_CACHE.clear()
+            plan = _analyze_expr(expr)
+            _PLAN_CACHE[expr] = plan
+        return self._exec_plan(plan, ctx, var_scope)
 
-        # Strip comments: DAX supports // and -- for single-line comments
-        # Must not strip -- inside strings (e.g., SVG attributes)
-        lines = expr.split('\n')
-        clean_lines = []
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith('//') or stripped.startswith('--'):
-                continue
-            # Remove inline comments (// or --) but NOT inside strings
-            in_str = False
-            result_chars = []
-            i = 0
-            while i < len(stripped):
-                ch = stripped[i]
-                if ch == '"':
-                    in_str = not in_str
-                if not in_str:
-                    if stripped[i:i+2] == '//' or stripped[i:i+2] == '--':
-                        break  # Rest of line is comment
-                result_chars.append(ch)
-                i += 1
-            stripped = ''.join(result_chars).rstrip()
-            if stripped:
-                clean_lines.append(stripped)
-        expr = ' '.join(clean_lines).strip()
-
-        if not expr:
-            return None
-
-        # -----------------------------------------------------------
-        # VAR / RETURN support
-        # -----------------------------------------------------------
-        # Detect if the expression contains VAR ... RETURN blocks.
-        # We look for the pattern:  VAR _name = <expr> ... RETURN <expr>
-        # This must be checked BEFORE any other parsing so that the whole
-        # multi-statement block is handled as a unit.
-        if re.search(r'\bVAR\b', expr, re.IGNORECASE) and re.search(r'\bRETURN\b', expr, re.IGNORECASE):
-            return self._eval_var_return(expr, ctx, var_scope)
-
-        # -----------------------------------------------------------
-        # Parenthesised sub-expression: ( expr )
-        # -----------------------------------------------------------
-        if expr.startswith('(') and expr.endswith(')'):
-            # Verify the parens actually wrap the whole expression
-            depth = 0
-            wraps_all = True
-            for i, ch in enumerate(expr):
-                if ch == '(':
-                    depth += 1
-                elif ch == ')':
-                    depth -= 1
-                if depth == 0 and i < len(expr) - 1:
-                    wraps_all = False
-                    break
-            if wraps_all:
-                return self._eval_expr(expr[1:-1].strip(), ctx, var_scope)
-
-        # String literal. DAX escapes a quote by DOUBLING it, so the literal for
-        # 6" pipe is "6"" pipe" -- four quote characters. Requiring exactly two
-        # rejected every such literal, which then fell through to be parsed as
-        # something else and came back BLANK. That silently deleted any text
-        # value containing a double quote (inches, "10\" x 4\"", a quoted
-        # phrase) when a calculated column referenced it.
-        if _FULL_STRING_LITERAL.match(expr):
-            return expr[1:-1].replace('""', '"')
-
-        # Numeric literal (incl. scientific notation: 1e6, 2.5E-3)
-        try:
-            if re.match(r'^[+-]?\d+(?:\.\d+)?[eE][+-]?\d+$', expr):
-                return float(expr)
-            if '.' in expr:
-                return float(expr)
-            return int(expr)
-        except ValueError:
-            pass
-
-        # Boolean/special
-        if expr.upper() == 'TRUE':
-            return True
-        if expr.upper() == 'FALSE':
-            return False
-
-        # -----------------------------------------------------------
-        # Variable reference: identifiers starting with _
-        # -----------------------------------------------------------
-        if var_scope and re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', expr):
-            var_name = expr
-            if var_name in var_scope:
-                return var_scope[var_name]
-            # Case-insensitive fallback
-            for k, v in var_scope.items():
-                if k.lower() == var_name.lower():
-                    return v
-
-        # Measure reference: [MeasureName] — only if no operators between brackets.
-        # In a row context, a bracket ref that is NOT a measure resolves to an
-        # extension column of the iterated table (SELECTCOLUMNS/ADDCOLUMNS names
-        # like [r]/[lbl]); measures take precedence, matching DAX resolution.
-        if expr.startswith('[') and expr.endswith(']') and expr.count('[') == 1 and expr.count(']') == 1:
-            measure_name = expr[1:-1]
-            if (measure_name not in ctx.measures and ctx._current_row
-                    and measure_name in ctx._current_row):
-                return ctx._current_row[measure_name]
-            return self.evaluate_measure(measure_name, ctx)
-
-        # Table[Column] reference — must be the ENTIRE expression (no trailing
-        # operators). The table part is either 'quoted' (anything goes) or an
-        # unquoted identifier — crucially containing NO arithmetic/comparison
-        # operators: "1 - S[D]" is arithmetic on column D, NOT column D of a
-        # table named "1 - S". The old permissive class swallowed the leading
-        # operand+operator, so any literal-first arithmetic around a bare
-        # column ref ("1 - Sales[Discount]") evaluated to BLANK (issues-9 §5:
-        # Total Sales = 0).
-        # Unquoted names use Unicode word classes ([^\W\d] = any letter or
-        # underscore) so non-ASCII table names (æøå, umlauts, …) keep working.
-        col_match = re.match(
-            r"(?:'([^'\[\]]+)'|([^\W\d][\w .]*))\s*\[([^\]]+)\]$", expr)
-        if col_match and '(' not in expr:
-            table_name = (col_match.group(1) or col_match.group(2)).strip()
-            col_name = col_match.group(3).strip()
-            # In row iteration context, resolve directly from current row —
-            # full-row dicts carry the column as a plain key; single-column
-            # dicts (VALUES/ALL iteration) carry it as __column__/__value__.
-            if ctx._current_row and ctx._current_row.get('__table__') == table_name:
-                if col_name in ctx._current_row:
-                    return ctx._current_row[col_name]
-                if ctx._current_row.get('__column__') == col_name:
-                    return ctx._current_row.get('__value__')
-            return (table_name, col_name)  # Return as column ref
-
-        # Simple column ref without table: [Column] — only if it's the entire expression
-        if re.match(r'^\[[^\]]+\]$', expr):
-            inner = expr[1:-1]
-            if (inner not in ctx.measures and ctx._current_row
-                    and inner in ctx._current_row):
-                return ctx._current_row[inner]
-            return self.evaluate_measure(inner, ctx)
-
-        # NOT prefix without parens: "NOT expr" or "not expr"
-        not_prefix = re.match(r'(?i)^not\s+(.+)$', expr)
-        if not_prefix:
-            inner_val = self._eval_expr(not_prefix.group(1).strip(), ctx, var_scope)
-            if inner_val is None or inner_val == 0 or inner_val == '' or inner_val is False:
-                return True
-            return False
-
-        # Logical AND / OR. Split at top level BEFORE binary/comparison so
-        # precedence is right ((a=1) && (b>2), not a = (1 && b) > 2) AND so that
-        # `&&` / `||` are not swallowed by the single-`&` string-concat branch
-        # further down (which would silently turn `A && B` into str(A)+str(B),
-        # dropping conditions — e.g. multi-condition RLS reporting 0 rows).
-        # `||` binds looser than `&&`, so try `||` first.
-        for _lop in ('||', '&&'):
-            _lparts = self._split_operators(expr, _lop)
-            if len(_lparts) > 1:
-                _vals = [self._dax_truthy(self._eval_expr(p.strip(), ctx, var_scope))
-                         for p in _lparts]
-                return any(_vals) if _lop == '||' else all(_vals)
-
-        # Binary operations: +, -, *, / — check BEFORE function calls
-        # so that FUNC() + expr is parsed as binary, not just FUNC()
-        result = self._eval_binary(expr, ctx, var_scope)
-        if result is not _NOT_APPLICABLE:
-            # A binary op matched — return its result even when that result is
-            # BLANK (None), e.g. x / 0. Only _NOT_APPLICABLE means "not binary".
-            return result
-
-        # Comparison: <, >, <=, >=, =, <>
-        # (also before function calls for same reason)
-        result = self._eval_comparison(expr, ctx, var_scope)
-        if result is not None:
-            return result
-
-        # String concatenation with &
-        if '&' in expr:
-            parts = self._split_top_level(expr, '&')
-            if len(parts) > 1:
-                results = [_concat_str(self._eval_expr(p.strip(), ctx, var_scope))
-                           for p in parts]
-                return ''.join(results)
-
-        # Unary minus on a non-literal operand ("-S[D]", "-[Measure]",
-        # "-CALCULATE(...)"): only AFTER binary/comparison/& splitting has
-        # declined — unary minus binds TIGHTER than those operators in DAX, so
-        # "-a + b" must parse as (-a) + b via the binary split, "-1 < 0" as
-        # (-1) < 0 via the comparison split, and "-1 & \"x\"" as (-1) & "x"
-        # via the concat split — never -(a + b) / -(1 < 0). Numeric literals
-        # ("-5", "-1e-5") were already handled by the number branch above.
-        if expr.startswith('-'):
-            inner_val = self._eval_expr(expr[1:].strip(), ctx, var_scope)
-            if isinstance(inner_val, (int, float)) and not isinstance(inner_val, bool):
-                return -inner_val
-            return None  # -BLANK() / non-numeric operand -> BLANK
-
-        # Function call: FUNC(args) — after binary/comparison so FUNC() + expr works
-        func_match = re.match(r'([A-Za-z_]\w*)\s*\(', expr)
-        if func_match:
-            func_name = func_match.group(1).upper()
-            args_str = self._extract_args(expr[func_match.end()-1:])
-            if args_str is not None:
-                args_text = args_str[1:-1]
+    def _exec_plan(self, plan, ctx: DAXContext, var_scope: dict | None):
+        """Run an analyzed plan. Each branch body is the old dispatch code,
+        verbatim, minus the syntactic re-analysis the plan already did."""
+        for kind, data in plan:
+            if kind == _P_CONST:
+                return data
+            if kind == _P_FUNC:
+                func_name, args_text = data
                 fn = self._func_map.get(func_name)
                 if fn:
                     return fn(args_text, ctx)
-                # Unknown/unsupported function — track and log
                 self.unsupported_functions.add(func_name)
                 import logging
                 logging.getLogger("pbix_mcp.dax").debug(
-                    "Unsupported DAX function: %s", func_name
-                )
+                    "Unsupported DAX function: %s", func_name)
                 return None
+            if kind == _P_BINARY:
+                op, parts = data
+                return self._fold_arith(parts, op, ctx, var_scope)
+            if kind == _P_CMP:
+                result = self._eval_comparison(data, ctx, var_scope)
+                if result is not None:
+                    return result
+                continue  # a blank side: the old chain fell through
+            if kind == _P_TCOL:
+                table_name, col_name = data
+                if ctx._current_row and ctx._current_row.get('__table__') == table_name:
+                    if col_name in ctx._current_row:
+                        return ctx._current_row[col_name]
+                    if ctx._current_row.get('__column__') == col_name:
+                        return ctx._current_row.get('__value__')
+                return (table_name, col_name)
+            if kind == _P_BRACKET1:
+                if (data not in ctx.measures and ctx._current_row
+                        and data in ctx._current_row):
+                    return ctx._current_row[data]
+                return self.evaluate_measure(data, ctx)
+            if kind == _P_MAYBEVAR:
+                if var_scope:
+                    if data in var_scope:
+                        return var_scope[data]
+                    for k, v in var_scope.items():
+                        if k.lower() == data.lower():
+                            return v
+                continue  # not a var in this scope: fall through to the tail
+            if kind == _P_PAREN:
+                return self._eval_expr(data, ctx, var_scope)
+            if kind == _P_LOGICAL:
+                lop, parts = data
+                vals = [self._dax_truthy(self._eval_expr(p, ctx, var_scope))
+                        for p in parts]
+                return any(vals) if lop == '||' else all(vals)
+            if kind == _P_CONCAT:
+                return ''.join(_concat_str(self._eval_expr(p, ctx, var_scope))
+                               for p in data)
+            if kind == _P_NEG:
+                inner_val = self._eval_expr(data, ctx, var_scope)
+                if isinstance(inner_val, (int, float)) and not isinstance(inner_val, bool):
+                    return -inner_val
+                return None
+            if kind == _P_NOT:
+                inner_val = self._eval_expr(data, ctx, var_scope)
+                if inner_val is None or inner_val == 0 or inner_val == '' or inner_val is False:
+                    return True
+                return False
+            if kind == _P_VARRET:
+                return self._eval_var_return(data, ctx, var_scope)
+            if kind == _P_BRACKET2:
+                if (data not in ctx.measures and ctx._current_row
+                        and data in ctx._current_row):
+                    return ctx._current_row[data]
+                return self.evaluate_measure(data, ctx)
+            if kind == _P_NONE:
+                return None
+            if kind == _P_TAIL:
+                return self._eval_tail(data, ctx)
+        return None
 
-        # Bare table name: resolve to list of full-row dicts for iteration
-        # This enables SUMX(Sales, expr), FILTER(Sales, expr), etc.
-        # Respects current filter context (including cross-table relationships).
+    def _eval_tail(self, expr: str, ctx: DAXContext):
+        """The old chain's final branch: a bare table name resolves to its
+        filtered rows for iteration; anything else is BLANK."""
         bare_name = expr.strip().strip("'")
         tbl = ctx.tables.get(bare_name)
         if tbl and tbl.get('rows'):
@@ -1305,7 +1405,6 @@ class DAXEngine:
                  **{cols[i]: row[i] for i in range(min(len(cols), len(row)))}}
                 for row in filtered_rows
             ]
-
         return None
 
     def _eval_var_return(self, expr: str, ctx: DAXContext, var_scope: dict | None = None) -> Any:
@@ -1381,6 +1480,12 @@ class DAXEngine:
 
     def _extract_args(self, expr: str) -> Optional[str]:
         """Extract balanced parentheses from expression starting with '('."""
+        return self._extract_args_scan(expr)
+
+    @staticmethod
+    @lru_cache(maxsize=200_000)
+    def _extract_args_scan(expr: str) -> Optional[str]:
+        """Character scan behind _extract_args, cached by input."""
         if not expr.startswith('('):
             return None
         depth = 0
@@ -1403,7 +1508,16 @@ class DAXEngine:
         return self._split_top_level(args_str, ',')
 
     def _split_top_level(self, expr: str, delimiter: str) -> list:
-        """Split expression at top-level delimiter, respecting parens and strings."""
+        """Split expression at top-level delimiter, respecting parens and strings.
+
+        Memoized via the static scan below -- same rationale as
+        _split_operators: pure function of the text, called per row."""
+        return list(self._split_toplevel_scan(expr, delimiter))
+
+    @staticmethod
+    @lru_cache(maxsize=200_000)
+    def _split_toplevel_scan(expr: str, delimiter: str) -> tuple:
+        """Character scan behind _split_top_level, cached by input."""
         parts = []
         current = []
         depth = 0
@@ -1430,7 +1544,7 @@ class DAXEngine:
             current.append(ch)
             i += 1
         parts.append(''.join(current))
-        return parts
+        return tuple(parts)
 
     def _split_operators(self, expr: str, op: str) -> list:
         """Split expr at top-level `op`, WITHOUT requiring surrounding spaces.
