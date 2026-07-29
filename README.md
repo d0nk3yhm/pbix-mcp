@@ -128,7 +128,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | DAX evaluation (174 functions) | **Stable API** | Best-effort semantic parity — stable API, practical evaluation for common DAX patterns; see accuracy notes below |
 | Metadata SQL read/write | **Stable** | Full SQLite access to tables, columns, relationships |
 | Default slicer filter extraction | **Stable** | Legacy Layout JSON and PBIR format |
-| PBIR read + write | **Stable** | Service-authored reports (`Report/definition/`) are read AND edited by the same tools as classic. All 126 tools are verified on both formats by applying the tool, saving, reopening and checking the saved bytes — see [docs/capability-parity.md](docs/capability-parity.md) |
+| PBIR read + write | **Stable** | Service-authored reports (`Report/definition/`) are read AND edited by the same tools as classic. The 126 tools present at the 0.9.39 parity audit are verified on both formats by applying the tool, saving, reopening and checking the saved bytes — see [docs/capability-parity.md](docs/capability-parity.md) |
 | Table data read | **Stable** | Native VertiPaq decoder — all materialized tables (no external dependencies) |
 | Calculated table evaluation | **Stable** | DATATABLE, GENERATESERIES, CALENDAR, field parameters |
 | XPress9 decompress/recompress | **Stable** | Byte-exact round-trip verified |
@@ -567,7 +567,7 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (126 tools)
+  server.py              # MCP server (127 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX builder (metadata, VertiPaq, layout, relationships)
   html_templates.py      # HTML/SVG template builders (kpi_card, bar_chart, gauge, table, …)
