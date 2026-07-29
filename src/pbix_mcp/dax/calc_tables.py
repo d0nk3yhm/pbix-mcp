@@ -457,6 +457,127 @@ def _mask_lookupvalue_calls(expr: str, target_table: str, target_columns,
     return "".join(out), specs, None
 
 
+_RELATED_RE = re.compile(r"\bRELATED\s*\(", re.I)
+_REL_MASK = "__REL{}__"
+
+
+def _related_paths(target_table: str, dest_table: str, relationships,
+                   limit: int = 8):
+    """Every many-to-one chain of ACTIVE relationships from target to dest.
+
+    RELATED only ever walks from the MANY side to the ONE side, which in AMO
+    metadata is From -> To. Returns a list of hop lists; the caller refuses
+    unless there is exactly one, because two paths mean the DAX is ambiguous
+    without USERELATIONSHIP and picking one would silently invent values.
+    """
+    edges: "dict[str, list[dict]]" = {}
+    for r in relationships or []:
+        if not r.get("IsActive", 1):
+            continue
+        edges.setdefault((r.get("FromTable") or "").lower(), []).append(r)
+    found: "list[list[dict]]" = []
+    stack: "list[tuple[str, list[dict], set[str]]]" = [
+        ((target_table or "").lower(), [], {(target_table or "").lower()})]
+    while stack:
+        node, path, seen = stack.pop()
+        if len(path) >= limit:
+            continue
+        for r in edges.get(node, []):
+            nxt = (r.get("ToTable") or "").lower()
+            if nxt in seen:
+                continue
+            if nxt == (dest_table or "").lower():
+                found.append(path + [r])
+                if len(found) > 1:
+                    return found
+            else:
+                stack.append((nxt, path + [r], seen | {nxt}))
+    return found
+
+
+def _parse_related(call: str, target_table: str, target_columns):
+    """(dest_table, dest_column) for RELATED(<one column ref>), or a reason.
+
+    The column MUST name its table. A bare RELATED([Col]) would have to be
+    resolved by searching every related table for that name, and a wrong guess
+    stores wrong values on every row -- so it is refused instead.
+    """
+    open_paren = call.find("(")
+    args = _split_args(call[open_paren + 1:-1])
+    if len(args) != 1:
+        return "RELATED takes exactly one column reference"
+    m = _COL_REF_FULL_RE.match(args[0].strip())
+    if not m:
+        return f"RELATED's argument {args[0]!r} is not a column reference"
+    tbl, col = (m.group(1) or m.group(2)), m.group(3)
+    if not tbl:
+        return (f"RELATED([{col}]) does not name its table; this engine will "
+                f"not guess which related table it means")
+    if tbl.lower() == (target_table or "").lower():
+        return (f"RELATED('{tbl}'[{col}]) points at the column's own table, "
+                f"which has no related row to fetch")
+    return tbl, col
+
+
+def _mask_related_calls(expr: str, target_table: str, target_columns,
+                        known_tables, relationships):
+    """(masked_expr, specs, reason) -- see _mask_lookupvalue_calls."""
+    spans = list(_scan_calls(expr, _RELATED_RE))
+    if not spans:
+        return expr, [], None
+    out: "list[str]" = []
+    specs: "list[dict]" = []
+    i = 0
+    for a, b in spans:
+        got = _parse_related(expr[a:b], target_table, target_columns)
+        if isinstance(got, str):
+            return expr, [], got
+        dest_table, dest_col = got
+        if known_tables is not None:
+            avail = {t.lower(): cols for t, cols in known_tables.items()}
+            cols = avail.get(dest_table.lower())
+            if cols is None:
+                return expr, [], (
+                    f"RELATED reads table '{dest_table}', whose data is not "
+                    f"available to this engine")
+            if dest_col.lower() not in {c.lower() for c in cols}:
+                return expr, [], (
+                    f"RELATED references '{dest_table}'[{dest_col}], which "
+                    f"that table does not have")
+        paths = _related_paths(target_table, dest_table, relationships)
+        if not paths:
+            return expr, [], (
+                f"RELATED('{dest_table}'[{dest_col}]): no active many-to-one "
+                f"relationship path from '{target_table}' to '{dest_table}'")
+        if len(paths) > 1:
+            return expr, [], (
+                f"RELATED('{dest_table}'[{dest_col}]): more than one active "
+                f"relationship path from '{target_table}' -- ambiguous without "
+                f"USERELATIONSHIP, so it is refused rather than guessed")
+        out.append(expr[i:a])
+        out.append(_REL_MASK.format(len(specs)))
+        specs.append({"table": dest_table, "column": dest_col,
+                      "path": paths[0]})
+        i = b
+    out.append(expr[i:])
+    return "".join(out), specs, None
+
+
+def related_table_names(expression: str) -> "set[str]":
+    """Tables a RELATED in `expression` reads, for lazy loading. See
+    `lookupvalue_table_names` -- best effort, the gate re-validates."""
+    out: "set[str]" = set()
+    e = strip_dax_comments(expression or "")
+    for a, b in _scan_calls(e, _RELATED_RE):
+        call = e[a:b]
+        args = _split_args(call[call.find("(") + 1:-1])
+        if len(args) == 1:
+            m = _COL_REF_FULL_RE.match(args[0].strip())
+            if m and (m.group(1) or m.group(2)):
+                out.add(m.group(1) or m.group(2))
+    return out
+
+
 def lookupvalue_table_names(expression: str) -> "set[str]":
     """Table names a LOOKUPVALUE in `expression` reads from.
 
@@ -478,7 +599,8 @@ def lookupvalue_table_names(expression: str) -> "set[str]":
 
 
 def calc_column_unsupported_reason(expression: str, target_table: str,
-                                   columns=None, known_tables=None):
+                                   columns=None, known_tables=None,
+                                   relationships=None):
     """Return why a calc-column expression can't be safely materialized, or None.
 
     None = the expression is a row-context expression over ``target_table``'s
@@ -499,6 +621,20 @@ def calc_column_unsupported_reason(expression: str, target_table: str,
     if not e.strip():
         return "expression is empty"
     if known_tables is not None:
+        # RELATED needs the relationship graph as well as the data. Without it
+        # the path cannot be resolved, so the call stays refused by the
+        # cross-table scan below rather than guessed at.
+        if relationships is not None:
+            e, rel_specs, rel_why = _mask_related_calls(
+                e, target_table, columns, known_tables, relationships)
+            if rel_why:
+                return rel_why
+            for spec in rel_specs:
+                fk = spec["path"][0].get("FromColumn")
+                if columns is not None and fk not in columns:
+                    return (f"RELATED('{spec['table']}'[{spec['column']}]) "
+                            f"joins on '{target_table}'[{fk}], which this "
+                            f"table does not have")
         e, lv_specs, lv_why = _mask_lookupvalue_calls(
             e, target_table, columns, known_tables)
         if lv_why:
@@ -891,6 +1027,90 @@ def _build_lv_index(spec: dict, all_tables: Dict[str, dict]):
     return {"distinct": index, "raw": raw}
 
 
+def _build_related_resolver(spec: dict, all_tables: Dict[str, dict]):
+    """value of the target row's FK -> the related row's column value.
+
+    Walks the hop chain once per DISTINCT key and memoises, so a fact table
+    with a handful of distinct foreign keys costs a handful of walks rather
+    than one per row.
+    """
+    def _tbl(name):
+        for tname, tdata in (all_tables or {}).items():
+            if tname.lower() == (name or "").lower():
+                return tdata
+        return None
+
+    hops = []
+    for hop in spec["path"]:
+        dst = _tbl(hop.get("ToTable"))
+        if dst is None:
+            return (f"RELATED needs table '{hop.get('ToTable')}', whose data "
+                    f"is not available to this engine")
+        cols = list(dst.get("columns") or [])
+        lower = {c.lower(): i for i, c in enumerate(cols)}
+        pk = (hop.get("ToColumn") or "").lower()
+        if pk not in lower:
+            return (f"RELATED: '{hop.get('ToTable')}' has no column "
+                    f"'{hop.get('ToColumn')}' to join on")
+        by_key: Dict[object, list] = {}
+        for r in dst.get("rows") or []:
+            by_key.setdefault(_lv_key(r[lower[pk]]), r)
+        hops.append((by_key, lower))
+    last_cols = hops[-1][1]
+    res_i = last_cols.get(spec["column"].lower())
+    if res_i is None:
+        return (f"RELATED: '{spec['table']}' has no column "
+                f"'{spec['column']}'")
+    # Each hop after the first joins on the PREVIOUS table's FK column.
+    fk_after = [(hop.get("FromColumn") or "").lower()
+                for hop in spec["path"][1:]]
+    memo: Dict[object, object] = {}
+
+    def resolve(fk_value):
+        key = _lv_key(fk_value)
+        if key in memo:
+            return memo[key]
+        val = None
+        cur = key
+        for i, (by_key, lower) in enumerate(hops):
+            row = by_key.get(cur)
+            if row is None:
+                val = None
+                break
+            if i == len(hops) - 1:
+                val = row[res_i]
+            else:
+                nxt_i = lower.get(fk_after[i])
+                if nxt_i is None:
+                    val = None
+                    break
+                cur = _lv_key(row[nxt_i])
+        memo[key] = val
+        return val
+
+    return resolve
+
+
+def _resolve_rel_masks(row_expr, rel_specs, rel_resolvers, row_data):
+    """Replace each `__RELn__` with this row's related value."""
+    out = row_expr
+    for n, spec in enumerate(rel_specs):
+        mask = _REL_MASK.format(n)
+        if mask not in out:
+            continue
+        fk = spec["path"][0].get("FromColumn")
+        hit = None
+        for cn, val in row_data.items():
+            if cn.lower() == (fk or "").lower():
+                hit = val
+                break
+        else:
+            return out, (
+                f"RELATED joins on a column '{fk}' that is not in this row")
+        out = out.replace(mask, f"({_dax_literal(rel_resolvers[n](hit))})")
+    return out, None
+
+
 def _resolve_lv_masks(row_expr, lv_specs, lv_index, row_data, target_table,
                       engine, dax_engine, all_tables, relationships):
     """Replace each `__LVn__` in `row_expr` with this row's looked-up literal.
@@ -961,6 +1181,16 @@ def evaluate_row_context_column(
     # n-row dimension would make the column O(n*m).
     known = {t: (v.get("columns") or [])
              for t, v in (all_tables or {}).items()}
+    clean, rel_specs, rel_why = _mask_related_calls(
+        clean, target_table, columns, known, relationships)
+    if rel_why:
+        return None, rel_why
+    rel_resolvers = []
+    for spec in rel_specs:
+        built = _build_related_resolver(spec, all_tables)
+        if isinstance(built, str):
+            return None, built
+        rel_resolvers.append(built)
     clean, lv_specs, lv_why = _mask_lookupvalue_calls(
         clean, target_table, columns, known)
     if lv_why:
@@ -976,6 +1206,11 @@ def evaluate_row_context_column(
     for row in rows:
         row_data = {cn: row[ci] for ci, cn in enumerate(columns)}
         row_expr = _subst_row(masked, row_data, target_table)
+        if rel_specs:
+            row_expr, rel_err = _resolve_rel_masks(
+                row_expr, rel_specs, rel_resolvers, row_data)
+            if rel_err:
+                return None, rel_err
         if lv_specs:
             row_expr, lv_err = _resolve_lv_masks(
                 row_expr, lv_specs, lv_index, row_data, target_table,

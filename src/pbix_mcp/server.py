@@ -10258,6 +10258,7 @@ def _materialize_table_calc_columns(
         evaluate_row_context_column,
         expand_variation_accessors,
         lookupvalue_table_names,
+        related_table_names,
     )
 
     # LOOKUPVALUE reads another table, so that table's rows have to be here.
@@ -10267,7 +10268,9 @@ def _materialize_table_calc_columns(
     if lookup_provider is not None:
         wanted: set[str] = set()
         for spec in calc_specs:
-            wanted |= lookupvalue_table_names(spec.get("expression") or "")
+            expr = spec.get("expression") or ""
+            wanted |= lookupvalue_table_names(expr)
+            wanted |= related_table_names(expr)
         for tn in wanted:
             if tn.lower() == table_name.lower():
                 continue
@@ -10312,8 +10315,8 @@ def _materialize_table_calc_columns(
             # it tell MIN('T'[Year]) from MIN('T'[Yeer]) -- the engine answers 0
             # for the misspelling rather than failing, so without this the
             # column would materialize as zeros and report success.
-            why = calc_column_unsupported_reason(qualified, table_name,
-                                                 col_names, known_tables)
+            why = calc_column_unsupported_reason(
+                qualified, table_name, col_names, known_tables, relationships)
             if why:
                 raise ValueError(f"'{table_name}'[{spec['column']}]: {why}")
             vals, err = evaluate_row_context_column(
@@ -10811,7 +10814,7 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
             continue
         bad = calc_column_unsupported_reason(
             r["expr"] or "", r["tbl"], model_tables.get(r["tbl"]),
-            model_tables)
+            model_tables, relationships)
         if bad:
             raise ValueError(
                 f"The model has a calculated column '{r['tbl']}'[{r['col']}] "
