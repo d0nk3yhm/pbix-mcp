@@ -66,14 +66,14 @@ DAX evaluation returns extended results:
 | `pbix_save` | `strip_sensitivity_label` | `False` | Removes MSIP sensitivity labels when True |
 | `pbix_close` | `force` | `False` | Refuses to close with unsaved changes |
 
-## Tool Categories (126 tools)
+## Tool Categories (127 tools)
 
 ### Create & File Management (6)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open` · `pbix_report_format`
 
 **Report formats** — a `.pbix` stores its report either as the **classic** single `Report/Layout` document, or as **PBIR** (`Report/definition/`, a tree of per-page/per-visual JSON), which is what every report authored in the Power BI *service* downloads as. **Both are fully read AND written** through the same entry points. Reading converts a PBIR tree to the classic shape (page names/size/type, visual names, geometry incl. z/tabOrder, `projections` + a synthesized `prototypeQuery` so column-vs-measure is recoverable, hidden state, filters, sync groups, mobile layout). Writing patches each page/visual back onto the **original file it was read from**, so fields this converter doesn't model (custom visual settings, `sortDefinition`, `howCreated`, …) survive an edit untouched — a write that changes nothing changes nothing on disk. Added pages/visuals are created, removed ones deleted, and `pages.json` `pageOrder`/`activePageName` kept in step; a classic `Report/Layout` is never planted alongside the tree. Resource and custom-visual registration works on both (`resourcePackages`/`publicCustomVisuals` live in `Report/definition/report.json` for PBIR, with that format's flat package shape and string item types). Call `pbix_report_format` for an open file's format and whether it is writable.
 
-### Report Layout & Visuals (28)
+### Report Layout & Visuals (29)
 Visual CRUD, visual-level sort authoring (`pbix_set_visual_sort`), page management, filters, positions, bookmarks (add/remove), settings, layout read/write, default filter extraction.
 
 **Editing primitives** — `pbix_rename_page`, `pbix_reorder_pages`, `pbix_set_page_visibility`, `pbix_duplicate_page`, `pbix_move_visual`, `pbix_duplicate_visual`. All behave identically on classic and PBIR. Renaming a page changes only `displayName`: the internal `name` is an identity that bookmarks, drillthrough and page navigation reference. Duplicating a page or visual assigns fresh identities to the copy (and to every visual on a copied page), since two objects sharing a `name` collide in bookmarks and navigation. `pbix_move_visual` writes the container geometry — `x`/`y`/`z`/`width`/`height` live on the container, not in the config JSON, so `pbix_set_visual_property` cannot reach them — and keeps the classic `config.layouts` copy in step. Pass `-1` for any axis to leave it unchanged. Page order: references not listed in `page_order` keep their relative order after the ones that are.

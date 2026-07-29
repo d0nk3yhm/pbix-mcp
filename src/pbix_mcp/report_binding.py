@@ -469,4 +469,102 @@ def compile_visual_binding(single_visual: dict, resolve_type=None):
         "visualElements": [{"DataRoles": data_roles}],
         "selects": dt_selects,
     }
+
+    # --- field parameters -------------------------------------------------
+    # A field-parameter binding stores the currently-RESOLVED field in the
+    # projections/Select (handled above like any field) and the parameter
+    # linkage in queryFieldParametersByRole. The COMPILED query additionally
+    # needs the parameter table joined in and a Where clause selecting the
+    # resolved field through the parameter's hidden "<Display> Fields" column,
+    # and the resolved select's dataTransforms entry needs
+    # sourceFieldParameters provenance. All three shapes are diffed against a
+    # Desktop-authored binding (OpenBI findings #19 ground truth). Without
+    # them Desktop silently degrades the well to an implicit Count.
+    qfp = single_visual.get("queryFieldParametersByRole") or {}
+    if qfp:
+        _apply_field_parameters(
+            q, data_transforms, qfp, projection_ordering, selects,
+            _entity_of, _native)
+
     return query, data_transforms
+
+
+def _nameof_literal(entity: str, prop: str) -> str:
+    """The Literal.Value Desktop stores for a field selected through a
+    parameter: the canonical ``'Table'[Field]`` ref (what NAMEOF() evaluates
+    to) wrapped as a TEXT literal -- outer single quotes, interior single
+    quotes doubled. ``'Sales'[Total Revenue]`` becomes
+    ``'''Sales''[Total Revenue]'``."""
+    canonical = f"'{entity}'[{prop}]"
+    return "'" + canonical.replace("'", "''") + "'"
+
+
+def _apply_field_parameters(q, data_transforms, qfp, projection_ordering,
+                            selects, _entity_of, _native):
+    """Stamp the compiled query + dataTransforms with field-parameter wiring.
+
+    ``q`` is the compiled Query dict (already deep-copied from the prototype),
+    ``qfp`` is singleVisual.queryFieldParametersByRole. For every parameter
+    entry: join the parameter's table into From, add a Where In-condition over
+    its hidden ``<Display> Fields`` column selecting the resolved field(s),
+    and mark the covered dataTransforms selects with sourceFieldParameters.
+    """
+    from_list = q.setdefault("From", [])
+    used_aliases = {f.get("Name") for f in from_list}
+    entity_alias = {f.get("Entity"): f.get("Name") for f in from_list}
+
+    def _alias_for(entity: str) -> str:
+        hit = entity_alias.get(entity)
+        if isinstance(hit, str):
+            return hit
+        base = (entity[:1].lower() or "t")
+        name = base
+        n = 0
+        while name in used_aliases:
+            n += 1
+            name = f"{base}{n}"
+        used_aliases.add(name)
+        entity_alias[entity] = name
+        from_list.append({"Name": name, "Entity": entity, "Type": 0})
+        return name
+
+    dt_selects = data_transforms["selects"]
+    for role, entries in qfp.items():
+        role_idxs = projection_ordering.get(role, [])
+        for entry in entries:
+            expr = (entry.get("expr") or {}).get("Column") or {}
+            param_entity = (expr.get("Expression", {})
+                            .get("SourceRef", {}).get("Entity"))
+            display_col = expr.get("Property")
+            if not param_entity or not display_col:
+                continue
+            start = int(entry.get("index", 0))
+            length = int(entry.get("length", 1))
+            covered = role_idxs[start:start + length]
+            if not covered:
+                continue
+            alias = _alias_for(param_entity)
+            # By this project's own add_field_parameter convention (and the
+            # Desktop-authored ground truth), the hidden NAMEOF column is
+            # "<display column> Fields".
+            fields_col = f"{display_col} Fields"
+            values = []
+            for ix in covered:
+                sel = selects[ix]
+                values.append([{"Literal": {"Value": _nameof_literal(
+                    _entity_of(sel), _native(sel))}}])
+            q.setdefault("Where", []).append({"Condition": {"In": {
+                "Expressions": [{"Column": {
+                    "Expression": {"SourceRef": {"Source": alias}},
+                    "Property": fields_col}}],
+                "Values": values,
+            }}})
+            provenance = [{
+                "expr": {"_kind": 2,
+                         "source": {"_kind": 0, "entity": param_entity},
+                         "ref": display_col},
+                "displayName": display_col,
+            }]
+            for ix in covered:
+                if 0 <= ix < len(dt_selects):
+                    dt_selects[ix]["sourceFieldParameters"] = provenance
