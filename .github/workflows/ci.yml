@@ -18,13 +18,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -37,7 +37,22 @@ jobs:
       - name: Type check with mypy (baseline 140 errors, fail if new errors added)
         shell: bash
         run: |
-          COUNT=$(mypy src/pbix_mcp/ --ignore-missing-imports --no-error-summary 2>&1 | grep -c "error:" || true)
+          # The old `| grep -c "error:" || true` swallowed EVERYTHING: a mypy
+          # crash, an aborted run, even mypy missing entirely all counted as
+          # "0 errors" and the gate passed green. Capture output and exit code
+          # separately: mypy exits 0 (clean) or 1 (type errors); anything else
+          # is an abnormal run and must fail the gate outright.
+          set +e
+          OUT=$(mypy src/pbix_mcp/ --ignore-missing-imports --no-error-summary 2>&1)
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -ne 0 ] && [ "$STATUS" -ne 1 ]; then
+            echo "FAIL: mypy exited abnormally (status $STATUS)"
+            echo "$OUT" | tail -20
+            exit 1
+          fi
+          COUNT=$(printf '%s
+' "$OUT" | grep -c "error:" || true)
           echo "mypy errors: $COUNT (baseline: 140)"
           if [ "$COUNT" -gt 140 ]; then
             echo "FAIL: mypy errors ($COUNT) exceed baseline (140)"

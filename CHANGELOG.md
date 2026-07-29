@@ -5,6 +5,111 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.55] - 2026-07-29
+
+Closes issue **#6** (compiled DAX expression plans), and fixes **two operator-precedence
+bugs** and **a paren-in-column-name bug** the new corpus-wide verification exposed —
+plus three `pbix_doctor` false-positive classes, an invalid `ExpressionKind` written by
+`set_incremental_refresh`, and ungated release workflows found by a repo audit.
+
+### #6 — compiled expression plans
+
+`_eval_expr` re-ran its whole dispatch chain — comment stripping, literal regexes,
+operator splitting, branch checks — on every call, and iterators call it once per row
+with the SAME text. The syntactic analysis is now done once per expression and cached
+as a "plan"; evaluation code is unchanged. The calculated-column evaluator stops
+substituting text per row entirely: column refs resolve through the engine's row
+context and each mask (aggregate / CALCULATE / RELATED / LOOKUPVALUE) binds as an
+engine VARIABLE, so the same text evaluates on every row and its plan is parsed once.
+`get_column_data` is also cached per context (contexts are copy-on-modify).
+
+Measured: the issue's own benchmark (`Agents_Performance`, 199,999 rows) went
+1196→504 ms for one measure and 2373→981 ms for three; `MS_Employee_Hiring`
+(5 calc columns × 1,290,259 rows) went 1053s→183s; `MS_Covid_Tracking` 332s.
+
+Verified per the issue's protocol: every measure in all 24 corpus files was captured
+before and after. **520 of 544 comparable measures are byte-identical**; the 24
+differences are 5 RAND-volatile measures, 2 identical-failure path artifacts, and 17
+measures changed BY the precedence fixes below — each classified individually, none
+unexplained.
+
+### Operator precedence was wrong in two ways (silent wrong values)
+
+Top-level split order IS precedence, and the old chain split arithmetic before
+comparison and before `&`, and `NOT` before `&&`. Every rule is now probed against
+Power BI Desktop's own engine, loosest to tightest: `||` `&&` `NOT` comparisons `&`
+`+ -` `* /`.
+
+- `a - b < 0` parsed as `a - (b < 0)`: the blank comparison became 0, the condition
+  collapsed to `a` — always truthy. `Employee[TenureDays]` (the absolute-difference
+  idiom `IF(a-b<0, b-a, a-b)`) materialized SIGN-FLIPPED on 1,247,139 of 1,290,259
+  rows. GeoSales' conditional-formatting measures (`IF([a]-[b]<0, red, blue)`)
+  answered `#D64550` where Desktop answers `#118DFF` — end-to-end verified against
+  the live Desktop engine.
+- `NOT ISBLANK(a) && NOT ISBLANK(b)` — the standard quick-measure template — parsed
+  as `NOT (ISBLANK(a) && NOT ISBLANK(b))`. Desktop: `NOT FALSE() && FALSE()` is FALSE.
+- `"a" & 1 + 2` parsed as `("a" & 1) + 2`; Desktop says `"a3"`.
+
+### Parentheses in column names read as BLANK (silent wrong values)
+
+The column-reference branch demanded `'(' not in expr`, so a reference to
+`Indicators[People using at least basic drinking water services (% of population)]`
+never resolved and read as BLANK. Every bucket column on `MS_Life_Expectancy`
+mis-bucketed thousands of rows. The regex is anchored at both ends, so when it
+matches, any paren is inside the quoted table name or the bracketed column name —
+both legal; the guard is gone.
+
+**Corpus ground truth after all fixes: 395 calculated columns match Desktop's stored
+values exactly, 0 logic mismatches** (4 remaining differences are the documented
+sub-microsecond DateTime-serial class on MS_Perf_Analyzer's trace tables), 23/24
+files rebuild, 0 fidelity findings.
+
+### set_incremental_refresh wrote an invalid ExpressionKind
+
+TOM's `ExpressionKind` enum defines a single member, `M = 0` — and every one of the
+25 Desktop/Service-authored Expression rows across the corpus is Kind=0, parameter
+queries included. The writer inserted **Kind=1**, which is precisely the out-of-range
+enum `PFE_TM_ENUM_VALUES_VALIDATION_FAILED` rejects. Now Kind=0.
+
+### Three pbix_doctor false-positive classes on working files
+
+- **Expression/DataMashup consistency** flagged 9 of 24 corpus files (37.5%): V3
+  enhanced-metadata files legitimately store shared M expressions with no DataMashup
+  part. The check now tests the REAL invalid condition — an out-of-range
+  `Expression.Kind`.
+- **Table/storage consistency** matched storage by display name, but storage folder
+  names are NOT the display name: special characters are space-sanitized
+  (`fct_Orders` → `fct Orders`) and a renamed table keeps its creation-time folder
+  (`PositiveYOY-NegativeYOY` lives in `Table (2542).tbl`). 10 of GeoSales' 14 tables
+  were flagged storage-less on a file Desktop opens fine. Matching is by table ID now.
+- **DAX measures** crashed with `NoneType has no len()` on Desktop's NULL-expression
+  placeholder measures (same class as the 0.9.53 builder fix).
+
+`pbix_doctor` now reports ALL CLEAN on GeoSales_Dashboard, MS_AI_Sample,
+MS_Life_Expectancy, IT_Support and Agents_Performance.
+
+### Release/CI hardening (repo audit)
+
+- `release.yml` published to PyPI with NO gates — a tag cut from a red commit still
+  shipped. A gate job (ruff + unit tests on windows-latest) now precedes build;
+  `github-release` needs `publish-pypi` so a rejected PyPI publish no longer leaves a
+  public GitHub release; `fail_on_unmatched_files: true` so an empty-asset release
+  fails instead of shipping hollow.
+- The CI mypy gate piped through `grep -c "error:" || true`, which counted a mypy
+  CRASH as zero errors and passed green. Exit status is now checked separately.
+- Actions bumped (checkout v7, setup-python v7, artifacts v7/v8); Python 3.14 added
+  to the matrix and classifiers.
+- `pbix_open`'s work dir was only second-granular, so two same-alias opens within one
+  second (parallel processes) extracted into the SAME directory and silently read
+  each other's models. The dir now carries pid + uuid.
+
+### Docs
+
+Tool count corrected to 126 (14 missing tools added to the README index), DAX
+function count to 174 (four stale sites), stale test totals refreshed, and seven
+stale "PBIR not supported" claims corrected across README, tool-contracts,
+limitations and html-visuals — PBIR has been read AND write since 0.9.35/0.9.39.
+
 ## [0.9.54] - 2026-07-29
 
 Closes issues **#4**, **#5** and **#7**. The theme is the same throughout: a wrong
