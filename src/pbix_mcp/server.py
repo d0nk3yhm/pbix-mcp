@@ -2154,6 +2154,14 @@ def pbix_create(
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
+# Built-in visual types with no data roles at all. Deliberately narrow: an
+# unrecognized type (any custom visual) is assumed to HAVE wells, so only the
+# provable cases are refused.
+_NO_DATA_ROLE_VISUALS = frozenset({
+    "textbox", "image", "shape", "basicShape", "actionButton",
+})
+
+
 def _field_parameter_tables(info: dict) -> set:
     """Names of tables that are FIELD PARAMETERS (ParameterMetadata
     ExtendedProperty on a column). Best-effort: empty set on any failure."""
@@ -2656,6 +2664,20 @@ def pbix_bind_field_parameter(
         if visual_index < 0 or visual_index >= len(containers):
             raise LayoutParseError(f"Visual index {visual_index} out of range")
 
+        # A visual with no field wells cannot host a field parameter. Binding
+        # one anyway used to "succeed", leaving a textbox carrying a query,
+        # dataTransforms and a Y projection -- structurally incoherent, and
+        # pbix_doctor does not flag it. Refuse only the types that provably
+        # have no data roles, so custom and unrecognized types still bind.
+        target_type = _parse_visual_config(
+            containers[visual_index]).get("singleVisual", {}).get("visualType", "")
+        if target_type in _NO_DATA_ROLE_VISUALS:
+            raise LayoutParseError(
+                f"Visual {visual_index} on page {page_index} is a "
+                f"'{target_type}', which has no field wells -- there is no "
+                f"role for a field parameter to swap. Bind it to a data "
+                f"visual (chart, card, table, matrix, slicer, ...) instead.")
+
         # --- the parameter's definition, from the model -------------------
         if parameter_name not in _field_parameter_tables(info):
             raise LayoutParseError(
@@ -2780,11 +2802,38 @@ def pbix_bind_field_parameter(
                 continue
             for it in items or []:
                 still_projected.add(it.get("queryRef"))
-        proto["Select"] = [
-            s2 for s2 in selects
-            if s2.get("Name") not in old_refs
-            or s2.get("Name") in still_projected]
+        dropped_sel = [s2 for s2 in selects
+                       if s2.get("Name") in old_refs
+                       and s2.get("Name") not in still_projected]
+        proto["Select"] = [s2 for s2 in selects if s2 not in dropped_sel]
         selects = proto["Select"]
+
+        # A prior pbix_set_visual_sort OrderBy may point at a select we just
+        # dropped -- rebinding Y from [TR] to [TC] otherwise leaves the
+        # compiled query ordering by a field it no longer selects, a DANGLING
+        # reference. The sort was on THIS role's field and the role still has
+        # one, so re-point it at the newly bound field (preserving the user's
+        # intent to sort by the value axis) rather than silently losing it.
+        order_by = proto.get("OrderBy") or []
+        if order_by and dropped_sel:
+            def _inner(node):
+                if "Aggregation" in node:
+                    node = node["Aggregation"].get("Expression", {})
+                return node.get("Measure") or node.get("Column") or {}
+
+            dropped_props = {(_inner(d).get("Property") or "") for d in dropped_sel}
+            kept = []
+            for ob in order_by:
+                prop = _inner(ob.get("Expression") or {}).get("Property") or ""
+                if prop and prop in dropped_props:
+                    ob = copy.deepcopy(ob)
+                    ob["Expression"] = {
+                        ("Measure" if is_measure else "Column"): {
+                            "Expression": {"SourceRef": {"Source": alias_name}},
+                            "Property": f_name,
+                        }}
+                kept.append(ob)
+            proto["OrderBy"] = kept
 
         node_kind = "Measure" if is_measure else "Column"
         if not any(s2.get("Name") == query_ref for s2 in selects):
