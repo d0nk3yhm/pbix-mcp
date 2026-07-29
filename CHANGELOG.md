@@ -113,8 +113,10 @@ MS_Life_Expectancy, IT_Support and Agents_Performance.
   fails instead of shipping hollow.
 - The CI mypy gate piped through `grep -c "error:" || true`, which counted a mypy
   CRASH as zero errors and passed green. Exit status is now checked separately.
-- Actions bumped (checkout v7, setup-python v7, artifacts v7/v8); Python 3.14 added
-  to the matrix and classifiers.
+- Actions bumped (checkout v7, setup-python v7, artifacts v7/v8). Python 3.14 was
+  tried and rolled back: the xmhuffman dependency ships no cp314 wheel and its
+  sdist build is broken, so the package cannot install on 3.14 until upstream
+  publishes wheels (reason recorded in the CI matrix comment).
 - `pbix_open`'s work dir was only second-granular, so two same-alias opens within one
   second (parallel processes) extracted into the SAME directory and silently read
   each other's models. The dir now carries pid + uuid.
