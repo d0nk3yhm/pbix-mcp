@@ -437,8 +437,27 @@ Now verified against Desktop's own engine: the report opens, and
 `INFO.CALCULATIONGROUPS()` / `INFO.CALCULATIONITEMS()` answer **1 group, 2
 items** — `Current` ordinal 0, `YTD` ordinal 1 — after a rebuild.
 
-## Next
+## Shipped
 
-1. Release the accumulated work (#4, #5, #7) and close the three issues.
-2. **#6** — compiled DAX expression tree. The CALCULATE compiler added for #4
-   is the same idea applied to one construct, and is a reasonable template.
+**0.9.54** is on PyPI and GitHub, all 8 CI cells green, F: mirror synced.
+Issues **#3, #4, #5, #7 are CLOSED**. Only **#6** remains open.
+
+## Next: issue #6, the only one left
+
+Memoization (landed) only helps where inputs repeat. The underlying cost is
+unchanged: the evaluator **re-parses the expression text for every distinct
+input**, because `_subst_row` builds a different string per row and
+`_eval_expr` parses it fresh. A column whose inputs are nearly all distinct — a
+timestamp difference, a high-cardinality key — saves nothing.
+
+The fix is to parse ONCE into a tree of closures over column indices and
+evaluate per row with no parsing. The CALCULATE/FILTER compiler added for #4 is
+that idea applied to one construct and is a reasonable template.
+
+**Gate any such change on byte-identical output**: `scratchpad/gt_all.py` diffs
+every calculated column in the corpus against Desktop's stored values. That
+tool is what found the four silent-wrong-value bugs; it is the right gate.
+
+Current timings to beat (24-report corpus, 23/24 rebuild):
+`MS_Employee_Hiring` 1053s, `MS_Human_Resources` 1046s, `MS_Life_Expectancy`
+415s, `MS_Store_Sales` 222s, everything else seconds.
