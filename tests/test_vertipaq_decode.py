@@ -383,3 +383,92 @@ class TestEveryDeclaredColumnComesBack:
         assert missing == [], (
             f"{len(missing)} declared data column(s) silently dropped: "
             f"{missing[:10]}")
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not os.path.isdir(CORPUS), reason="corpus not downloaded")
+class TestPrimarySegmentCapacityIsNotEntryCount:
+    """`primary_segment_size` is the array's CAPACITY, not the entries in use.
+
+    Across the corpus it is always a power of two (16, 32, 64, 256, 2048, 4096,
+    8192) while the entries actually used are far fewer. The real entries end
+    as soon as their run lengths add up to the segment's row count; the slots
+    after that hold sub-segment bytes, which read as nonsensical
+    (data_value, repeat) pairs.
+
+    Reading the full declared capacity therefore summed garbage run lengths.
+    It only surfaced when the garbage happened to be large, which is why it
+    looked like a property of particular columns: on the 1,290,259-row
+    `Employee` table of MS_Employee_Hiring.pbix, 13 columns decoded fine while
+    'date', 'Gender' and 'FP' blew past the sanity limit -- `Gender` summed to
+    93,629,586,803 rows -- and failed the whole edit.
+
+    Same root cause as the four `Fact` columns of MS_Corporate_Spend.pbix that
+    this issue was originally opened for.
+    """
+
+    @staticmethod
+    def _read(fname, table):
+        import zipfile
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
+
+        path = os.path.join(CORPUS, fname)
+        if not os.path.exists(path):
+            pytest.skip(f"{fname} not in corpus")
+        with zipfile.ZipFile(path) as z:
+            abf = decompress_datamodel(z.read("DataModel"))
+        meta = read_metadata_sqlite(abf)
+        return read_table_from_abf(abf, table, meta)
+
+    @pytest.mark.parametrize("fname,table,rows", [
+        ("MS_Employee_Hiring.pbix", "Employee", 1290259),
+        ("MS_Human_Resources.pbix", "Employee", 1290259),
+        ("MS_Corporate_Spend.pbix", "Fact", 166216),
+    ])
+    def test_table_decodes_completely(self, fname, table, rows):
+        td = self._read(fname, table)
+        assert len(td["rows"]) == rows
+        assert td["columns"], "no columns decoded"
+
+    @pytest.mark.parametrize("column", ["date", "Gender", "FP"])
+    def test_the_three_columns_that_used_to_raise(self, column):
+        """These raised 'expands to more than 16,777,216 rows'."""
+        td = self._read("MS_Employee_Hiring.pbix", "Employee")
+        assert column in td["columns"]
+        idx = td["columns"].index(column)
+        vals = [r[idx] for r in td["rows"]]
+        assert any(v is not None for v in vals)
+
+    def test_recovered_values_are_plausible_not_garbage(self):
+        """A mis-parse yields wild indices, so check the value DOMAINS."""
+        td = self._read("MS_Employee_Hiring.pbix", "Employee")
+        col = {c: [r[i] for r in td["rows"]]
+               for i, c in enumerate(td["columns"])}
+        assert len({v for v in col["Gender"] if v is not None}) == 2
+        assert len({v for v in col["FP"] if v is not None}) == 2
+        ages = [v for v in col["Age"] if v is not None]
+        assert 0 < min(ages) and max(ages) < 120, f"ages {min(ages)}..{max(ages)}"
+
+    def test_foreign_keys_resolve_against_their_dimensions(self):
+        """The strongest offline check: a mis-decoded key would point at the
+        wrong dictionary entry and orphan against its dimension.
+
+        `Fact[Cost Element ID]` is excluded deliberately -- the MODEL declares
+        it String while `Cost Element[Cost Element ID]` is Double, a type
+        mismatch in the source file itself, not a decode fault.
+        """
+        fact = self._read("MS_Corporate_Spend.pbix", "Fact")
+        pairs = [("Scenario ID", "Scenario"), ("Business Area ID", "Business Area"),
+                 ("Country/Region ID", "Country Region"), ("Department", "Department")]
+        for fcol, dim_table in pairs:
+            dim = self._read("MS_Corporate_Spend.pbix", dim_table)
+            if fcol not in fact["columns"]:
+                pytest.skip(f"{fcol} not decoded")
+            fi = fact["columns"].index(fcol)
+            keys = {v for r in dim["rows"] for v in r}
+            orphans = {r[fi] for r in fact["rows"]
+                       if r[fi] is not None and r[fi] not in keys}
+            assert not orphans, f"{fcol}: {len(orphans)} orphan key(s) vs {dim_table}"

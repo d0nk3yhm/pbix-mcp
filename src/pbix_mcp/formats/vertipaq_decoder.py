@@ -457,11 +457,17 @@ def decode_idf(
         if segments is not None:
             if seg_idx >= len(segments):
                 break
-            seg_bw, seg_rle_base, seg_bp_add = segments[seg_idx]
+            seg = segments[seg_idx]
+            seg_bw, seg_rle_base, seg_bp_add = seg[0], seg[1], seg[2]
+            # Each segment declares its own record count; without it a segment
+            # would keep consuming past its real entries (see
+            # _decode_idf_segment_at on ps_count being a capacity).
+            seg_rows = seg[3] if len(seg) > 3 else 0
         else:
             seg_bw, seg_rle_base, seg_bp_add = bit_width, rle_base, 0
+            seg_rows = row_count
         seg_indices, pos = _decode_idf_segment_at(
-            buf, pos, seg_bw, seg_rle_base, seg_bp_add
+            buf, pos, seg_bw, seg_rle_base, seg_bp_add, seg_rows
         )
         indices.extend(seg_indices)
         seg_idx += 1
@@ -475,7 +481,8 @@ def decode_idf(
 
 
 def _decode_idf_segment_at(
-    buf: bytes, pos: int, bit_width: int, rle_base: int, bitpacked_add: int = 0
+    buf: bytes, pos: int, bit_width: int, rle_base: int, bitpacked_add: int = 0,
+    seg_rows: int = 0,
 ):
     """Decode ONE segment of an .idf starting at ``pos``.
 
@@ -502,7 +509,21 @@ def _decode_idf_segment_at(
             f"IDF segment at byte {pos} declares {ps_count:,} primary entries, "
             f"more than the remaining {len(buf) - pos:,} bytes can hold")
 
-    # Read primary segment entries
+    # Read primary segment entries.
+    #
+    # ps_count is the ALLOCATED CAPACITY of the primary array, not the number of
+    # entries in use -- across the corpus it is always a power of two (16, 32,
+    # 64, 256, 2048, 4096, 8192) while the used entries are far fewer. The real
+    # entries end as soon as their run lengths add up to the segment's row
+    # count; the slots after that hold sub-segment bytes, which read as
+    # nonsensical (data_value, repeat) pairs.
+    #
+    # Reading the full capacity therefore summed garbage run lengths. It only
+    # surfaced when the garbage was large: on MS_Employee_Hiring.pbix the
+    # 1,290,259-row Employee table decoded fine for 13 columns but blew past the
+    # sanity limit on 'date', 'Gender' and 'FP' (Gender summed to 93 billion
+    # rows), failing the whole edit. Verified on all 16 columns of that table:
+    # each reaches exactly 1,290,259 and then stops.
     primary_entries = []
     p = pos + 8
     total_rows = 0
@@ -519,6 +540,8 @@ def _decode_idf_segment_at(
                 f"{_MAX_SEGMENT_ROWS:,} rows; a VertiPaq segment holds at most "
                 f"~1,048,576, so this run length is not real data")
         primary_entries.append((dv, rv))
+        if seg_rows and total_rows >= seg_rows:
+            break  # the segment's rows are complete; the rest is not entries
 
     # Advance past full primary segment (skip any remaining padding)
     p = pos + 8 + ps_count * 8
@@ -901,7 +924,7 @@ def read_table_from_abf(
                 _gmin = seg_meta_list[0]["min_data_id"]
                 _seg_params = [
                     (s["bit_width"] or bit_width, _gmin - _null_offset,
-                     s["min_data_id"] - _gmin)
+                     s["min_data_id"] - _gmin, s["records"])
                     for s in seg_meta_list
                 ]
             try:
