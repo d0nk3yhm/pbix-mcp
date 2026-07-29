@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.57] - 2026-07-29
+
+Closes issue **#8** (from OpenBI service-verification findings #19): there was no
+way to bind a field parameter into a visual programmatically, and the naive
+attempt failed SILENTLY.
+
+### The trap this closes
+
+`pbix_datamodel_add_field_parameter` authors the model half correctly (re-verified
+by the findings), but putting the parameter's display column straight into a
+projection (`projections.Y = [{"queryRef": "Metric.Metric"}]`) makes Desktop treat
+it as ordinary text and degrade the well to an implicit "Count of Metric" — six
+equal bars, no field-swapping, no error.
+
+### `pbix_bind_field_parameter` (127 tools)
+
+`pbix_bind_field_parameter(alias, page_index, visual_index, role, parameter_name,
+initial_field="")` authors the working shape — all five pieces, each diffed
+piece-by-piece against a Desktop-authored binding and confirmed IDENTICAL:
+
+1. `projections.<role>` holds the currently-RESOLVED field, with the matching
+   `prototypeQuery.Select` entry carrying `NativeReferenceName`;
+2. `queryFieldParametersByRole` on `singleVisual` carries the parameter linkage
+   (index/length/display-column expr);
+3. `columnProperties` restates the parameter's display label;
+4. the compiled `query` joins the parameter table and gains a `Where` clause
+   selecting the resolved field through the hidden `"<name> Fields"` column with
+   the NAMEOF-style triple-quoted literal (`'''Sales''[Total Revenue]'`);
+5. the resolved field's `dataTransforms` select carries `sourceFieldParameters`
+   provenance.
+
+`initial_field` accepts a display name or a `Table[Field]` ref, defaulting to the
+parameter's first field. Rebinding replaces cleanly (no accreted selects or Where
+clauses); unknown parameters and fields are refused with the valid options named.
+
+**Verified in Power BI Desktop**: a from-scratch file (pbix_create + parameter +
+chart + this tool) opens clean and renders "Revenue, Units and Profit by Month"
+with all three parameter fields as series — the real field-parameter expansion,
+not the degraded Count.
+
+### The silent degradation now warns
+
+`pbix_add_visual` and `pbix_update_visual_json` warn when a projection's queryRef
+resolves to a field-parameter display column without `queryFieldParametersByRole`
+— including when the binding compiler has already wrapped the bare column in the
+implicit `CountNonNull(...)` aggregation, which is the degradation itself in
+flight. The warning names this tool as the fix.
+
+### Docs
+
+The binding shape is documented in docs/rich-content.md (it appeared nowhere
+before); tool counts updated to 127.
+
 ## [0.9.56] - 2026-07-29
 
 Verification and sync release. No behaviour change: the diff against 0.9.55 is
