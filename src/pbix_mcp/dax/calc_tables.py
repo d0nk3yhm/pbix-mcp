@@ -289,9 +289,196 @@ _CALC_UNSAFE_FUNCS = _CALC_SELF_AGG_FUNCS | _CALC_CONTEXT_FUNCS
 _CALC_REF_RE = re.compile(r"(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))\s*\[")
 _CALC_FUNC_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_\.]*)\s*\(")
 
+# DAX reserved words that can legally sit immediately before a column
+# reference. `VAR _x = 1 RETURN [Col] * _x` is a SAME-table expression, but the
+# regex above reads the bare word before `[` as a table name and reported
+# "references another table 'RETURN'" -- refusing the single most common modern
+# DAX idiom with a nonsense reason.
+#
+# Only the BARE branch is excluded. DAX requires a table whose name is a
+# reserved word to be quoted, so a real table named Return is written
+# 'Return'[Col] and still matches the quoted branch. That asymmetry is what
+# makes this safe: skipping a bare keyword can never hide a genuine cross-table
+# reference, which would turn a refusal into a silently wrong value.
+_DAX_RESERVED_BEFORE_REF = frozenset({"var", "return", "not", "in"})
+
+
+_LOOKUPVALUE_RE = re.compile(r"\bLOOKUPVALUE\s*\(", re.I)
+_COL_REF_FULL_RE = re.compile(r"^(?:'([^']+)'|([A-Za-z_]\w*))?\s*\[([^\]]+)\]$")
+_LV_MASK = "__LV{}__"
+_LV_MASK_RE = re.compile(r"__LV(\d+)__")
+
+
+def _scan_calls(expr: str, name_re: "re.Pattern[str]"):
+    """Yield (start, end) of every call matching `name_re` in `expr`.
+
+    Generalises `_scan_aggregate_calls`. Walks the SHADOW to the matching close
+    paren so a paren inside a string literal or a column name cannot unbalance
+    the count.
+    """
+    shadow = _agg_shadow(expr)
+    i = 0
+    while True:
+        m = name_re.search(shadow, i)
+        if not m:
+            return
+        depth, j = 0, m.end() - 1
+        while j < len(shadow):
+            ch = shadow[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            j += 1
+        yield m.start(), j
+        i = j
+
+
+def _split_args(argstr: str) -> "list[str]":
+    """Split a call's argument text on TOP-LEVEL commas.
+
+    Splits on the shadow so a comma inside a string literal or a bracketed
+    column name (`[Rate, net]` is a legal column name) is not a separator.
+    """
+    shadow = _agg_shadow(argstr)
+    parts, depth, start = [], 0, 0
+    for k, ch in enumerate(shadow):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(argstr[start:k])
+            start = k + 1
+    parts.append(argstr[start:])
+    return [p.strip() for p in parts]
+
+
+def _parse_column_ref(text: str, target_table: str, target_columns):
+    """(table, column) for a lone column reference, or None if not one.
+
+    A BARE `[Col]` resolves to the target table only when that table really has
+    the column. Guessing otherwise would silently look the value up in the
+    wrong table -- `LOOKUPVALUE([Index], [id], [parentId])` is a legal
+    self-lookup, but the same shape naming a column the target lacks means the
+    author meant some other table and we must refuse instead.
+    """
+    m = _COL_REF_FULL_RE.match(text.strip())
+    if not m:
+        return None
+    tbl, col = (m.group(1) or m.group(2)), m.group(3)
+    if tbl:
+        return tbl, col
+    if target_columns is not None and col not in target_columns:
+        return None
+    return target_table, col
+
+
+def _parse_lookupvalue(call: str, target_table: str, target_columns,
+                       known_tables):
+    """Parse one LOOKUPVALUE call into a spec, or return a refusal string.
+
+    LOOKUPVALUE(<result>, <search1>, <value1>, [<searchN>, <valueN>...]
+                [, <alternateResult>]) -- an ODD argument count has no
+    alternate result, an EVEN one ends with it.
+
+    Every result/search column must live on ONE table, and that table's data
+    must be available; the values are row-context expressions over the target
+    table. Anything else is refused rather than guessed.
+    """
+    open_paren = call.find("(")
+    args = _split_args(call[open_paren + 1:-1])
+    if len(args) < 3:
+        return "LOOKUPVALUE needs at least a result column, a search column and a value"
+    alt = None
+    if len(args) % 2 == 0:
+        alt = args[-1]
+        args = args[:-1]
+    res = _parse_column_ref(args[0], target_table, target_columns)
+    if not res:
+        return (f"LOOKUPVALUE's result argument {args[0]!r} is not a column "
+                f"reference this engine can resolve")
+    lv_table, result_col = res
+    pairs = []
+    for k in range(1, len(args), 2):
+        sc = _parse_column_ref(args[k], target_table, target_columns)
+        if not sc:
+            return (f"LOOKUPVALUE's search argument {args[k]!r} is not a "
+                    f"column reference this engine can resolve")
+        if sc[0].lower() != lv_table.lower():
+            return (f"LOOKUPVALUE mixes tables: result is on '{lv_table}' but "
+                    f"'{sc[1]}' is on '{sc[0]}'")
+        pairs.append((sc[1], args[k + 1]))
+    if known_tables is not None:
+        avail = {t.lower(): cols for t, cols in known_tables.items()}
+        cols = avail.get(lv_table.lower())
+        if cols is None:
+            return (f"LOOKUPVALUE reads table '{lv_table}', whose data is not "
+                    f"available to this engine")
+        have = {c.lower() for c in cols}
+        for cn in [result_col] + [p[0] for p in pairs]:
+            if cn.lower() not in have:
+                return (f"LOOKUPVALUE references '{lv_table}'[{cn}], which "
+                        f"that table does not have")
+    return {"table": lv_table, "result": result_col, "pairs": pairs,
+            "alt": alt}
+
+
+def _mask_lookupvalue_calls(expr: str, target_table: str, target_columns,
+                            known_tables):
+    """(masked_expr, specs, reason).
+
+    Replaces each supported LOOKUPVALUE call with a `__LV<n>__` placeholder --
+    no brackets, no parens -- so the caller's cross-table reference scan and
+    function scan do not see the lookup table or the LOOKUPVALUE name itself.
+    The value expressions are pulled OUT of the mask and validated separately
+    by the caller, so masking never smuggles an unsupported sub-expression past
+    the gate.
+    """
+    spans = list(_scan_calls(expr, _LOOKUPVALUE_RE))
+    if not spans:
+        return expr, [], None
+    out: "list[str]" = []
+    specs: "list[dict]" = []
+    i = 0
+    for a, b in spans:
+        spec = _parse_lookupvalue(expr[a:b], target_table, target_columns,
+                                  known_tables)
+        if isinstance(spec, str):
+            return expr, [], spec
+        out.append(expr[i:a])
+        out.append(_LV_MASK.format(len(specs)))
+        specs.append(spec)
+        i = b
+    out.append(expr[i:])
+    return "".join(out), specs, None
+
+
+def lookupvalue_table_names(expression: str) -> "set[str]":
+    """Table names a LOOKUPVALUE in `expression` reads from.
+
+    Best-effort and deliberately un-validating: it exists so a caller can DECIDE
+    WHICH TABLES TO LOAD before the gate runs. The gate re-parses properly and
+    refuses anything that does not hold up, so a wrong guess here costs a
+    needless table read, never a wrong value.
+    """
+    out: "set[str]" = set()
+    e = strip_dax_comments(expression or "")
+    for a, b in _scan_calls(e, _LOOKUPVALUE_RE):
+        call = e[a:b]
+        args = _split_args(call[call.find("(") + 1:-1])
+        for arg in args:
+            m = _COL_REF_FULL_RE.match(arg.strip())
+            if m and (m.group(1) or m.group(2)):
+                out.add(m.group(1) or m.group(2))
+    return out
+
 
 def calc_column_unsupported_reason(expression: str, target_table: str,
-                                   columns=None):
+                                   columns=None, known_tables=None):
     """Return why a calc-column expression can't be safely materialized, or None.
 
     None = the expression is a row-context expression over ``target_table``'s
@@ -302,11 +489,37 @@ def calc_column_unsupported_reason(expression: str, target_table: str,
     ``columns`` is the target table's column names when the caller knows them.
     It lets an aggregate over a misspelled column be refused instead of quietly
     answering 0; callers without the list simply lose that one check.
+
+    ``known_tables`` maps table name -> column names for the tables whose DATA
+    the caller can supply. It is what makes LOOKUPVALUE supportable: without it
+    every cross-table read is still refused, so a caller that cannot produce
+    other tables' rows keeps the old, strictly-safe behaviour.
     """
     e = expand_variation_accessors(strip_dax_comments(expression))
     if not e.strip():
         return "expression is empty"
+    if known_tables is not None:
+        e, lv_specs, lv_why = _mask_lookupvalue_calls(
+            e, target_table, columns, known_tables)
+        if lv_why:
+            return lv_why
+        # The masked-out value expressions still have to hold up on their own:
+        # they are evaluated in the target table's row context, so anything the
+        # gate would refuse there must be refused here too.
+        for spec in lv_specs:
+            for _sc, val_expr in spec["pairs"]:
+                why = calc_column_unsupported_reason(
+                    val_expr, target_table, columns, known_tables)
+                if why:
+                    return f"inside LOOKUPVALUE: {why}"
+            if spec["alt"]:
+                why = calc_column_unsupported_reason(
+                    spec["alt"], target_table, columns, known_tables)
+                if why:
+                    return f"inside LOOKUPVALUE: {why}"
     for quoted, bare in _CALC_REF_RE.findall(e):
+        if not quoted and bare.lower() in _DAX_RESERVED_BEFORE_REF:
+            continue
         tbl = quoted or bare
         if tbl.lower() != target_table.lower():
             return (
@@ -596,6 +809,130 @@ def _refs_any_column(expr: str) -> bool:
     return bool(_COLUMN_REF.search(_strip_strings(expr)))
 
 
+def _dax_literal(val) -> str:
+    """A python value as DAX source text."""
+    if isinstance(val, str):
+        return '"' + val.replace('"', '""') + '"'
+    if val is None:
+        return "BLANK()"
+    if isinstance(val, bool):
+        return "TRUE()" if val else "FALSE()"
+    if isinstance(val, (datetime, date)):
+        # A date must go in QUOTED -- bare 2024-01-15 00:00:00 is not
+        # parseable DAX, which made every date-part expression fail.
+        return '"' + val.isoformat() + '"'
+    return str(val)
+
+
+def _subst_row(expr: str, row_data: dict, target_table: str) -> str:
+    """Replace every reference to the target table's columns with this row's value."""
+    for cn, val in row_data.items():
+        lit = None
+        for pat in (f"'{target_table}'[{cn}]", f"{target_table}[{cn}]"):
+            if pat in expr:
+                if lit is None:
+                    lit = _dax_literal(val)
+                expr = expr.replace(pat, lit)
+    return expr
+
+
+def _lv_key(val):
+    """Normalise a value for LOOKUPVALUE matching.
+
+    Strings compare case-INSENSITIVELY: Power BI models use a case-insensitive
+    collation by default, so LOOKUPVALUE(T[X], T[Cat], "abc") really does match
+    a stored "ABC". Numbers unify int/float so 3 matches 3.0, and a midnight
+    datetime matches the plain date -- the same normalisation the corpus
+    ground-truth comparison uses.
+    """
+    if val is None or isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.casefold()
+    if isinstance(val, datetime):
+        return val.date() if (val.hour, val.minute, val.second,
+                              val.microsecond) == (0, 0, 0, 0) else val
+    if isinstance(val, date):
+        return val
+    if isinstance(val, (int, float)):
+        f = float(val)
+        return int(f) if f.is_integer() else f
+    return val
+
+
+def _build_lv_index(spec: dict, all_tables: Dict[str, dict]):
+    """key(tuple of search values) -> set of distinct result values, or a reason."""
+    src = None
+    for tname, tdata in (all_tables or {}).items():
+        if tname.lower() == spec["table"].lower():
+            src = tdata
+            break
+    if src is None:
+        return (f"LOOKUPVALUE reads table '{spec['table']}', whose data is "
+                f"not available to this engine")
+    cols = list(src.get("columns") or [])
+    lower = {c.lower(): i for i, c in enumerate(cols)}
+    try:
+        res_i = lower[spec["result"].lower()]
+        search_i = [lower[sc.lower()] for sc, _v in spec["pairs"]]
+    except KeyError as exc:
+        return (f"LOOKUPVALUE references '{spec['table']}'[{exc.args[0]}], "
+                f"which that table does not have")
+    index: Dict[tuple, set] = {}
+    for r in src.get("rows") or []:
+        key = tuple(_lv_key(r[i]) for i in search_i)
+        index.setdefault(key, set()).add(_lv_key(r[res_i]))
+    # Keep one representative of each result value in its ORIGINAL form; the
+    # normalised key is only for matching, never for the value we store.
+    raw: Dict[tuple, object] = {}
+    for r in src.get("rows") or []:
+        key = tuple(_lv_key(r[i]) for i in search_i)
+        raw.setdefault(key, r[res_i])
+    return {"distinct": index, "raw": raw}
+
+
+def _resolve_lv_masks(row_expr, lv_specs, lv_index, row_data, target_table,
+                      engine, dax_engine, all_tables, relationships):
+    """Replace each `__LVn__` in `row_expr` with this row's looked-up literal.
+
+    Returns (expr, error). DAX's own rules: no matching row yields the
+    alternate result if one was supplied and BLANK otherwise; several matching
+    rows are fine as long as they all carry the SAME result value. Genuinely
+    ambiguous matches are an ERROR in DAX -- Desktop would refuse to refresh
+    the column -- so we refuse the whole column rather than pick one.
+    """
+    out = row_expr
+    for n, spec in enumerate(lv_specs):
+        mask = _LV_MASK.format(n)
+        if mask not in out:
+            continue
+        idx = lv_index[n]
+        key = []
+        for _sc, val_expr in spec["pairs"]:
+            sub = _subst_row(val_expr, row_data, target_table)
+            try:
+                ctx = dax_engine.DAXContext(
+                    all_tables, {}, None, None, None, relationships or [])
+                key.append(_lv_key(engine._eval_expr(sub, ctx)))
+            except Exception as exc:  # noqa: BLE001 - refuse, don't guess
+                return out, f"LOOKUPVALUE search value failed to evaluate: {exc}"
+        hits = idx["distinct"].get(tuple(key))
+        if hits is None:
+            if spec["alt"] is not None:
+                repl = _subst_row(spec["alt"], row_data, target_table)
+            else:
+                repl = "BLANK()"
+        elif len(hits) > 1:
+            return out, (
+                f"LOOKUPVALUE('{spec['table']}'[{spec['result']}], ...) "
+                f"matches rows with different values -- ambiguous, which is an "
+                f"error in DAX")
+        else:
+            repl = _dax_literal(idx["raw"][tuple(key)])
+        out = out.replace(mask, f"({repl})")
+    return out, None
+
+
 def evaluate_row_context_column(
     columns: List[str],
     rows: List[list],
@@ -618,30 +955,33 @@ def evaluate_row_context_column(
     engine = dax_engine.DAXEngine()
     values: list = []
     unresolved: set = set()
+    # LOOKUPVALUE reads ANOTHER table, so it is neither row-substitutable nor a
+    # whole-column aggregate. Mask each call to a placeholder and resolve it per
+    # row from a prebuilt index -- built once, not per row, or a lookup over an
+    # n-row dimension would make the column O(n*m).
+    known = {t: (v.get("columns") or [])
+             for t, v in (all_tables or {}).items()}
+    clean, lv_specs, lv_why = _mask_lookupvalue_calls(
+        clean, target_table, columns, known)
+    if lv_why:
+        return None, lv_why
+    lv_index = []
+    for spec in lv_specs:
+        built = _build_lv_index(spec, all_tables)
+        if isinstance(built, str):
+            return None, built
+        lv_index.append(built)
     # Aggregate calls are row-independent, so mask them once rather than per row.
     masked, agg_spans = _mask_aggregate_calls(clean)
     for row in rows:
         row_data = {cn: row[ci] for ci, cn in enumerate(columns)}
-        row_expr = masked
-        for cn, val in row_data.items():
-            for pat in (f"'{target_table}'[{cn}]", f"{target_table}[{cn}]"):
-                if pat in row_expr:
-                    if isinstance(val, str):
-                        esc = val.replace('"', '""')
-                        row_expr = row_expr.replace(pat, f'"{esc}"')
-                    elif val is None:
-                        row_expr = row_expr.replace(pat, "BLANK()")
-                    elif isinstance(val, bool):
-                        row_expr = row_expr.replace(
-                            pat, "TRUE()" if val else "FALSE()")
-                    elif isinstance(val, (datetime, date)):
-                        # A date must go in as a QUOTED literal — bare
-                        # 2024-01-15 00:00:00 is not parseable DAX, which made
-                        # every date-part expression fail.
-                        row_expr = row_expr.replace(
-                            pat, '"' + val.isoformat() + '"')
-                    else:
-                        row_expr = row_expr.replace(pat, str(val))
+        row_expr = _subst_row(masked, row_data, target_table)
+        if lv_specs:
+            row_expr, lv_err = _resolve_lv_masks(
+                row_expr, lv_specs, lv_index, row_data, target_table,
+                engine, dax_engine, all_tables, relationships)
+            if lv_err:
+                return None, lv_err
         unresolved |= _unresolved_refs(row_expr)
         row_expr = _unmask_aggregate_calls(row_expr, agg_spans)
         try:

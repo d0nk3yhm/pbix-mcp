@@ -10242,6 +10242,7 @@ def _materialize_table_calc_columns(
     data_rows: list[dict],
     calc_specs: list[dict],
     relationships: list,
+    lookup_provider=None,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """Evaluate a table's calculated columns in dependency order.
 
@@ -10256,7 +10257,26 @@ def _materialize_table_calc_columns(
         calc_column_unsupported_reason,
         evaluate_row_context_column,
         expand_variation_accessors,
+        lookupvalue_table_names,
     )
+
+    # LOOKUPVALUE reads another table, so that table's rows have to be here.
+    # Loaded LAZILY and cached: only tables a LOOKUPVALUE actually names get
+    # decoded, so an ordinary same-table calc column still costs one read.
+    lookup_data: dict[str, dict] = {}
+    if lookup_provider is not None:
+        wanted: set[str] = set()
+        for spec in calc_specs:
+            wanted |= lookupvalue_table_names(spec.get("expression") or "")
+        for tn in wanted:
+            if tn.lower() == table_name.lower():
+                continue
+            try:
+                got = lookup_provider(tn)
+            except Exception:  # noqa: BLE001 - a miss just means "refuse later"
+                got = None
+            if got:
+                lookup_data[tn] = got
 
     col_names = [c["name"] for c in data_columns]
     type_by_name = {c["name"]: c.get("data_type", "String") for c in data_columns}
@@ -10275,6 +10295,9 @@ def _materialize_table_calc_columns(
                 continue
             snapshot = {table_name: {"columns": list(col_names),
                                      "rows": [list(r) for r in rows]}}
+            snapshot.update(lookup_data)
+            known_tables = {t: list(v.get("columns") or [])
+                            for t, v in snapshot.items()}
             # Expand `X.[Date]` BEFORE qualifying bare references. When the
             # table ALSO has a real column named Date, the qualifier reads the
             # accessor's `[Date]` as a bare same-table reference and rewrites it
@@ -10290,7 +10313,7 @@ def _materialize_table_calc_columns(
             # for the misspelling rather than failing, so without this the
             # column would materialize as zeros and report success.
             why = calc_column_unsupported_reason(qualified, table_name,
-                                                 col_names)
+                                                 col_names, known_tables)
             if why:
                 raise ValueError(f"'{table_name}'[{spec['column']}]: {why}")
             vals, err = evaluate_row_context_column(
@@ -10769,13 +10792,26 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
         "AND c.ExplicitName NOT LIKE 'RowNumber%'").fetchall()
     dropped = {t.lower(): {c.lower() for c in cols}
                for t, cols in (drop_columns or {}).items()}
+    # Table -> column names for the WHOLE model, from metadata only (no data
+    # decode). This is what lets the gate accept a LOOKUPVALUE: it can confirm
+    # the table and columns it names really exist before anything is read.
+    model_tables: dict[str, list[str]] = {}
+    for r in conn.execute(
+        "SELECT t.Name AS tbl, "
+        "       COALESCE(c.ExplicitName, c.InferredName) AS col "
+        "FROM [Column] c JOIN [Table] t ON c.TableID = t.ID "
+        "WHERE t.ModelID = 1 "
+        "AND COALESCE(c.ExplicitName, c.InferredName) NOT LIKE 'RowNumber%'"):
+        model_tables.setdefault(r["tbl"], []).append(r["col"])
     calc_by_table: dict[str, list[dict]] = {}
     for r in existing:
         if r["tbl"].lower() in skip:
             continue
         if (r["col"] or "").lower() in dropped.get(r["tbl"].lower(), ()):
             continue
-        bad = calc_column_unsupported_reason(r["expr"] or "", r["tbl"])
+        bad = calc_column_unsupported_reason(
+            r["expr"] or "", r["tbl"], model_tables.get(r["tbl"]),
+            model_tables)
         if bad:
             raise ValueError(
                 f"The model has a calculated column '{r['tbl']}'[{r['col']}] "
@@ -10831,8 +10867,33 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
             td = read_table_from_abf(abf, tname, meta)
             data_rows = [dict(zip(td["columns"], rv))
                          for rv in td.get("rows", [])]
+        def _lookup_table(want: str, _tname=tname):
+            """Rows of another table, for a LOOKUPVALUE in _tname's calc columns.
+
+            Prefers the caller's REPLACEMENT rows when it is also rewriting that
+            table -- looking the value up in the VertiPaq copy the caller is
+            about to overwrite would resolve against stale data.
+            """
+            if want.lower() == _tname.lower():
+                return None
+            for cand, ov in base_data.items():
+                if cand.lower() == want.lower():
+                    return {"columns": [c["name"] if isinstance(c, dict) else c
+                                        for c in ov["columns"]],
+                            "rows": [list(r) for r in ov["rows"]]}
+            hit = conn.execute(
+                "SELECT Name FROM [Table] WHERE ModelID = 1 "
+                "AND lower(Name) = lower(?)", (want,)).fetchone()
+            if not hit:
+                return None
+            td2 = read_table_from_abf(abf, hit["Name"], meta,
+                                      include_calculated=True)
+            return {"columns": list(td2.get("columns") or []),
+                    "rows": [list(r) for r in td2.get("rows") or []]}
+
         cols_out, rows_out, restamp = _materialize_table_calc_columns(
-            tname, data_cols, data_rows, specs, relationships)
+            tname, data_cols, data_rows, specs, relationships,
+            lookup_provider=_lookup_table)
         # The calc columns' values go into VertiPaq, but must NOT be embedded in
         # the partition's Enter-data M — Power BI recomputes them from DAX.
         table_updates[tname] = {"columns": cols_out, "rows": rows_out,
