@@ -27,6 +27,7 @@ import sqlite3
 import struct
 import tempfile
 import traceback
+import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -1203,10 +1204,17 @@ def pbix_open(file_path: str, alias: str = "") -> str:
     if alias in _open_files:
         raise FileAlreadyOpenError(f"Alias '{alias}' is already in use. Close it first or choose a different alias.")
 
-    # Create work directory
+    # Create work directory. The timestamp alone is only second-granular, so
+    # two same-alias opens within one second -- e.g. parallel PROCESSES each
+    # opening a file under the same alias -- landed in the SAME directory and
+    # silently overwrote each other's extracted model: one process then read
+    # the other's tables, and the concurrent extract/validate race surfaced as
+    # a bogus "path traversal" refusal. The pid+uuid suffix makes the
+    # directory unique per open.
     work_dir = os.path.join(
         tempfile.gettempdir(),
-        f"pbix_mcp_{alias}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        f"pbix_mcp_{alias}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        f"_{os.getpid()}_{uuid.uuid4().hex[:8]}",
     )
     os.makedirs(work_dir, exist_ok=True)
 
@@ -15673,7 +15681,11 @@ def pbix_doctor(alias: str) -> str:
                          FROM Measure m JOIN [Table] t ON m.TableID = t.ID""")
             lines = []
             for row in c.fetchall():
-                expr = row[2][:40] + "..." if len(row[2]) > 40 else row[2]
+                # Desktop writes placeholder measures with Expression NULL
+                # (same class as the 0.9.53 builder fix). len(None) crashed
+                # this check on MS_Life_Expectancy -- a working file.
+                raw = row[2] or ""
+                expr = raw[:40] + "..." if len(raw) > 40 else raw
                 lines.append(f"    [{row[0]}] {row[1]} = {expr}")
             if not lines:
                 return "None"
@@ -15725,9 +15737,14 @@ def pbix_doctor(alias: str) -> str:
             missing = []
             for row in c.fetchall():
                 tid, tname = row
-                # Check if any ABF file references this table's ID
-                # Table data files use pattern: TableName (ID).tbl\...
-                marker = f"{tname} ({tid}).tbl"
+                # Match by ID, never by name. Storage folder names are NOT the
+                # display name: special characters are space-sanitized
+                # (fct_Orders -> "fct Orders", "# Measures" -> "  Measures")
+                # and a RENAMED table keeps its creation-time folder
+                # ("PositiveYOY-NegativeYOY" lives in "Table (2542).tbl").
+                # The old name-based marker flagged 10 of GeoSales_Dashboard's
+                # 14 tables as storage-less on a file Desktop opens fine.
+                marker = f"({tid}).tbl"
                 if marker not in abf_str:
                     missing.append(tname)
             if missing:
@@ -15768,21 +15785,38 @@ def pbix_doctor(alias: str) -> str:
             return "No orphaned references"
         _check("Metadata referential integrity", check_orphaned_refs)
 
-        # 16. Expression rows without DataMashup
+        # 16. Expression.Kind must be a valid enum value.
+        #
+        # This check used to demand a DataMashup whenever Expression rows
+        # exist, which FALSE-POSITIVED on 9 of the 24 corpus files (37.5%):
+        # V3 "enhanced metadata" files (Version >= 1.28, incl. every
+        # Service-downloaded report) legitimately store shared M expressions
+        # in the model with no DataMashup part at all. The REAL trigger of
+        # PFE_TM_ENUM_VALUES_VALIDATION_FAILED is an out-of-range enum:
+        # TOM's ExpressionKind has a single member, M = 0, and every one of
+        # the 25 Desktop/Service-authored Expression rows across the corpus
+        # is Kind=0 -- including parameter queries. Kind=1 is what the old
+        # incremental-refresh writer inserted, and what PBI rejects.
         def check_expressions():
             _init_datamodel()
             c = db_conn.cursor()
             c.execute("SELECT COUNT(*) FROM Expression")
             expr_count = c.fetchone()[0]
-            if expr_count > 0:
-                mashup_path = os.path.join(info["work_dir"], "DataMashup")
-                if not os.path.exists(mashup_path):
-                    raise ValueError(
-                        f"{expr_count} Expression row(s) in metadata but no DataMashup — "
-                        f"PBI will reject with PFE_TM_ENUM_VALUES_VALIDATION_FAILED"
-                    )
-            return f"{expr_count} expressions (DataMashup present)" if expr_count else "None"
-        _check("Expression/DataMashup consistency", check_expressions)
+            c.execute(
+                "SELECT Name, Kind FROM Expression WHERE Kind IS NOT NULL "
+                "AND Kind != 0")
+            bad = c.fetchall()
+            if bad:
+                names = ", ".join(f"{n!r} (Kind={k})" for n, k in bad[:5])
+                raise ValueError(
+                    f"{len(bad)} Expression row(s) with an invalid Kind — "
+                    f"TOM's ExpressionKind enum only defines M=0, so PBI "
+                    f"rejects the file with "
+                    f"PFE_TM_ENUM_VALUES_VALIDATION_FAILED: {names}"
+                )
+            return (f"{expr_count} expressions, all Kind=0"
+                    if expr_count else "None")
+        _check("Expression Kind validity", check_expressions)
 
         # 17. MAXID consistency
         def check_maxid():
@@ -16599,10 +16633,16 @@ def pbix_set_incremental_refresh(
                 raise ValueError(f"Table '{table_name}' not found")
             table_id = trow[0]
 
-            # Only insert RangeStart/RangeEnd expressions if the file has a DataMashup.
-            # Without a DataMashup, Expression rows cause PBI to reject the file with
-            # PFE_TM_ENUM_VALUES_VALIDATION_FAILED because the expressions have no
-            # corresponding M query section to resolve against.
+            # RangeStart/RangeEnd are M parameter expressions. Kind MUST be 0:
+            # TOM's ExpressionKind enum defines a single member (M = 0), and
+            # all 25 Desktop/Service-authored Expression rows across the
+            # corpus -- parameter queries included -- carry Kind=0. This
+            # writer used to insert Kind=1, which is exactly the out-of-range
+            # enum PFE_TM_ENUM_VALUES_VALIDATION_FAILED complains about; the
+            # missing-DataMashup theory the old comment blamed was disproven
+            # by 9 corpus files holding Expression rows with no DataMashup.
+            # The DataMashup gate itself is kept for now: the no-DataMashup
+            # (V3) incremental-refresh flow has not been verified in Desktop.
             has_mashup = os.path.exists(os.path.join(info["work_dir"], "DataMashup"))
             if has_mashup:
                 for param_name in ("RangeStart", "RangeEnd"):
@@ -16610,11 +16650,10 @@ def pbix_set_incremental_refresh(
                     if not c.fetchone():
                         c.execute("SELECT COALESCE(MAX(ID), 0) + 1 FROM Expression")
                         expr_id = c.fetchone()[0]
-                        # Kind=1 = M expression (parameters are M expressions with meta annotations)
                         c.execute(
                             "INSERT INTO Expression (ID, ModelID, Name, Kind, "
                             "Expression, ModifiedTime) "
-                            "VALUES (?, 1, ?, 1, ?, datetime('now'))",
+                            "VALUES (?, 1, ?, 0, ?, datetime('now'))",
                             (expr_id, param_name,
                              '#datetime(2020, 1, 1, 0, 0, 0) meta [IsParameterQuery=true, '
                              'Type="DateTime", IsParameterQueryRequired=true]')
