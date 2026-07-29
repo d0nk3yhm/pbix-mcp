@@ -2,7 +2,7 @@
 
 ## DAX Engine
 
-The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 204 real-world measures), not a strict Analysis Services runtime.
+The DAX engine is a **best-effort evaluator** (174 functions, 99.5% accuracy on 204 real-world measures), not a strict Analysis Services runtime.
 
 | Behavior | What happens | Impact |
 |----------|-------------|--------|
@@ -24,7 +24,7 @@ The DAX engine is a **best-effort evaluator** (156 functions, 99.5% accuracy on 
 | DirectQuery (open existing) | Read-only for layout/measures/metadata; DAX eval unavailable (data lives in remote source) |
 | Composite models | Not tested |
 | Live connections | Not supported |
-| PBIR layout | Read-only for filter extraction; layout write requires legacy format |
+| PBIR layout | Full read AND write — PBIR (`Report/definition`) files are edited in place (create/delete pages and visuals, filters, geometry) through the same tools as classic `Report/Layout` |
 
 ## HTML / CSS / SVG visuals
 
@@ -35,7 +35,7 @@ The bundled `PBIX HTML` custom visual (`pbix_add_html_visual`, see
 |--------|---------|
 | No external resources | Power BI's visual sandbox blocks all network requests — no `<script src>`, `<link>`, remote `<img>`/font, or `@import`. Inline everything; embed images as base64 `data:` URIs. |
 | Content size | The HTML content measure must stay under ~32,000 characters (Analysis Services silently truncates a longer text cell); `pbix_add_html_visual` raises before the limit. |
-| Legacy layout only | Embedding the custom visual requires the legacy `Report/Layout` format; the PBIR `Report/definition` format is not yet supported. |
+| Layout formats | Both formats are supported (since 0.9.39): `pbix_add_html_visual` works on legacy `Report/Layout` AND PBIR `Report/definition` files — on PBIR the visual is written in place and `publicCustomVisuals` is synced into `report.json`. |
 | Cross-filter needs a bound field | `category_field` cross-filtering only affects visuals reachable (through model relationships) from the bound column — same as any native visual. |
 | Uncertified | The visual uses `innerHTML` and is intentionally uncertified (not published to AppSource). **Consequence: it renders EMPTY in the Power BI service** under default tenant trust policy (uncertified file-embedded visuals are blocked) — it is a Desktop-only capability. For service-portable rich content use [rich-content.md](rich-content.md) (SVG image measures, Deneb references). |
 
