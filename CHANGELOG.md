@@ -64,6 +64,22 @@ values exactly, 0 logic mismatches** (4 remaining differences are the documented
 sub-microsecond DateTime-serial class on MS_Perf_Analyzer's trace tables), 23/24
 files rebuild, 0 fidelity findings.
 
+### Found by adversarial review of the rewrite
+
+- **Fixed before release:** a RELATED/CALCULATE mask nested inside a LOOKUPVALUE
+  search value resolved against the PREVIOUS row's scope — every row silently
+  materialized the previous row's lookup result, shifted by one. The scope is now
+  installed before LOOKUPVALUE resolution; the reviewer's repro now yields the
+  Desktop-correct chain.
+- **Documented behavior changes** (all proven improvements or neutral, none with
+  corpus coverage): a datetime reaching a TEXT context now renders as Python's
+  `str()` (`2024-01-15 00:00:00`, no `T` — matching how measures already rendered
+  it); NaN/Infinity doubles now propagate through arithmetic instead of silently
+  collapsing to BLANK; string values containing newlines are preserved verbatim
+  (the old text-splicing path corrupted them to spaces); and callers that bypass
+  `calc_column_unsupported_reason` and evaluate iterator expressions directly get
+  real DAX row-context shadowing instead of the old substituted-constant behavior.
+
 ### set_incremental_refresh wrote an invalid ExpressionKind
 
 TOM's `ExpressionKind` enum defines a single member, `M = 0` — and every one of the
