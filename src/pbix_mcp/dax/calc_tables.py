@@ -1049,7 +1049,10 @@ def _unresolved_refs(row_expr: str) -> set:
 
 _AGG_CALL_RE = re.compile(
     r"\b(" + "|".join(sorted(_CALC_SELF_AGG_FUNCS)) + r")\s*\(", re.IGNORECASE)
-_AGG_MASK = "\x00AGG{}\x00"
+# An identifier, deliberately: the row loop binds each masked aggregate as
+# an engine VARIABLE (evaluated once -- the gate only admits row-independent
+# aggregates), so the mask must be resolvable by the engine's var lookup.
+_AGG_MASK = "__AGG{}__"
 # The ONLY argument shape treated as a whole-column aggregate: exactly one
 # column reference, optionally table-qualified. Anything else -- a second
 # argument, a bare table name, an expression -- is not this.
@@ -1357,26 +1360,6 @@ def _build_related_resolver(spec: dict, all_tables: Dict[str, dict]):
     return resolve
 
 
-def _resolve_rel_masks(row_expr, rel_specs, rel_resolvers, row_data):
-    """Replace each `__RELn__` with this row's related value."""
-    out = row_expr
-    for n, spec in enumerate(rel_specs):
-        mask = _REL_MASK.format(n)
-        if mask not in out:
-            continue
-        fk = spec["path"][0].get("FromColumn")
-        hit = None
-        for cn, val in row_data.items():
-            if cn.lower() == (fk or "").lower():
-                hit = val
-                break
-        else:
-            return out, (
-                f"RELATED joins on a column '{fk}' that is not in this row")
-        out = out.replace(mask, f"({_dax_literal(rel_resolvers[n](hit))})")
-    return out, None
-
-
 def _ord_key(v):
     """A sortable key for the inequality column, or None if not orderable."""
     if isinstance(v, bool):
@@ -1593,66 +1576,55 @@ def _outer_value_fn(rhs: str, target_table: str, columns, engine, dax_engine,
     return fn
 
 
-def _resolve_calc_masks(row_expr, calc_specs, calc_resolvers, row_data):
-    """Replace each `__CALCn__` with this row's aggregate."""
-    out = row_expr
-    for n in range(len(calc_specs)):
-        mask = _CALC_MASK.format(n)
-        if mask in out:
-            out = out.replace(mask, f"({_dax_literal(calc_resolvers[n](row_data))})")
-    return out
+_MASK_TOKEN_RE = re.compile(r"__(?:AGG|CALC|REL|LV)\d+__")
 
 
-def _resolve_lv_masks(row_expr, lv_specs, lv_index, row_data, target_table,
-                      engine, dax_engine, all_tables, relationships):
-    """Replace each `__LVn__` in `row_expr` with this row's looked-up literal.
+def _lv_row_value(spec, idx, row_data, target_table, engine, dax_engine,
+                  all_tables, relationships):
+    """One row's LOOKUPVALUE result as a VALUE -- (value, error).
 
-    Returns (expr, error). DAX's own rules: no matching row yields the
-    alternate result if one was supplied and BLANK otherwise; several matching
-    rows are fine as long as they all carry the SAME result value. Genuinely
-    ambiguous matches are an ERROR in DAX -- Desktop would refuse to refresh
-    the column -- so we refuse the whole column rather than pick one.
+    Same semantics as the old text-splicing resolver: several matching rows
+    must agree or the column is refused; a miss yields the alternate result if
+    supplied, else BLANK. Search values and the alternate expression are still
+    substituted-and-checked as text, so an unresolvable reference inside them
+    refuses exactly as before instead of silently reading as blank.
     """
-    out = row_expr
-    for n, spec in enumerate(lv_specs):
-        mask = _LV_MASK.format(n)
-        if mask not in out:
-            continue
-        idx = lv_index[n]
-        key = []
-        for _sc, val_expr in spec["pairs"]:
-            sub = _subst_row(val_expr, row_data, target_table)
-            # An UNSUBSTITUTED reference here is silent poison: the engine
-            # reads it as blank, the key matches nothing, and the column
-            # materialises as BLANK on every affected row instead of failing.
-            # Events[ParentIndex] did exactly that -- 102 of 117 rows blank
-            # where Desktop stored a value.
+    key = []
+    for _sc, val_expr in spec["pairs"]:
+        sub = _subst_row(val_expr, row_data, target_table)
+        stray = _unresolved_refs(sub)
+        if stray:
+            return None, (
+                "LOOKUPVALUE search value references a column this engine "
+                "cannot resolve in row context: " + ", ".join(sorted(stray)))
+        try:
+            ctx = dax_engine.DAXContext(
+                all_tables, {}, None, None, None, relationships or [])
+            key.append(_lv_key(engine._eval_expr(sub, ctx)))
+        except Exception as exc:  # noqa: BLE001 - refuse, don't guess
+            return None, f"LOOKUPVALUE search value failed to evaluate: {exc}"
+    hits = idx["distinct"].get(tuple(key))
+    if hits is None:
+        if spec["alt"] is not None:
+            sub = _subst_row(spec["alt"], row_data, target_table)
             stray = _unresolved_refs(sub)
             if stray:
-                return out, (
-                    "LOOKUPVALUE search value references a column this engine "
-                    "cannot resolve in row context: " + ", ".join(sorted(stray)))
+                return None, (
+                    "references a column this engine cannot resolve in row "
+                    "context: " + ", ".join(sorted(stray)))
             try:
                 ctx = dax_engine.DAXContext(
                     all_tables, {}, None, None, None, relationships or [])
-                key.append(_lv_key(engine._eval_expr(sub, ctx)))
-            except Exception as exc:  # noqa: BLE001 - refuse, don't guess
-                return out, f"LOOKUPVALUE search value failed to evaluate: {exc}"
-        hits = idx["distinct"].get(tuple(key))
-        if hits is None:
-            if spec["alt"] is not None:
-                repl = _subst_row(spec["alt"], row_data, target_table)
-            else:
-                repl = "BLANK()"
-        elif len(hits) > 1:
-            return out, (
-                f"LOOKUPVALUE('{spec['table']}'[{spec['result']}], ...) "
-                f"matches rows with different values -- ambiguous, which is an "
-                f"error in DAX")
-        else:
-            repl = _dax_literal(idx["raw"][tuple(key)])
-        out = out.replace(mask, f"({repl})")
-    return out, None
+                return engine._eval_expr(sub, ctx), None
+            except Exception as exc:  # noqa: BLE001
+                return None, f"row evaluation failed: {exc}"
+        return None, None
+    if len(hits) > 1:
+        return None, (
+            f"LOOKUPVALUE('{spec['table']}'[{spec['result']}], ...) "
+            f"matches rows with different values -- ambiguous, which is an "
+            f"error in DAX")
+    return idx["raw"][tuple(key)], None
 
 
 def evaluate_row_context_column(
@@ -1674,6 +1646,14 @@ def evaluate_row_context_column(
     from pbix_mcp.dax import engine as dax_engine
 
     clean = expand_variation_accessors(strip_dax_comments(expression)).strip()
+    # Refuse the pathological expression that already contains a mask-shaped
+    # identifier BEFORE any masking runs -- binding our masks as variables
+    # would silently shadow it. After masking, the tokens are legitimately
+    # everywhere, so the check only means anything here.
+    if _MASK_TOKEN_RE.search(clean):
+        return None, (
+            "expression contains a reserved __AGG/__CALC/__REL/__LV token, "
+            "which this engine uses internally")
     engine = dax_engine.DAXEngine()
     values: list = []
     unresolved: set = set()
@@ -1724,20 +1704,47 @@ def evaluate_row_context_column(
     # Aggregate calls are row-independent, so mask them once rather than per row.
     masked, agg_spans = _mask_aggregate_calls(clean)
 
+    # Evaluate each masked aggregate ONCE -- the gate only admits whole-column
+    # aggregates of this table, which are the same value on every row -- and
+    # bind it as an engine variable under its mask token.
+    base_scope: dict = {}
+    for n, call in enumerate(agg_spans):
+        try:
+            actx = dax_engine.DAXContext(
+                all_tables, {}, None, None, None, relationships or [])
+            base_scope[_AGG_MASK.format(n)] = engine._eval_expr(call, actx)
+        except Exception as e:  # noqa: BLE001 - refuse, don't store garbage
+            return None, f"row evaluation failed: {e}"
+
+    # The expression text is IDENTICAL on every row now (no per-row literal
+    # substitution), so the unresolved-reference safety check no longer needs
+    # to run per row: probe ONE row's substitution. Same text, same column
+    # set, same set of strays on every row.
+    if rows:
+        probe_data = {cn: rows[0][ci] for ci, cn in enumerate(columns)}
+        unresolved = _unresolved_refs(_subst_row(masked, probe_data,
+                                                 target_table))
+        if unresolved:
+            return None, (
+                "references a column this engine cannot resolve in row "
+                "context: " + ", ".join(sorted(unresolved)))
+
     # A plain row expression is a PURE FUNCTION of the columns it names, so
     # rows that agree on those columns give the same answer. Memoising on that
-    # tuple collapses the work to the number of DISTINCT inputs:
-    # `IF([Age]<30,1,IF([Age]<50,2,3))` over 1,290,259 rows has ~80 distinct
-    # ages, and the evaluator re-parsed the substituted expression text every
-    # single row. Only enabled when nothing per-row-stateful is in play --
-    # CALCULATE/RELATED/LOOKUPVALUE resolve against columns that may not appear
-    # in the masked text, so memoising those could reuse a wrong answer.
+    # tuple collapses the work to the number of DISTINCT inputs. Only enabled
+    # when nothing per-row-stateful is in play -- CALCULATE/RELATED/LOOKUPVALUE
+    # resolve against columns that may not appear in the masked text, so
+    # memoising those could reuse a wrong answer.
     memo_cols = None
     memo: dict = {}
-    if not (calc_specs or rel_specs or lv_specs):
+    per_row_masks = bool(calc_specs or rel_specs or lv_specs)
+    if not per_row_masks:
         memo_cols = [c for c in columns
                      if f"'{target_table}'[{c}]" in masked
                      or f"{target_table}[{c}]" in masked]
+        # No per-row scope entries: the aggregate bindings are constant, so
+        # the engine-level scope can be installed once for the whole loop.
+        engine._current_var_scope = base_scope or None
 
     for row in rows:
         row_data = {cn: row[ci] for ci, cn in enumerate(columns)}
@@ -1746,35 +1753,45 @@ def evaluate_row_context_column(
             if key in memo:
                 values.append(memo[key])
                 continue
-        row_expr = _subst_row(masked, row_data, target_table)
-        if calc_specs:
-            try:
-                row_expr = _resolve_calc_masks(
-                    row_expr, calc_specs, calc_resolvers, row_data)
-            except ValueError as exc:
-                return None, str(exc)
-        if rel_specs:
-            row_expr, rel_err = _resolve_rel_masks(
-                row_expr, rel_specs, rel_resolvers, row_data)
-            if rel_err:
-                return None, rel_err
-        if lv_specs:
-            row_expr, lv_err = _resolve_lv_masks(
-                row_expr, lv_specs, lv_index, row_data, target_table,
-                engine, dax_engine, all_tables, relationships)
-            if lv_err:
-                return None, lv_err
-        unresolved |= _unresolved_refs(row_expr)
-        row_expr = _unmask_aggregate_calls(row_expr, agg_spans)
+        if per_row_masks:
+            scope = dict(base_scope)
+            if calc_specs:
+                try:
+                    for n in range(len(calc_specs)):
+                        scope[_CALC_MASK.format(n)] = calc_resolvers[n](row_data)
+                except ValueError as exc:
+                    return None, str(exc)
+            for n, spec in enumerate(rel_specs):
+                fk = spec["path"][0].get("FromColumn")
+                for cn, val in row_data.items():
+                    if cn.lower() == (fk or "").lower():
+                        scope[_REL_MASK.format(n)] = rel_resolvers[n](val)
+                        break
+                else:
+                    return None, (
+                        f"RELATED joins on a column '{fk}' that is not in "
+                        f"this row")
+            for n, spec in enumerate(lv_specs):
+                val, lv_err = _lv_row_value(
+                    spec, lv_index[n], row_data, target_table, engine,
+                    dax_engine, all_tables, relationships)
+                if lv_err:
+                    return None, lv_err
+                scope[_LV_MASK.format(n)] = val
+            engine._current_var_scope = scope
         try:
             ctx = dax_engine.DAXContext(
                 all_tables, {}, None, None, None, relationships or [])
-            got = engine._eval_expr(row_expr, ctx)
+            # Column refs resolve through the engine's own row context, so the
+            # SAME text evaluates on every row and its plan is parsed once.
+            ctx._current_row = {'__table__': target_table, **row_data}
+            got = engine._eval_expr(masked, ctx)
             values.append(got)
             if memo_cols is not None and len(memo) < 200_000:
                 memo[tuple(_lv_key(row_data.get(c)) for c in memo_cols)] = got
         except Exception as e:  # noqa: BLE001 - refuse, don't store garbage
             return None, f"row evaluation failed: {e}"
+    engine._current_var_scope = None
     if engine.unsupported_functions:
         return None, (
             "expression uses unsupported function(s): "
