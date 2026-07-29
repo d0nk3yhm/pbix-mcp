@@ -151,8 +151,11 @@ class TestCarrySpecShape:
         for tname, fks, _identity in server._CARRY_SPEC:
             for kind in fks.values():
                 if kind.startswith("self:"):
-                    assert kind[5:] in seen, (
-                        f"{tname} references {kind[5:]} before it is carried")
+                    # A trailing "?" marks the reference OPTIONAL; the parent
+                    # table name is what has to have been carried already.
+                    parent = kind[5:].rstrip("?")
+                    assert parent in seen, (
+                        f"{tname} references {parent} before it is carried")
             seen.append(tname)
 
     def test_every_carried_table_has_a_user_facing_meaning(self):
@@ -607,3 +610,116 @@ class TestRebuildOpensInPowerBI:
         wrong = {k: (control[k], edited.get(k)) for k in control
                  if k in edited and edited[k] != control[k]}
         assert wrong == {}, f"{len(wrong)} measure(s) changed: {list(wrong)[:5]}"
+
+
+class TestCalculationGroupSurvivesARebuild:
+    """Issue #7: a calculation group was dropped SILENTLY by a rebuild.
+
+    No corpus file contains one, so the path had never run. Authoring one with
+    this project's own `pbix_datamodel_add_calculation_group` and then editing
+    a table reproduced it exactly: CalculationGroup, CalculationItem,
+    [Table].CalculationGroupID and the Type=7 partition all went to zero, and
+    the tool still answered success: true with an empty warnings list.
+
+    A calculation group is wired from BOTH ends. Carrying the CalculationGroup
+    row back is not enough — without the [Table] back-reference and the Type=7
+    partition the group's table loads present but inert.
+    """
+
+    BASE = "GeoSales_Dashboard.pbix"
+    EDIT_TABLE = "Returns"
+
+    def _fixture(self, tmpdir):
+        src = os.path.join(CORPUS, self.BASE)
+        if not os.path.exists(src):
+            pytest.skip(f"{self.BASE} not in corpus")
+        work = os.path.join(tmpdir, "cg.pbix")
+        shutil.copy(src, work)
+        alias = "cg" + uuid.uuid4().hex[:8]
+        server.pbix_open(work, alias)
+        try:
+            res = json.loads(server.pbix_datamodel_add_calculation_group(
+                alias, "Time Intelligence", json.dumps([
+                    {"name": "Current", "expression": "SELECTEDMEASURE()"},
+                    {"name": "YTD", "expression":
+                        "TOTALYTD(SELECTEDMEASURE(), 'dim-Date'[Date])"},
+                ])))
+            if not res.get("success"):
+                pytest.skip(f"could not author: {str(res.get('message'))[:90]}")
+            server.pbix_save(alias)
+        finally:
+            try:
+                server.pbix_close(alias, force=True)
+            except Exception:
+                pass
+        return work
+
+    @staticmethod
+    def _cg_counts(path):
+        con, tmp = _meta_conn(path)
+        try:
+            return {
+                "CalculationGroup": con.execute(
+                    "SELECT COUNT(*) FROM [CalculationGroup]").fetchone()[0],
+                "CalculationItem": con.execute(
+                    "SELECT COUNT(*) FROM [CalculationItem]").fetchone()[0],
+                "TableBackRef": con.execute(
+                    "SELECT COUNT(*) FROM [Table] WHERE CalculationGroupID "
+                    "IS NOT NULL AND CalculationGroupID != 0").fetchone()[0],
+                "Partition7": con.execute(
+                    "SELECT COUNT(*) FROM [Partition] "
+                    "WHERE Type = 7").fetchone()[0],
+            }
+        finally:
+            con.close()
+            os.unlink(tmp)
+
+    def test_the_fixture_really_has_a_calculation_group(self, tmp_path):
+        """Guards the guard: if authoring stops working the test below is void."""
+        got = self._cg_counts(self._fixture(str(tmp_path)))
+        assert got["CalculationGroup"] == 1
+        assert got["CalculationItem"] == 2
+        assert got["TableBackRef"] == 1
+        assert got["Partition7"] == 1
+
+    def test_nothing_is_lost_across_a_rebuild(self, tmp_path):
+        fixture = self._fixture(str(tmp_path))
+        before = self._cg_counts(fixture)
+        after = self._cg_counts(
+            _save_after(fixture, str(tmp_path), self.EDIT_TABLE))
+        lost = {k: (before[k], after[k]) for k in before if after[k] < before[k]}
+        assert not lost, f"rebuild lost {lost}"
+
+    def test_the_items_keep_their_names_and_expressions(self, tmp_path):
+        fixture = self._fixture(str(tmp_path))
+        out = _save_after(fixture, str(tmp_path), self.EDIT_TABLE)
+        con, tmp = _meta_conn(out)
+        try:
+            rows = con.execute(
+                "SELECT Name, Expression FROM [CalculationItem] "
+                "ORDER BY Ordinal").fetchall()
+        finally:
+            con.close()
+            os.unlink(tmp)
+        assert [r[0] for r in rows] == ["Current", "YTD"]
+        assert "SELECTEDMEASURE" in (rows[0][1] or "")
+
+    def test_the_group_points_at_a_table_that_still_exists(self, tmp_path):
+        """A dangling foreign key is worse than a missing feature."""
+        fixture = self._fixture(str(tmp_path))
+        out = _save_after(fixture, str(tmp_path), self.EDIT_TABLE)
+        con, tmp = _meta_conn(out)
+        try:
+            dangling = con.execute(
+                "SELECT COUNT(*) FROM [CalculationGroup] cg "
+                "WHERE cg.TableID NOT IN (SELECT ID FROM [Table])"
+            ).fetchone()[0]
+            orphan_items = con.execute(
+                "SELECT COUNT(*) FROM [CalculationItem] ci "
+                "WHERE ci.CalculationGroupID NOT IN "
+                "(SELECT ID FROM [CalculationGroup])").fetchone()[0]
+        finally:
+            con.close()
+            os.unlink(tmp)
+        assert dangling == 0
+        assert orphan_items == 0
