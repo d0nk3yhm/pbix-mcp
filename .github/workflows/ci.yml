@@ -51,8 +51,7 @@ jobs:
             echo "$OUT" | tail -20
             exit 1
           fi
-          COUNT=$(printf '%s
-' "$OUT" | grep -c "error:" || true)
+          COUNT=$(echo "$OUT" | grep -c "error:" || true)
           echo "mypy errors: $COUNT (baseline: 140)"
           if [ "$COUNT" -gt 140 ]; then
             echo "FAIL: mypy errors ($COUNT) exceed baseline (140)"
