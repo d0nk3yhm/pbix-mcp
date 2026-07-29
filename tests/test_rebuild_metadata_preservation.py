@@ -704,6 +704,30 @@ class TestCalculationGroupSurvivesARebuild:
         assert [r[0] for r in rows] == ["Current", "YTD"]
         assert "SELECTEDMEASURE" in (rows[0][1] or "")
 
+    def test_the_partition_has_no_query_definition(self, tmp_path):
+        """Type=7 partitions must NOT carry a QueryDefinition.
+
+        The rebuild writes an Enter-data M query for every partition. Leaving
+        it on a calculation group's partition made Power BI reject the whole
+        file on open: "Partition 'X' in table 'X' has the QueryDefinition
+        property set which is not a valid field for this partition type."
+        Every metadata-level check passed -- referential integrity clean, all
+        other partition fields identical to an authored group -- so only
+        opening it in Desktop found this.
+        """
+        fixture = self._fixture(str(tmp_path))
+        out = _save_after(fixture, str(tmp_path), self.EDIT_TABLE)
+        con, tmp = _meta_conn(out)
+        try:
+            bad = con.execute(
+                "SELECT COUNT(*) FROM [Partition] "
+                "WHERE Type = 7 AND QueryDefinition IS NOT NULL "
+                "AND QueryDefinition != ''").fetchone()[0]
+        finally:
+            con.close()
+            os.unlink(tmp)
+        assert bad == 0, "a calculation-group partition kept its QueryDefinition"
+
     def test_the_group_points_at_a_table_that_still_exists(self, tmp_path):
         """A dangling foreign key is worse than a missing feature."""
         fixture = self._fixture(str(tmp_path))
