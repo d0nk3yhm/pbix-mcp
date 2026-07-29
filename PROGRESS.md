@@ -11,7 +11,7 @@ and how, what is left, and the traps already hit so they are not re-hit.
 | **#4** calc columns blocking corpus files | groups (a) `.[Date]`, (b) LOOKUPVALUE + RELATED, (c) CALCULATE/FILTER all **DONE** |
 | **#5** columns fail to decode | **root-caused, fixed, tested, committed** |
 | **#6** DAX perf / compiled expression tree | not started — bottleneck MEASURED, see below |
-| **#7** calc groups, translations, detail-rows | not started |
+| **#7** calc groups, translations, detail-rows | **DONE** — verified live in Desktop via INFO.CALCULATIONGROUPS() |
 
 Released 07-28: **0.9.50–0.9.53** (PyPI + GitHub, CI green). Work since then is
 committed but **not yet released**.
@@ -392,10 +392,50 @@ differs from Desktop in the sub-microsecond digits — e.g. `3796149882573.3325`
 vs `3796149882573.333`. Visible on `MS_Perf_Analyzer`'s trace tables, which are
 refused for other reasons (RANKX, PATH/PATHITEM) anyway.
 
+## Issue #7 — calculation groups now survive a rebuild
+
+The issue asked for a .pbix authored in Desktop. Not needed: this project's own
+`pbix_datamodel_add_calculation_group` builds one, which is also the exact case
+the issue calls out ("a model this project itself created can contain
+calculation groups that a later rebuild-path edit would drop").
+
+Reproduced first. Authoring a group on `GeoSales_Dashboard` and then editing a
+table dropped `CalculationGroup`, `CalculationItem`, `[Table]
+.CalculationGroupID` and the Type=7 partition **to zero**, with `success: true`
+and an empty warnings list.
+
+All 14 tables from the issue are now in `_CARRY_SPEC`. Two things the generic
+carry could not do on its own:
+
+* **A calculation group is wired from BOTH ends.** `[Table].CalculationGroupID`
+  points back at the group, and the partition must be `Type=7`. Without them the
+  group's table loads present but inert.
+* **Optional self-references (`self:X?`) were declared but never worked** — the
+  snapshot built its remap key from the raw kind string, so it looked for a
+  table literally called `FormatStringDefinition?`. Now a calculation item
+  survives losing its format string instead of vanishing with it.
+
+### The Desktop-only failure
+
+Every metadata check passed — referential integrity clean, no dangling keys,
+all four counts restored, doctor reporting nothing the source file did not
+already have — and Power BI **still refused the file**:
+
+> Partition 'Time Intelligence' in table 'Time Intelligence' has the
+> QueryDefinition property set which is not a valid field for this partition type.
+
+The rebuild writes an Enter-data M query for every partition; setting `Type=7`
+left it in place. Ground truth from an authored group: a Type=7 partition
+carries NO `QueryDefinition`, and every other field already matched byte for
+byte. **Only opening the file in Desktop found this** — a standing argument for
+the GUI check even when every offline gate is green.
+
+Now verified against Desktop's own engine: the report opens, and
+`INFO.CALCULATIONGROUPS()` / `INFO.CALCULATIONITEMS()` answer **1 group, 2
+items** — `Current` ordinal 0, `YTD` ordinal 1 — after a rebuild.
+
 ## Next
 
-1. Release the accumulated work (#4 + #5) and close both issues.
-2. **#7** — carry calculation groups / translations / detail-rows across a
-   rebuild; the test .pbix still has to be authored in Desktop.
-3. **#6** — compiled DAX expression tree. The CALCULATE compiler added here is
-   the same idea applied to one construct, and is a reasonable template.
+1. Release the accumulated work (#4, #5, #7) and close the three issues.
+2. **#6** — compiled DAX expression tree. The CALCULATE compiler added for #4
+   is the same idea applied to one construct, and is a reasonable template.

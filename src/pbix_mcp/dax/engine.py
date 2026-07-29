@@ -98,12 +98,26 @@ def _as_number(v):
         except ValueError:
             pass
         # Only ISO-ish shapes, so an ordinary word is still "not a number".
-        if _ISO_DATEISH.match(s):
-            got = _as_datetime(s)
-            if got is not None:
-                return (got - datetime(1899, 12, 30)).total_seconds() / 86400.0
-        return None
+        return _iso_serial(s)
     return None
+
+
+@lru_cache(maxsize=100_000)
+def _iso_serial(s: str):
+    """OA serial for an ISO-ish date string, or None. Cached.
+
+    The row-context evaluator substitutes every date as an ISO string, so a
+    single expression over a wide table re-parses the same handful of dates
+    millions of times: `[date] - [HireDate]` on a 1.29M-row table is ~2.6M
+    strptime calls for a few thousand distinct dates. Caching turns almost all
+    of them into a dict hit. Pure function of the string, so the cache is safe.
+    """
+    if not _ISO_DATEISH.match(s):
+        return None
+    got = _as_datetime(s)
+    if got is None:
+        return None
+    return (got - datetime(1899, 12, 30)).total_seconds() / 86400.0
 
 
 # A whole expression that is exactly one DAX string literal. Interior quotes
