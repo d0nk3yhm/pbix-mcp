@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.56] - 2026-07-29
+
+Verification and sync release. No behaviour change: the diff against 0.9.55 is
+documentation plus this version bump.
+
+### Issue #5's fix is now confirmed against Power BI Desktop
+
+When #5 shipped, its fix was verified structurally (run lengths summing to exactly
+the row count), referentially (0 orphan relationships) and semantically (plausible
+ranges) — but Desktop was in use at the time, so it was never checked against
+Desktop's own engine, and `PROGRESS.md` said so. Both files have now been opened in
+Power BI Desktop and its workspace engine queried over ADOMD.
+
+`MS_Corporate_Spend` `Fact` — all 8 aggregates identical, including
+`SUM(Value) = 4203674047.3179` to the last digit, and DISTINCTCOUNT of Value /
+Department / Cost Element ID / Scenario ID = 35,807 / 410 / 240 / 5.
+
+`MS_Employee_Hiring` `Employee` (1,290,259 rows) — all 9 identical.
+
+Because equal aggregates can still hide unequal data, also checked at the VALUE
+level on exactly the three columns the bug corrupted: `Gender` (C 590,639 ·
+D 699,620), `FP` (F 631,127 · P 659,132), the six earliest `date` values with their
+exact row counts, and `Age` (SUM 50,965,422 · AVG 39.5001484198134 · COUNT
+1,290,259). Every distinct value and row count matches. `Gender` is the column that
+summed to 93,629,586,803 rows before the fix.
+
+### Sync
+
+Tag, `main` and the published package now all point at the same tree — 0.9.55's tag
+sat two documentation commits behind `main`. The F: working mirror was also audited
+file-by-file against every tracked path (26 were stale, from earlier partial syncs)
+and is now byte-identical.
+
 ## [0.9.55] - 2026-07-29
 
 Closes issue **#6** (compiled DAX expression plans), and fixes **two operator-precedence
