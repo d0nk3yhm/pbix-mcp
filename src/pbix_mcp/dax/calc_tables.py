@@ -1723,8 +1723,29 @@ def evaluate_row_context_column(
         lv_index.append(built)
     # Aggregate calls are row-independent, so mask them once rather than per row.
     masked, agg_spans = _mask_aggregate_calls(clean)
+
+    # A plain row expression is a PURE FUNCTION of the columns it names, so
+    # rows that agree on those columns give the same answer. Memoising on that
+    # tuple collapses the work to the number of DISTINCT inputs:
+    # `IF([Age]<30,1,IF([Age]<50,2,3))` over 1,290,259 rows has ~80 distinct
+    # ages, and the evaluator re-parsed the substituted expression text every
+    # single row. Only enabled when nothing per-row-stateful is in play --
+    # CALCULATE/RELATED/LOOKUPVALUE resolve against columns that may not appear
+    # in the masked text, so memoising those could reuse a wrong answer.
+    memo_cols = None
+    memo: dict = {}
+    if not (calc_specs or rel_specs or lv_specs):
+        memo_cols = [c for c in columns
+                     if f"'{target_table}'[{c}]" in masked
+                     or f"{target_table}[{c}]" in masked]
+
     for row in rows:
         row_data = {cn: row[ci] for ci, cn in enumerate(columns)}
+        if memo_cols is not None:
+            key = tuple(_lv_key(row_data.get(c)) for c in memo_cols)
+            if key in memo:
+                values.append(memo[key])
+                continue
         row_expr = _subst_row(masked, row_data, target_table)
         if calc_specs:
             try:
@@ -1748,7 +1769,10 @@ def evaluate_row_context_column(
         try:
             ctx = dax_engine.DAXContext(
                 all_tables, {}, None, None, None, relationships or [])
-            values.append(engine._eval_expr(row_expr, ctx))
+            got = engine._eval_expr(row_expr, ctx)
+            values.append(got)
+            if memo_cols is not None and len(memo) < 200_000:
+                memo[tuple(_lv_key(row_data.get(c)) for c in memo_cols)] = got
         except Exception as e:  # noqa: BLE001 - refuse, don't store garbage
             return None, f"row evaluation failed: {e}"
     if engine.unsupported_functions:
