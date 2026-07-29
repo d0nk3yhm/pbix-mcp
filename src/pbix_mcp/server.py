@@ -1633,6 +1633,7 @@ def pbix_update_visual_json(
 
         containers[visual_index]["config"] = json.dumps(new_config, ensure_ascii=False)
         _set_layout(info["work_dir"], layout)
+        _warn_unbound_field_parameters(info, new_config)
         info["modified"] = True
         return ToolResponse.ok(f"Updated visual config on page {page_index}, visual {visual_index}").to_text()
     except PBIXMCPError as e:
@@ -2153,6 +2154,79 @@ def pbix_create(
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
+def _field_parameter_tables(info: dict) -> set:
+    """Names of tables that are FIELD PARAMETERS (ParameterMetadata
+    ExtendedProperty on a column). Best-effort: empty set on any failure."""
+    out: set = set()
+    try:
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        with open(dm_path, "rb") as f:
+            meta_bytes = read_metadata_sqlite(decompress_datamodel(f.read()))
+        fd, tmp_path = tempfile.mkstemp(suffix=".db")
+        os.write(fd, meta_bytes)
+        os.close(fd)
+        try:
+            conn = sqlite3.connect(tmp_path)
+            for row in conn.execute(
+                "SELECT DISTINCT t.Name FROM ExtendedProperty ep "
+                "JOIN [Column] c ON ep.ObjectID = c.ID AND ep.ObjectType = 4 "
+                "JOIN [Table] t ON c.TableID = t.ID "
+                "WHERE ep.Name = 'ParameterMetadata'"):
+                out.add(row[0])
+            conn.close()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001 - detection is advisory only
+        pass
+    return out
+
+
+def _warn_unbound_field_parameters(info: dict, config: dict) -> None:
+    """Warn when a projection targets a field-parameter display column but the
+    visual carries no queryFieldParametersByRole.
+
+    Desktop does not error on that shape -- it silently treats the display
+    column as ordinary text and degrades the well to an implicit Count
+    (OpenBI findings #19: six equal "Count of Metric" bars instead of
+    field-swapping). A warning is the difference between a five-minute fix
+    and a silently wrong chart."""
+    try:
+        sv = config.get("singleVisual") or {}
+        projections = sv.get("projections") or {}
+        if not projections:
+            return
+        qfp = sv.get("queryFieldParametersByRole") or {}
+        param_tables = _field_parameter_tables(info)
+        if not param_tables:
+            return
+        for role, items in projections.items():
+            if role in qfp:
+                continue
+            for it in items or []:
+                ref = str((it or {}).get("queryRef") or "")
+                # The binding compiler may already have wrapped the bare
+                # column in an implicit aggregation -- the very degradation
+                # being warned about -- so the ref can arrive as
+                # "CountNonNull(Metric.Metric)". Unwrap before matching.
+                m = re.match(r"^[A-Za-z]+\(([^)]+)\)$", ref)
+                if m:
+                    ref = m.group(1)
+                table = ref.split(".", 1)[0] if "." in ref else ""
+                if table in param_tables:
+                    _responses.add_pending_warning(
+                        f"Projection '{ref}' ({role}) targets field-parameter "
+                        f"table '{table}' without queryFieldParametersByRole "
+                        f"-- Power BI will silently degrade it to an implicit "
+                        f"Count. Use pbix_bind_field_parameter to bind it.")
+    except Exception:  # noqa: BLE001 - advisory only
+        pass
+
+
 def _report_type_resolver(info: dict):
     """Build ``resolve_type(entity, prop, is_measure) -> data_type`` from the
     open model's metadata, for report-binding type codes (best-effort).
@@ -2437,6 +2511,7 @@ def pbix_add_visual(
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
 
+        _warn_unbound_field_parameters(info, config)
         idx = len(page["visualContainers"]) - 1
         page_name = page.get("displayName", f"Page {page_index}")
         return ToolResponse.ok(f"Added {visual_type} visual at ({x},{y}) {width}x{height} on '{page_name}' (index {idx})").to_text()
@@ -2525,6 +2600,239 @@ def pbix_set_visual_sort(
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}",
                                   getattr(e, "code", None)).to_text()
+
+
+@mcp.tool()
+def pbix_bind_field_parameter(
+    alias: str,
+    page_index: int,
+    visual_index: int,
+    role: str,
+    parameter_name: str,
+    initial_field: str = "",
+) -> str:
+    """Bind a field parameter into a visual's field well (real field-swapping).
+
+    Putting the parameter's display column straight into a projection does NOT
+    work: Desktop silently treats it as ordinary text and degrades the well to
+    an implicit Count -- plausible-looking bars, wrong semantics, no error.
+    The working shape (diffed against a Desktop-authored binding) keeps the
+    currently-RESOLVED field in the projection and expresses the parameter
+    linkage separately. This tool authors all five pieces:
+
+    1. ``projections.<role>`` holds the resolved field's queryRef, with the
+       matching prototypeQuery Select entry carrying ``NativeReferenceName``;
+    2. ``queryFieldParametersByRole`` on singleVisual carries the parameter
+       linkage (index/length/display-column expr);
+    3. ``columnProperties`` restates the parameter's display label for the
+       resolved field;
+    4. the compiled query joins the parameter table and gains a Where clause
+       selecting the resolved field through the hidden "<name> Fields" column
+       (NAMEOF-style triple-quoted literal);
+    5. the resolved field's dataTransforms select carries
+       ``sourceFieldParameters`` provenance.
+
+    Args:
+        alias: The alias of the open file
+        page_index: Zero-based page index
+        visual_index: Zero-based visual index on the page
+        role: The field well to bind (e.g. "Y", "Values", "Category")
+        parameter_name: Name of the field-parameter table (as created by
+            pbix_datamodel_add_field_parameter)
+        initial_field: Which of the parameter's fields the visual shows before
+            any slicer selection -- a display name ("Revenue") or a field ref
+            ("Sales[Total Revenue]" / "'Sales'[Total Revenue]"). Defaults to
+            the parameter's first field.
+    """
+    try:
+        info = _ensure_open(alias)
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError("No layout found")
+        sections = layout.get("sections", [])
+        if page_index < 0 or page_index >= len(sections):
+            raise LayoutParseError(f"Page index {page_index} out of range")
+        containers = sections[page_index].get("visualContainers", [])
+        if visual_index < 0 or visual_index >= len(containers):
+            raise LayoutParseError(f"Visual index {visual_index} out of range")
+
+        # --- the parameter's definition, from the model -------------------
+        if parameter_name not in _field_parameter_tables(info):
+            raise LayoutParseError(
+                f"'{parameter_name}' is not a field parameter in this model "
+                f"(no ParameterMetadata). Create one with "
+                f"pbix_datamodel_add_field_parameter first.")
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        with open(dm_path, "rb") as f:
+            abf = decompress_datamodel(f.read())
+        meta_bytes = read_metadata_sqlite(abf)
+        td = read_table_from_abf(abf, parameter_name, meta_bytes,
+                                 include_calculated=True)
+        cols = td.get("columns") or []
+        fields_col = f"{parameter_name} Fields"
+        order_col = f"{parameter_name} Order"
+        if parameter_name not in cols or fields_col not in cols:
+            raise LayoutParseError(
+                f"'{parameter_name}' does not have the expected field-"
+                f"parameter columns ('{parameter_name}', '{fields_col}').")
+        di, fi = cols.index(parameter_name), cols.index(fields_col)
+        oi = cols.index(order_col) if order_col in cols else None
+        tuples = [(r[di], r[fi], (r[oi] if oi is not None else n))
+                  for n, r in enumerate(td.get("rows") or [])]
+        if not tuples:
+            raise LayoutParseError(f"'{parameter_name}' has no fields.")
+        tuples.sort(key=lambda t: t[2])
+
+        # --- resolve initial_field ----------------------------------------
+        chosen = None
+        if initial_field:
+            want = initial_field.strip()
+            canonical = None
+            try:
+                _t, _n, canonical = _normalize_field_ref(want)
+            except Exception:  # noqa: BLE001 - maybe it is a display name
+                pass
+            for disp, ref, _o in tuples:
+                if disp == want or (canonical and ref == canonical):
+                    chosen = (disp, ref)
+                    break
+            if chosen is None:
+                raise LayoutParseError(
+                    f"initial_field {initial_field!r} is not one of "
+                    f"'{parameter_name}''s fields: "
+                    + ", ".join(d for d, _r, _o in tuples))
+        else:
+            chosen = (tuples[0][0], tuples[0][1])
+        display, canonical_ref = chosen
+        f_table, f_name, _canon = _normalize_field_ref(canonical_ref)
+
+        # Column or measure? The Select node kind must match the model.
+        fd, tmp_path = tempfile.mkstemp(suffix=".db")
+        os.write(fd, meta_bytes)
+        os.close(fd)
+        try:
+            conn = sqlite3.connect(tmp_path)
+            conn.row_factory = sqlite3.Row
+            trow = conn.execute(
+                "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
+                (f_table,)).fetchone()
+            if not trow:
+                raise LayoutParseError(
+                    f"Parameter field {canonical_ref} points at a table that "
+                    f"no longer exists ('{f_table}').")
+            is_measure = bool(conn.execute(
+                "SELECT 1 FROM Measure WHERE TableID = ? AND Name = ?",
+                (trow["ID"], f_name)).fetchone())
+            if not is_measure and not conn.execute(
+                    "SELECT 1 FROM [Column] WHERE TableID = ? AND "
+                    "COALESCE(ExplicitName, InferredName) = ?",
+                    (trow["ID"], f_name)).fetchone():
+                raise LayoutParseError(
+                    f"Parameter field {canonical_ref} no longer exists in "
+                    f"the model.")
+            conn.close()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        # --- author the visual config -------------------------------------
+        vc = containers[visual_index]
+        config = _parse_visual_config(vc)
+        sv = config.setdefault("singleVisual", {})
+        proto = sv.setdefault("prototypeQuery", {"Version": 2, "From": [],
+                                                 "Select": []})
+        from_list = proto.setdefault("From", [])
+        selects = proto.setdefault("Select", [])
+        query_ref = f"{f_table}.{f_name}"
+
+        # Alias for the resolved field's table in the PROTOTYPE (the
+        # parameter table itself joins only in the COMPILED query).
+        alias_name = None
+        used = {fr.get("Name") for fr in from_list}
+        for fr in from_list:
+            if fr.get("Entity") == f_table:
+                alias_name = fr.get("Name")
+                break
+        if alias_name is None:
+            base = (f_table[:1].lower() or "t")
+            alias_name = base
+            n = 0
+            while alias_name in used:
+                n += 1
+                alias_name = f"{base}{n}"
+            from_list.append({"Name": alias_name, "Entity": f_table,
+                              "Type": 0})
+
+        # Drop any select previously projected into this role (including the
+        # naive parameter-display-column shape this tool replaces) -- unless
+        # another role still projects it.
+        old_refs = {it.get("queryRef")
+                    for it in (sv.get("projections") or {}).get(role, [])}
+        old_refs.add(f"{parameter_name}.{parameter_name}")
+        still_projected = set()
+        for r2, items in (sv.get("projections") or {}).items():
+            if r2 == role:
+                continue
+            for it in items or []:
+                still_projected.add(it.get("queryRef"))
+        proto["Select"] = [
+            s2 for s2 in selects
+            if s2.get("Name") not in old_refs
+            or s2.get("Name") in still_projected]
+        selects = proto["Select"]
+
+        node_kind = "Measure" if is_measure else "Column"
+        if not any(s2.get("Name") == query_ref for s2 in selects):
+            selects.append({
+                node_kind: {
+                    "Expression": {"SourceRef": {"Source": alias_name}},
+                    "Property": f_name,
+                },
+                "Name": query_ref,
+                "NativeReferenceName": display,
+            })
+
+        sv.setdefault("projections", {})[role] = [{"queryRef": query_ref}]
+        sv.setdefault("queryFieldParametersByRole", {})[role] = [{
+            "index": 0,
+            "length": 1,
+            "expr": {"Column": {
+                "Expression": {"SourceRef": {"Entity": parameter_name}},
+                "Property": parameter_name,
+            }},
+        }]
+        sv.setdefault("columnProperties", {})[query_ref] = {
+            "displayName": display}
+
+        # --- recompile the caches (query + dataTransforms) ----------------
+        from pbix_mcp.report_binding import compile_visual_binding
+        q, dt = compile_visual_binding(sv, _report_type_resolver(info))
+        if q is not None:
+            vc["query"] = json.dumps(q, ensure_ascii=False)
+            vc["dataTransforms"] = json.dumps(dt, ensure_ascii=False)
+            vc.setdefault("filters", "[]")
+        # Serialize AFTER compile: implicit value-role aggregation mutates
+        # the prototype, and the persisted config must match the query.
+        vc["config"] = json.dumps(config, ensure_ascii=False)
+
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Field parameter '{parameter_name}' bound to role '{role}' of "
+            f"visual {visual_index} on page {page_index}; initial field "
+            f"'{display}' ({canonical_ref}). A slicer over "
+            f"'{parameter_name}' now swaps this well's field.").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}",
+                                  str(getattr(e, "code", "") or
+                                      "PBIX_MCP_ERROR")).to_text()
 
 
 @mcp.tool()

@@ -8,7 +8,7 @@
 
 An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python — no templates, no skeletons, no Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026.
 
-Exposes 126 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing (rename / reorder / hide / duplicate pages, move & copy visuals — identically on classic `Report/Layout` and service-authored **PBIR**), visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, sort-by-column, TMDL export, incremental refresh, DAX evaluation (174 functions), RLS security, and binary format internals.
+Exposes 127 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing (rename / reorder / hide / duplicate pages, move & copy visuals — identically on classic `Report/Layout` and service-authored **PBIR**), visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, sort-by-column, TMDL export, incremental refresh, DAX evaluation (174 functions), RLS security, and binary format internals.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
@@ -174,13 +174,13 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 - **Full DataModel rebuild** — `set_table_data`, `update_table_rows`, `add/remove_relationship`, `remove_table` trigger a full DataModel rebuild via the builder pipeline. Most other tools (`add_measure`, `modify_measure`, `modify_column`, `set_rls_role`, `add_perspective`, `add_culture`, `add_translations`, `update_data_source`, etc.) use a lightweight metadata-only path.
 
 
-## Tools (126)
+## Tools (127)
 
 ### Create & File Management (5)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open`
 
-### Report Layout & Visuals (29)
-`pbix_add_visual` · `pbix_remove_visual` · `pbix_duplicate_visual` · `pbix_move_visual` · `pbix_format_visual` · `pbix_set_visual_sort` · `pbix_get_pages` · `pbix_add_page` · `pbix_remove_page` · `pbix_rename_page` · `pbix_duplicate_page` · `pbix_reorder_pages` · `pbix_set_page_visibility` · `pbix_get_page_visuals` · `pbix_get_visual_detail` · `pbix_get_visual_positions` · `pbix_set_visual_property` · `pbix_update_visual_json` · `pbix_get_layout_raw` · `pbix_set_layout_raw` · `pbix_report_format` · `pbix_get_filters` · `pbix_set_filters` · `pbix_get_default_filters` · `pbix_get_settings` · `pbix_set_settings` · `pbix_get_bookmarks` · `pbix_add_bookmark` · `pbix_remove_bookmark`
+### Report Layout & Visuals (30)
+`pbix_add_visual` · `pbix_remove_visual` · `pbix_duplicate_visual` · `pbix_move_visual` · `pbix_format_visual` · `pbix_set_visual_sort`, `pbix_bind_field_parameter` · `pbix_get_pages` · `pbix_add_page` · `pbix_remove_page` · `pbix_rename_page` · `pbix_duplicate_page` · `pbix_reorder_pages` · `pbix_set_page_visibility` · `pbix_get_page_visuals` · `pbix_get_visual_detail` · `pbix_get_visual_positions` · `pbix_set_visual_property` · `pbix_update_visual_json` · `pbix_get_layout_raw` · `pbix_set_layout_raw` · `pbix_report_format` · `pbix_get_filters` · `pbix_set_filters` · `pbix_get_default_filters` · `pbix_get_settings` · `pbix_set_settings` · `pbix_get_bookmarks` · `pbix_add_bookmark` · `pbix_remove_bookmark`
 
 ### DAX Engine (5)
 `pbix_evaluate_dax` · `pbix_evaluate_dax_per_dimension` · `pbix_evaluate_dax_grouped` · `pbix_evaluate_calculated_columns` · `pbix_clear_dax_cache`

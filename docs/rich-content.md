@@ -149,6 +149,40 @@ coexist. The manual alternative — a disconnected table via
 `pbix_set_table_data` + a `SWITCH(SELECTEDVALUE(…))` measure — still works
 and also survives rebuilds.
 
+### Binding a field parameter into a visual
+
+Creating the parameter is only the model half. Putting its display column
+straight into a projection (`projections.Y = [{"queryRef": "Metric.Metric"}]`)
+does NOT bind it: Desktop silently treats the column as ordinary text and
+degrades the well to an implicit **Count** — plausible-looking bars, wrong
+semantics, no error. `pbix_add_visual` / `pbix_update_visual_json` now WARN
+when they see that shape.
+
+`pbix_bind_field_parameter(alias, page_index, visual_index, role,
+parameter_name, initial_field="")` authors the working shape (diffed
+piece-by-piece against a Desktop-authored binding):
+
+1. `projections.<role>` holds the currently-RESOLVED field's queryRef, and
+   the matching `prototypeQuery.Select` entry carries `NativeReferenceName`;
+2. `queryFieldParametersByRole` on `singleVisual` carries the parameter
+   linkage: `{"Y": [{"index": 0, "length": 1, "expr": {"Column":
+   {"Expression": {"SourceRef": {"Entity": "Metric"}}, "Property":
+   "Metric"}}}]}`;
+3. `columnProperties` restates the parameter's display label for the
+   resolved field;
+4. the compiled `query` joins the parameter table and gains a `Where` clause
+   selecting the resolved field through the hidden `"<name> Fields"` column,
+   with the NAMEOF-style triple-quoted literal
+   (`'''Sales''[Total Revenue]'`);
+5. the resolved field's `dataTransforms` select carries
+   `sourceFieldParameters` provenance.
+
+`initial_field` picks which field the visual shows before any slicer
+selection — a display name (`"Revenue"`) or a ref (`"Sales[Total Revenue]"`)
+— defaulting to the parameter's first field. Verified in Power BI Desktop:
+the bound chart field-swaps (all fields as series when nothing is selected,
+the chosen field after a slicer pick), instead of the degraded Count.
+
 ## Reading Desktop rich content back
 
 `read_table_from_abf` (and everything built on it: `pbix_get_table_data`,
