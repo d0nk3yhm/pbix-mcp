@@ -10255,6 +10255,7 @@ def _materialize_table_calc_columns(
     from pbix_mcp.dax.calc_tables import (
         calc_column_unsupported_reason,
         evaluate_row_context_column,
+        expand_variation_accessors,
     )
 
     col_names = [c["name"] for c in data_columns]
@@ -10274,8 +10275,16 @@ def _materialize_table_calc_columns(
                 continue
             snapshot = {table_name: {"columns": list(col_names),
                                      "rows": [list(r) for r in rows]}}
+            # Expand `X.[Date]` BEFORE qualifying bare references. When the
+            # table ALSO has a real column named Date, the qualifier reads the
+            # accessor's `[Date]` as a bare same-table reference and rewrites it
+            # to `'T'[EstimatedCloseDate].'T'[Date]`, which no longer matches
+            # the accessor -- expansion silently stops firing and the column is
+            # refused as unresolvable. Expanding first is immune to the
+            # collision. (Tables without a Date column qualify fine either way.)
             qualified = _qualify_bare_column_refs(
-                spec["expression"], table_name, col_names)
+                expand_variation_accessors(spec["expression"]),
+                table_name, col_names)
             # Re-run the gate now that the column list is known. Only here can
             # it tell MIN('T'[Year]) from MIN('T'[Yeer]) -- the engine answers 0
             # for the misspelling rather than failing, so without this the

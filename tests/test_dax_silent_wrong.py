@@ -625,3 +625,45 @@ class TestVariationAccessorAgainstDesktop:
         wrong = [i for i, r in enumerate(td["rows"])
                  if norm(r[di]) != norm(vals[i])]
         assert wrong == [], f"{len(wrong)} of {len(vals)} rows differ from Desktop"
+
+
+class TestVariationAccessorSurvivesQualification:
+    """The accessor must be expanded BEFORE bare references are qualified.
+
+    `_qualify_bare_column_refs` rewrites a bare `[Name]` to `'T'[Name]` when
+    Name is a column of the table. If the table has a real column named `Date`
+    -- extremely common on fact tables -- then in
+    `'Fact'[EstimatedCloseDate].[Date]` the accessor's own `[Date]` looks
+    exactly like that and qualifies to
+    `'Fact'[EstimatedCloseDate].'Fact'[Date]`, which no longer matches
+    `_VARIATION_ACCESSOR`. Expansion then silently stops firing and the column
+    is refused as unresolvable.
+
+    A table WITHOUT a Date column is unaffected, which is why the corpus file
+    that motivated the accessor work passes either way -- this guards the
+    collision case, not that file.
+    """
+
+    def test_qualification_mangles_the_accessor_on_name_collision(self):
+        """Guards the guard: if this stops holding, the ordering is moot."""
+        expr = "'Fact'[EstimatedCloseDate].[Date]"
+        assert server._qualify_bare_column_refs(
+            expr, "Fact", ["EstimatedCloseDate"]) == expr
+        assert server._qualify_bare_column_refs(
+            expr, "Fact", ["EstimatedCloseDate", "Date"]) == (
+                "'Fact'[EstimatedCloseDate].'Fact'[Date]")
+
+    def test_materialization_expands_despite_a_colliding_date_column(self):
+        """Fails if expansion runs after qualification."""
+        import datetime as _dt
+        cols = [{"name": "EstimatedCloseDate", "data_type": "DateTime"},
+                {"name": "Date", "data_type": "String"}]
+        rows = [{"EstimatedCloseDate": _dt.datetime(2024, 3, 5, 14, 30),
+                 "Date": "x"},
+                {"EstimatedCloseDate": _dt.datetime(2023, 7, 19), "Date": "y"}]
+        _c, out, _r = server._materialize_table_calc_columns(
+            "Fact", cols, rows,
+            [{"column": "CloseDay",
+              "expression": "'Fact'[EstimatedCloseDate].[Date]"}], [])
+        assert [r["CloseDay"] for r in out] == [
+            _dt.datetime(2024, 3, 5), _dt.datetime(2023, 7, 19)]

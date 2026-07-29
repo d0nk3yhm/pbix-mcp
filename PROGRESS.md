@@ -8,7 +8,7 @@ and how, what is left, and the traps already hit so they are not re-hit.
 | issue | state |
 |---|---|
 | **#3** service verification of the rebuild path | **CLOSED** — all 3 schema eras verified live in Power BI Desktop |
-| **#4** calc columns blocking corpus files | partial — 14/24 files OK (was 11); group (a) .[Date] DONE, 2 groups left |
+| **#4** calc columns blocking corpus files | partial — 15/24 files OK (was 11); group (a) .[Date] DONE, 2 groups left |
 | **#5** columns fail to decode | **root-caused, fixed, tested** — pending sweep + release |
 | **#6** DAX perf / compiled expression tree | not started — but the bottleneck is now MEASURED, see below |
 | **#7** calc groups, translations, detail-rows | not started |
@@ -231,7 +231,31 @@ when specifically testing them.
     NOT expanded — they map to auto-date template columns with locale-dependent
     display strings. Each is confirmed to **refuse**, never materialize a guess.
   * 8 tests; 3 fail against the previous release.
-* Gates at this point: ruff clean, mypy 140 (baseline), **1007 unit tests pass**.
+  * `MS_Revenue_Opportunities.pbix` now **OK** → **15/24**. Sweep clean:
+    0 fidelity findings.
+* **Ordering fix in `_materialize_table_calc_columns`** — expand the accessor
+  BEFORE `_qualify_bare_column_refs`. This is a *separate latent* bug, NOT what
+  unblocked the file above (I first claimed it was; wrong — see the trap below).
+  When the table also has a real column named `Date`, the qualifier reads the
+  accessor's own `[Date]` as a bare same-table reference and rewrites it to
+  `'T'[Close].'T'[Date]`, which stops matching `_VARIATION_ACCESSOR` — expansion
+  silently stops firing and the column is refused. Common shape on fact tables.
 
-Next: finish the 21-file regression sweep, release #5 + `.[Date]` together,
-close #5, then #4 group (b) cross-table refs.
+### Trap: a repro built with inputs the real path never passes
+
+I diagnosed the above from a hand-built `col_names` that included `Date`, saw
+`'Fact'[EstimatedCloseDate].'Fact'[Date]`, and concluded that was why the file
+was refused. Instrumenting the **real** call showed `col_names` has no `Date`
+at that point, so the qualifier leaves the accessor alone. Reverting only the
+server.py edit still left the file OK — the `calc_tables.py` expansion alone
+fixed it.
+
+The first regression test I wrote passed with AND without the fix, because it
+inherited the same wrong `col_names`. **A test that passes both ways proves
+nothing** — always run it against the reverted fix. The kept test uses
+`col_names` containing `Date` and is confirmed to fail without the ordering fix.
+
+* Gates at this point: ruff clean, mypy 140 (baseline), **1009 unit tests pass**.
+
+Next: release #5 + `.[Date]` together, close #5, then #4 group (b) cross-table
+refs.
