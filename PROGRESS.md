@@ -667,3 +667,55 @@ still binds. The refusal is asserted not to mutate the visual.
   present at the 0.9.39 audit") rather than bumped to 127 — bumping them would
   have claimed the newer tools were audited when they were not. These landed
   AFTER the v0.9.58 tag, so the 0.9.58 artifacts still carry the old counts.
+
+# 0.9.59 — OpenBI findings #18 (the guard rail), and the #19 verdict
+
+Asked whether findings #19 was fully closed. Verified it, and in checking whether
+anything ELSE was outstanding found that #18 was not — it had been read as "no
+action needed" because OpenBI had already fixed their own side, but its suggested
+guard rail was never implemented here, and the defect was live in 0.9.58.
+
+## #19 — closed, verified against Desktop's own binding
+
+Diffed the SHIPPED 0.9.58 output against the Desktop-authored ground truth in
+OpenBI's `workspace/field_param_demo.pbix` (visual index 1) — the file a human
+rebound by hand in Desktop and saved. All 8 sub-pieces of the 5 documented pieces
+MATCH: projections.Y, NativeReferenceName, Select node kind,
+queryFieldParametersByRole, columnProperties, query From entities, the Where
+clause, sourceFieldParameters. Suggestions 1-3 all delivered (helper, warning on
+the naive shape in both add_visual and update_visual_json, docs).
+
+The one item not implemented is by-NAME visual addressing (`visual_index/name`).
+That is not a gap: all seven sibling visual-targeting tools
+(format_visual, set_visual_property, remove_visual, update_visual_json,
+move_visual, set_visual_sort, get_visual_detail) are index-only, so adding it to
+this one tool alone would break the convention.
+
+## #18 — was NOT closed; now fixed
+
+`get_column_data`'s memo was keyed `(table, column)` with no filter component,
+while `_measure_cache`'s key already carried a filter fingerprint. That asymmetry
+was the defect: re-pointing one context per grouping served the first grouping's
+members forever. Reproduced on shipped 0.9.58, fixed by making `filter_context` a
+property whose setter clears the column memo, re-verified on shipped 0.9.59.
+
+`_measure_cache` is deliberately left alone — its entries are filter-tagged, so
+clearing it would only cost the fast path. Two of the four regression tests exist
+purely to hold that line (memo still serves repeat calls; measure cache survives
+assignment); they pass both pre- and post-fix by design.
+
+## Traps hit
+
+* **"All issues closed" meant the GitHub tracker only.** The OpenBI findings docs
+  (`D:\OpenBIv2\openbi\openbi\docs\pbix-mcp-issues-*.md`) are a separate stream,
+  and #18 was sitting in it unaddressed. Check both before claiming clear.
+* **"Not a request to change behaviour" is not the same as "nothing to do".**
+  #18 opened by saying OpenBI had already worked around it; the actionable part
+  was three suggested guard rails further down. A report that is polite about its
+  own severity still has to be read to the end.
+* **A hand-built DAXContext fixture failed for the wrong reason.** `tables[t]
+  ["columns"]` is a list of NAME STRINGS, not column dicts; passing dicts blew up
+  in `_auto_detect_date_table` with `'dict' object has no attribute 'lower'`, so
+  the new tests failed even WITH the fix. Copy an existing fixture's shape rather
+  than inventing one, and always check that a new test fails for the reason you
+  intend.
