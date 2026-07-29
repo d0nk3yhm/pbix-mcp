@@ -135,7 +135,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | ABF archive manipulation | **Stable** | List, extract, replace internal files |
 | DataMashup (M code) editing | **Stable** | Read/write Power Query expressions |
 | File save/repack | **Stable** | Auto-backup on overwrite, SecurityBindings auto-removed, optional MSIP sensitivity label stripping |
-| Calculated column evaluation | **Beta** | Per-row DAX expression evaluation; tested with synthetic data |
+| Calculated column evaluation | **Stable** | Per-row DAX evaluation, re-evaluated across a rebuild. Supports row-context expressions over the table's own columns, whole-column aggregates, the auto date/time `X.[Date]` accessor, `LOOKUPVALUE`, `RELATED` (single unambiguous many-to-one path), and `CALCULATE(<agg>, FILTER(<own table>, <predicate>))` incl. `EARLIER` — the predicate is compiled to a hash index or a prefix aggregate, so a 1.7M-row table costs one lookup per row. Verified against the values Power BI Desktop itself stored in a 24-report corpus. Anything it cannot reproduce EXACTLY is refused with a reason, never materialized with a guess |
 | Password extraction | **Beta** | Regex scan of DAX measures for embedded passwords |
 | Row-Level Security (RLS) | **Stable** | Read, write, and evaluate RLS roles. `set_rls_role` uses binary splice — roles persist across save/reopen. MAXID-based ID allocation. Verified on PBI Desktop files |
 | Bookmark creation | **Beta** | Create/remove bookmarks with page targeting and visual visibility state |
