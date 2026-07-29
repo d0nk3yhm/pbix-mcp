@@ -53,7 +53,10 @@ columns across the corpus were silently discarded on read** — including
 - `VAR … RETURN [Col]` was refused as *"references another table 'RETURN'"* — the bare
   word before `[` was read as a table name, rejecting the most common modern DAX idiom.
 
-**Corpus: PENDING_SWEEP files now rebuild** (was 11 at the start of this work).
+**Corpus: 23 of 24 files now rebuild** (was 11 at the start of this work). The
+one refusal is `MS_Perf_Analyzer`, whose `Events[Path]` uses `PATH` — a genuine
+table scan this engine does not implement, refused deliberately rather than
+guessed.
 
 ### Four silent-wrong-value bugs in the DAX engine
 
@@ -100,9 +103,23 @@ surfaced it. Verified against Desktop's own engine: `INFO.CALCULATIONGROUPS()` a
 
 ### Performance
 
-Calculated-column evaluation caches ISO-date string coercion (~12x on that path).
-Dates reach the evaluator as ISO strings, so a wide table re-parsed the same handful
-of dates millions of times.
+Two changes to calculated-column evaluation, both value-identical (checked against
+Desktop's stored values, 90 columns, 0 mismatches):
+
+- ISO-date string coercion is cached — dates reach the evaluator as ISO strings, so
+  a wide table re-parsed the same handful of dates millions of times (~12x on that
+  path).
+- A plain row expression is a pure function of the columns it names, so results are
+  memoized on the tuple of those values. `IF([Age]<30,1,IF([Age]<50,2,3))` over
+  1,290,259 rows has about 80 distinct ages; the evaluator had been re-parsing the
+  substituted expression text every single row. Not applied when a CALCULATE,
+  RELATED or LOOKUPVALUE mask is present, since those read columns that need not
+  appear in the masked text.
+
+`MS_Employee_Hiring` (5 calculated columns over 1,290,259 rows) went from over an
+hour — it never completed — to **1053s**. `MS_Human_Resources` 1046s,
+`MS_Life_Expectancy` 415s, `MS_Store_Sales` 222s; the rest of the corpus is seconds.
+Per-row evaluation is still the bottleneck for wide tables, which is issue #6.
 
 ### Known limitation
 
