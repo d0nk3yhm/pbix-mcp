@@ -10,11 +10,14 @@ and how, what is left, and the traps already hit so they are not re-hit.
 | **#3** service verification of the rebuild path | **CLOSED** — all 3 schema eras verified live in Power BI Desktop |
 | **#4** calc columns blocking corpus files | groups (a) `.[Date]`, (b) LOOKUPVALUE + RELATED, (c) CALCULATE/FILTER all **DONE** |
 | **#5** columns fail to decode | **root-caused, fixed, tested, committed** |
-| **#6** DAX perf / compiled expression tree | not started — bottleneck MEASURED, see below |
+| **#6** DAX perf / compiled expression tree | partial — two memoizations landed (1h+ -> 1053s on a 1.29M-row file); the compiled tree itself is still open |
 | **#7** calc groups, translations, detail-rows | **DONE** — verified live in Desktop via INFO.CALCULATIONGROUPS() |
 
-Released 07-28: **0.9.50–0.9.53** (PyPI + GitHub, CI green). Work since then is
-committed but **not yet released**.
+Released 07-28: **0.9.50-0.9.53**. **0.9.54** closes #4, #5 and #7.
+
+**Corpus: 23 of 24 rebuild** (was 11). The one refusal is MS_Perf_Analyzer's
+ = , a genuine table scan this engine does not
+implement -- refused deliberately, not a bug.
 
 ## Verifying against Desktop WITHOUT opening Desktop
 
