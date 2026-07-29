@@ -242,3 +242,29 @@ class TestParenthesesInColumnNames:
             cols, [list(r) for r in rows], e, "Indicators", snap, [])
         assert err is None
         assert vals == ["high", "low"]
+
+
+class TestNestedMaskScopeIsCurrentRow:
+    """A RELATED mask inside a LOOKUPVALUE search value must resolve against
+    THIS row's scope. The scope used to be installed after the LOOKUPVALUE
+    resolution, so the nested mask read the PREVIOUS row's value -- every row
+    silently materialized the previous row's lookup result, shifted by one.
+    Found by adversarial review; Desktop ground truth is the unshifted chain.
+    """
+
+    def test_related_inside_lookupvalue_uses_this_rows_value(self):
+        rels = [{"FromTable": "T", "FromColumn": "fk",
+                 "ToTable": "Third", "ToColumn": "key", "IsActive": 1}]
+        snap = {
+            "T": {"columns": ["id", "fk"],
+                  "rows": [[10, 1], [11, 2], [12, 3]]},
+            "Third": {"columns": ["key", "K2"],
+                      "rows": [[1, "A"], [2, "B"], [3, "C"]]},
+            "Other": {"columns": ["Key", "Val"],
+                      "rows": [["A", "vA"], ["B", "vB"], ["C", "vC"]]},
+        }
+        e = "LOOKUPVALUE(Other[Val], Other[Key], RELATED(Third[K2]))"
+        vals, err = evaluate_row_context_column(
+            ["id", "fk"], [[10, 1], [11, 2], [12, 3]], e, "T", snap, rels)
+        assert err is None
+        assert vals == ["vA", "vB", "vC"]  # NOT [None, "vA", "vB"]

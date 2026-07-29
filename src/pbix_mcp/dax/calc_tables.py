@@ -1771,6 +1771,15 @@ def evaluate_row_context_column(
                     return None, (
                         f"RELATED joins on a column '{fk}' that is not in "
                         f"this row")
+            # Install THIS row's scope BEFORE resolving LOOKUPVALUEs: a
+            # RELATED/CALCULATE mask can sit inside a LOOKUPVALUE search value
+            # (the gate admits it), and _lv_row_value evaluates that value
+            # through the engine. Installing the scope after the loop made the
+            # nested mask resolve against the PREVIOUS row's scope -- every
+            # row silently materialized the previous row's lookup result,
+            # shifted by one. The LV results join the same dict, so the main
+            # evaluation below sees them too.
+            engine._current_var_scope = scope
             for n, spec in enumerate(lv_specs):
                 val, lv_err = _lv_row_value(
                     spec, lv_index[n], row_data, target_table, engine,
@@ -1778,7 +1787,6 @@ def evaluate_row_context_column(
                 if lv_err:
                     return None, lv_err
                 scope[_LV_MASK.format(n)] = val
-            engine._current_var_scope = scope
         try:
             ctx = dax_engine.DAXContext(
                 all_tables, {}, None, None, None, relationships or [])
