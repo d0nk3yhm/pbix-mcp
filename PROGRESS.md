@@ -554,3 +554,66 @@ gate no longer swallows crashes, and seven verified-stale doc claims fixed.
 `gh issue list --state open` returns nothing. Remaining known limits are
 documented in docs/limitations.md (PATH/RANKX refusals on MS_Perf_Analyzer,
 DateTime sub-microsecond serials, xmhuffman/3.14).
+
+---
+
+# Session 2026-07-29 (evening) — 0.9.56 / 0.9.57
+
+## 0.9.56 — verification + sync
+
+Issue #5's fix had never been GUI-confirmed (PROGRESS.md said so and listed the
+check as outstanding). Done now: both files opened in Power BI Desktop, engine
+queried over ADOMD. `MS_Corporate_Spend` `Fact` matches on all 8 aggregates
+including `SUM 4203674047.3179` to the last digit; `MS_Employee_Hiring`
+`Employee` matches on all 9 across 1,290,259 rows. Because equal aggregates can
+hide unequal data, also VALUE-level on the three columns the bug corrupted:
+`Gender` C 590,639 / D 699,620, `FP` F 631,127 / P 659,132, the six earliest
+dates with exact counts, `Age` SUM/AVG/COUNT. Every distinct value and row
+count identical.
+
+Also a genuine sync gap: `v0.9.55` sat two doc commits behind `main`, so tag,
+branch and package pointed at three different trees. A published tag cannot be
+moved (PyPI rejects a duplicate version; pinned consumers break), so 0.9.56 was
+cut from the tip. **And the F: mirror was 26 files stale** — every earlier
+"F: synced" had copied a hand-picked list, never the full tracked set. Now
+audited file-by-file (0 of 118 out-of-sync) and re-checked AFTER the version
+bump, which caught 4 more the bump had just invalidated.
+
+## 0.9.57 — issue #8, field-parameter visual binding
+
+From OpenBI findings #19, which arrived with Desktop-authored ground truth.
+`pbix_datamodel_add_field_parameter` owned the model half; there was no way to
+author the REPORT half, and the naive shape (the parameter's display column
+straight into a projection) makes Desktop silently degrade the well to an
+implicit "Count of Metric" — plausible bars, wrong semantics, no error.
+
+`pbix_bind_field_parameter` authors all five pieces; each was structurally
+diffed against the ground truth and came back IDENTICAL (projections,
+`queryFieldParametersByRole`, `columnProperties`, the compiled query's
+parameter join + `Where` over the hidden `"<name> Fields"` column with the
+NAMEOF triple-quoted literal, and `dataTransforms.sourceFieldParameters`).
+The compile lives in `report_binding.compile_visual_binding`, so future
+recompile paths preserve the wiring instead of dropping it.
+
+Desktop-verified: a from-scratch file renders "Revenue, Units and Profit by
+Month" with all three parameter fields as series — the real expansion, not the
+Count. `pbix_add_visual`/`pbix_update_visual_json` now warn on the naive shape,
+including after the compiler has wrapped it in implicit `CountNonNull(...)`
+(the degradation in flight). 127 tools; shape documented in rich-content.md.
+
+## Traps hit
+
+* **A cancelled release almost shipped a CHANGELOG-less tree.** The heredoc
+  writing the 0.9.57 entry died on the triple-quoted NAMEOF literal, so the
+  commit landed without it and the tag was already pushed. Caught it in the
+  Release run's first seconds, cancelled before `publish-pypi`, wrote the entry
+  via a file-based patch (never a shell heredoc for content with quotes), then
+  moved the tag. Verified afterwards that the SHIPPED sdist contains the entry.
+* **An empty workflow result is not a clean bill of health.** The adversarial
+  review of the new tool returned `{actionable: [], speculative: []}` — because
+  all three agents died on API 529 before running. Read the failures block, not
+  just the result.
+* GUI automation: dismissing Desktop's "Enter your email address" modal needs a
+  click GUARDED by `WindowFromPoint` resolving to the PBIDesktop process. An
+  unguarded `SendKeys` went to the user's browser instead.
+
