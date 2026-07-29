@@ -183,6 +183,19 @@ selection — a display name (`"Revenue"`) or a ref (`"Sales[Total Revenue]"`)
 the bound chart field-swaps (all fields as series when nothing is selected,
 the chosen field after a slicer pick), instead of the degraded Count.
 
+Two things the tool handles for you:
+
+- **Rebinding a sorted well.** Rebinding drops the select it replaces. If a
+  prior `pbix_set_visual_sort` targeted that field, the OrderBy is re-pointed
+  at the newly bound field — otherwise the compiled query would order by a
+  field it no longer selects. Desktop-verified: rebinding a Revenue-sorted
+  well to Units renders sorted descending by Units.
+- **Visuals with no field wells are refused.** `textbox`, `image`, `shape`,
+  `basicShape` and `actionButton` have no roles for a parameter to swap;
+  binding one used to "succeed" and leave the textbox carrying a query.
+  Unrecognized types (custom visuals) are assumed to have wells and still
+  bind.
+
 ## Reading Desktop rich content back
 
 `read_table_from_abf` (and everything built on it: `pbix_get_table_data`,

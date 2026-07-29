@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.58] - 2026-07-29
+
+Two defects in `pbix_bind_field_parameter` (shipped in 0.9.57), both found by
+adversarial probing of the shapes the happy-path tests did not cover.
+
+### Rebinding a sorted well left a DANGLING OrderBy
+
+`pbix_bind_field_parameter` drops the select it replaces. If a prior
+`pbix_set_visual_sort` had targeted that field, the compiled query kept ordering
+by a field it no longer selected:
+
+```
+sort  Y (Sales[Total Revenue]) desc
+rebind Y -> Sales[Total Units]
+  Select  = [Sales.Month, Sales.Total Units]
+  OrderBy = Sales.Total Revenue        <-- not in Select
+```
+
+The rebind now re-points such an OrderBy at the newly bound field, preserving
+the user's intent to sort by the value axis rather than silently dropping the
+sort.
+
+**Verified in Power BI Desktop**: a from-scratch file that sorts by Revenue desc
+and then rebinds the well to Units opens clean and renders sorted DESC by
+**Total Units** — Feb (30), Jan (20), Mar (10). The fixture's rows are chosen so
+the two orders are opposites (Revenue desc would be Mar, Jan, Feb), which makes
+the sort field unambiguous on screen.
+
+### Binding to a visual with no field wells is now refused
+
+Binding a field parameter to a `textbox` "succeeded", leaving the textbox
+carrying a `query`, `dataTransforms` and a `Y` projection — structurally
+incoherent, and `pbix_doctor` does not flag it. The tool now refuses for the
+built-in types that provably have no data roles (`textbox`, `image`, `shape`,
+`basicShape`, `actionButton`) and names the visual type in the message. The
+check is deliberately narrow: an unrecognized type (any custom visual) is
+assumed to have wells, so it still binds.
+
 ## [0.9.57] - 2026-07-29
 
 Closes issue **#8** (from OpenBI service-verification findings #19): there was no

@@ -251,3 +251,71 @@ class TestSavedRoundTrip:
             assert os.path.getsize(out) > 0
         finally:
             server.pbix_close(alias2, force=True)
+
+
+class TestSortInteraction:
+    """Rebinding must not leave the compiled query ordering by a field it no
+    longer selects. Found by adversarial probing after 0.9.57 shipped: after
+    pbix_set_visual_sort on the bound field, rebinding Y to a different field
+    dropped that select but left the OrderBy pointing at it — a dangling
+    reference in the compiled query.
+    """
+
+    def _bound_and_sorted(self, alias):
+        r = json.loads(server.pbix_bind_field_parameter(
+            alias, 0, 0, "Y", "Metric", initial_field="Revenue"))
+        assert r.get("success"), r
+        r = json.loads(server.pbix_set_visual_sort(
+            alias, 0, 0, "Sales.Total Revenue", "desc"))
+        assert r.get("success"), r
+
+    def test_wiring_survives_a_resort(self, fp_report):
+        alias = fp_report
+        self._bound_and_sorted(alias)
+        config, query, _dt = _visual(alias, 0)
+        sv = config["singleVisual"]
+        assert "queryFieldParametersByRole" in sv
+        q = query["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
+        assert q.get("Where"), "the parameter Where clause was lost by re-sort"
+
+    def test_rebind_leaves_no_dangling_order_by(self, fp_report):
+        alias = fp_report
+        self._bound_and_sorted(alias)
+        r = json.loads(server.pbix_bind_field_parameter(
+            alias, 0, 0, "Y", "Metric", initial_field="Units"))
+        assert r.get("success"), r
+        config, query, _dt = _visual(alias, 0)
+        sv = config["singleVisual"]
+        selects = {s["Name"] for s in sv["prototypeQuery"]["Select"]}
+        assert "Sales.Total Revenue" not in selects  # replaced
+        q = query["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
+        blob = json.dumps(q.get("OrderBy") or [])
+        # the OrderBy must point at the NEW field, never the dropped one
+        assert "Total Revenue" not in blob, f"dangling OrderBy: {blob}"
+        assert "Total Units" in blob, f"sort intent lost: {blob}"
+
+class TestNoDataRoleVisuals:
+    """A visual with no field wells cannot host a field parameter. This used to
+    "succeed", leaving a textbox carrying a query + dataTransforms + a Y
+    projection -- incoherent, and pbix_doctor does not flag it."""
+
+    @pytest.mark.parametrize("vtype", ["textbox", "image", "shape"])
+    def test_refused_and_visual_left_untouched(self, fp_report, vtype):
+        alias = fp_report
+        r = json.loads(server.pbix_add_visual(
+            alias, 0, vtype, 10, 10, 200, 60, ""))
+        assert r.get("success"), r
+        before = _visual(alias, 1)
+        r = json.loads(server.pbix_bind_field_parameter(
+            alias, 0, 1, "Y", "Metric"))
+        assert not r.get("success"), r
+        assert "no field wells" in r.get("message", "")
+        after = _visual(alias, 1)
+        assert after == before, "a refused bind must not mutate the visual"
+        assert after[1] is None, "a non-data visual must not gain a query"
+
+    def test_a_real_data_visual_still_binds(self, fp_report):
+        """The guard must not catch anything with wells."""
+        r = json.loads(server.pbix_bind_field_parameter(
+            fp_report, 0, 0, "Y", "Metric"))
+        assert r.get("success"), r
