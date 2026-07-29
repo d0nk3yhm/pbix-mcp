@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.59] - 2026-07-30
+
+Closes the guard rail requested in OpenBI findings **#18**: re-pointing one
+`DAXContext` across groupings returned the FIRST grouping's column members for
+every later grouping — silently.
+
+### `get_column_data`'s memo now follows the filter context
+
+0.9.55 memoized `get_column_data` per `(table, column)`, valid only for the
+filter set in force when it was populated. `filter_context` is a public writable
+attribute, so this caller pattern — correct through 0.9.54 — went quietly wrong:
+
+```python
+for cat in ["Books", "Clothing", "Electronics"]:
+    ctx.filter_context = {"Categories.CategoryName": [cat]}   # reuse + re-point
+    print(cat, sorted(set(ctx.get_column_data("Products", "ProductName"))))
+# 0.9.55-0.9.58: Books' products printed three times
+```
+
+`filter_context` is now a property whose setter clears the column memo, so
+assignment is a supported way to re-point a context. No exception was raised and
+the parent subtotals still reconciled, which is the combination that lets this
+survive review — OpenBI hit it in a two-level matrix where only the child rows
+were wrong.
+
+`_measure_cache` is deliberately NOT cleared: its key already carries a
+filter-context fingerprint, so its entries stay valid and re-pointing back keeps
+the fast path. That asymmetry between the two memos was the actual defect.
+
+**Not** covered, and now documented on the property: mutating the dict in place
+(`ctx.filter_context[k] = v`) cannot be observed by any memo. Assign a new dict,
+or use `with_filters()` / `without_filters()`.
+
+The issue-#6 win is intact — the setter fires once per assignment, not per call.
+Measured on `Agents_Performance.pbix`: 524-539 ms per measure with the guard
+rail, 540-598 ms without.
+
 ## [0.9.58] - 2026-07-29
 
 Two defects in `pbix_bind_field_parameter` (shipped in 0.9.57), both found by
