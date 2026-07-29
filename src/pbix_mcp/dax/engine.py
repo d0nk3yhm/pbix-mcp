@@ -61,23 +61,71 @@ _AGG_CALL_RE = re.compile(
 )
 
 
+# Only an ISO-ish date shape may be read as a number by _as_number; a plain
+# word must stay non-numeric.
+# Fractional seconds included: the row-context evaluator substitutes dates
+# with datetime.isoformat(), which keeps microseconds. Omitting them made
+# every microsecond-precision timestamp non-numeric, so `[end] * 86400000`
+# came out BLANK on all 117 rows of a real trace table.
+_ISO_DATEISH = re.compile(
+    r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?$")
+
+
 def _as_number(v):
-    """Best-effort numeric coercion; None when the value isn't numeric."""
+    """Best-effort numeric coercion; None when the value isn't numeric.
+
+    A DATE is a number in DAX -- days since 1899-12-30, with the time of day as
+    the fraction -- which is what makes the common `[Timestamp] * 86400000`
+    milliseconds idiom work. Without this, dates coerced to nothing and every
+    such column silently materialised BLANK or 0 instead of a value.
+
+    Dates also arrive here as ISO STRINGS: the calculated-column evaluator
+    substitutes a row's date as a quoted literal, since bare
+    `2024-01-15 00:00:00` is not parseable DAX.
+    """
     if isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
         return float(v)
+    if isinstance(v, datetime):
+        return (v - datetime(1899, 12, 30)).total_seconds() / 86400.0
+    if isinstance(v, date):
+        return float((v - date(1899, 12, 30)).days)
     if isinstance(v, str):
+        s = v.strip()
         try:
-            return float(v.strip())
+            return float(s)
         except ValueError:
-            return None
+            pass
+        # Only ISO-ish shapes, so an ordinary word is still "not a number".
+        if _ISO_DATEISH.match(s):
+            got = _as_datetime(s)
+            if got is not None:
+                return (got - datetime(1899, 12, 30)).total_seconds() / 86400.0
+        return None
     return None
 
 
 # A whole expression that is exactly one DAX string literal. Interior quotes
 # must be DOUBLED, which is how DAX escapes them.
 _FULL_STRING_LITERAL = re.compile(r'^"(?:[^"]|"")*"$')
+
+
+def _concat_str(v):
+    """Render a value for the DAX `&` operator.
+
+    `str(v or '')` dropped every FALSY value, so `"0" & 0` produced "0" instead
+    of "00" -- and the zero-padding idiom RIGHT("0" & n, 2) silently lost its
+    pad on exactly the rows where n was 0. Only BLANK renders as empty.
+    A whole float renders without the ".0" tail, as Power BI does.
+    """
+    if v is None:
+        return ''
+    if isinstance(v, bool):
+        return 'TRUE' if v else 'FALSE'
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
 
 
 def _as_date(v):
@@ -105,6 +153,16 @@ def _as_datetime(v):
         return datetime(v.year, v.month, v.day)
     if isinstance(v, str):
         s = v.strip()
+        # Fractional seconds FIRST, and matched against the whole string: the
+        # `s[:len(fmt) + 2]` truncation below silently discarded microseconds,
+        # so a timestamp came back rounded down to the second. On a trace table
+        # that turned `[end] * 86400000` into an answer 403 ms adrift of
+        # Desktop's on every row -- close enough to look right, and wrong.
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                return datetime.strptime(s, fmt)
+            except ValueError:
+                continue
         for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
                     "%d/%m/%Y", "%m/%d/%Y"):
             try:
@@ -1185,7 +1243,8 @@ class DAXEngine:
         if '&' in expr:
             parts = self._split_top_level(expr, '&')
             if len(parts) > 1:
-                results = [str(self._eval_expr(p.strip(), ctx, var_scope) or '') for p in parts]
+                results = [_concat_str(self._eval_expr(p.strip(), ctx, var_scope))
+                           for p in parts]
                 return ''.join(results)
 
         # Unary minus on a non-literal operand ("-S[D]", "-[Measure]",
@@ -1489,38 +1548,53 @@ class DAXEngine:
     def _eval_binary(self, expr: str, ctx: DAXContext, var_scope: dict | None = None) -> Any:
         """Evaluate binary arithmetic: +, -, *, /
         In DAX, BLANK is treated as 0 in arithmetic operations."""
-        # Split at lowest precedence first (+ and -)
+        # `+`/`-` and `*`/`/` are LEFT-associative. Evaluating parts[0] against
+        # the REJOINED tail made them right-associative, so `10 - 3 - 2` gave 9
+        # instead of 5 and `20 / 4 / 5` gave 25 instead of 1 -- wrong on every
+        # repeated subtraction or division, silently.
+        #
+        # Splitting on `+` before `-` (and `*` before `/`) is still correct:
+        # a - b + c groups as (a - b) + c, so each `-` chain folds on its own.
         for op in ['+', '-']:
             parts = self._split_operators(expr, op)
             if len(parts) > 1:
-                left = self._eval_expr(parts[0].strip(), ctx, var_scope)
-                right = self._eval_expr(op.join(parts[1:]).strip(), ctx, var_scope)
-                # DAX: BLANK treated as 0 in arithmetic
-                if left is None: left = 0
-                if right is None: right = 0
-                if isinstance(left, (int, float)) and isinstance(right, (int, float)):
-                    return left + right if op == '+' else left - right
-                return None
+                return self._fold_arith(parts, op, ctx, var_scope)
 
-        # Then * and /
         for op in ['*', '/']:
             parts = self._split_operators(expr, op)
             if len(parts) > 1:
-                left = self._eval_expr(parts[0].strip(), ctx, var_scope)
-                right = self._eval_expr(op.join(parts[1:]).strip(), ctx, var_scope)
-                # DAX: BLANK treated as 0 in arithmetic
-                if left is None: left = 0
-                if right is None: right = 0
-                if isinstance(left, (int, float)) and isinstance(right, (int, float)):
-                    if op == '*':
-                        return left * right
-                    elif right != 0:
-                        return left / right
-                    else:
-                        return None
-                return None
+                return self._fold_arith(parts, op, ctx, var_scope)
 
         return _NOT_APPLICABLE
+
+    def _fold_arith(self, parts, op, ctx, var_scope):
+        """Fold `parts` left-to-right with `op`, DAX-style."""
+        acc = self._eval_expr(parts[0].strip(), ctx, var_scope)
+        for p in parts[1:]:
+            rhs = self._eval_expr(p.strip(), ctx, var_scope)
+            # DAX: BLANK is 0 in arithmetic.
+            left = 0 if acc is None else acc
+            right = 0 if rhs is None else rhs
+            if not (isinstance(left, (int, float))
+                    and isinstance(right, (int, float))):
+                # A DATE is a number in DAX, and the row-context evaluator
+                # hands dates over as ISO strings, so coerce before giving up.
+                # Returning None here made `[end] - [start]` blank on every row
+                # of a datetime column.
+                left, right = _as_number(left), _as_number(right)
+                if left is None or right is None:
+                    return None
+            if op == '+':
+                acc = left + right
+            elif op == '-':
+                acc = left - right
+            elif op == '*':
+                acc = left * right
+            else:
+                if right == 0:
+                    return None
+                acc = left / right
+        return acc
 
     def _eval_comparison(self, expr: str, ctx: DAXContext, var_scope: dict | None = None) -> Any:
         """Evaluate comparison operators."""
@@ -2376,6 +2450,11 @@ class DAXEngine:
         ('yyyy', '%Y'), ('yy', '%y'), ('MMMM', '%B'), ('MMM', '%b'), ('MM', '%m'),
         ('dddd', '%A'), ('ddd', '%a'), ('dd', '%d'), ('HH', '%H'), ('hh', '%I'),
         ('mm', '%M'), ('ss', '%S'), ('AM/PM', '%p'), ('am/pm', '%p'),
+        # Power BI accepts the upper-case spellings too. Without them
+        # FORMAT(d, "YYYY-MM-DD") returned the literal "YYYY-01-DD": only MM
+        # matched, and the rest of the picture was copied through verbatim.
+        ('YYYY', '%Y'), ('YY', '%y'), ('DDDD', '%A'), ('DDD', '%a'),
+        ('DD', '%d'), ('SS', '%S'),
     )
 
     def _fn_format(self, args_str: str, ctx: DAXContext) -> Any:
@@ -2421,8 +2500,22 @@ class DAXEngine:
                 else:
                     decimals = 0
                 use_comma = ',' in fmt_str
-                formatted = f"{val:,.{decimals}f}" if use_comma else f"{val:.{decimals}f}"
-                return formatted
+                # Leading zeros: each '0' LEFT of the decimal point is a digit
+                # that must always be shown. FORMAT(1, "000") is "001", not
+                # "1" -- the padded form is how Power BI's own "New group"
+                # and sort-key columns are built, so getting it wrong changes
+                # sort order as well as display.
+                min_int = fmt_str.split('.')[0].count('0')
+                neg = val < 0
+                body = (f"{abs(val):,.{decimals}f}" if use_comma
+                        else f"{abs(val):.{decimals}f}")
+                int_part, _dot, dec_part = body.partition('.')
+                digits = int_part.replace(',', '')
+                if len(digits) < min_int:
+                    digits = '0' * (min_int - len(digits)) + digits
+                    int_part = (f"{int(digits):,}" if use_comma else digits)
+                formatted = int_part + ('.' + dec_part if dec_part else '')
+                return ('-' + formatted) if neg else formatted
             # "0.0%" style
             if fmt_str.endswith('%'):
                 inner_fmt = fmt_str[:-1]
