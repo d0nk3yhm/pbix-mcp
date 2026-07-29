@@ -1,4 +1,4 @@
-# Session progress — 2026-07-28
+# Session progress — 2026-07-28 → 07-29
 
 Working note for picking this back up. Records what was done, what is verified
 and how, what is left, and the traps already hit so they are not re-hit.
@@ -8,14 +8,40 @@ and how, what is left, and the traps already hit so they are not re-hit.
 | issue | state |
 |---|---|
 | **#3** service verification of the rebuild path | **CLOSED** — all 3 schema eras verified live in Power BI Desktop |
-| **#4** calc columns blocking corpus files | partial — 15/24 files OK (was 11); group (a) .[Date] DONE, 2 groups left |
-| **#5** columns fail to decode | **root-caused, fixed, tested** — pending sweep + release |
-| **#6** DAX perf / compiled expression tree | not started — but the bottleneck is now MEASURED, see below |
+| **#4** calc columns blocking corpus files | groups (a) `.[Date]`, (b) LOOKUPVALUE + RELATED, (c) CALCULATE/FILTER all **DONE** |
+| **#5** columns fail to decode | **root-caused, fixed, tested, committed** |
+| **#6** DAX perf / compiled expression tree | not started — bottleneck MEASURED, see below |
 | **#7** calc groups, translations, detail-rows | not started |
 
-Released today: **0.9.50, 0.9.51, 0.9.52, 0.9.53** (all on PyPI + GitHub, CI green).
+Released 07-28: **0.9.50–0.9.53** (PyPI + GitHub, CI green). Work since then is
+committed but **not yet released**.
 
-## The verification method that actually works
+## Verifying against Desktop WITHOUT opening Desktop
+
+The single most valuable tool this session. The corpus files were authored in
+Power BI Desktop, so a calculated column's **stored VertiPaq values ARE
+Desktop's answer**. Recomputing from the DAX and diffing them is exact ground
+truth, needs no GUI, and covers hundreds of thousands of rows at once.
+
+```
+scratchpad/gt_all.py    every calc column in the corpus vs Desktop's stored values
+scratchpad/lv_gt.py     the cross-table (LOOKUPVALUE / RELATED) subset
+```
+
+It found **four silent-wrong-value bugs the whole unit suite missed**. Run it
+after any change to the DAX engine or the calc-column evaluator.
+
+Two rules learned the hard way:
+
+* **Skip volatile expressions.** A `TODAY()` column's stored values were
+  computed when the file was last refreshed. `MS_AI_Sample`
+  `Opportunities[Days Remaining In Pipeline]` read as a 2467-row MISMATCH that
+  was purely the 973 days since authoring — every difference was exactly -973,
+  and the 2467 rows were exactly the `Status="Open"` ones. Not a bug.
+* **Qualify bare references first**, as `_materialize_table_calc_columns` does.
+  Without it the tool reports failures the real path never has.
+
+## Verifying against a LIVE Desktop (when the GUI is needed)
 
 Everything below was checked against **Power BI Desktop's own Analysis Services
 engine**, not against documentation and not against expectations.
@@ -259,3 +285,117 @@ nothing** — always run it against the reverted fix. The kept test uses
 
 Next: release #5 + `.[Date]` together, close #5, then #4 group (b) cross-table
 refs.
+
+---
+
+# Session 2026-07-29 — issue #4 finished, four engine bugs found
+
+## Issue #4 is complete: all three groups
+
+**(a) auto-date `.[Date]`** — `expand_variation_accessors` rewrites `X.[Date]`
+to `DATE(YEAR(X), MONTH(X), DAY(X))`. Applied in BOTH the gate and the
+evaluator so they cannot disagree, and **before** `_qualify_bare_column_refs`
+(see the trap below). Only `.[Date]` is expanded; `.[Year]`, `.[Month]`,
+`.[Quarter]`, `.[Day]`, `.[MonthNo]` map to auto-date template columns with
+locale-dependent display strings and are confirmed to REFUSE.
+
+**(b) cross-table refs** — LOOKUPVALUE and RELATED.
+
+* Both are parsed, validated against the model's real tables/columns, and
+  MASKED so the cross-table scan never sees them; the value sub-expressions are
+  pulled back out and re-gated on their own, so masking cannot smuggle an
+  unsupported expression past the gate.
+* Indexes are built ONCE per column, not per row.
+* LOOKUPVALUE: several matching rows are fine when they agree; genuinely
+  ambiguous matches are an ERROR in DAX, so the column is refused rather than
+  picking one. A miss yields the alternate result if supplied, else BLANK.
+  String matching is case-INSENSITIVE (Power BI's default collation).
+* RELATED walks many-to-one only (From → To in AMO) across ACTIVE
+  relationships. Two paths, no path, wrong direction, a bare `RELATED([Col])`,
+  or an inactive relationship are each refused, never guessed.
+* A caller that supplies neither `known_tables` nor `relationships` keeps the
+  old strictly-safe refusal, so nothing regressed for pure-python callers.
+
+**(c) CALCULATE / FILTER** — the semantic that makes it tractable: in a
+calculated column CALCULATE performs context transition, and a FILTER over that
+SAME table replaces the transitioned filter entirely. So `FILTER(T, cond)` and
+`FILTER(ALL(T), cond)` both reduce to *aggregate every row of T satisfying
+cond*. Confirmed against Desktop's stored values, not assumed.
+
+Performance mattered: `MS_Covid_Tracking`'s COVID table has **1,740,185 rows**,
+so a literal per-row scan is ~3e12 operations. The predicate is COMPILED
+instead:
+
+* equality terms → a hash index, one dict lookup per row;
+* one inequality → a prefix aggregate over each group sorted by that column,
+  answered with a bisect;
+* right-hand sides are memoised on just the columns they mention, so
+  `DATEADD(COVID[Date], -1, DAY)` costs one evaluation per distinct date.
+
+`VAR`s are inlined into the predicate so scoping is not reimplemented.
+
+## Four silent-wrong-value bugs the unit suite never saw
+
+All four were found by diffing against Desktop's stored values, and all four
+now have tests that fail against the previous code.
+
+1. **`-` and `/` were RIGHT-associative.** `_eval_binary` evaluated `parts[0]`
+   against the REJOINED tail: `10 - 3 - 2` → 9 instead of 5, `20 / 4 / 5` → 25
+   instead of 1. This hit **every measure and calculated column** containing a
+   repeated subtraction or division. Found because
+   `MS_Competitive_Marketing` `Date[Rolling Period]` disagreed with Desktop on
+   1096 of 6209 rows. Splitting on `+` before `-` is still correct, because
+   `a - b + c` groups as `(a - b) + c`; only the fold had to become left-to-right.
+2. **`&` rendered every FALSY value as empty** — `str(v or '')`. The
+   zero-padding idiom `RIGHT("0" & n, 2)` lost its pad on exactly the rows
+   where n was 0: `'P-00'` became `'P-0'`, 93 rows.
+3. **A DATE is a number in DAX** (days since 1899-12-30) but `_as_number`
+   returned None for one, so `[Timestamp] * 86400000` was BLANK on every row.
+   Dates reach the evaluator as ISO strings; `_as_datetime` also truncated the
+   fractional seconds, leaving timestamps rounded to the whole second.
+4. **FORMAT** ignored leading-zero pictures (`FORMAT(1, "000")` → `"1"`, not
+   `"001"` — which changes sort order, not just display) and recognised only
+   lower-case date tokens, so `FORMAT(d, "YYYY-MM-DD")` returned the literal
+   `"YYYY-01-DD"`.
+
+Plus a fifth, in the new code: an **unresolved column reference** inside a
+LOOKUPVALUE search value or a FILTER right-hand side reads as blank, matches
+nothing, and materialises BLANK rather than failing. `Events[ParentIndex]` was
+blank on 102 of 117 rows where Desktop had a value. Both paths now check
+`_unresolved_refs` after substitution and refuse.
+
+## Traps hit this session
+
+**A repro built with inputs the real path never passes.** I diagnosed the
+`.[Date]` refusal from a hand-built `col_names` that contained `Date`, saw the
+qualifier mangle the accessor, and concluded that was the cause. Instrumenting
+the REAL call showed `col_names` has no `Date` there. Reverting only the
+server.py edit left the file still OK — the `calc_tables.py` expansion alone
+fixed it. The ordering fix is real but guards a DIFFERENT, latent case (a table
+that also has a column named `Date`).
+
+**A test that passes both ways proves nothing.** The first regression test for
+that fix inherited the same wrong `col_names` and passed with AND without the
+fix. Always run a new test against the reverted fix.
+
+**The engine can answer with a non-scalar and not flag it.** `DATEADD` returns
+a marker tuple `('__DATEADD__', ...)` and registers nothing in
+`unsupported_functions`. Compared against index keys it simply never matched,
+so the CALCULATE collapsed to its empty result on every row. Filter values are
+now required to be scalars.
+
+## Known limitation
+
+DateTime columns decode to Python `datetime` (microsecond resolution) while
+VertiPaq stores a double serial. Scaling a timestamp to milliseconds therefore
+differs from Desktop in the sub-microsecond digits — e.g. `3796149882573.3325`
+vs `3796149882573.333`. Visible on `MS_Perf_Analyzer`'s trace tables, which are
+refused for other reasons (RANKX, PATH/PATHITEM) anyway.
+
+## Next
+
+1. Release the accumulated work (#4 + #5) and close both issues.
+2. **#7** — carry calculation groups / translations / detail-rows across a
+   rebuild; the test .pbix still has to be authored in Desktop.
+3. **#6** — compiled DAX expression tree. The CALCULATE compiler added here is
+   the same idea applied to one construct, and is a reasonable template.

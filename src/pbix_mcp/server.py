@@ -7440,6 +7440,43 @@ _CARRY_SPEC: list[tuple[str, dict[str, str], tuple[str, ...]]] = [
      ("ObjectID", "ObjectType", "Name")),
     ("ChangedProperty", {"ObjectID": "object"},
      ("ObjectID", "ObjectType", "Property")),
+    # --- features no corpus file exercises (issue #7) -----------------------
+    # A rebuild dropped every one of these silently, with success: true and an
+    # empty warnings list. Reproduced with a calculation group authored by this
+    # project's own pbix_datamodel_add_calculation_group: CalculationGroup,
+    # CalculationItem, Table.CalculationGroupID and the Type=7 partition all
+    # went to zero.
+    #
+    # These come AFTER FormatStringDefinition and PerspectiveTable above,
+    # because "self:" resolves against rows carried earlier in the same pass.
+    ("QueryGroup", {"ModelID": "model"}, ("ModelID", "Folder")),
+    ("CalculationGroup", {"TableID": "table"}, ("TableID",)),
+    ("CalculationItem",
+     {"CalculationGroupID": "self:CalculationGroup",
+      "FormatStringDefinitionID": "self:FormatStringDefinition?"},
+     ("CalculationGroupID", "Name")),
+    ("CalculationExpression",
+     {"CalculationGroupID": "self:CalculationGroup",
+      "FormatStringDefinitionID": "self:FormatStringDefinition?"},
+     ("CalculationGroupID",)),
+    ("Set", {"TableID": "table"}, ("TableID", "Name")),
+    ("PerspectiveSet", {"PerspectiveTableID": "self:PerspectiveTable",
+                        "SetID": "self:Set"},
+     ("PerspectiveTableID", "SetID")),
+    ("ObjectTranslation", {"CultureID": "culture", "ObjectID": "object"},
+     ("CultureID", "ObjectID", "ObjectType", "Property")),
+    ("DetailRowsDefinition", {"ObjectID": "object"},
+     ("ObjectID", "ObjectType")),
+    ("AlternateOf", {"ColumnID": "column", "BaseColumnID": "column?",
+                     "BaseTableID": "table?"}, ("ColumnID",)),
+    ("RefreshPolicy", {"TableID": "table"}, ("TableID",)),
+    ("Calendar", {"TableID": "table"}, ("TableID", "Name")),
+    ("TimeUnitColumnAssociation", {"CalendarID": "self:Calendar"},
+     ("CalendarID", "TimeUnit")),
+    ("CalendarColumnReference",
+     {"TimeUnitColumnAssociationID": "self:TimeUnitColumnAssociation",
+      "ColumnID": "column"}, ("TimeUnitColumnAssociationID", "ColumnID")),
+    ("AnalyticsAIMetadata", {"ModelID": "model"}, ("ModelID", "Name")),
 ]
 
 # What each carried table means to someone using the report, for the warning
@@ -7462,6 +7499,20 @@ _CARRY_MEANING = {
     "ExtendedProperty": "extended properties",
     "ChangedProperty": "changed-property bookkeeping",
     "Function": "user-defined DAX functions",
+    "QueryGroup": "query display folders",
+    "CalculationGroup": "calculation groups",
+    "CalculationItem": "calculation groups",
+    "CalculationExpression": "calculation groups",
+    "Set": "named sets",
+    "PerspectiveSet": "named sets in perspectives",
+    "ObjectTranslation": "translated names for other languages",
+    "DetailRowsDefinition": "detail-rows / drill-through expressions",
+    "AlternateOf": "aggregation-table wiring",
+    "RefreshPolicy": "incremental refresh policies",
+    "Calendar": "calendars",
+    "TimeUnitColumnAssociation": "calendar time-unit associations",
+    "CalendarColumnReference": "calendar column references",
+    "AnalyticsAIMetadata": "AI analytics metadata",
 }
 
 
@@ -7830,7 +7881,9 @@ def _snapshot_carryable_metadata(conn: sqlite3.Connection) -> dict:
                     d[col] = None
                     continue
                 if kind.startswith("self:"):
-                    d[col] = ("#self", kind[5:], val)
+                    # Strip a trailing "?" so the remap key is the real table
+                    # name; the "?" only says the reference is OPTIONAL.
+                    d[col] = ("#self", kind[5:].rstrip("?"), val)
                     continue
                 ident = fwd.get(val)
                 if ident is None:
@@ -7900,8 +7953,14 @@ def _restore_carryable_metadata(dm_path: str, snap: dict) -> list[str]:
                     elif isinstance(val, tuple) and val and val[0] == "#self":
                         new = remap.get(val[1], {}).get(val[2])
                         if new is None:
-                            ok = False
-                            break
+                            # An OPTIONAL self reference drops to NULL rather
+                            # than taking its whole row down with it: a
+                            # calculation item should survive losing its format
+                            # string, not vanish because of it.
+                            ok = fks.get(col, "").endswith("?")
+                            if not ok:
+                                break
+                            new = None
                         resolved[col] = new
                     else:
                         resolved[col] = val
@@ -7932,6 +7991,26 @@ def _restore_carryable_metadata(dm_path: str, snap: dict) -> list[str]:
                 )
                 if old_id is not None:
                     remap.setdefault(tname, {})[old_id] = max_id
+
+        # A calculation group is wired up from BOTH ends, and the rebuild only
+        # rewrites one of them. Carrying the CalculationGroup row back is not
+        # enough: [Table].CalculationGroupID points the other way, and a
+        # calculation group's partition must be Type=7 (CalculationGroup
+        # source). Without these two the model loads with the group's table
+        # present but inert -- the items never appear.
+        try:
+            groups = c.execute(
+                "SELECT ID, TableID FROM [CalculationGroup]").fetchall()
+        except sqlite3.Error:
+            groups = []
+        for g in groups:
+            try:
+                c.execute("UPDATE [Table] SET CalculationGroupID = ? "
+                          "WHERE ID = ?", (g["ID"], g["TableID"]))
+                c.execute("UPDATE [Partition] SET Type = 7 WHERE TableID = ?",
+                          (g["TableID"],))
+            except sqlite3.Error:
+                pass
 
         # Re-point the singleton references at the rows just re-created.
         singles = snap.get("__singletons__") or {}
