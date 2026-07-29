@@ -617,3 +617,53 @@ including after the compiler has wrapped it in implicit `CountNonNull(...)`
   click GUARDED by `WindowFromPoint` resolving to the PBIDesktop process. An
   unguarded `SendKeys` went to the user's browser instead.
 
+# 0.9.58 — the two defects my own tests missed
+
+The 0.9.57 tests covered the happy path and the refusals. Probing the shapes
+they did NOT cover found two real defects in `pbix_bind_field_parameter`.
+
+## Rebinding a sorted well left a dangling OrderBy
+
+`pbix_bind_field_parameter` drops the select it replaces. A prior
+`pbix_set_visual_sort` on that field then left the compiled query ordering by a
+field no longer in `Select`:
+
+```
+sort   Y (Sales[Total Revenue]) desc
+rebind Y -> Sales[Total Units]
+  Select  = [Sales.Month, Sales.Total Units]
+  OrderBy = Sales.Total Revenue          <-- dangling
+```
+
+The rebind now re-points such an OrderBy at the newly bound field. Re-pointing
+beats dropping: the sort was on this role's field and the role still has one, so
+the user's intent (sort by the value axis) survives.
+
+Desktop-verified with a fixture whose rows make the two orders OPPOSITE —
+Revenue desc would be Mar, Jan, Feb; Units desc is Feb, Jan, Mar. Desktop
+rendered Feb (30), Jan (20), Mar (10), so the sort field is unambiguous on
+screen rather than inferred. `workspace/fp_sort_rebind.pbix` carries a slicer,
+so the field-swap is clickable.
+
+## Binding to a visual with no field wells "succeeded"
+
+A textbox bind returned `success=True` and left the textbox carrying a `query`,
+`dataTransforms` and a `Y` projection — incoherent, and `pbix_doctor` does not
+flag it. Now refused for the built-in types that provably have no data roles
+(`textbox`, `image`, `shape`, `basicShape`, `actionButton`). Deliberately
+narrow: an unrecognized type (any custom visual) is assumed to have wells, so it
+still binds. The refusal is asserted not to mutate the visual.
+
+## Traps hit
+
+* **`grep -c` and `str.count` count substrings, not decorators.** Both reported
+  128 `@mcp.tool()` for a 127-tool surface; the 128th is the string inside a
+  docstring. Matching on the STRIPPED line (`== "@mcp.tool()"`) and resolving
+  each to its following `def` gives 127 with no duplicates. The category counts
+  in tool-contracts.md sum to exactly 127, which is the real cross-check.
+* **Stale counts survive a "stale-claim sweep".** README and architecture.md
+  still claimed 126 tools. Two of the stale mentions were verification-SCOPE
+  claims tied to the 0.9.39 parity audit, so they were re-scoped ("the 126 tools
+  present at the 0.9.39 audit") rather than bumped to 127 — bumping them would
+  have claimed the newer tools were audited when they were not. These landed
+  AFTER the v0.9.58 tag, so the 0.9.58 artifacts still carry the old counts.

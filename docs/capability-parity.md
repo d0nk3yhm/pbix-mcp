@@ -110,8 +110,8 @@ samples.
 
 ### How this is verified
 
-All 126 tools are tested on both formats by applying the tool, saving, reopening
-and checking the **saved bytes**, with a negative control proving each check
+The 126 tools present at the 0.9.39 audit are tested on both formats by
+applying the tool, saving, reopening and checking the **saved bytes**, with a negative control proving each check
 fails on an untouched file. As of 0.9.39: 50 persist, 59 are read-only, 2 are
 not applicable to the fixtures, and 0 lose their change.
 
