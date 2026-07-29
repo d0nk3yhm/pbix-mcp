@@ -10,10 +10,10 @@ and how, what is left, and the traps already hit so they are not re-hit.
 | **#3** service verification of the rebuild path | **CLOSED** — all 3 schema eras verified live in Power BI Desktop |
 | **#4** calc columns blocking corpus files | groups (a) `.[Date]`, (b) LOOKUPVALUE + RELATED, (c) CALCULATE/FILTER all **DONE** |
 | **#5** columns fail to decode | **root-caused, fixed, tested, committed** |
-| **#6** DAX perf / compiled expression tree | partial — two memoizations landed (1h+ -> 1053s on a 1.29M-row file); the compiled tree itself is still open |
+| **#6** DAX perf / compiled expression tree | **CLOSED** in 0.9.55 — plan cache + row-context calc columns; 1053s -> 183s; 520/544 measures byte-identical, the rest classified |
 | **#7** calc groups, translations, detail-rows | **DONE** — verified live in Desktop via INFO.CALCULATIONGROUPS() |
 
-Released 07-28: **0.9.50-0.9.53**. **0.9.54** closes #4, #5 and #7.
+Released 07-28/29: **0.9.50-0.9.55**. Every GitHub issue is CLOSED (#3-#7).
 
 **Corpus: 23 of 24 rebuild** (was 11). The one refusal is MS_Perf_Analyzer's
  = , a genuine table scan this engine does not
@@ -461,3 +461,66 @@ tool is what found the four silent-wrong-value bugs; it is the right gate.
 Current timings to beat (24-report corpus, 23/24 rebuild):
 `MS_Employee_Hiring` 1053s, `MS_Human_Resources` 1046s, `MS_Life_Expectancy`
 415s, `MS_Store_Sales` 222s, everything else seconds.
+
+---
+
+# Session 2026-07-29 (later) — 0.9.55: issue #6 closed, ZERO issues open
+
+## What shipped
+
+Compiled expression plans (analysis cached per expression; calc columns
+evaluate the SAME text per row via ctx._current_row + mask VARIABLES), a
+per-context column-data cache, and — exposed by the corpus-wide verification
+the rewrite enabled — **two operator-precedence bugs and a
+parens-in-column-name bug**, all Desktop-probed:
+
+* Split order IS precedence, loosest first: `|| && NOT cmp & +- */`.
+  The old chain split arithmetic before comparison: `a - b < 0` parsed as
+  `a - (b < 0)` — Employee[TenureDays] sign-flipped on 1.25M rows; GeoSales
+  CF measures answered #D64550 where Desktop answers #118DFF (verified live).
+* The TCOL guard `'(' not in expr` made `[... (% of population)]` columns
+  read BLANK — every Life_Expectancy bucket column mis-bucketed.
+
+Plus: three pbix_doctor false-positive classes fixed (Kind validity instead
+of the disproven DataMashup theory; storage matched by TABLE ID, not
+sanitized display name; NULL-expression measures no longer crash the check —
+doctor now ALL CLEAN on five corpus files), set_incremental_refresh writes
+Kind=0 (TOM's ExpressionKind has only M=0; Kind=1 was the real
+PFE_TM_ENUM_VALUES_VALIDATION_FAILED trigger), pbix_open work dirs are
+pid+uuid unique, the release pipeline is GATED (ruff+pytest before build,
+github-release after publish-pypi, fail_on_unmatched_files), the CI mypy
+gate no longer swallows crashes, and seven verified-stale doc claims fixed.
+
+## Verification ledger for 0.9.55
+
+* 1089 unit tests green; 17 of the new tests fail against 0.9.54.
+* Measures: all 24 files baselined before/after with unique aliases —
+  520/544 byte-identical; 24 diffs = 5 RAND-volatile + 2 path artifacts +
+  17 precedence-class, EACH classified against its DAX body.
+* Calc columns: 395 match Desktop's stored values exactly, 0 logic
+  mismatches; 4 sub-microsecond DateTime-serial diffs (documented).
+* Sweep 23/24 OK, 0 findings; Employee_Hiring 183s (was 1053s).
+* Adversarial review (3 skeptics, repro required) found ONE real bug —
+  nested-mask stale scope — fixed pre-release, repro kept as a test.
+* CI 8/8 green (read the run); release pipeline gate/build/publish/release
+  all green; PyPI install of 0.9.55 verified; F: synced.
+
+## Traps hit (recorded so they are not re-hit)
+
+* **My baseline harness raced itself**: 4 processes × same alias → same
+  work dir (second-granular timestamp) → cross-contaminated captures AND a
+  bogus "path traversal" refusal. The product fix (pid+uuid) came from a
+  harness bug — but only because the anomaly was chased, not shrugged off.
+* **A YAML block scalar ate a literal newline** from a patch script's 
+:
+  the workflow failed in 0s. Validate workflow files with yaml.safe_load
+  before pushing.
+* **Python 3.14 was advertised then rolled back**: xmhuffman has no cp314
+  wheel and a broken sdist. Do not advertise a version the package cannot
+  install on; the matrix comment records the re-add condition.
+
+## Nothing is open
+
+`gh issue list --state open` returns nothing. Remaining known limits are
+documented in docs/limitations.md (PATH/RANKX refusals on MS_Perf_Analyzer,
+DateTime sub-microsecond serials, xmhuffman/3.14).
