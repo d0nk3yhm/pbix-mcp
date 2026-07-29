@@ -268,3 +268,63 @@ class TestNestedMaskScopeIsCurrentRow:
             ["id", "fk"], [[10, 1], [11, 2], [12, 3]], e, "T", snap, rels)
         assert err is None
         assert vals == ["vA", "vB", "vC"]  # NOT [None, "vA", "vB"]
+
+class TestFilterContextInvalidatesColumnMemo:
+    """OpenBI findings #18: get_column_data is memoized per (table, column), NOT
+    per filter set. A caller that re-pointed ONE context per grouping got the
+    FIRST grouping's members back for every later grouping -- silently, with the
+    parent subtotals still reconciling. Assigning filter_context must clear it.
+    """
+
+    def _ctx(self, fc=None):
+        tables = {
+            "Categories": {"columns": ["CategoryName"],
+                           "rows": [["Books"], ["Clothing"], ["Electronics"]]},
+            "Products": {"columns": ["ProductName", "CategoryName"],
+                         "rows": [["Python Cookbook", "Books"],
+                                  ["Winter Jacket", "Clothing"],
+                                  ["Laptop Pro 16", "Electronics"]]},
+        }
+        rels = [{"FromTable": "Products", "FromColumn": "CategoryName",
+                 "ToTable": "Categories", "ToColumn": "CategoryName",
+                 "IsActive": True}]
+        return de.DAXContext(tables, {}, None, None, fc, rels)
+
+    def _members(self, ctx):
+        return sorted(v for v in ctx.get_column_data("Products", "ProductName")
+                      if v is not None)
+
+    def test_reused_context_matches_fresh_contexts(self):
+        cats = ["Books", "Clothing", "Electronics"]
+        reused_ctx = self._ctx()
+        reused, fresh = {}, {}
+        for c in cats:
+            reused_ctx.filter_context = {"Categories.CategoryName": [c]}
+            reused[c] = self._members(reused_ctx)
+            fresh[c] = self._members(
+                self._ctx({"Categories.CategoryName": [c]}))
+        assert reused == fresh, f"stale memo: {reused} != {fresh}"
+        # and the three groupings must be DISTINCT -- the original bug passed a
+        # weaker assertion because the stray members happened to evaluate blank
+        assert len({tuple(v) for v in reused.values()}) == 3, reused
+
+    def test_assignment_clears_the_memo(self):
+        ctx = self._ctx({"Categories.CategoryName": ["Books"]})
+        self._members(ctx)
+        assert ctx._column_data_cache, "expected the memo to be populated"
+        ctx.filter_context = {"Categories.CategoryName": ["Clothing"]}
+        assert not ctx._column_data_cache, "assignment must clear the memo"
+
+    def test_memo_still_serves_repeat_calls_under_one_filter_set(self):
+        """The issue-#6 fast path must survive: no clearing without assignment."""
+        ctx = self._ctx({"Categories.CategoryName": ["Books"]})
+        first = ctx.get_column_data("Products", "ProductName")
+        again = ctx.get_column_data("Products", "ProductName")
+        assert again is first, "repeat call should hit the memo, not rebuild"
+
+    def test_measure_cache_is_not_cleared(self):
+        """Its key carries a filter fingerprint, so its entries stay valid."""
+        ctx = self._ctx({"Categories.CategoryName": ["Books"]})
+        ctx._measure_cache[("M", ())] = 42
+        ctx.filter_context = {"Categories.CategoryName": ["Clothing"]}
+        assert ctx._measure_cache.get(("M", ())) == 42

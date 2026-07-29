@@ -610,14 +610,18 @@ class DAXContext:
         self.date_column = date_column or 'Date'
         self.filter_context = filter_context or {}
         self.relationships = relationships or []
-        # Filtered column values, cached per (table, column). Safe because a
-        # context's filter state is COPY-ON-MODIFY -- filter_context is only
-        # ever assigned at construction, never mutated in place -- and no
-        # caller mutates the returned list (audited: they wrap it in list(),
+        # Filtered column values, cached per (table, column) -- NOT per filter
+        # set, so the memo is only valid for the filter context in force when it
+        # was populated. Re-ASSIGNING filter_context clears it (see the property
+        # below); mutating that dict in place cannot be detected. No caller
+        # mutates the returned list either (audited: they wrap it in list(),
         # sorted() or a comprehension). This is the issue-#6 _minmax_column
         # win: a measure like MIN(T[Col]) under one outer context rebuilt the
         # same filtered list on every one of thousands of per-row calls.
         self._column_data_cache: dict = {}
+        # __init__ assigned filter_context BEFORE this cache existed, so the
+        # property setter could not clear it. Nothing is cached yet, so there is
+        # nothing to lose -- but keep this after the cache is created.
         # Auto-detect date table if not provided (relationship-aware).
         if date_table:
             self.date_table = date_table
@@ -916,10 +920,43 @@ class DAXContext:
 
         return []
 
+    @property
+    def filter_context(self) -> dict:
+        """The filter set this context evaluates under.
+
+        ASSIGNING this is supported and clears the per-context column memo, so
+        reusing one context across groupings works:
+
+            ctx.filter_context = {"Categories.CategoryName": ["Books"]}
+
+        MUTATING the dict in place (``ctx.filter_context[k] = v``) is NOT
+        supported -- no memo can observe that, and stale values are served.
+        Assign a new dict, or use :meth:`with_filters` / :meth:`without_filters`
+        to derive a fresh context.
+        """
+        return self._filter_context
+
+    @filter_context.setter
+    def filter_context(self, value: Optional[dict]) -> None:
+        self._filter_context = value or {}
+        # Everything memoized under the previous filter set is now invalid.
+        # OpenBI findings #18: a caller re-pointed ONE context per grouping, and
+        # every grouping after the first got the FIRST grouping's members back --
+        # silently, with the parent subtotals still reconciling, which is exactly
+        # the combination that survives review. _measure_cache is deliberately
+        # NOT cleared: its key already carries a filter-context fingerprint, so
+        # its entries stay valid (and re-pointing back keeps the fast path).
+        # __init__ assigns before the cache exists, hence the guard.
+        cache = getattr(self, "_column_data_cache", None)
+        if cache:
+            cache.clear()
+
     def get_column_data(self, table_name: str, column_name: str) -> list:
         """Get all values for a column, respecting current filter context.
 
-        Cached per context -- do NOT mutate the returned list."""
+        Memoized per (table, column) for the CURRENT filter set -- assigning
+        :attr:`filter_context` invalidates it. Do NOT mutate the returned list.
+        """
         _ck = (table_name, column_name)
         _hit: list | None = self._column_data_cache.get(_ck)
         if _hit is not None:
