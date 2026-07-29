@@ -18,7 +18,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        # 3.14 is NOT in the matrix: the xmhuffman dependency ships no cp314
+        # wheel and its sdist build is broken ('xmhuffman.pyx' doesn't match
+        # any files), so the package cannot install on 3.14 at all. Re-add the
+        # cell (and the trove classifier) when upstream publishes cp314 wheels.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v7
