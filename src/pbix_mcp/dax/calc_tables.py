@@ -457,8 +457,263 @@ def _mask_lookupvalue_calls(expr: str, target_table: str, target_columns,
     return "".join(out), specs, None
 
 
+# ---------------------------------------------------------------------------
+# CALCULATE(<aggregate>, FILTER(<own table>, <predicate>)) in a row context
+# ---------------------------------------------------------------------------
+# In a calculated column, CALCULATE first performs CONTEXT TRANSITION -- the
+# current row becomes a filter on every column of its table. A FILTER over that
+# SAME table, passed as CALCULATE's filter argument, then REPLACES that filter
+# entirely. So `CALCULATE(SUM(T[x]), FILTER(T, cond))` and
+# `CALCULATE(SUM(T[x]), FILTER(ALL(T), cond))` both reduce to "aggregate over
+# every row of T satisfying cond" -- the current row does not restrict it.
+# That equivalence is what makes this tractable, and it is confirmed against
+# Desktop's own stored values, not assumed (see tests).
+#
+# Doing it literally would be O(rows^2): MS_Covid_Tracking's COVID table has
+# 1,740,185 rows, so a per-row table scan is ~3e12 operations. Instead the
+# predicate is compiled into either a hash index (equality terms) or a prefix
+# aggregate over a sorted key (one inequality term), both of which answer every
+# row in one lookup.
+_CALCULATE_RE = re.compile(r"\bCALCULATE\s*\(", re.I)
+_FILTER_CALL_RE = re.compile(r"^\s*FILTER\s*\(", re.I)
+_ALL_CALL_RE = re.compile(r"^\s*ALL\s*\(\s*(?:'([^']+)'|([A-Za-z_]\w*))\s*\)\s*$",
+                          re.I)
+_BARE_TABLE_RE = re.compile(r"^\s*(?:'([^']+)'|([A-Za-z_]\w*))\s*$")
+_CALC_MASK = "__CALC{}__"
+_VAR_DEF_RE = re.compile(r"\bVAR\s+([A-Za-z_]\w*)\s*=", re.I)
+_RETURN_KW_RE = re.compile(r"\bRETURN\b", re.I)
+_EARLIER_CALL_RE = re.compile(r"\bEARLIER\s*\(\s*((?:'[^']+'|\w+)?\[[^\]]+\])\s*\)",
+                              re.I)
+# Longest first so "<=" is not read as "<" then "=".
+_CMP_OPS = ("<=", ">=", "<>", "=", "<", ">")
+_CALC_AGGS = {"sum", "min", "max", "average", "count", "counta",
+              "countrows", "distinctcount"}
+# Only the DAY interval: MONTH/QUARTER/YEAR carry end-of-month rules that
+# have not been checked against Desktop, so they stay refused.
+_DATEADD_DAY_RE = re.compile(
+    r"^\(*\s*DATEADD\s*\(\s*(.+?)\s*,\s*(-?\d+)\s*,\s*DAY\s*\)\s*\)*$",
+    re.I | re.S)
+
 _RELATED_RE = re.compile(r"\bRELATED\s*\(", re.I)
 _REL_MASK = "__REL{}__"
+
+
+def _parse_calculate(call: str, target_table: str, target_columns,
+                     var_list):
+    """Parse CALCULATE(<agg>, FILTER(<own table>, <pred>)) into a spec.
+
+    Returns a spec dict or a refusal string. Deliberately narrow: exactly one
+    filter argument, over the column's OWN table, with a predicate that is a
+    conjunction of comparisons whose left side is one of that table's columns.
+    Anything else -- KEEPFILTERS, a second filter, an aggregate over another
+    table, an OR, a computed left side -- is refused, because the whole point
+    of this gate is that a shape we cannot reproduce exactly never materialises.
+    """
+    open_paren = call.find("(")
+    args = _split_args(call[open_paren + 1:-1])
+    if len(args) != 2:
+        return ("CALCULATE with %d argument(s) is not supported here; only "
+                "CALCULATE(<aggregate>, FILTER(...)) is" % len(args))
+    agg_text, filt_text = args[0], args[1]
+
+    agg_open = agg_text.find("(")
+    if agg_open < 0 or not agg_text.rstrip().endswith(")"):
+        return f"CALCULATE's first argument {agg_text!r} is not an aggregate"
+    agg_name = agg_text[:agg_open].strip().lower()
+    if agg_name not in _CALC_AGGS:
+        return (f"CALCULATE over '{agg_name.upper()}' is not supported here; "
+                f"only {', '.join(sorted(a.upper() for a in _CALC_AGGS))} are")
+    agg_arg = agg_text[agg_open + 1:agg_text.rstrip().rfind(")")].strip()
+    agg_col = None
+    if agg_name == "countrows":
+        m = _BARE_TABLE_RE.match(agg_arg)
+        if not m or (m.group(1) or m.group(2)).lower() != target_table.lower():
+            return "COUNTROWS must name this column's own table"
+    else:
+        ref = _parse_column_ref(agg_arg, target_table, target_columns)
+        if not ref:
+            return (f"{agg_name.upper()}({agg_arg}) is not a single column of "
+                    f"'{target_table}'")
+        if ref[0].lower() != target_table.lower():
+            return (f"{agg_name.upper()} aggregates '{ref[0]}', not this "
+                    f"column's own table '{target_table}'")
+        agg_col = ref[1]
+
+    if not _FILTER_CALL_RE.match(filt_text):
+        return ("CALCULATE's filter argument must be a FILTER(...) over this "
+                "column's own table")
+    f_open = filt_text.find("(")
+    f_args = _split_args(filt_text[f_open + 1:filt_text.rstrip().rfind(")")])
+    if len(f_args) != 2:
+        return "FILTER takes a table and a predicate"
+    tbl_text, pred = f_args
+    m_all = _ALL_CALL_RE.match(tbl_text)
+    m_bare = _BARE_TABLE_RE.match(tbl_text)
+    named = ((m_all.group(1) or m_all.group(2)) if m_all
+             else (m_bare.group(1) or m_bare.group(2)) if m_bare else None)
+    if not named or named.lower() != target_table.lower():
+        return (f"FILTER must scan this column's own table '{target_table}'; "
+                f"{tbl_text.strip()!r} is not supported here")
+
+    if _split_top_level(pred, "||") != [pred.strip()]:
+        return "FILTER predicates combined with || are not supported here"
+    eq_terms, ineq = [], None
+    for term in _split_top_level(pred, "&&"):
+        parts = _split_comparison(term)
+        if not parts:
+            return (f"FILTER predicate term {term.strip()!r} is not a simple "
+                    f"comparison this engine can compile")
+        lhs, op, rhs = parts
+        ref = _parse_column_ref(lhs, target_table, target_columns)
+        if not ref or ref[0].lower() != target_table.lower():
+            return (f"FILTER predicate compares {lhs.strip()!r}, which is not "
+                    f"a column of '{target_table}'")
+        rhs_inlined = _inline_vars(rhs, var_list)
+        # EARLIER(<col>) means the OUTER row -- exactly what the right-hand
+        # side is evaluated against here, so it reduces to the column itself.
+        rhs_inlined = _EARLIER_CALL_RE.sub(lambda m: m.group(1), rhs_inlined)
+        if op in ("=", "=="):
+            eq_terms.append((ref[1], rhs_inlined))
+        elif op == "<>":
+            return "FILTER with <> is not supported here"
+        else:
+            if ineq is not None:
+                return ("FILTER with more than one inequality is not "
+                        "supported here")
+            ineq = (ref[1], op, rhs_inlined)
+    return {"agg": agg_name, "agg_col": agg_col, "eq": eq_terms, "ineq": ineq}
+
+
+def _mask_calculate_calls(expr: str, target_table: str, target_columns,
+                          var_list):
+    """(masked_expr, specs, reason) -- see _mask_lookupvalue_calls."""
+    spans = list(_scan_calls(expr, _CALCULATE_RE))
+    if not spans:
+        return expr, [], None
+    out: "list[str]" = []
+    specs: "list[dict]" = []
+    i = 0
+    for a, b in spans:
+        spec = _parse_calculate(expr[a:b], target_table, target_columns,
+                                var_list)
+        if isinstance(spec, str):
+            return expr, [], spec
+        out.append(expr[i:a])
+        out.append(_CALC_MASK.format(len(specs)))
+        specs.append(spec)
+        i = b
+    out.append(expr[i:])
+    return "".join(out), specs, None
+
+
+def _replace_identifier(text: str, name: str, repl: str) -> str:
+    """Replace whole-word `name` outside string literals and bracketed names."""
+    shadow = _agg_shadow(text)
+    pat = re.compile(r"\b" + re.escape(name) + r"\b")
+    out, i = [], 0
+    for m in pat.finditer(shadow):
+        out.append(text[i:m.start()])
+        out.append(repl)
+        i = m.end()
+    out.append(text[i:])
+    return "".join(out)
+
+
+def _extract_top_level_vars(expr: str):
+    """([(name, definition)], body) for `VAR a = .. VAR b = .. RETURN body`.
+
+    Only DEPTH-0 definitions: a VAR inside a nested call belongs to that call's
+    own scope and must not be hoisted out of it.
+    """
+    shadow = _agg_shadow(expr)
+    marks = []
+    depth, i = 0, 0
+    while i < len(shadow):
+        ch = shadow[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif depth == 0:
+            m = _VAR_DEF_RE.match(shadow, i)
+            if m:
+                marks.append(("VAR", m.start(), m.end(), m.group(1)))
+                i = m.end()
+                continue
+            m2 = _RETURN_KW_RE.match(shadow, i)
+            if m2:
+                marks.append(("RETURN", m2.start(), m2.end(), None))
+                i = m2.end()
+                continue
+        i += 1
+    if not marks:
+        return [], expr
+    out = []
+    for k, (kind, start, end, name) in enumerate(marks):
+        if kind != "VAR":
+            continue
+        stop = marks[k + 1][1] if k + 1 < len(marks) else len(expr)
+        out.append((name, expr[end:stop].strip()))
+    ret = [m for m in marks if m[0] == "RETURN"]
+    body = expr[ret[-1][2]:] if ret else expr
+    return out, body
+
+
+def _inline_vars(text: str, var_list) -> str:
+    """`text` with every VAR reference replaced by its definition.
+
+    DAX VARs are scoped in order, so each definition is resolved against the
+    ones before it first. Inlining lets a CALCULATE's predicate be compiled
+    into a plain function of the outer row without reimplementing scoping.
+    """
+    resolved: "list[tuple[str, str]]" = []
+    for name, defn in var_list:
+        d = defn
+        for pname, pdef in resolved:
+            d = _replace_identifier(d, pname, f"({pdef})")
+        resolved.append((name, d))
+    out = text
+    for name, d in resolved:
+        out = _replace_identifier(out, name, f"({d})")
+    return out
+
+
+def _split_top_level(text: str, sep: str):
+    """Split on a top-level operator, using the shadow."""
+    shadow = _agg_shadow(text)
+    parts, depth, start, k = [], 0, 0, 0
+    while k < len(shadow):
+        ch = shadow[k]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif depth == 0 and shadow.startswith(sep, k):
+            parts.append(text[start:k])
+            k += len(sep)
+            start = k
+            continue
+        k += 1
+    parts.append(text[start:])
+    return [p.strip() for p in parts]
+
+
+def _split_comparison(term: str):
+    """(lhs, op, rhs) for a top-level comparison, or None."""
+    shadow = _agg_shadow(term)
+    depth = 0
+    for k, ch in enumerate(shadow):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif depth == 0:
+            for op in _CMP_OPS:
+                if shadow.startswith(op, k):
+                    # "=" inside "<=" / ">=" / "<>" is handled by ordering.
+                    return (term[:k].strip(), op,
+                            term[k + len(op):].strip())
+    return None
 
 
 def _related_paths(target_table: str, dest_table: str, relationships,
@@ -621,6 +876,17 @@ def calc_column_unsupported_reason(expression: str, target_table: str,
     if not e.strip():
         return "expression is empty"
     if known_tables is not None:
+        # CALCULATE(<agg>, FILTER(<own table>, <pred>)) is compiled, not
+        # iterated. Masked first so its predicate's own column references are
+        # not mistaken for the outer expression's.
+        _vars, _body = _extract_top_level_vars(e)
+        e, calc_specs, calc_why = _mask_calculate_calls(
+            e, target_table, columns, _vars)
+        if calc_why:
+            return calc_why
+        if calc_specs and columns is None:
+            return ("CALCULATE needs this table's column list to compile its "
+                    "filter, which this caller did not supply")
         # RELATED needs the relationship graph as well as the data. Without it
         # the path cannot be resolved, so the call stays refused by the
         # cross-table scan below rather than guessed at.
@@ -1111,6 +1377,232 @@ def _resolve_rel_masks(row_expr, rel_specs, rel_resolvers, row_data):
     return out, None
 
 
+def _ord_key(v):
+    """A sortable key for the inequality column, or None if not orderable."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, date):
+        return datetime(v.year, v.month, v.day)
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        return v
+    return None
+
+
+def _running(agg: str, vals: "list"):
+    """Prefix aggregate over `vals`, as a list where [i] covers vals[:i+1]."""
+    out: "list" = []
+    if agg == "sum":
+        acc = 0.0
+        for v in vals:
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                acc += float(v)
+            out.append(acc)
+    elif agg in ("count", "counta"):
+        acc = 0
+        for v in vals:
+            if v is not None:
+                acc += 1
+            out.append(acc)
+    elif agg == "countrows":
+        for i in range(len(vals)):
+            out.append(i + 1)
+    elif agg == "distinctcount":
+        # DAX's DISTINCTCOUNT counts BLANK as one distinct value.
+        seen: set = set()
+        for v in vals:
+            seen.add(_lv_key(v))
+            out.append(len(seen))
+    elif agg in ("min", "max"):
+        cur_k, cur_v = None, None
+        for v in vals:
+            k = _ord_key(v)
+            if k is not None and (
+                    cur_k is None or (k < cur_k if agg == "min" else k > cur_k)):
+                cur_k, cur_v = k, v
+            out.append(cur_v)
+    elif agg == "average":
+        acc, n = 0.0, 0
+        for v in vals:
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                acc += float(v)
+                n += 1
+            out.append(acc / n if n else None)
+    return out
+
+
+def _aggregate(agg: str, vals: "list"):
+    """Whole-group aggregate, matching `_running`'s final element."""
+    run = _running(agg, vals)
+    return run[-1] if run else (0 if agg in
+                                ("count", "counta", "countrows",
+                                 "distinctcount") else None)
+
+
+def _build_calculate_resolver(spec, columns, rows, outer_fns):
+    """Compile the CALCULATE into one lookup per row.
+
+    Equality terms become a hash index; a single inequality becomes a prefix
+    aggregate over each group sorted by that column. Both are built once, so
+    the per-row cost is a dict lookup (plus a bisect when there is an
+    inequality) rather than a scan of the table.
+    """
+    import bisect
+
+    lower = {c.lower(): i for i, c in enumerate(columns)}
+    eq_idx = []
+    for col, _rhs in spec["eq"]:
+        if col.lower() not in lower:
+            return f"FILTER references '{col}', which this table does not have"
+        eq_idx.append(lower[col.lower()])
+    agg = spec["agg"]
+    val_i = (lower.get((spec["agg_col"] or "").lower())
+             if spec["agg_col"] else None)
+    if spec["agg_col"] and val_i is None:
+        return (f"{agg.upper()} references '{spec['agg_col']}', which this "
+                f"table does not have")
+
+    def _val(r):
+        return None if val_i is None else r[val_i]
+
+    if spec["ineq"] is None:
+        groups: "dict[tuple, list]" = {}
+        for r in rows:
+            groups.setdefault(
+                tuple(_lv_key(r[i]) for i in eq_idx), []).append(_val(r))
+        table = {k: _aggregate(agg, v) for k, v in groups.items()}
+        empty = _aggregate(agg, [])
+
+        def resolve(row_data):
+            key = tuple(_lv_key(fn(row_data)) for fn in outer_fns["eq"])
+            return table.get(key, empty)
+        return resolve
+
+    ineq_col, op, _rhs = spec["ineq"]
+    if ineq_col.lower() not in lower:
+        return (f"FILTER references '{ineq_col}', which this table does not "
+                f"have")
+    ineq_i = lower[ineq_col.lower()]
+    buckets: "dict[tuple, list]" = {}
+    for r in rows:
+        k = _ord_key(r[ineq_i])
+        if k is None:
+            return (f"FILTER compares '{ineq_col}', which holds values this "
+                    f"engine cannot order (blank or mixed types)")
+        buckets.setdefault(
+            tuple(_lv_key(r[i]) for i in eq_idx), []).append((k, _val(r)))
+    compiled = {}
+    for key, pairs in buckets.items():
+        pairs.sort(key=lambda p: p[0])
+        keys = [p[0] for p in pairs]
+        vals = [p[1] for p in pairs]
+        if op in ("<", "<="):
+            compiled[key] = (keys, _running(agg, vals), False)
+        else:
+            rev = _running(agg, list(reversed(vals)))
+            compiled[key] = (keys, list(reversed(rev)), True)
+    empty = _aggregate(agg, [])
+
+    def resolve(row_data):
+        key = tuple(_lv_key(fn(row_data)) for fn in outer_fns["eq"])
+        got = compiled.get(key)
+        if got is None:
+            return empty
+        keys, prefix, suffix = got
+        thr = _ord_key(outer_fns["ineq"](row_data))
+        if thr is None:
+            return empty
+        if not suffix:
+            n = (bisect.bisect_right(keys, thr) if op == "<="
+                 else bisect.bisect_left(keys, thr))
+            return prefix[n - 1] if n else empty
+        n = (bisect.bisect_left(keys, thr) if op == ">="
+             else bisect.bisect_right(keys, thr))
+        return prefix[n] if n < len(prefix) else empty
+    return resolve
+
+
+def _outer_value_fn(rhs: str, target_table: str, columns, engine, dax_engine,
+                    all_tables, relationships):
+    """A function of the outer row for a predicate's right-hand side.
+
+    A bare column reference reads the column directly. Anything else is
+    evaluated by the engine but MEMOISED on just the columns it mentions --
+    `DATEADD(COVID[Date], -1, DAY)` over 1.7M rows becomes one evaluation per
+    distinct date rather than 1.7M.
+    """
+    idx = {c.lower(): i for i, c in enumerate(columns)}
+    ref = _parse_column_ref(rhs, target_table, columns)
+    if ref and ref[0].lower() == target_table.lower():
+        i = idx.get(ref[1].lower())
+        if i is not None:
+            return lambda row_data: row_data.get(columns[i])
+
+    # DATEADD is a TIME-INTELLIGENCE function: the engine answers it with a
+    # marker tuple, not a scalar. Left alone, that tuple simply never matched
+    # any index key, so `... - CALCULATE(SUM(x), FILTER(t, date = yesterday))`
+    # quietly returned the unreduced value on every row. In a row context over
+    # a single date it is just a day shift, so compute it directly.
+    m_da = _DATEADD_DAY_RE.match(rhs.strip())
+    if m_da:
+        inner = _outer_value_fn(m_da.group(1), target_table, columns, engine,
+                               dax_engine, all_tables, relationships)
+        delta = int(m_da.group(2))
+
+        def shift(row_data):
+            base = inner(row_data)
+            if isinstance(base, datetime):
+                return base + timedelta(days=delta)
+            if isinstance(base, date):
+                return base + timedelta(days=delta)
+            if base is None:
+                return None
+            raise ValueError(
+                "DATEADD was given a non-date value this engine cannot shift")
+        return shift
+    used = [c for c in columns
+            if f"'{target_table}'[{c}]" in rhs or f"{target_table}[{c}]" in rhs]
+    memo: dict = {}
+
+    def fn(row_data):
+        key = tuple(_lv_key(row_data.get(c)) for c in used)
+        if key in memo:
+            return memo[key]
+        sub = _subst_row(rhs, {c: row_data.get(c) for c in used}, target_table)
+        stray = _unresolved_refs(sub)
+        if stray:
+            raise ValueError(
+                "FILTER value references a column this engine cannot resolve "
+                "in row context: " + ", ".join(sorted(stray)))
+        ctx = dax_engine.DAXContext(all_tables, {}, None, None, None,
+                                    relationships or [])
+        got = engine._eval_expr(sub, ctx)
+        # A filter value MUST be a scalar. The engine represents the
+        # time-intelligence functions as marker tuples and tables as lists;
+        # either would compare unequal to every stored value and silently
+        # collapse the whole CALCULATE to its empty result, so refuse instead.
+        if isinstance(got, (tuple, list, dict, set)):
+            raise ValueError(
+                f"FILTER compares against {rhs.strip()!r}, which this engine "
+                f"does not reduce to a single value")
+        memo[key] = got
+        return got
+    return fn
+
+
+def _resolve_calc_masks(row_expr, calc_specs, calc_resolvers, row_data):
+    """Replace each `__CALCn__` with this row's aggregate."""
+    out = row_expr
+    for n in range(len(calc_specs)):
+        mask = _CALC_MASK.format(n)
+        if mask in out:
+            out = out.replace(mask, f"({_dax_literal(calc_resolvers[n](row_data))})")
+    return out
+
+
 def _resolve_lv_masks(row_expr, lv_specs, lv_index, row_data, target_table,
                       engine, dax_engine, all_tables, relationships):
     """Replace each `__LVn__` in `row_expr` with this row's looked-up literal.
@@ -1130,6 +1622,16 @@ def _resolve_lv_masks(row_expr, lv_specs, lv_index, row_data, target_table,
         key = []
         for _sc, val_expr in spec["pairs"]:
             sub = _subst_row(val_expr, row_data, target_table)
+            # An UNSUBSTITUTED reference here is silent poison: the engine
+            # reads it as blank, the key matches nothing, and the column
+            # materialises as BLANK on every affected row instead of failing.
+            # Events[ParentIndex] did exactly that -- 102 of 117 rows blank
+            # where Desktop stored a value.
+            stray = _unresolved_refs(sub)
+            if stray:
+                return out, (
+                    "LOOKUPVALUE search value references a column this engine "
+                    "cannot resolve in row context: " + ", ".join(sorted(stray)))
             try:
                 ctx = dax_engine.DAXContext(
                     all_tables, {}, None, None, None, relationships or [])
@@ -1181,6 +1683,24 @@ def evaluate_row_context_column(
     # n-row dimension would make the column O(n*m).
     known = {t: (v.get("columns") or [])
              for t, v in (all_tables or {}).items()}
+    _vars, _body = _extract_top_level_vars(clean)
+    clean, calc_specs, calc_why = _mask_calculate_calls(
+        clean, target_table, columns, _vars)
+    if calc_why:
+        return None, calc_why
+    calc_resolvers = []
+    for spec in calc_specs:
+        outer = {"eq": [_outer_value_fn(rhs, target_table, columns, engine,
+                                        dax_engine, all_tables, relationships)
+                        for _c, rhs in spec["eq"]],
+                 "ineq": (_outer_value_fn(spec["ineq"][2], target_table,
+                                          columns, engine, dax_engine,
+                                          all_tables, relationships)
+                          if spec["ineq"] else None)}
+        built = _build_calculate_resolver(spec, columns, rows, outer)
+        if isinstance(built, str):
+            return None, built
+        calc_resolvers.append(built)
     clean, rel_specs, rel_why = _mask_related_calls(
         clean, target_table, columns, known, relationships)
     if rel_why:
@@ -1206,6 +1726,12 @@ def evaluate_row_context_column(
     for row in rows:
         row_data = {cn: row[ci] for ci, cn in enumerate(columns)}
         row_expr = _subst_row(masked, row_data, target_table)
+        if calc_specs:
+            try:
+                row_expr = _resolve_calc_masks(
+                    row_expr, calc_specs, calc_resolvers, row_data)
+            except ValueError as exc:
+                return None, str(exc)
         if rel_specs:
             row_expr, rel_err = _resolve_rel_masks(
                 row_expr, rel_specs, rel_resolvers, row_data)

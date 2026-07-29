@@ -667,3 +667,120 @@ class TestVariationAccessorSurvivesQualification:
               "expression": "'Fact'[EstimatedCloseDate].[Date]"}], [])
         assert [r["CloseDay"] for r in out] == [
             _dt.datetime(2024, 3, 5), _dt.datetime(2023, 7, 19)]
+
+
+class TestArithmeticAssociativity:
+    """`-` and `/` are LEFT-associative.
+
+    `_eval_binary` evaluated parts[0] against the REJOINED tail, which makes
+    them right-associative: 10 - 3 - 2 came out 9 instead of 5, and
+    20 / 4 / 5 came out 25 instead of 1. Every repeated subtraction or
+    division in every measure and calculated column was affected, silently.
+    Found by diffing MS_Competitive_Marketing Date[Rolling Period] against the
+    values Desktop stored: 1096 of 6209 rows disagreed.
+    """
+
+    @staticmethod
+    def _ev(expr):
+        from pbix_mcp.dax import engine as de
+        return de.DAXEngine()._eval_expr(
+            expr, de.DAXContext({}, {}, None, None, None, []))
+
+    def test_repeated_subtraction(self):
+        assert self._ev("10 - 3 - 2") == 5
+        assert self._ev("100 - 10 - 5 - 1") == 84
+
+    def test_repeated_division(self):
+        assert self._ev("20 / 4 / 5") == 1
+
+    def test_mixed_operators_keep_left_to_right_order(self):
+        assert self._ev("10 - 3 + 2") == 9
+        assert self._ev("1 - 2 + 3 - 4") == -2
+        assert self._ev("8 / 4 * 2") == 4
+        assert self._ev("2 * 3 / 4") == 1.5
+
+    def test_the_rolling_period_shape(self):
+        assert self._ev("37 - (3-1)*12 - 1") == 12
+
+    def test_plain_integer_arithmetic_stays_integral(self):
+        assert self._ev("1 + 2") == 3
+
+
+class TestConcatenationOfFalsyValues:
+    """`&` rendered every FALSY value as empty.
+
+    `str(v or '')` turned 0 into "", so the zero-padding idiom
+    RIGHT("0" & n, 2) lost its pad on exactly the rows where n was 0 --
+    'P-00' became 'P-0' on 93 rows of MS_Competitive_Marketing.
+    """
+
+    @staticmethod
+    def _ev(expr):
+        from pbix_mcp.dax import engine as de
+        return de.DAXEngine()._eval_expr(
+            expr, de.DAXContext({}, {}, None, None, None, []))
+
+    def test_zero_is_not_blank(self):
+        assert self._ev('"0" & 0') == "00"
+        assert self._ev('RIGHT("0" & 0, 2)') == "00"
+
+    def test_blank_is_still_empty(self):
+        assert self._ev('"x" & BLANK()') == "x"
+
+    def test_whole_floats_render_without_a_tail(self):
+        assert self._ev('"n=" & 3.0') == "n=3"
+
+    def test_booleans_render_as_dax_spells_them(self):
+        assert self._ev('"b=" & (1=1)') == "b=TRUE"
+
+
+class TestDatesAreNumbers:
+    """A DATE is a number in DAX -- days since 1899-12-30.
+
+    `_as_number` returned None for dates, so the common
+    `[Timestamp] * 86400000` milliseconds idiom evaluated to BLANK on every
+    row. Dates reach the evaluator as ISO strings, microseconds included.
+    """
+
+    @staticmethod
+    def _ev(expr):
+        from pbix_mcp.dax import engine as de
+        return de.DAXEngine()._eval_expr(
+            expr, de.DAXContext({}, {}, None, None, None, []))
+
+    def test_date_multiplies_as_its_serial(self):
+        assert self._ev("DATE(2020,1,2) * 2") == 87664
+
+    def test_date_difference_is_days(self):
+        assert self._ev("DATE(2020,1,3) - DATE(2020,1,1)") == 2
+
+    def test_iso_string_with_microseconds_keeps_them(self):
+        got = self._ev('"2020-04-15T22:04:42.403333" * 86400000')
+        assert abs(got - 3796149882403.333) < 1e-3
+
+    def test_a_plain_word_is_still_not_a_number(self):
+        assert self._ev('"hello" * 2') is None
+
+
+class TestFormatPictures:
+    @staticmethod
+    def _ev(expr):
+        from pbix_mcp.dax import engine as de
+        return de.DAXEngine()._eval_expr(
+            expr, de.DAXContext({}, {}, None, None, None, []))
+
+    def test_leading_zero_picture(self):
+        """FORMAT(1, "000") is "001". Desktop builds sort-key columns this
+        way, so dropping the pad changes sort order, not just display."""
+        assert self._ev('FORMAT(1, "000")') == "001"
+        assert self._ev('FORMAT(23, "000")') == "023"
+        assert self._ev('FORMAT(-7, "000")') == "-007"
+
+    def test_existing_pictures_are_unchanged(self):
+        assert self._ev('FORMAT(1.5, "0.00")') == "1.50"
+        assert self._ev('FORMAT(1234, "#,##0")') == "1,234"
+
+    def test_upper_case_date_tokens(self):
+        """FORMAT(d, "YYYY-MM-DD") returned the literal "YYYY-01-DD"."""
+        assert self._ev('FORMAT(DATE(2020,1,2), "YYYY-MM-DD")') == "2020-01-02"
+        assert self._ev('FORMAT(DATE(2020,1,2), "yyyy-MM-dd")') == "2020-01-02"
