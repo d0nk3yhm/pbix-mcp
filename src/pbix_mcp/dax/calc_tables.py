@@ -303,7 +303,7 @@ def calc_column_unsupported_reason(expression: str, target_table: str,
     It lets an aggregate over a misspelled column be refused instead of quietly
     answering 0; callers without the list simply lose that one check.
     """
-    e = strip_dax_comments(expression)
+    e = expand_variation_accessors(strip_dax_comments(expression))
     if not e.strip():
         return "expression is empty"
     for quoted, bare in _CALC_REF_RE.findall(e):
@@ -381,6 +381,40 @@ def calc_column_unsupported_reason(expression: str, target_table: str,
 # is never mistaken for one.
 _COLUMN_REF = re.compile(r"(?:'[^']+'|\b\w+)?\[[^\]]+\]")
 _STRING_LITERAL = re.compile(r'"(?:[^"]|"")*"')
+
+# `'Fact'[EstimatedCloseDate].[Date]` — the auto date/time VARIATION accessor.
+# A `Variation` metadata row links the column to a hidden LocalDateTable through
+# a relationship, and `.[Date]` reads that table's Date column. Because the
+# relationship joins on the date itself, the value is simply the date part of
+# the column, needing no traversal at evaluation time.
+#
+# VERIFIED against Power BI Desktop's own stored values for
+# test_corpus/MS_Revenue_Opportunities.pbix `Fact[Date]`: 458/458 rows equal the
+# date part of `Fact[EstimatedCloseDate]`.
+_VARIATION_ACCESSOR = re.compile(
+    r"((?:'[^']+'|\b\w+)?\[[^\]]+\])\s*\.\s*\[([^\]]+)\]")
+
+# Only `.[Date]` is verified. The other parts map to auto-date TEMPLATE columns
+# whose values are locale-dependent display strings ("January", "Qtr 1"), so
+# they are deliberately left unexpanded — the unresolved-reference check then
+# refuses them rather than guessing.
+_VARIATION_VERIFIED = {"date"}
+
+
+def expand_variation_accessors(expr: str) -> str:
+    """Rewrite `X.[Date]` to the date part of X, using verified primitives only.
+
+    DATE/YEAR/MONTH/DAY are all separately checked against Desktop, so the
+    expansion introduces no new unverified behaviour and drops any time
+    component exactly as the LocalDateTable's Date column does.
+    """
+    def _sub(m: "re.Match[str]") -> str:
+        col, part = m.group(1), m.group(2)
+        if part.strip().lower() not in _VARIATION_VERIFIED:
+            return m.group(0)
+        return f"DATE(YEAR({col}), MONTH({col}), DAY({col}))"
+
+    return _VARIATION_ACCESSOR.sub(_sub, expr or "")
 
 
 def _strip_strings(expr: str) -> str:
@@ -580,7 +614,7 @@ def evaluate_row_context_column(
     """
     from pbix_mcp.dax import engine as dax_engine
 
-    clean = strip_dax_comments(expression).strip()
+    clean = expand_variation_accessors(strip_dax_comments(expression)).strip()
     engine = dax_engine.DAXEngine()
     values: list = []
     unresolved: set = set()

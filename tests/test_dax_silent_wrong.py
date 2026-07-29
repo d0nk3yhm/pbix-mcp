@@ -542,3 +542,86 @@ class TestStringLiteralsAreNotTornApart:
         c = eng_mod.DAXContext({}, {}, None, None, None, [])
         assert eng._eval_expr('"a ""quoted"" b"', c) == 'a "quoted" b'
         assert eng._eval_expr('"plain"', c) == "plain"
+
+
+class TestAutoDateVariationAccessor:
+    """`'Fact'[EstimatedCloseDate].[Date]` — the auto date/time VARIATION accessor.
+
+    A `Variation` metadata row links the column to a hidden LocalDateTable via a
+    relationship, and `.[Date]` reads that table's Date column. Because the
+    relationship joins on the date itself, the value is just the date part of
+    the column and needs no traversal at evaluation time.
+
+    Ground truth: Power BI Desktop's OWN stored values for
+    test_corpus/MS_Revenue_Opportunities.pbix `Fact[Date]` equal the date part
+    of `Fact[EstimatedCloseDate]` on all 458 rows.
+    """
+
+    @staticmethod
+    def _eval(expr):
+        import datetime as _dt
+
+        from pbix_mcp.dax.calc_tables import evaluate_row_context_column
+        cols = ["D"]
+        rows = [[_dt.datetime(2024, 3, 5, 14, 30)],
+                [_dt.datetime(2023, 7, 19, 0, 0)]]
+        tables = {"F": {"columns": cols, "rows": [list(r) for r in rows]}}
+        return evaluate_row_context_column(cols, rows, expr, "F", tables, [])
+
+    def test_date_part_is_taken_and_time_dropped(self):
+        import datetime as _dt
+        vals, err = self._eval("'F'[D].[Date]")
+        assert err is None, err
+        assert vals == [_dt.datetime(2024, 3, 5), _dt.datetime(2023, 7, 19)]
+
+    @pytest.mark.parametrize("part", ["Year", "Month", "Quarter", "Day", "MonthNo"])
+    def test_unverified_parts_refuse_rather_than_guess(self, part):
+        """Those map to auto-date TEMPLATE columns whose values are
+        locale-dependent display strings ("January", "Qtr 1"). Until each is
+        checked against Desktop they must refuse, never materialize a guess."""
+        vals, err = self._eval(f"'F'[D].[{part}]")
+        assert vals is None and err is not None
+
+    def test_expansion_uses_only_verified_primitives(self):
+        from pbix_mcp.dax.calc_tables import expand_variation_accessors
+        out = expand_variation_accessors("'Fact'[X].[Date]")
+        assert out == "DATE(YEAR('Fact'[X]), MONTH('Fact'[X]), DAY('Fact'[X]))"
+        # an ordinary reference is untouched
+        assert expand_variation_accessors("'Fact'[X]") == "'Fact'[X]"
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not os.path.isdir(CORPUS), reason="corpus not downloaded")
+class TestVariationAccessorAgainstDesktop:
+    def test_matches_desktops_own_stored_values(self):
+        import zipfile
+
+        from pbix_mcp.dax.calc_tables import evaluate_row_context_column
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
+
+        src = os.path.join(CORPUS, "MS_Revenue_Opportunities.pbix")
+        if not os.path.exists(src):
+            pytest.skip("MS_Revenue_Opportunities.pbix not in corpus")
+        with zipfile.ZipFile(src) as z:
+            abf = decompress_datamodel(z.read("DataModel"))
+        meta = read_metadata_sqlite(abf)
+        td = read_table_from_abf(abf, "Fact", meta, include_calculated=True)
+        cols = td["columns"]
+        assert "Date" in cols and "EstimatedCloseDate" in cols
+        di = cols.index("Date")
+        in_cols = [c for c in cols if c != "Date"]
+        in_rows = [[r[cols.index(c)] for c in in_cols] for r in td["rows"]]
+        snap = {"Fact": {"columns": list(in_cols),
+                         "rows": [list(r) for r in in_rows]}}
+        vals, err = evaluate_row_context_column(
+            in_cols, in_rows, "'Fact'[EstimatedCloseDate].[Date]",
+            "Fact", snap, [])
+        assert err is None, err
+
+        def norm(v):
+            return v.date() if hasattr(v, "date") else v
+        wrong = [i for i, r in enumerate(td["rows"])
+                 if norm(r[di]) != norm(vals[i])]
+        assert wrong == [], f"{len(wrong)} of {len(vals)} rows differ from Desktop"
