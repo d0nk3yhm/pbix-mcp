@@ -184,11 +184,19 @@ class ModelReader:
         if "relationships" in self._metadata_cache:
             return self._metadata_cache["relationships"]
 
+        # COALESCE is REQUIRED, not tidiness: a calculated-table column (Type=4)
+        # carries only InferredName, and ExplicitName is NULL. Every Desktop
+        # marked/auto date table has one, so reading ExplicitName alone returned
+        # ToColumnName=None for `FactSales[DateKey] -> Date[Date]`. The DAX engine
+        # then could not map the relationship, so a Date filter never reached the
+        # fact table and every date-scoped measure silently returned the GRAND
+        # TOTAL -- e.g. Agents_Performance [MTD Total Sales] came back BLANK where
+        # Desktop gives $19,260,877.
         rows = self._query_metadata("""
             SELECT ft.Name AS FromTableName,
-                   fc.ExplicitName AS FromColumnName,
+                   COALESCE(fc.ExplicitName, fc.InferredName) AS FromColumnName,
                    tt.Name AS ToTableName,
-                   tc.ExplicitName AS ToColumnName,
+                   COALESCE(tc.ExplicitName, tc.InferredName) AS ToColumnName,
                    r.IsActive,
                    r.CrossFilteringBehavior
             FROM [Relationship] r

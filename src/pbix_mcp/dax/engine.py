@@ -177,6 +177,7 @@ _P_NEG = 13       # unary minus
 _P_FUNC = 14      # FUNC(args), name + args text precomputed
 _P_TAIL = 15      # bare table name / final BLANK
 _P_IN = 16        # <scalar> IN <set>; may return None -> fall through
+_P_TABLECTOR = 17  # { a, b, c } -> one-column table, column named Value
 
 _PLAN_CACHE: dict = {}
 
@@ -233,8 +234,32 @@ def _analyze_expr(raw):
     if not expr:
         return ((_P_NONE, None),)
 
+    # ''[Value] -- an EMPTY table qualifier. Power BI's own auto-generated
+    # measures use it to read the implicit [Value] column of a table constructor
+    # (see _ShowValueForDates: MAXX({ MAX(T[C]) }, ''[Value])). An empty table
+    # name matches nothing, so strip the qualifier and let the bare-bracket path
+    # read the column out of the current row.
+    if "''[" in expr:
+        expr = expr.replace("''[", "[")
+
     if _VAR_KW_RE.search(expr) and _RETURN_KW_RE.search(expr):
         return ((_P_VARRET, expr),)
+
+    # A table constructor: { expr, expr, ... } -> a one-column table whose column
+    # is called Value, which is the name DAX gives it.
+    if expr.startswith('{') and expr.endswith('}'):
+        depth = 0
+        wraps_all = True
+        for i, ch in enumerate(expr):
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+            if depth == 0 and i < len(expr) - 1:
+                wraps_all = False
+                break
+        if wraps_all:
+            return ((_P_TABLECTOR, expr[1:-1].strip()),)
 
     if expr.startswith('(') and expr.endswith(')'):
         depth = 0
@@ -522,6 +547,29 @@ def _relative_date_bounds(spec: dict):
     if "next" in spec:
         return anchor, anchor + span
     return anchor - span, anchor
+
+
+def _extremum(cur, cand, want_max: bool):
+    """Running MAX/MIN across the types DAX's MAXX/MINX accept.
+
+    The old test was ``isinstance(result, (int, float))``, so a DATE-valued
+    iteration collapsed to the 0 fallback: Power BI's own _ShowValueForDates
+    guard does ``MAXX({ MAX('FactSales'[DateKey]) }, ''[Value])``, got 0, and the
+    measure it guards silently returned BLANK where Desktop shows $19,260,877.
+    Text is accepted too (DAX's MAXX over strings returns the last one
+    alphabetically). A candidate that cannot be compared with what is already
+    held is skipped rather than raising.
+    """
+    if cand is None or isinstance(cand, bool):
+        return cur
+    if not isinstance(cand, (int, float, str, datetime, date)):
+        return cur
+    if cur is None:
+        return cand
+    try:
+        return cand if ((cand > cur) if want_max else (cand < cur)) else cur
+    except TypeError:
+        return cur
 
 
 def make_value_matcher(spec):
@@ -1398,6 +1446,20 @@ class DAXEngine:
             if kind == _P_BINARY:
                 op, parts = data
                 return self._fold_arith(parts, op, ctx, var_scope)
+            if kind == _P_TABLECTOR:
+                # One row per element, carrying the value under BOTH the
+                # single-column convention (__column__/__value__, which
+                # _make_row_context filters on) and a plain "Value" key, so
+                # ''[Value] / [Value] resolves through the bare-bracket path.
+                rows = []
+                for elem in (self._split_top_level(data, ',') if data else []):
+                    elem = elem.strip()
+                    if not elem:
+                        continue
+                    v = self._eval_expr(elem, ctx, var_scope)
+                    rows.append({'__table__': '', '__column__': 'Value',
+                                 '__value__': v, 'Value': v})
+                return rows
             if kind == _P_IN:
                 result = self._eval_in(data[0], data[1], ctx, var_scope)
                 if result is not None:
@@ -2995,14 +3057,10 @@ class DAXEngine:
                     row_ctx = self._make_row_context(row_item, ctx)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
-                    if isinstance(result, (int, float)):
-                        if max_val is None or result > max_val:
-                            max_val = result
+                    max_val = _extremum(max_val, result, True)
                 else:
                     result = self._eval_expr(row_expr, ctx)
-                    if isinstance(result, (int, float)):
-                        if max_val is None or result > max_val:
-                            max_val = result
+                    max_val = _extremum(max_val, result, True)
             return max_val if max_val is not None else 0
         # Fallback: if table_ref is a column ref, get max of column
         if isinstance(table_ref, tuple) and len(table_ref) == 2:
@@ -3027,14 +3085,10 @@ class DAXEngine:
                     row_ctx = self._make_row_context(row_item, ctx)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
-                    if isinstance(result, (int, float)):
-                        if min_val is None or result < min_val:
-                            min_val = result
+                    min_val = _extremum(min_val, result, False)
                 else:
                     result = self._eval_expr(row_expr, ctx)
-                    if isinstance(result, (int, float)):
-                        if min_val is None or result < min_val:
-                            min_val = result
+                    min_val = _extremum(min_val, result, False)
             return min_val if min_val is not None else 0
         if isinstance(table_ref, tuple) and len(table_ref) == 2:
             values = [v for v in ctx.get_column_data(table_ref[0], table_ref[1]) if isinstance(v, (int, float))]

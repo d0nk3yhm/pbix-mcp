@@ -29,9 +29,14 @@ These produce a plausible answer with no error, which is why they survived so lo
 - [ ] **issues-15** -- residual COALESCE(ExplicitName, InferredName) instance
 - [ ] **issues-5** -- lat/long in X/Y value roles must AVERAGE, not Sum
 
-- [ ] **issues-9 (follow-on)** -- the RANKX/TOPN-over-parameter-scalar chain is
-      inaccurate: `Table MTD Sales` returns BLANK where Desktop returns
-      $19,260,877. Blocks enabling the `IN` operator generally.
+- [ ] **issues-9 (follow-on)** -- Agents_Performance must match Desktop on ALL
+      SIX affected measures, not five. Three root causes found and fixed so far
+      (unreleased): relationships to a calculated-table column read as
+      `ToColumn=None` so date filters never propagated; the `{...}` table
+      constructor and its implicit `''[Value]` column were unimplemented; and
+      MAXX/MINX dropped DATE values, collapsing to 0. Remaining: `CALCULATETABLE`
+      is unsupported, which `CF Table` and `Table MTD Sales` reach once the
+      guard evaluates. Also still blocks enabling the `IN` operator generally.
 
 ## Open: Desktop fidelity
 

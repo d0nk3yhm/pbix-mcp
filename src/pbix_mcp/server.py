@@ -9285,8 +9285,10 @@ def _modify_metadata_sqlite(
 
             modified_rels = []
             for rrow in conn.execute(
-                "SELECT ft.Name as ft, fc.ExplicitName as fc, "
-                "tt.Name as tt, tc.ExplicitName as tc "
+                "SELECT ft.Name as ft, "
+                "COALESCE(fc.ExplicitName, fc.InferredName) as fc, "
+                "tt.Name as tt, "
+                "COALESCE(tc.ExplicitName, tc.InferredName) as tc "
                 "FROM Relationship r "
                 "JOIN [Table] ft ON r.FromTableID = ft.ID "
                 "JOIN [Column] fc ON r.FromColumnID = fc.ID "
@@ -10045,8 +10047,9 @@ def pbix_datamodel_modify_relationship(
                 "JOIN [Column] fc ON r.FromColumnID = fc.ID "
                 "JOIN [Table] tt ON r.ToTableID = tt.ID "
                 "JOIN [Column] tc ON r.ToColumnID = tc.ID "
-                "WHERE ft.Name = ? AND fc.ExplicitName = ? "
-                "AND tt.Name = ? AND tc.ExplicitName = ?",
+                "WHERE ft.Name = ? AND COALESCE(fc.ExplicitName, fc.InferredName) = ? "
+                "AND tt.Name = ? "
+                "AND COALESCE(tc.ExplicitName, tc.InferredName) = ?",
                 (from_table, from_column, to_table, to_column)).fetchone()
             if row is None:
                 # Desktop may store the pair in the opposite orientation.
@@ -10058,8 +10061,10 @@ def pbix_datamodel_modify_relationship(
                     "JOIN [Column] fc ON r.FromColumnID = fc.ID "
                     "JOIN [Table] tt ON r.ToTableID = tt.ID "
                     "JOIN [Column] tc ON r.ToColumnID = tc.ID "
-                    "WHERE ft.Name = ? AND fc.ExplicitName = ? "
-                    "AND tt.Name = ? AND tc.ExplicitName = ?",
+                    "WHERE ft.Name = ? "
+                    "AND COALESCE(fc.ExplicitName, fc.InferredName) = ? "
+                    "AND tt.Name = ? "
+                    "AND COALESCE(tc.ExplicitName, tc.InferredName) = ?",
                     (to_table, to_column, from_table, from_column)).fetchone()
                 if row is not None:
                     found["swapped"] = True
@@ -16015,7 +16020,9 @@ def pbix_doctor(alias: str) -> str:
         def check_relationships():
             _init_datamodel()
             c = db_conn.cursor()
-            c.execute("""SELECT ft.Name, fc.ExplicitName, tt.Name, tc.ExplicitName, r.IsActive
+            c.execute("""SELECT ft.Name, COALESCE(fc.ExplicitName, fc.InferredName),
+                                tt.Name, COALESCE(tc.ExplicitName, tc.InferredName),
+                                r.IsActive
                          FROM Relationship r
                          JOIN [Table] ft ON r.FromTableID = ft.ID
                          JOIN [Column] fc ON r.FromColumnID = fc.ID
@@ -16857,7 +16864,8 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
     # ---- relationships.tmdl ----
     c.execute(
         "SELECT r.Name, r.IsActive, r.CrossFilteringBehavior, "
-        "ft.Name, fc.ExplicitName, tt.Name, tc.ExplicitName "
+        "ft.Name, COALESCE(fc.ExplicitName, fc.InferredName), "
+        "tt.Name, COALESCE(tc.ExplicitName, tc.InferredName) "
         "FROM [Relationship] r "
         "JOIN [Table] ft ON r.FromTableID = ft.ID "
         "JOIN [Column] fc ON r.FromColumnID = fc.ID "
