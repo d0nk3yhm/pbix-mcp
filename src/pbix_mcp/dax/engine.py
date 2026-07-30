@@ -6066,20 +6066,29 @@ def _find_selectedvalue_targets(expr: str) -> list:
 def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
                             filter_context: dict | None = None,
                             date_table: str | None = None, date_column: str | None = None,
-                            relationships: list | None = None) -> dict:
+                            relationships: list | None = None,
+                            simulate_row_context: bool = True) -> dict:
     """Evaluate measures with smart fallback for SELECTEDVALUE-dependent measures.
 
     When a measure returns BLANK and its expression uses SELECTEDVALUE on a
     parameter table, this tries evaluating with each possible value to find
     a non-BLANK result. This simulates what Power BI does when a visual
     provides row context for a parameter table.
+
+    That simulation makes the answer DIFFER FROM DESKTOP at the grand total,
+    where the honest result is BLANK. Agents_Performance's five TopN/BottomN
+    measures end in SWITCH(TRUE(), SELECTEDVALUE('Clustered Employees'[Order]) =
+    1, ...) with NO default: with no selection Desktop returns BLANK, while the
+    fallback picked Order = 1 and reported 385,096.472. Pass
+    simulate_row_context=False for Desktop-identical evaluation; pbix_evaluate_dax
+    does so unless the caller opts in.
     """
     ctx = DAXContext(tables, measures, date_table, date_column, filter_context, relationships)
     results = {}
 
     for name in measure_names:
         val = _engine.evaluate_measure(name, ctx)
-        if val is not None:
+        if val is not None or not simulate_row_context:
             results[name] = val
             continue
 

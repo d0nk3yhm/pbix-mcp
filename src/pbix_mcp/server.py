@@ -12226,10 +12226,14 @@ def pbix_evaluate_dax(
         dax_engine._engine.unsupported_functions.clear()
         logger.info("Evaluating %d measures for '%s'", len(measure_names), alias)
 
+        # simulate_row_context=False: report what the MODEL returns, exactly as
+        # Desktop's own engine does. The fallback that guesses a parameter-table
+        # selection when a measure is BLANK produced numbers Desktop never shows
+        # at the grand total (see evaluate_measures_smart).
         results = dax_engine.evaluate_measures_smart(
             measure_names, ctx['tables'], ctx['measure_defs'],
             fc, ctx['date_table'], ctx['date_column'],
-            ctx.get('relationships')
+            ctx.get('relationships'), simulate_row_context=False
         )
 
         # Build structured response with DAXResult objects
