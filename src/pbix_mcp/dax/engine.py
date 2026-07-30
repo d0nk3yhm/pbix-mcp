@@ -3672,7 +3672,38 @@ class DAXEngine:
                             if key not in groups:
                                 groups[key] = []
                             groups[key].append(row_item['__value__'])
-                    if groups:
+                    if groups and '__row__' in first:
+                        # A multi-column row set REPLACES the filter context of
+                        # the tables it covers, propagation included -- the same
+                        # thing a bare ALL(Table) does. Only adding the row
+                        # values left a related dimension's filter in force on
+                        # top of them: under a filter on Owners[Manager],
+                        # `CALCULATE(AVERAGE('Cases'[CSAT]),
+                        #  FILTER(ALL('Cases'),1=1))` averaged that manager's
+                        # 3,914 rows where Desktop returns the global 4.2706.
+                        #
+                        # This is scoped by the SAME snapshot ALL uses, and that
+                        # is what makes it safe. An earlier attempt suppressed
+                        # the table outright and took [Actives] from Desktop's
+                        # 32,401 to 1,260,817: it is
+                        # `CALCULATE([EmpCount], FILTER(Employee, ...))`, and the
+                        # blanket flag also blocked the Date[PeriodNumber] filter
+                        # that [EmpCount] creates LATER from reaching Employee.
+                        # With a snapshot there is nothing live to suppress at
+                        # the grand total, so that filter still propagates.
+                        tbls = {r['__table__'] for r in result
+                                if isinstance(r, dict) and '__table__' in r}
+                        new_ctx = new_ctx.without_filters(
+                            [k for k in new_ctx.filter_context
+                             if any(k.startswith(f"{t}.") for t in tbls)])
+                        snaps = {t: new_ctx._filter_snapshot(t) for t in tbls}
+                        new_ctx = new_ctx.with_filters(groups)
+                        new_ctx._no_propagate = new_ctx._no_propagate | tbls
+                        new_ctx._no_prop_keys = {**new_ctx._no_prop_keys, **snaps}
+                    elif groups:
+                        # Single-column row set (ALL(T[Col]), VALUES): replaces
+                        # the filter on that ONE column, and a filter reaching
+                        # the table through a relationship still applies.
                         new_ctx = new_ctx.with_filters(groups)
                 continue
 

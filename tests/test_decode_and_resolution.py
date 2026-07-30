@@ -150,6 +150,58 @@ class TestAllOnlySuppressesTheFiltersItCleared:
                   'ALL(Fact))', filters={"Dim.grp": ["Y"]}) == 10
 
 
+class TestTableFilterArgumentReplacesPropagation:
+    """A MULTI-COLUMN table filter argument replaces the filter context of the
+    tables it covers, propagation included -- like ALL(Table), and scoped by the
+    same snapshot.
+
+    Desktop, filtering the related Owners[Manager] on MS_AI_Sample:
+
+        CALCULATE(AVERAGE('Cases'[CSAT]), FILTER(ALL('Cases'), 1=1)) = 4.2706
+        CALCULATE(COUNTROWS('Cases'),     FILTER(ALL('Cases'), 1=1)) = 10000
+        AVERAGE('Cases'[CSAT])  (no ALL)                  = 4.13796627491058
+
+    The row set and the SELECTEDVALUE were already right; the aggregate inside
+    was still being evaluated against that manager's 3,914 rows. The four
+    [CSAT Impact*] measures are 1 - AllAvgExcept/AllAvg over this shape and came
+    out +-0.03 where Desktop gives exactly 0.
+
+    A first attempt at this suppressed the covered tables OUTRIGHT and took
+    MS_Employee_Hiring's [Actives] from Desktop's 32,401 to 1,260,817 --
+    `CALCULATE([EmpCount], FILTER(Employee, ...))`, where the blanket flag also
+    blocked the Date[PeriodNumber] filter [EmpCount] creates LATER. The last
+    test below is that shape, and it is the one the earlier scoping test
+    missed: it asserted ALL(Fact[v]) directly and never wrapped it in FILTER.
+    """
+
+    FILTERS = {"Dim.grp": ["X"]}
+
+    def test_filter_over_all_clears_the_propagated_filter(self):
+        assert ev("CALCULATE(SUM(Fact[v]), FILTER(ALL(Fact), 1=1))",
+                  filters=self.FILTERS) == 30
+
+    def test_it_agrees_with_the_bare_all(self):
+        assert ev("CALCULATE(SUM(Fact[v]), ALL(Fact))",
+                  filters=self.FILTERS) == ev(
+                      "CALCULATE(SUM(Fact[v]), FILTER(ALL(Fact), 1=1))",
+                      filters=self.FILTERS) == 30
+
+    def test_the_bare_table_expression_was_already_right(self):
+        assert ev("COUNTROWS(FILTER(ALL(Fact), 1=1))",
+                  filters=self.FILTERS) == 2
+
+    def test_a_single_column_filter_does_NOT_suppress_propagation(self):
+        assert ev("CALCULATE(SUM(Fact[v]), ALL(Fact[v]))",
+                  filters=self.FILTERS) == 10
+
+    def test_a_later_nested_filter_still_propagates(self):
+        """The [Actives] shape: FILTER(Fact, ...) with nothing live to
+        suppress, then a nested CALCULATE creates a filter. Suppressing the
+        table outright blocked it and inflated the answer ~39x on the corpus."""
+        assert ev('CALCULATE(CALCULATE(SUM(Fact[v]), Dim[grp] = "X"), '
+                  'FILTER(Fact, 1=1))') == 10
+
+
 class TestOneRowTableIsAScalar:
     """A measure must evaluate to a value. `LASTDATE('Year'[Date])` returned
     the internal row-dict list, whose str() leaked 72 characters of Python
