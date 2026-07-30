@@ -1011,7 +1011,14 @@ class DAXContext:
             if idx >= 0:
                 _m = make_value_matcher(values)
                 frontier_rows = [r for r in frontier_rows if _m(r[idx])]
+        # Selecting BLANK selects DAX's unknown member: the rows on the far side
+        # of the relationship whose key matches NO row of this dimension. No real
+        # dimension row matches it, so it must be resolved at the join instead.
+        wants_blank = any(
+            isinstance(v, (list, tuple, set, frozenset)) and any(x is None for x in v)
+            for _c, v in col_filters)
         frontier_tbl = src_tbl
+        first_hop = True
         for (cur_name, nxt_name, col_cur, col_nxt) in path:
             cur_idx = self._find_col_idx(frontier_tbl['columns'], col_cur)
             if cur_idx < 0:
@@ -1023,6 +1030,14 @@ class DAXContext:
             nxt_idx = self._find_col_idx(nxt_tbl['columns'], col_nxt)
             if nxt_idx < 0:
                 return None
+            if wants_blank and first_hop:
+                # Resolve the unknown member: keys present on the far side that
+                # match no row of this dimension. Adding them to allowed_keys
+                # selects exactly the rows DAX attributes to the blank row.
+                member_keys = {str(r[cur_idx]) for r in frontier_tbl['rows']}
+                allowed_keys |= {str(r[nxt_idx]) for r in nxt_tbl['rows']
+                                 if str(r[nxt_idx]) not in member_keys}
+            first_hop = False
             if nxt_name == target_table:
                 # Final hop: emit the filter for the fact table (empty set is OK).
                 return (allowed_keys, nxt_idx)
@@ -2026,6 +2041,13 @@ class DAXEngine:
         val = row_item.get('__value__')
         if col and val is not None:
             filters[f"{table_name}.{col}"] = [val]
+        elif col and '__value__' in row_item:
+            # The BLANK (unknown) member. It must still emit a filter -- skipping
+            # it left the context UNFILTERED, so iterating a dimension that has an
+            # unknown member evaluated the measure once over the whole model and
+            # AVERAGEX came out double. The propagation resolves [None] to the
+            # rows whose key matches no dimension row.
+            filters[f"{table_name}.{col}"] = [None]
         new_ctx = ctx.with_filters(filters)
         # Bind the current row for ALL iteration shapes (full-row SUMX dicts,
         # single-column VALUES/ALL dicts, ADDCOLUMNS/SELECTCOLUMNS extension
@@ -2954,7 +2976,13 @@ class DAXEngine:
                 if col_idx >= 0:
                     # Return list of {column: value} dicts for iteration
                     all_values = list(set(row[col_idx] for row in tbl['rows'] if row[col_idx] is not None))
-                    return [{'__table__': table_name, '__column__': col_name, '__value__': v} for v in all_values]
+                    out = [{'__table__': table_name, '__column__': col_name,
+                            '__value__': v} for v in all_values]
+                    if self._has_unknown_member(table_name, col_name, col_idx,
+                                                tbl, ctx):
+                        out.append({'__table__': table_name,
+                                    '__column__': col_name, '__value__': None})
+                    return out
 
         # Table-level ALL: ALL('TableName') — return all rows as multi-column row dicts
         table_name = ref.strip("'").strip()
@@ -3036,6 +3064,41 @@ class DAXEngine:
 
     _DATEADD_ARGS_RE = re.compile(
         r"'?([^'\[]+)'?\s*\[([^\]]+)\]\s*,\s*(-?\d+)\s*,\s*(\w+)", re.IGNORECASE)
+
+    def _has_unknown_member(self, table_name: str, col_name: str, col_idx: int,
+                            tbl: dict, ctx: DAXContext) -> bool:
+        """Does this dimension column need DAX's BLANK (unknown) member?
+
+        When a related table holds a key that matches no row here, the engine
+        adds a blank row to the dimension and attributes those facts to it. In
+        Agents_Performance one DimStore row points at EmployeeKey 245, which does
+        not exist in DimEmployee, so Desktop's ALL(DimEmployee[EmployeeKey])
+        yields 294 members and AVERAGEX over it divides by 262 non-blank, not 261.
+        Omitting the member made every "Employees Avg ..." measure differ.
+
+        Memoized: the far side can be a fact table, and this is called per ALL().
+        """
+        key = (id(tbl), 'unknown-member', col_idx)
+        hit = ctx._filter_idx_cache.get(key)
+        if hit is not None:
+            return bool(hit)
+        member_keys = {str(r[col_idx]) for r in tbl['rows']}
+        found = False
+        for rel in (ctx.relationships or []):
+            if (rel.get('ToTable') != table_name
+                    or str(rel.get('ToColumn') or '').lower() != col_name.lower()):
+                continue
+            ftbl = ctx.tables.get(rel.get('FromTable'))
+            if not ftbl:
+                continue
+            fi = ctx._find_col_idx(ftbl['columns'], rel.get('FromColumn'))
+            if fi < 0:
+                continue
+            if any(str(r[fi]) not in member_keys for r in ftbl['rows']):
+                found = True
+                break
+        ctx._filter_idx_cache[key] = found
+        return found
 
     def _fn_dateadd(self, args_str: str, ctx: DAXContext) -> Any:
         """DATEADD(<dates>, offset, interval) as a real TABLE.
@@ -4158,8 +4221,19 @@ class DAXEngine:
             table_name = col_match.group(1).strip()
             col_name = col_match.group(2).strip()
             values = ctx.get_column_data(table_name, col_name)
-            unique = list(set(values))
-            return [{'__table__': table_name, '__column__': col_name, '__value__': v} for v in unique]
+            unique = [v for v in set(values) if v is not None]
+            out = [{'__table__': table_name, '__column__': col_name,
+                    '__value__': v} for v in unique]
+            # ALLSELECTED spans the whole column, so it carries DAX's BLANK
+            # (unknown) member too when a related table holds an unmatched key.
+            tbl = ctx.tables.get(table_name)
+            if tbl:
+                ci = ctx._find_col_idx(tbl['columns'], col_name)
+                if ci >= 0 and self._has_unknown_member(table_name, col_name,
+                                                        ci, tbl, ctx):
+                    out.append({'__table__': table_name,
+                                '__column__': col_name, '__value__': None})
+            return out
         return ('__ALLSELECTED__', ref)
 
     def _fn_keepfilters(self, args_str: str, ctx: DAXContext) -> Any:
