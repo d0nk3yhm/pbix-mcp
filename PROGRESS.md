@@ -91,15 +91,31 @@ Every one of these is a measure where Desktop and this engine disagree under a
 FILTER CONTEXT. They are recorded with their root-cause class so the next
 session starts from evidence rather than from scratch.
 
-- **Ecommerce_Conversion `*_PMTD/PQTD` and `*_%Delta` under `QuarterName=Q1`.**
-  Desktop BLANK, we return a value (and the `%Delta` measures built on them come
-  out -1.0). The chain is
-  `_FirstDatePrevtQTD = CALCULATE(MAX(dimDate[FirstOfMonth]), DATEADD(dimDate[Date],-1,QUARTER))`
-  which is correctly BLANK in Q1 (the previous quarter is outside the calendar),
-  then `_LastDatePrevQ = DATE(YEAR(_Max_Date), MONTH(_FirstDatePrevtQTD), DAY(_Max_Date))`.
-  Start by checking `MONTH(BLANK())` and `DATE()` with a blank part against
-  Desktop -- a blank month probably has to poison the whole DATE(), and the
-  DATESBETWEEN that follows.
+**FIXED since this list was written** (each Desktop-verified, each with tests):
+
+- `New Hires SPLY` and the whole SPLY/YoY family -- `DATEADD` shifted the single
+  min..max range, so seven disjoint quarters became one span. Commit 8c84783.
+- Ecommerce `*_PMTD/PQTD` and `*_%Delta` @ Q1 -- a shifted period outside the
+  calendar applied NO filter instead of an empty one. Commit 243d836.
+
+**REVERTED, and the reason matters more than the fix** (commit 219e63d):
+`FILTER(ALL(T), ...)` as a CALCULATE filter argument does not suppress
+relationship propagation the way bare `ALL(T)` does. That IS a real defect --
+Desktop returns the global 4.2706 for
+`CALCULATE(AVERAGE('Cases'[CSAT]), FILTER(ALL('Cases'),1=1))` under a filter on
+the related Owners[Manager], and we return that manager's 4.1379. Suppressing
+propagation for every MULTI-COLUMN row set fixed all four [CSAT Impact*]
+measures but broke MS_Employee_Hiring far worse: `[Actives]` went from
+Desktop's exact 32,401 to 1,260,817, and ~20 dependent measures with it.
+Cause: `EmpCount` is
+`CALCULATE(COUNT([EmplID]), FILTER(ALL('Date'[PeriodNumber]), ...))` -- a
+SINGLE-column ALL that our engine still materialises as `__row__` dicts, so the
+"multi-column" test matched it and cleared the period restriction. The scoping
+test I wrote asserted the single-column case as `ALL(Fact[v])` directly and
+never wrapped it in FILTER, so it passed while the real shape broke.
+A narrower fix must key off what the row set actually SPANS (all columns of the
+table) rather than the presence of `__row__`, and must be checked against
+`[Actives]` = 32,401 before anything else.
 - **MS_AI_Sample `CSAT Impact` / `- Agent` / `- Products` / `- Subject` per
   Manager.** Desktop 0, we return +-0.03. All four share one shape:
   `VAR AllAvg = CALCULATE(AVERAGE(Cases[CSAT]), ALL(Cases))`
@@ -124,20 +140,12 @@ session starts from evidence rather than from scratch.
     adding temp measures, or build the DAXContext the way `cmp_ctx.py` does.
 - **Agents_Performance `Rank Filtering *` under `StoreType=Catalog`.** Desktop 0,
   we return 1.
-- **MS_Employee_Hiring `New Hires SPLY` — the quarter filter is DROPPED, not
-  mis-computed.** Desktop 11601 @ Qtr=2 and 13840 @ Qtr=3; we return **43120 for
-  both**, and 43120 is the measure's GRAND TOTAL. A constant answer across
-  filter values is the signature of a filter that never reached the
-  evaluation, so look at the SPLY/SAMEPERIODLASTYEAR path dropping the
-  incoming context, NOT at the arithmetic. `Bad Hires YoY Var @ Qtr=N`
-  (Desktop 0, we return +2466 / -7104) is built on it and should follow.
-  This is NOT the earlier budget-timeout cluster in the same file -- a timeout
-  yields None, and these are confident numbers.
 - **MS_Employee_Hiring `AVG Tenure Days @ Qtr=2`** Desktop 2952.93, we return
-  None; same family as the `AVG Tenure Months @ Qtr=N` -1 above.
+  None; same family as the `AVG Tenure Months @ Qtr=N` -1 above. Re-check after
+  the DATEADD fix -- it was measured before.
 - **MS_Competitive_Marketing `% Units Market Share SPLY @ MfgisVanArsdel=Yes`**
   Desktop 1, we return 0; and `@Indicator05` Desktop 2, we return 1. Both are
-  SPLY-family, so check them against the same root cause as New Hires SPLY.
+  SPLY-family; re-measure against the DATEADD fix before investigating.
 - **Two capture artefacts, not engine bugs**: `Employee Name @ StoreType=Catalog`
   and `Date Range Previous Period @ QuarterName=Q1` compare via the LEN
   fallback because the captured value was truncated; confirm against Desktop's
