@@ -1192,6 +1192,7 @@ class DAXContext:
         self._max_eval_calls = 3_000_000
         # Build relationship index: { (fromTable, toTable): { fromCol, toCol } }
         self._rel_index = {}
+        self._rel_dir: dict = {}
         for rel in self.relationships:
             if rel.get('IsActive'):
                 ft = rel.get('FromTable', '')
@@ -1201,6 +1202,23 @@ class DAXContext:
                 if ft and tt and fc and tc:
                     self._rel_index[(ft, tt)] = {'from_col': fc, 'to_col': tc}
                     self._rel_index[(tt, ft)] = {'from_col': tc, 'to_col': fc}
+                    # ...and a DIRECTED copy for propagation. _rel_index is
+                    # symmetric, which is fine for "is there a relationship
+                    # between these two" but wrong for filtering: a filter flows
+                    # from the ONE side (ToTable) to the MANY side (FromTable),
+                    # the same rule _rel_adj uses for multi-hop below.
+                    #
+                    # Using the symmetric index propagated MANY -> ONE too, so
+                    # filtering DimStore restricted DimEmployee and
+                    # SELECTEDVALUE(DimEmployee[EmployeeKey]) answered 213 where
+                    # Desktop answers BLANK -- Desktop's COUNTROWS(DimEmployee)
+                    # under DimStore[StoreType]="Catalog" is 293, i.e. the
+                    # unfiltered total. Agents_Performance's three
+                    # [Rank Filtering *] measures and [Employee Name] all turn on
+                    # that SELECTEDVALUE.
+                    self._rel_dir[(ft, tt)] = {'from_col': fc, 'to_col': tc}
+                    if rel.get('CrossFilteringBehavior') == 2:
+                        self._rel_dir[(tt, ft)] = {'from_col': tc, 'to_col': fc}
         # Directed adjacency for MULTI-HOP (snowflake) filter propagation.
         # A filter propagates along the default cross-filter direction: from the
         # "one" side (ToTable) to the "many" side (FromTable). Each edge carries
@@ -1393,7 +1411,7 @@ class DAXContext:
                 continue
 
             # Find relationship between source dim table and target table
-            rel = self._rel_index.get((table_name, src_table))
+            rel = self._rel_dir.get((table_name, src_table))
             if not rel:
                 # Try via date table special handling (for Year/Month filters on date dim)
                 if src_table == self.date_table:

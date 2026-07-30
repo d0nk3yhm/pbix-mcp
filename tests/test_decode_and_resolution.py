@@ -202,6 +202,38 @@ class TestTableFilterArgumentReplacesPropagation:
                   'FILTER(Fact, 1=1))') == 10
 
 
+class TestPropagationIsDirectional:
+    """A filter flows from the ONE side of a relationship to the MANY side, not
+    back. `Fact.k -> Dim.k` makes Fact the many side, so filtering Fact must
+    leave Dim untouched.
+
+    The single-hop index was built symmetrically, so filtering the many side
+    restricted the one side. Desktop, on Agents_Performance, where
+    `DimStore[EmployeeKey] -> DimEmployee[EmployeeKey]`:
+
+        COUNTROWS(DimEmployee)                                   293
+        ... under DimStore[StoreType] = "Catalog"                293   unchanged
+        SELECTEDVALUE(DimEmployee[EmployeeKey]) under the same   BLANK
+        COUNTROWS(DimStore) under DimEmployee[EmployeeKey] = 213 1     one->many
+
+    With SELECTEDVALUE resolving to an employee instead of BLANK, the first
+    branch of `[Rank Filtering Employyees MTD]`'s SWITCH matched and it answered
+    1 where Desktop answers 0. The multi-hop adjacency already had this rule;
+    only the single-hop index disagreed with it.
+    """
+
+    def test_filtering_the_many_side_leaves_the_one_side_alone(self):
+        assert ev("CALCULATE(COUNTROWS(Dim), Fact[v] = 10)") == 2
+
+    def test_selectedvalue_on_the_one_side_stays_blank(self):
+        assert ev("CALCULATE(SELECTEDVALUE(Dim[grp]), Fact[v] = 10)") is None
+
+    def test_the_one_to_many_direction_still_propagates(self):
+        """The direction that must keep working: Dim is the one side."""
+        assert ev("SUM(Fact[v])", filters={"Dim.grp": ["X"]}) == 10
+        assert ev("CALCULATE(SUM(Fact[v]), Dim[grp] = \"X\")") == 10
+
+
 class TestOneRowTableIsAScalar:
     """A measure must evaluate to a value. `LASTDATE('Year'[Date])` returned
     the internal row-dict list, whose str() leaked 72 characters of Python
