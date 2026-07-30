@@ -5,13 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.62] - 2026-07-31
 
-**Four filter-context defects, found by widening the Desktop comparison past the
+**Five filter-context defects, found by widening the Desktop comparison past the
 grand total.** The grand total is one cell per measure and the cell where
 blank-propagation, relationship filtering and time intelligence trivially agree;
 comparing `measure x dimension value` is what exposed these. Every rule below is
 Desktop's answer, taken from the workspace `msmdsrv` over ADOMD.
+
+Verified on the release commit: **431/431** comparable measures at the grand
+total, **1,701/1,705** measure×dimension cells under a filter context, and
+**397/397** calculated columns against their stored VertiPaq values.
+
+The four remaining filter-context cells are one known cluster on
+`Agents_Performance`, tracked in `PROGRESS.md`: a filter on a COLUMN must not
+propagate from the many side of a relationship to the one side, while a filter on
+a TABLE must, because it filters the expanded table. Desktop returns both in the
+same model. The engine currently gets the table case right and the column case
+wrong; a fix that reversed that trade was landed and reverted this cycle rather
+than shipped.
 
 ### Time intelligence
 
