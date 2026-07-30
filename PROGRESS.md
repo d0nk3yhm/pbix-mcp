@@ -85,104 +85,73 @@ scratchpad/cmp_ctx.py              diff, with the same rules as the totals sweep
   Python's microsecond datetime cannot hold — the decoder now carries the
   original stored serial on the value.
 
-## Still open (found by the filter-context sweep, NOT yet fixed)
+## Filter-context findings — what the sweep found, fixed and still open
 
-Every one of these is a measure where Desktop and this engine disagree under a
-FILTER CONTEXT. They are recorded with their root-cause class so the next
-session starts from evidence rather than from scratch.
+Every entry is a measure where Desktop and this engine disagreed under a FILTER
+CONTEXT, recorded with its root-cause class so the next session starts from
+evidence rather than from scratch. The grand-total sweep could not see any of
+them.
 
-**FIXED since this list was written** (each Desktop-verified, each with tests):
+**FIXED since this list was written.** Each Desktop-verified, each with tests
+that fail on the pre-fix code.
 
 - `New Hires SPLY` and the whole SPLY/YoY family -- `DATEADD` shifted the single
-  min..max range, so seven disjoint quarters became one span. Commit 8c84783.
+  min..max range, so seven disjoint quarters became one span and the measure
+  returned the GRAND TOTAL under every quarter. Commit 8c84783.
 - Ecommerce `*_PMTD/PQTD` and `*_%Delta` @ Q1 -- a shifted period outside the
-  calendar applied NO filter instead of an empty one. Commit 243d836.
+  calendar applied NO filter instead of an empty one, so PMTD/PQTD answered
+  14,548,763 against Desktop's BLANK and the %Delta measures came out -1.0.
+  Commit 243d836.
+- **`ALL(Table)` suppressed too much** -- a PRE-EXISTING defect, found while
+  diagnosing the revert below and independent of it. `_no_propagate` flagged a
+  table for the rest of the evaluation, so a filter created LATER inside a
+  nested CALCULATE could never propagate into it. Desktop keeps it:
+  `CALCULATE(CALCULATE(AVERAGE('Cases'[CSAT]), 'Owners'[Manager]="Low, Spencer"),
+  ALL('Cases'))` is 4.13796627491058 there and was 4.2706 here; the nested
+  COUNTROWS was 3914 against our 10000. Suppression now carries a SNAPSHOT of
+  the filters live when ALL ran -- key AND value signature. The signature is
+  what makes composition right: under an outer "Weiler, Anne" with an inner
+  "Low, Spencer", Desktop returns Spencer's number, so re-filtering a column
+  ALL had cleared makes a NEW filter. Keying on the name alone got that case
+  wrong (30 where DAX says 10). Commit edd951a.
+- MS_AI_Sample's four `CSAT Impact*` measures -- a multi-column table filter
+  argument now replaces propagation the way `ALL(Table)` does, scoped by that
+  same snapshot. Commit 3d0c2f2, after 25e3bfe did it unscoped and was reverted.
 
-**REVERTED, and the reason matters more than the fix** (commit 219e63d):
-`FILTER(ALL(T), ...)` as a CALCULATE filter argument does not suppress
-relationship propagation the way bare `ALL(T)` does. That IS a real defect --
-Desktop returns the global 4.2706 for
-`CALCULATE(AVERAGE('Cases'[CSAT]), FILTER(ALL('Cases'),1=1))` under a filter on
-the related Owners[Manager], and we return that manager's 4.1379. Suppressing
-propagation for every MULTI-COLUMN row set fixed all four [CSAT Impact*]
-measures but broke MS_Employee_Hiring far worse: `[Actives]` went from
-Desktop's exact 32,401 to 1,260,817, and ~20 dependent measures with it.
-Cause -- and the first explanation written here was WRONG, so it is worth
-stating what was actually measured. The row shapes are:
+**Read this before touching filter suppression again.** 25e3bfe fixed CSAT by
+suppressing propagation for every table a multi-column row set covered, and took
+MS_Employee_Hiring's `[Actives]` from Desktop's 32,401 to 1,260,817 -- about
+twenty dependent measures with it. `[Actives]` is
+`CALCULATE([EmpCount], FILTER(Employee, ...))`, and `[EmpCount]` creates a
+`Date[PeriodNumber]` filter LATER; the blanket flag blocked it from reaching
+Employee. Two things went wrong beyond the code itself:
 
-    FILTER(ALL(Cases), 1=1)                    __row__=True   23 of 23 cols
-    FILTER(ALL('Date'[PeriodNumber]), ...)     __row__=FALSE   0 cols
-    FILTER(Employee, ISBLANK(...))             __row__=True   16 of 16 cols
+- The first root cause written here was WRONG. It blamed a single-column ALL
+  being materialised as `__row__` dicts. Measured, `FILTER(ALL('Date'[PeriodNumber]),
+  ...)` has `__row__`=False and zero columns, and never matched the branch at
+  all. Measure the shapes before theorising about them.
+- The scoping test asserted the single-column case as `ALL(Fact[v])` DIRECTLY
+  and never wrapped it in FILTER, so it passed while the shape that actually
+  breaks went unchecked. `test_a_later_nested_filter_still_propagates` is now
+  that shape and fails on 25e3bfe with the same 30-vs-10 signature.
 
-So the single-column ALL never carried `__row__` and never matched the branch;
-"multi-column vs single-column" is NOT the distinction that broke this, and
-keying a narrower fix off how many columns the row set spans would not help.
-
-What actually happened: `[Actives]` is
-`CALCULATE([EmpCount], FILTER(Employee, ISBLANK(Employee[TermDate])))`, the
-third shape, so the branch fired and set `_no_propagate = {Employee}`. That
-flag then PERSISTED into the nested `[EmpCount]` =
-`CALCULATE(COUNT([EmplID]), FILTER(ALL('Date'[PeriodNumber]), ... = MAX(...)))`
-and blocked the Date -> Employee propagation that restricts the count to the
-latest period. 1,260,817 is exactly the blank-TermDate row count with NO period
-restriction, against Desktop's 32,401.
-
-That is the real design problem: `_no_propagate` cannot tell "suppress the
-filters that already existed when ALL was applied" from "block a filter created
-LATER inside a nested CALCULATE". DAX only means the first.
-
-**This is a PRE-EXISTING defect in the `ALL(Table)` branch, now Desktop-verified
-and open on its own account** -- it is not something the reverted commit
-introduced. On MS_AI_Sample:
-
-    CALCULATE(AVERAGE('Cases'[CSAT]), 'Owners'[Manager]="Low, Spencer")
-        Desktop 4.13796627491058   ours 4.1379  OK
-    CALCULATE(CALCULATE(AVERAGE('Cases'[CSAT]), 'Owners'[Manager]="Low, Spencer"),
-              ALL('Cases'))
-        Desktop 4.13796627491058   ours 4.2706  WRONG
-    ...the same nested COUNTROWS: Desktop 3914, ours 10000.
-
-Desktop keeps the inner filter's propagation even though the outer CALCULATE
-applied ALL('Cases'). The minimal repro needs no corpus file:
-
-    Fact(k,v) = [a,10],[b,20];  Dim(k,grp) = [a,X],[b,Y];  Fact.k -> Dim.k
-    CALCULATE(CALCULATE(SUM(Fact[v]), Dim[grp]="X"), ALL(Fact))
-        DAX says 10 (only row a);  we return 30.
-
-The fix is to make suppression remember WHICH filter keys were live when ALL was
-applied, instead of flagging the table forever: propagation from those keys is
-dropped, propagation from keys created later is not. That also makes the CSAT
-case fall out correctly, because there the Owners filter IS live at the moment
-`FILTER(ALL('Cases'),...)` is applied. Check any attempt against BOTH anchors:
+Any future change here must keep BOTH anchors at once:
 `[Actives]` = 32,401 and
 `CALCULATE(AVERAGE('Cases'[CSAT]), FILTER(ALL('Cases'),1=1))` = 4.2706.
-- **MS_AI_Sample `CSAT Impact` / `- Agent` / `- Products` / `- Subject` per
-  Manager.** Desktop 0, we return +-0.03. All four share one shape:
-  `VAR AllAvg = CALCULATE(AVERAGE(Cases[CSAT]), ALL(Cases))`
-  `VAR AllAvgExcept = CALCULATE(AVERAGE(Cases[CSAT]),`
-  `    FILTER(ALL(Cases), Cases[X] <> SELECTEDVALUE(Cases[X])))`
-  `RETURN 1 - (AllAvgExcept / AllAvg)`, X = Topic/Agent/ProductSeq/Subject.
-  Desktop's exact 0 means AllAvgExcept == AllAvg, i.e. the predicate drops NO
-  row. Two things were checked and one hypothesis was KILLED:
-  - NOT the FILTER row-substitution guard (`_AGG_CALL_RE`, engine.py:4688).
-    `SELECTEDVALUE` is absent from that regex, so the obvious theory was that
-    the iterated row's value gets substituted. A 4-row fixture refutes it: our
-    `SELECTEDVALUE` inside `FILTER(ALL(T), ...)` returns BLANK either way.
-  - It exposed a DIFFERENT bug instead. CALCULATE's filter arguments are
-    evaluated in the OUTER context, so with `Topic` pinned outside,
-    `SELECTEDVALUE(Cases[Topic])` must be "A" and the measure non-zero. We
-    return 0.0 there too -- our `ALL(Cases)` clears the column BEFORE the
-    SELECTEDVALUE in the predicate is evaluated. Fixture, hand-checkable:
-    4 rows [A,5],[B,3],[A,4],[B,2]; pinned Topic=A -> 1 - 2.5/3.5 = 0.2857.
-  - So the +-0.03 is most likely rows dropped by `Col <> BLANK()` where the
-    column HAS blanks. Next step needs a real probe of the four VARs on the
-    file. `pbix_evaluate_dax` takes MEASURE NAMES, not expressions -- probe by
-    adding temp measures, or build the DAXContext the way `cmp_ctx.py` does.
+
+**STILL OPEN.** Every one is a Desktop disagreement under a filter context, and
+every one was measured BEFORE the four fixes above -- re-run the sweep and
+re-confirm each before spending time on it.
+
 - **Agents_Performance `Rank Filtering *` under `StoreType=Catalog`.** Desktop 0,
-  we return 1.
+  we return 1. Three measures: `Dynamics`, `Employyees MTD`, `Employyees MTD%`
+  (the misspelling is the model's). They wrap IN around a RANKX/TOPN chain --
+  see the note in `TestInMachinery` about why IN is deliberately not wired into
+  the expression planner.
 - **MS_Employee_Hiring `AVG Tenure Days @ Qtr=2`** Desktop 2952.93, we return
-  None; same family as the `AVG Tenure Months @ Qtr=N` -1 above. Re-check after
-  the DATEADD fix -- it was measured before.
+  None, and `AVG Tenure Months @ Qtr=N` returned -1 against Desktop's 91-99.5.
+  `AVG Tenure Days` is `AVERAGE([TenureDays])` -- a bare column reference, so
+  start with home-table resolution rather than the date logic.
 - **MS_Competitive_Marketing `% Units Market Share SPLY @ MfgisVanArsdel=Yes`**
   Desktop 1, we return 0; and `@Indicator05` Desktop 2, we return 1. Both are
   SPLY-family; re-measure against the DATEADD fix before investigating.
