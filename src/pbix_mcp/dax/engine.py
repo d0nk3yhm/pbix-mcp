@@ -2270,8 +2270,13 @@ class DAXEngine:
                         for p in parts]
                 return any(vals) if lop == '||' else all(vals)
             if kind == _P_CONCAT:
-                return ''.join(_concat_str(self._eval_expr(p, ctx, var_scope))
-                               for p in data)
+                # `&` renders a blank as "", but an ALL-BLANK concatenation is
+                # BLANK, not the empty string -- Desktop: BLANK() & BLANK() is
+                # blank, while BLANK() & "x" is "x".
+                vals = [self._eval_expr(p, ctx, var_scope) for p in data]
+                if all(v is None for v in vals):
+                    return None
+                return ''.join(_concat_str(v) for v in vals)
             if kind == _P_NEG:
                 inner_val = self._eval_expr(data, ctx, var_scope)
                 if isinstance(inner_val, (int, float)) and not isinstance(inner_val, bool):
@@ -2672,8 +2677,17 @@ class DAXEngine:
     def _fold_arith(self, parts, op, ctx, var_scope):
         """Fold `parts` left-to-right with `op`, DAX-style."""
         acc = self._eval_expr(parts[0].strip(), ctx, var_scope)
+        # A blank folds to 0 for + and - ONLY IF SOMETHING ELSE HAS A VALUE.
+        # When every operand is blank the whole expression is blank:
+        #   BLANK()+BLANK() -> BLANK      BLANK()+BLANK()+5 -> 5
+        #   BLANK()-BLANK() -> BLANK      BLANK()-5         -> -5
+        # Folding unconditionally made MS_Corporate_Spend's [Var LE2] read 0
+        # under a Scenario slice where both operands are blank and Desktop
+        # shows nothing -- a measured zero where there is no measurement.
+        any_value = acc is not None
         for p in parts[1:]:
             rhs = self._eval_expr(p.strip(), ctx, var_scope)
+            any_value = any_value or rhs is not None
             # BLANK acts as 0 for + and -, but not for * and /. Every rule
             # below was read off the live Desktop engine (msmdsrv), not the
             # docs:
@@ -2722,7 +2736,7 @@ class DAXEngine:
                         return float('nan')
                     return float('inf') if left > 0 else float('-inf')
                 acc = left / right
-        return acc
+        return acc if any_value else None
 
     def _in_set_values(self, right: str, ctx: DAXContext,
                        var_scope: dict | None = None) -> list | None:
