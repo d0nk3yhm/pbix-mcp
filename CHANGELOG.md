@@ -121,10 +121,30 @@ totals sweep could reach:
   carries the original stored serial on the value. MS_Perf_Analyzer's four
   millisecond columns went from mismatching to bit-identical.
 
+### A reference that cannot be resolved is refused, not evaluated around
+
+The plain aggregates parsed their argument with a pure regex, so
+`SUM(T[No Such Column])` produced a syntactically valid reference,
+`get_column_data` returned nothing, the aggregate came back BLANK, and `+`
+folded that to 0 — the surrounding arithmetic carried on and produced a
+confident wrong number. MS_Life_Expectancy has five measures that sum a column
+the model does not contain: Desktop refuses all five, and this engine answered
+**3,104,480** for `[Health]` and **222** for `[Health Expenditure]`.
+
+Both paths now refuse — the aggregates validate the parsed reference, and a
+qualified `Table[Name]` that is neither a column nor a measure raises rather
+than degrading to BLANK. A CALCULATE predicate naming a missing column is
+refused for the same reason; that behaviour had been pinned by a test that
+described it as "NOT desirable", to be changed deliberately.
+
 ### Verification
 
 547 measures across 24 files, each compared against Desktop's own answer with a
-1e-9 relative band for floats. Bit-identical float agreement is not achievable
+1e-9 relative band for floats. Separately, **397 calculated columns across the
+whole corpus recompute bit-identically to the values Desktop itself stored** —
+0 mismatches — with 8 deliberate refusals (PATH / PATHITEM / RANKX and
+multi-column MAX−MIN need a table scan this engine does not implement) and 2
+budget refusals. Bit-identical float agreement is not achievable
 in principle — VertiPaq sums a column in parallel segments — and
 `MS_Corporate_Spend`'s `[Var LE1]` is the worked example: the exact decimal
 answer is 14,697,755.96505, this engine returns 14,697,755.965050012 (correctly
