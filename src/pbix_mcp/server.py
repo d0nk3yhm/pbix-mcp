@@ -11974,8 +11974,16 @@ def _get_dax_context(alias: str) -> dict:
     # Load measures
     measures_list = model.dax_measures
     measure_defs = {}
+    measure_tables = {}
     for m in measures_list:
         measure_defs[m.get('Name', '')] = m.get('Expression', '')
+        # A measure's HOME TABLE is what DAX uses to disambiguate an
+        # unqualified [Column] inside it. Dropping it here made
+        # MS_Revenue_Opportunities' `Revenue = SUM([ProductRevenue])` blank:
+        # three tables own a ProductRevenue column, so the reference resolved
+        # to nothing and all six measures on that table read BLANK.
+        if m.get('TableName'):
+            measure_tables[m.get('Name', '')] = m.get('TableName')
 
     # Load relationships
     rels_list = model.relationships
@@ -12071,6 +12079,7 @@ def _get_dax_context(alias: str) -> dict:
     ctx = {
         'tables': tables,
         'measure_defs': measure_defs,
+        'measure_tables': measure_tables,
         'date_table': date_table,
         'date_column': date_column,
         'relationships': relationships,
@@ -12287,7 +12296,8 @@ def pbix_evaluate_dax(
         results = dax_engine.evaluate_measures_smart(
             measure_names, ctx['tables'], ctx['measure_defs'],
             fc, ctx['date_table'], ctx['date_column'],
-            ctx.get('relationships'), simulate_row_context=False
+            ctx.get('relationships'), simulate_row_context=False,
+            measure_tables=ctx.get('measure_tables')
         )
 
         # Build structured response with DAXResult objects
@@ -12489,6 +12499,11 @@ def pbix_evaluate_dax_grouped(
             via ``truncated``/``group_count``.
         apply_default_filters: When filter_context is empty, apply the report's
             persisted default slicer selections (default False = raw model).
+            NOTE: pbix_evaluate_dax defaults this to True; the per-dimension and
+            grouped tools default to False. That is deliberate — a sweep over
+            many group keys is normally asked against the RAW model — but it
+            means the same measure can differ between the two tools unless you
+            pass the flag explicitly. Do so whenever you compare their output.
         page_index: Scope for those defaults: -1 merges every page, >= 0 scopes
             to that page (service semantics).
         top_n: Keep only the highest/lowest N groups after evaluation — a live

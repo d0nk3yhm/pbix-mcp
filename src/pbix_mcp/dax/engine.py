@@ -351,6 +351,21 @@ def _format_number(val: float, fmt: str):
     return out
 
 
+def _scalarize(v):
+    """A ONE-ROW, ONE-COLUMN table is implicitly a scalar in DAX.
+
+    `last year = LASTDATE('Year'[Date])` is a measure, so it must evaluate to a
+    value; Desktop renders it as the date (8 characters). This engine returned
+    the internal row-dict list, whose str() is 72 characters of Python repr --
+    the kind of leak that shows up in a report as literal
+    "[{'__table__': ...}]" text.
+    """
+    if (isinstance(v, list) and len(v) == 1 and isinstance(v[0], dict)
+            and '__value__' in v[0]):
+        return v[0]['__value__']
+    return v
+
+
 def _concat_str(v):
     """Render a value for the DAX `&` operator.
 
@@ -360,6 +375,7 @@ def _concat_str(v):
     Numbers go through _dax_number_str, which reproduces Desktop's 15-digit
     fixed/scientific choice instead of Python's 17-digit repr.
     """
+    v = _scalarize(v)
     if v is None:
         return ''
     if isinstance(v, bool):
@@ -1142,6 +1158,10 @@ class DAXContext:
             self.date_table = self._auto_detect_date_table(tables, self.relationships)
         # Set during row iteration (SUMX, AVERAGEX, etc.)
         self._current_row: Optional[dict] = None
+        # measure name -> the table it is DEFINED ON. DAX uses it to resolve an
+        # unqualified [Column] inside that measure, which is the only thing that
+        # can disambiguate a column name several tables share.
+        self.measure_tables: dict = {}
         # Tables an enclosing ALL(Table)/REMOVEFILTERS(Table) made immune to
         # cross-table filter propagation (see _get_cross_table_filters).
         self._no_propagate: set = set()
@@ -1721,6 +1741,7 @@ class DAXContext:
                          self.date_column, new_filters, self.relationships)
         ctx._filter_idx_cache = self._filter_idx_cache
         ctx._no_propagate = set(self._no_propagate)
+        ctx.measure_tables = self.measure_tables
         # Share the measure memo by REFERENCE across the derivation family. Its
         # key already carries a filter-context fingerprint, so entries are
         # scoped to the context that produced them and cannot leak between
@@ -1737,6 +1758,7 @@ class DAXContext:
                          self.date_column, new_filters, self.relationships)
         ctx._filter_idx_cache = self._filter_idx_cache
         ctx._no_propagate = set(self._no_propagate)
+        ctx.measure_tables = self.measure_tables
         return ctx
 
 
@@ -1776,6 +1798,9 @@ class DAXEngine:
         # Filter context of the OUTERMOST measure -- the query/slicer selection
         # that ALLSELECTED restores (see _selected_ctx).
         self._query_filters: dict | None = None
+        # Home tables of the measures currently on the evaluation stack; the
+        # innermost one disambiguates a bare [Column] inside that measure.
+        self._home_tables: list = []
         self._func_map = {
             # --- Aggregation ---
             'SUM': self._fn_sum,
@@ -2053,8 +2078,9 @@ class DAXEngine:
         # filters, so plain aggregates must NOT step back to the outer context.
         _prev_outer = getattr(ctx, '_outer_ctx', None)
         ctx._outer_ctx = None
+        self._home_tables.append(ctx.measure_tables.get(measure_name))
         try:
-            result = self._eval_expr(expr.strip(), ctx)
+            result = _scalarize(self._eval_expr(expr.strip(), ctx))
             if cache_key:
                 ctx._measure_cache[cache_key] = result
             return result
@@ -2070,6 +2096,7 @@ class DAXEngine:
             return None
         finally:
             ctx._outer_ctx = _prev_outer
+            self._home_tables.pop()
             ctx._eval_stack.discard(measure_name)
             self._eval_depth -= 1
             if self._eval_depth == 0:
@@ -2963,13 +2990,23 @@ class DAXEngine:
         # Memoized per model: this runs inside per-row iteration, and scanning
         # every table's column list on each row was measurable.
         key = (id(ctx.tables), name)
-        hit = self._bare_col_cache.get(key, _MISSING)
-        if hit is _MISSING:
+        owners = self._bare_col_cache.get(key, _MISSING)
+        if owners is _MISSING:
             owners = [tn for tn, t in ctx.tables.items()
                       if ctx._find_col_idx(t.get('columns') or [], name) >= 0]
-            hit = (owners[0], name) if len(owners) == 1 else None
-            self._bare_col_cache[key] = hit
-        return hit
+            self._bare_col_cache[key] = owners
+        if len(owners) == 1:
+            return (owners[0], name)
+        # Several tables own the name. DAX does NOT refuse -- it resolves the
+        # reference against the table the MEASURE IS DEFINED ON.
+        # MS_Revenue_Opportunities' `Revenue = SUM([ProductRevenue])` lives on
+        # Fact, and Fact / Fact A / Fact B all have a ProductRevenue column;
+        # refusing returned BLANK for all six measures on that table where
+        # Desktop returns 1,968,250,939.
+        home = self._home_tables[-1] if self._home_tables else None
+        if home and home in owners:
+            return (home, name)
+        return None
 
     def _charge_eval(self, ctx: DAXContext) -> None:
         """Charge one unit of the eval budget (same accounting _eval_expr does).
@@ -4192,9 +4229,18 @@ class DAXEngine:
         return _concat_str(val)
 
     def _fn_concatenate(self, args_str: str, ctx: DAXContext) -> Any:
+        """CONCATENATE(a, b) -- the function form of `&`, and it renders its
+        arguments the same way.
+
+        `str(x or '')` dropped every FALSY value, so a legitimate 0 vanished:
+        MS_Regional_Sales' [Fcst adj slicer alt text] read
+        "...current value is " where Desktop reads "...current value is 0".
+        _concat_str is the one renderer for both forms, so a number also comes
+        out with DAX's 15-digit formatting rather than Python's repr.
+        """
         args = self._split_args(args_str)
-        parts = [str(self._eval_expr(a.strip(), ctx) or '') for a in args]
-        return ''.join(parts)
+        return ''.join(_concat_str(self._eval_expr(a.strip(), ctx))
+                       for a in args)
 
     def _fn_sumx(self, args_str: str, ctx: DAXContext) -> Any:
         """SUMX(table_expression, expression) — iterate over table rows, sum expression."""
@@ -4432,13 +4478,29 @@ class DAXEngine:
         if not args:
             return []
         col = self._parse_column_ref(args[0]) or self._as_column_ref(args[0], ctx)
+        universe = None
         if col is None:
-            return []
-        table_name, col_name = col
+            # The first argument is a TABLE EXPRESSION, not a column reference.
+            # MS_Life_Expectancy writes `LASTNONBLANK(ALL(Years[Years]), [...])`
+            # in five measures; requiring a bare column reference made every one
+            # of them BLANK.
+            src = self._eval_expr(args[0].strip(), ctx)
+            if not isinstance(src, list) or not src:
+                return []
+            first = src[0]
+            if not isinstance(first, dict) or '__column__' not in first:
+                return []
+            table_name = first['__table__']
+            col_name = first['__column__']
+            universe = [r.get('__value__') for r in src
+                        if isinstance(r, dict)]
+        else:
+            table_name, col_name = col
         expr = args[1].strip() if len(args) > 1 else None
         values = []
         seen = set()
-        for v in ctx.get_column_data(table_name, col_name):
+        for v in (universe if universe is not None
+                  else ctx.get_column_data(table_name, col_name)):
             key = str(v)
             if key in seen:
                 continue
@@ -6945,7 +7007,8 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
                             filter_context: dict | None = None,
                             date_table: str | None = None, date_column: str | None = None,
                             relationships: list | None = None,
-                            simulate_row_context: bool = True) -> dict:
+                            simulate_row_context: bool = True,
+                            measure_tables: dict | None = None) -> dict:
     """Evaluate measures with smart fallback for SELECTEDVALUE-dependent measures.
 
     When a measure returns BLANK and its expression uses SELECTEDVALUE on a
@@ -6962,6 +7025,9 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
     does so unless the caller opts in.
     """
     ctx = DAXContext(tables, measures, date_table, date_column, filter_context, relationships)
+    # A measure's home table is the only thing that can disambiguate an
+    # unqualified [Column] several tables share -- see _resolve_bare_column.
+    ctx.measure_tables = measure_tables or {}
     results = {}
 
     for name in measure_names:

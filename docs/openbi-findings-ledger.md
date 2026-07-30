@@ -23,9 +23,13 @@ These produce a plausible answer with no error, which is why they survived so lo
       implemented and used by CALCULATE but deliberately NOT enabled for
       general expressions -- it unmasks an inaccurate RANKX/TOPN chain that
       then returns confidently wrong values instead of BLANK. See below.
-- [ ] **issues-3** -- set_visual_property / update_visual_json on a CLASSIC layout do not recompile query+dataTransforms, so Desktop renders the old field
+- [x] **issues-3** -- set_visual_property / update_visual_json on a CLASSIC layout now recompile query+dataTransforms (0.9.61), so Desktop no longer renders the old field
 - [ ] **issues-7** -- "measure not found" is indistinguishable from a genuine BLANK; needs a typed DAXError
-- [ ] **issues-9** -- default-filter behaviour differs between pbix_evaluate_dax and pbix_evaluate_dax_per_dimension
+- [x] **issues-9** -- default-filter behaviour differs between pbix_evaluate_dax and pbix_evaluate_dax_per_dimension.
+      NOT A DEFECT: the divergence is a deliberate contract (a per-dimension
+      sweep is normally asked against the raw model) and is pinned by tests.
+      The real gap was documentation -- `pbix_evaluate_dax_grouped` carried no
+      NOTE. Added in 0.9.61; all three tools now say so in their own docstring.
 - [x] **issues-15** -- residual COALESCE(ExplicitName, InferredName) instances (fixed 0.9.61). Four sites audited and corrected: `pbix_get_hierarchies`'
       level query, `_report_type_resolver`'s Type IN (1,2,4) scan,
       `_detect_field_parameter_shape` (whose `ExplicitName NOT LIKE` also

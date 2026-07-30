@@ -86,6 +86,41 @@ Desktop answers FALSE there too (it is NOT `ISFILTERED`).
   over 1.7M rows ran for over two hours at 4 GB with no output. It now refuses
   with a row count and points at `PBIX_DAX_MAX_SECONDS`.
 
+### Found by comparing UNDER A FILTER CONTEXT, not just at the grand total
+
+The grand total is one cell per measure, and the cell least likely to expose a
+bug. A second sweep compares every measure against Desktop for several values
+of a real dimension column — ~1,700 cells — and found these, none of which the
+totals sweep could reach:
+
+- **`ALL(Table)` now clears a filter that reaches the table THROUGH a
+  relationship**, not just the direct `Table.col` keys. `CALCULATE(MAX(COVID[Date]),
+  ALL(COVID))` went BLANK under a state slice matching no COVID row, where
+  Desktop returns the global maximum. `ALLSELECTED(Table)` is now distinguished
+  from it: it RESTORES the query context rather than clearing it.
+- **A value-encoded Decimal column read 10,000x too large.** A fixed-decimal
+  column is stored as its value times 10,000 whichever way it is encoded; the
+  value-encoded branch skipped the scaling the dictionary branch applies. Proved
+  without Desktop by decoding the same 397-row AdventureWorks Product table out
+  of two corpus files: `Product[List Price]` came out 2.29–3578.27 from one and
+  22900–35782700 from the other. This is a DATA bug — it affected every read of
+  such a column, not only DAX.
+- **A bare `[Column]` several tables share resolves against the measure's HOME
+  TABLE**, which is what DAX does. Three tables own `ProductRevenue`, so
+  refusing blanked all six MS_Revenue_Opportunities measures; `Revenue` now
+  returns Desktop's 1,968,250,939 exactly.
+- **`FIRSTNONBLANK` / `LASTNONBLANK` accept a table expression**, not only a
+  column reference — five MS_Life_Expectancy measures pass `ALL(Years[Years])`.
+- **A one-row, one-column table is a scalar.** `LASTDATE('Year'[Date])` leaked
+  72 characters of Python repr into the measure's value.
+- **`CONCATENATE` dropped a legitimate `0`** (`str(x or '')`), the same defect
+  already fixed for `&`; it now shares one renderer with the operator.
+- **Datetime precision.** The serial conversion rounded twice and landed on the
+  wrong double for 27% of timestamps (54,550 of 200,000 random instants), and
+  .NET's 100-ns ticks do not fit Python's 1-µs datetime at all — the decoder now
+  carries the original stored serial on the value. MS_Perf_Analyzer's four
+  millisecond columns went from mismatching to bit-identical.
+
 ### Verification
 
 547 measures across 24 files, each compared against Desktop's own answer with a
