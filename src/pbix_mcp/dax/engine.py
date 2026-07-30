@@ -1162,6 +1162,10 @@ class DAXContext:
         # unqualified [Column] inside that measure, which is the only thing that
         # can disambiguate a column name several tables share.
         self.measure_tables: dict = {}
+        # {table: {column names}} straight from the model metadata. EMPTY means
+        # "unknown", and an unresolvable-reference check must then refuse
+        # nothing rather than everything.
+        self.model_columns: dict = {}
         # Tables an enclosing ALL(Table)/REMOVEFILTERS(Table) made immune to
         # cross-table filter propagation (see _get_cross_table_filters).
         self._no_propagate: set = set()
@@ -1742,6 +1746,7 @@ class DAXContext:
         ctx._filter_idx_cache = self._filter_idx_cache
         ctx._no_propagate = set(self._no_propagate)
         ctx.measure_tables = self.measure_tables
+        ctx.model_columns = self.model_columns
         # Share the measure memo by REFERENCE across the derivation family. Its
         # key already carries a filter-context fingerprint, so entries are
         # scoped to the context that produced them and cannot leak between
@@ -1759,6 +1764,7 @@ class DAXContext:
         ctx._filter_idx_cache = self._filter_idx_cache
         ctx._no_propagate = set(self._no_propagate)
         ctx.measure_tables = self.measure_tables
+        ctx.model_columns = self.model_columns
         return ctx
 
 
@@ -3058,6 +3064,17 @@ class DAXEngine:
             return
         if self._measure_exists(col[1], ctx):
             return          # Table[Measure] is a legal qualified reference
+        # `ctx.tables` holds only what was MATERIALIZED. A column the model has
+        # but this run did not load is NOT an unresolvable reference, and
+        # refusing it blanked thirteen MS_Employee_Hiring / MS_Human_Resources
+        # measures that Desktop evaluates perfectly well. Refuse only on the
+        # model's own schema, and only when that schema is actually known.
+        known = (ctx.model_columns or {}).get(col[0])
+        if not known:
+            return
+        lowered = col[1].lower()
+        if any(c.lower() == lowered for c in known):
+            return
         from pbix_mcp.errors import DAXEvaluationError
         raise DAXEvaluationError(
             f"Column '{col[1]}' in table '{col[0]}' cannot be found or may not "
@@ -7070,7 +7087,8 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
                             date_table: str | None = None, date_column: str | None = None,
                             relationships: list | None = None,
                             simulate_row_context: bool = True,
-                            measure_tables: dict | None = None) -> dict:
+                            measure_tables: dict | None = None,
+                            model_columns: dict | None = None) -> dict:
     """Evaluate measures with smart fallback for SELECTEDVALUE-dependent measures.
 
     When a measure returns BLANK and its expression uses SELECTEDVALUE on a
@@ -7090,6 +7108,7 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
     # A measure's home table is the only thing that can disambiguate an
     # unqualified [Column] several tables share -- see _resolve_bare_column.
     ctx.measure_tables = measure_tables or {}
+    ctx.model_columns = model_columns or {}
     results = {}
 
     for name in measure_names:
