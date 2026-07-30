@@ -3502,13 +3502,19 @@ class DAXEngine:
 
             # DATEADD
             if filter_arg.upper().startswith('DATEADD'):
-                new_ctx = self._apply_dateadd_filter(filter_arg, new_ctx)
+                _shifted_ctx = self._apply_dateadd_filter(filter_arg, new_ctx)
+                if _shifted_ctx is None:
+                    return None          # period outside the date table -> BLANK
+                new_ctx = _shifted_ctx
                 continue
 
             # SAMEPERIODLASTYEAR
             if filter_arg.upper().startswith('SAMEPERIODLASTYEAR'):
-                new_ctx = self._apply_dateadd_filter(
+                _shifted_ctx = self._apply_dateadd_filter(
                     f"DATEADD({filter_arg[19:-1].strip()}, -1, YEAR)", new_ctx)
+                if _shifted_ctx is None:
+                    return None          # period outside the date table -> BLANK
+                new_ctx = _shifted_ctx
                 continue
 
             # USERELATIONSHIP(col1, col2) — activate a specific (usually inactive)
@@ -3811,8 +3817,15 @@ class DAXEngine:
         _nc._filter_idx_cache = ctx._filter_idx_cache
         return _nc
 
-    def _apply_dateadd_filter(self, expr: str, ctx: DAXContext) -> DAXContext:
-        """Apply DATEADD as a filter context modification."""
+    def _apply_dateadd_filter(self, expr: str,
+                              ctx: DAXContext) -> Optional[DAXContext]:
+        """Apply DATEADD as a filter context modification.
+
+        Returns None when the shifted period falls OUTSIDE the date table --
+        an empty filter, which makes the whole CALCULATE BLANK. That is a real
+        answer, not a missing one, and the caller must not treat it as "no
+        filter".
+        """
         # Parse DATEADD(column, offset, interval)
         match = re.search(r"DATEADD\s*\(\s*'?([^'\[]+)'?\s*\[([^\]]+)\]\s*,\s*(-?\d+)\s*,\s*(\w+)\s*\)", expr, re.IGNORECASE)
         if not match:
@@ -3897,6 +3910,27 @@ class DAXEngine:
                 _nc._filter_idx_cache = ctx._filter_idx_cache
                 return _nc
 
+        # Nothing above produced a shifted set, and the date table and column
+        # both resolve -- so the period genuinely falls OUTSIDE the calendar.
+        # That is an EMPTY filter, and an empty filter means BLANK, never "no
+        # filter". Returning ctx unchanged applied NO filter at all:
+        # Ecommerce_Conversion's calendar starts 2025-01-01, so under
+        # QuarterName=Q1 `DATEADD(dimDate[Date],-1,QUARTER)` asks for Oct-Dec
+        # 2024, and [Page_Views_PMTD/PQTD] answered 14,548,763 where Desktop is
+        # BLANK. The three *_%Delta measures divide by it and came out exactly
+        # -1.0 -- DIVIDE(BLANK - P, P) -- against Desktop's BLANK.
+        #
+        # The TABLE form was already correct (COUNTROWS of the same DATEADD is
+        # blank); only this filter path was wrong. Same rule the table-valued
+        # time-intelligence branch of CALCULATE already documents.
+        #
+        # This must stay AFTER the year-column fallback above. A SPARSE date
+        # table (the eight isolated days in tests/test_dax_engine.py) shifts to
+        # dates that do not exist, so the per-run shift is legitimately empty
+        # while the year fallback still resolves 2023 -> 2022 = 290. Deciding
+        # BLANK before that ran turned three passing tests into None.
+        if interval in ('DAY', 'WEEK', 'MONTH', 'QUARTER', 'YEAR'):
+            return None
         return ctx
 
     def _fn_removefilters(self, args_str: str, ctx: DAXContext) -> Any:
