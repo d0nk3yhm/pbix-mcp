@@ -4179,14 +4179,29 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 3:
             return None
-        parts = [_as_number(self._eval_expr(a.strip(), ctx)) for a in args[:3]]
-        if any(p is None for p in parts):
+        raw = [self._eval_expr(a.strip(), ctx) for a in args[:3]]
+        parts = [_as_number(v) for v in raw]
+        # A BLANK part counts as 0 and rolls over, exactly like an out-of-range
+        # one -- only an ALL-BLANK call is blank. Verified against Desktop:
+        #   DATE(2025, BLANK(), 4)          -> 12/4/2024   (month 0 of 2025)
+        #   DATE(BLANK(), BLANK(), BLANK()) -> BLANK
+        # Returning BLANK for any blank part broke the quick-measure idiom
+        # `DATE(YEAR(x), MONTH(<blank>), DAY(x))`, which Ecommerce_Conversion's
+        # PMTD/PQTD measures use to build the previous period's end date.
+        if all(p is None for p in parts):
             return None
-        y, m, d = (int(p) for p in parts)  # type: ignore[arg-type]
+        if any(v is not None and p is None for v, p in zip(raw, parts)):
+            return None          # a non-blank, non-numeric part is still an error
+        y, m, d = (int(p) if p is not None else 0 for p in parts)
         month_zero = (m - 1)
         year = y + month_zero // 12
         month = month_zero % 12 + 1
-        return datetime(year, month, 1) + timedelta(days=d - 1)
+        try:
+            return datetime(year, month, 1) + timedelta(days=d - 1)
+        except (ValueError, OverflowError):
+            # Out of representable range -- a blank YEAR lands in year 0. Blank
+            # rather than crash the whole measure.
+            return None
 
     def _shift_months(self, d: datetime, n: int) -> datetime:
         month_zero = (d.month - 1) + n
