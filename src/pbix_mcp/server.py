@@ -12306,10 +12306,22 @@ def pbix_evaluate_dax(
 
         # Build structured response with DAXResult objects
         unsupported = set(dax_engine._engine.unsupported_functions)
+        timed_out = set(dax_engine._engine.timed_out)
         dax_results = []
         for name, val in results.items():
             if val is not None:
                 dax_results.append(DAXResult(name=name, value=val, status="ok"))
+            elif name in timed_out:
+                # NOT a blank: the evaluation was abandoned on the wall-clock
+                # budget. Reporting it as blank made "no value" and "we ran out
+                # of time" look identical in the tool output.
+                dax_results.append(DAXResult(
+                    name=name, value=None, status="error",
+                    error_message=(
+                        "evaluation budget exceeded "
+                        f"({dax_engine._engine._max_eval_seconds:.0f}s); raise "
+                        "PBIX_DAX_MAX_SECONDS to allow longer"),
+                ))
             elif unsupported:
                 # Value is None and unsupported functions were hit — mark as unsupported
                 dax_results.append(DAXResult(
