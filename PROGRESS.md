@@ -139,6 +139,56 @@ Any future change here must keep BOTH anchors at once:
 `[Actives]` = 32,401 and
 `CALCULATE(AVERAGE('Cases'[CSAT]), FILTER(ALL('Cases'),1=1))` = 4.2706.
 
+### Directional propagation: Desktop-correct, REVERTED anyway (6a4896a -> 8a77b9d)
+
+Our single-hop relationship index is SYMMETRIC, so a filter propagates from the
+MANY side of a relationship to the ONE side. Desktop does not do that, and this
+is not in doubt -- on Agents_Performance, where
+`DimStore[EmployeeKey] -> DimEmployee[EmployeeKey]`:
+
+```
+COUNTROWS(DimEmployee)                                    Desktop 293
+  ... under DimStore[StoreType] = "Catalog"               Desktop 293  UNCHANGED
+CALCULATE(SELECTEDVALUE(DimEmployee[EmployeeKey]), same)  Desktop BLANK, ours 213
+CALCULATE(COUNTROWS(DimStore), DimEmployee[EmployeeKey]=213)
+                                                          Desktop 1  one->many flows
+```
+
+Making the single-hop index directional (matching `_rel_adj`, which already had
+the rule) took Agents_Performance from 404/408 to **408/408** and left five other
+files unchanged. It also took MS_Employee_Hiring's `[Actives]` from Desktop's
+**32,401 to None**, and about thirty dependent cells with it -- the whole
+Actives / TO % / Sep% / BadHire% family. Bisected precisely: 32,401 at 3d0c2f2,
+None at 6a4896a. Not a timeout -- it returns None in 201s with a 1800s budget
+and an empty `timed_out` set.
+
+So the rule is right and our engine still depends on breaking it. Reverted,
+because it costs ~30 cells to buy 4.
+
+**Where to start next time, with the measurement already done.** `[EmpCount]` is
+`CALCULATE(COUNT([EmplID]), FILTER(ALL('Date'[PeriodNumber]),
+'Date'[PeriodNumber] = MAX('Date'[PeriodNumber])))`, and the model has a direct
+`Employee[date] -> Date[Date]` (Employee many, Date one), so `Date -> Employee`
+is a LEGAL one->many direction and `_rel_dir[('Employee','Date')]` exists -- the
+lookup is not what fails. The thing to explain first:
+
+```
+CALCULATE(COUNTROWS(Employee), 'Date'[PeriodNumber] = 201612)
+    is None on BOTH 3d0c2f2 and 6a4896a
+```
+
+That propagation is ALREADY broken in the green build, which means `[Actives]`
+reaches 32,401 by some other route that the symmetric index enables. Find that
+route before re-landing the direction rule. Note the join column (`Date[Date]`)
+is NOT the filtered column (`Date[PeriodNumber]`), so the direct path has to
+filter the dimension and then map through the join key -- that is the first
+place to look.
+
+Two anchors, both required, and neither is optional:
+`[Actives]` = 32,401 (MS_Employee_Hiring) and
+`CALCULATE(SELECTEDVALUE(DimEmployee[EmployeeKey]), DimStore[StoreType]="Catalog")`
+= BLANK (Agents_Performance).
+
 - **`FORMAT` date pictures were .NET-cased**, so `mmmm` rendered `0000` instead
   of `July` and every `mm/dd/yyyy` came out `00/19/2021`. Commit 72c0afc. Only
   ONE corpus measure uses a real date picture (`MS_Covid_Tracking[Updated]`),
