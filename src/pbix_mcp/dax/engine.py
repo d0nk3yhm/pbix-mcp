@@ -195,30 +195,100 @@ _RETURN_KW_RE = re.compile(r'\bRETURN\b', re.IGNORECASE)
 
 
 def _strip_line_comments(expr):
-    """Strip // and -- comments, respecting string literals. Verbatim from the
-    old _eval_expr body -- the plan cache hoists it out of the per-call path."""
-    lines = expr.split('\n')
-    clean_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith('//') or stripped.startswith('--'):
-            continue
-        in_str = False
-        result_chars = []
-        i = 0
-        while i < len(stripped):
-            ch = stripped[i]
+    """Strip // and -- comments, respecting string literals.
+
+    The string state is tracked across the WHOLE expression, not per line. It
+    used to reset on every newline, so a multi-line string literal lost its
+    quoting and any ``--`` inside it was taken for a comment: an SVG measure
+    containing ``<!-- Data -->`` came back as ``<!`` with the rest of the line
+    eaten. That is the shape every measure in docs/rich-content.md's SVG rail
+    has, and Desktop of course returns the comment intact.
+
+    Newlines INSIDE a string literal are preserved for the same reason -- they
+    are part of the value. Outside a string they become spaces, as before, since
+    DAX is whitespace-insensitive there.
+    """
+    # Segments alternate between outside-string and inside-string text so the
+    # whitespace collapse can be applied to the former ONLY. Collapsing runs of
+    # spaces everywhere flattened the indentation of an SVG literal and made the
+    # value 32 characters shorter than Desktop's.
+    segs: list = []          # (text, is_string)
+    buf: list = []
+    in_str = False
+    i = 0
+    n = len(expr)
+    while i < n:
+        ch = expr[i]
+        if in_str:
             if ch == '"':
-                in_str = not in_str
-            if not in_str:
-                if stripped[i:i+2] == '//' or stripped[i:i+2] == '--':
-                    break
-            result_chars.append(ch)
+                # "" is an escaped quote inside a DAX string, not a terminator.
+                if i + 1 < n and expr[i + 1] == '"':
+                    buf.append('""')
+                    i += 2
+                    continue
+                buf.append(ch)
+                segs.append((''.join(buf), True))
+                buf = []
+                in_str = False
+                i += 1
+                continue
+            buf.append(ch)
             i += 1
-        stripped = ''.join(result_chars).rstrip()
-        if stripped:
-            clean_lines.append(stripped)
-    return ' '.join(clean_lines).strip()
+            continue
+        if ch == '"':
+            segs.append((''.join(buf), False))
+            buf = [ch]
+            in_str = True
+            i += 1
+            continue
+        if expr[i:i + 2] in ('//', '--'):
+            j = expr.find('\n', i)
+            if j < 0:
+                break
+            i = j          # leave the newline; it becomes the line separator
+            continue
+        buf.append(' ' if ch == '\n' else ch)
+        i += 1
+    segs.append((''.join(buf), in_str))
+    parts = [t if is_s else re.sub(r'[ \t]+', ' ', t) for t, is_s in segs]
+    return ''.join(parts).strip()
+
+
+def _collapse_ws_outside_strings(expr: str) -> str:
+    r"""Collapse runs of whitespace to one space, but NEVER inside a string
+    literal. A blanket re.sub(r'\s+', ' ') flattened the newlines and
+    indentation of an SVG literal, so a measure that Desktop returns as 665
+    characters came back as 633 with every line joined.
+    """
+    out = []
+    in_str = False
+    i = 0
+    n = len(expr)
+    while i < n:
+        ch = expr[i]
+        if in_str:
+            if ch == '"':
+                if i + 1 < n and expr[i + 1] == '"':
+                    out.append('""')
+                    i += 2
+                    continue
+                in_str = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch.isspace():
+            if out and out[-1] != ' ':
+                out.append(' ')
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out).strip()
 
 
 def _analyze_expr(raw):
@@ -1740,6 +1810,16 @@ class DAXEngine:
                         return ctx._current_row[col_name]
                     if ctx._current_row.get('__column__') == col_name:
                         return ctx._current_row.get('__value__')
+                # A reference to a column that does NOT exist must be BLANK, not
+                # a (table, column) marker. Agents_Performance's TopN/BottomN
+                # measures read 'Top-Bottom-N'[Top-Bottom-N Value] while that
+                # table only has [Top-Bottom-N]; Desktop blanks the whole measure,
+                # whereas the marker leaked into the arithmetic and those five
+                # measures returned confident numbers (19,260,876.5611 and
+                # friends) where Desktop shows nothing.
+                _t = ctx.tables.get(table_name)
+                if _t is not None and ctx._find_col_idx(_t['columns'], col_name) < 0:
+                    return None
                 return (table_name, col_name)
             if kind == _P_BRACKET1:
                 if (data not in ctx.measures and ctx._current_row
@@ -1823,7 +1903,7 @@ class DAXEngine:
         # We'll use a simple state-machine approach scanning word by word.
 
         # Normalise whitespace
-        text = re.sub(r'\s+', ' ', expr).strip()
+        text = _collapse_ws_outside_strings(expr)
 
         var_decls = []
         return_expr = None
@@ -2683,6 +2763,16 @@ class DAXEngine:
             # Evaluate the filter arg — if it returns a list of row dicts,
             # extract filter values grouped by table.column
             result = self._eval_expr(filter_arg, new_ctx)
+            if isinstance(result, list) and not result:
+                # An EMPTY filter table removes every row, so the expression is
+                # BLANK. Falling through here treated it as "no filter at all"
+                # and returned the GRAND TOTAL: Agents_Performance's five
+                # TopN/BottomN measures each reported a confident number
+                # (19,260,876.5611 and friends) where Desktop shows nothing,
+                # because their FILTER matched no rows. Same principle the
+                # multi-hop propagation already documents -- an empty result is a
+                # real result and must be applied.
+                return None
             if isinstance(result, list) and result:
                 first = result[0]
                 if isinstance(first, dict) and '__table__' in first:
