@@ -138,14 +138,22 @@ class TestInMachinery:
         would be nonsense, so report unknown."""
         assert de.DAXEngine()._in_set_values('{(1,"a"),(2,"b")}', self._ctx()) is None
 
-    def test_empty_table_expression_is_unknown_not_false(self):
-        """This engine returns [] for a table function it cannot evaluate in the
-        current scope (VALUES(T[C]) inside a row context), so an empty table
-        expression must not be reported as a confident FALSE."""
+    def test_empty_table_expression_is_false_not_unknown(self):
+        """DAX: membership in an EMPTY table is FALSE.
+
+        This originally returned "unknown" to hedge against a table function the
+        engine cannot evaluate in the current scope (VALUES(T[C]) inside a row
+        context yields []). That hedge was worse than the thing it guarded: the
+        IN step fell through to the next plan step, which could answer with
+        something truthy, and Agents_Performance's "Rank Filtering Employyees
+        MTD" returned 1 where Desktop returns 0 -- its TOPN is legitimately empty
+        and both IN tests should simply be FALSE.
+        """
         eng = de.DAXEngine()
         ctx = self._ctx()
         ctx._current_row = {"__table__": "P", "S": "Lead", "V": 100}
-        assert eng._in_set_values('VALUES(P[S])', ctx) is None
+        assert eng._in_set_values('VALUES(P[S])', ctx) == []
+        assert eng._eval_in('"Lead"', 'VALUES(P[S])', ctx) is False
 
     def test_single_column_table_expression(self):
         vals = de.DAXEngine()._in_set_values('VALUES(P[S])', self._ctx())
