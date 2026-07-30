@@ -31,6 +31,7 @@ Supports 150+ DAX functions:
 - String concatenation with &
 """
 
+import bisect
 import calendar
 import decimal
 import json
@@ -4001,23 +4002,55 @@ class DAXEngine:
         seen_src = [d for d in (_as_datetime(v) for v in visible) if d is not None]
         if not seen_src:
             return []
-        # Shift the RANGE, not each date independently. Mapping date-by-date
-        # leaves holes wherever no source date lands on a target: nothing shifts
-        # onto Jan 29-31 (there is no "Feb 31"), nor onto the 31st of any month
-        # whose successor has 30 days. Those holes silently dropped a day of
-        # sales each -- PM Total Sales came out 11.9M short of Desktop, and every
-        # PM/PQ/PY/MAT/YOY measure built on it inherited the error. DAX shifts the
-        # selected period and returns the corresponding period, so the result is
-        # contiguous over the date table.
-        lo = self._shift_date(min(seen_src), offset, interval)
-        hi = self._shift_date(max(seen_src), offset, interval)
-        if lo is None or hi is None:
-            return []
-        lo_d = lo.date() if isinstance(lo, datetime) else lo
-        hi_d = hi.date() if isinstance(hi, datetime) else hi
-        if lo_d > hi_d:
-            lo_d, hi_d = hi_d, lo_d
-        return [universe[k] for k in sorted(universe) if lo_d <= k <= hi_d]
+        # Shift each CONTIGUOUS RUN of the selection -- not each date
+        # independently, and not the single min..max range.
+        #
+        # Mapping date-by-date leaves holes wherever no source date lands on a
+        # target: nothing shifts onto Jan 29-31 (there is no "Feb 31"), nor onto
+        # the 31st of any month whose successor has 30 days. Those holes
+        # silently dropped a day of sales each -- PM Total Sales came out 11.9M
+        # short of Desktop, and every PM/PQ/PY/MAT/YOY measure built on it
+        # inherited the error. So a run is shifted as a PERIOD and refilled
+        # contiguously over the date table.
+        #
+        # But one min..max range is only correct when the selection IS one
+        # block. `'Date'[Qtr] = 2` selects seven DISJOINT quarters, and min..max
+        # spans everything between the first and the last, so the filter
+        # degenerated to the whole table: [New Hires SPLY] returned the grand
+        # total 43120 under every quarter, where Desktop returns 11601 for Q2
+        # and 13840 for Q3. Desktop's own COUNTROWS over the same shift is
+        # 546 = 91 x 6 -- six shifted QUARTERS, not six years of dates -- and
+        # 644 = 92 x 7 for a -1 MONTH shift, i.e. Mar+Apr+May in each of the
+        # seven years. Per-run shifting reproduces both; a single range cannot.
+        uni_sorted = sorted(universe)
+        pos = {k: i for i, k in enumerate(uni_sorted)}
+        runs: list = []
+        for _d in sorted({(x.date() if isinstance(x, datetime) else x)
+                          for x in seen_src}):
+            i = pos.get(_d)
+            if i is None:
+                continue
+            if runs and i == runs[-1][1] + 1:
+                runs[-1][1] = i
+            else:
+                runs.append([i, i])
+        out: dict = {}
+        for a, b in runs:
+            ka, kb = uni_sorted[a], uni_sorted[b]
+            lo = self._shift_date(datetime(ka.year, ka.month, ka.day),
+                                  offset, interval)
+            hi = self._shift_date(datetime(kb.year, kb.month, kb.day),
+                                  offset, interval)
+            if lo is None or hi is None:
+                continue
+            lo_d = lo.date() if isinstance(lo, datetime) else lo
+            hi_d = hi.date() if isinstance(hi, datetime) else hi
+            if lo_d > hi_d:
+                lo_d, hi_d = hi_d, lo_d
+            for k in uni_sorted[bisect.bisect_left(uni_sorted, lo_d):
+                                bisect.bisect_right(uni_sorted, hi_d)]:
+                out[k] = universe[k]
+        return [out[k] for k in sorted(out)]
 
     _DATEADD_ARGS_RE = re.compile(
         r"'?([^'\[]+)'?\s*\[([^\]]+)\]\s*,\s*(-?\d+)\s*,\s*(\w+)", re.IGNORECASE)
