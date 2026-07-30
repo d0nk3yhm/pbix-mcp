@@ -34,6 +34,26 @@ Desktop's answer, taken from the workspace `msmdsrv` over ADOMD.
   already correct — `COUNTROWS` of the same `DATEADD` was blank — so only the
   CALCULATE filter path skipped the empty result.
 
+### FORMAT
+
+- **Date pictures are VBA-style and case-INSENSITIVE.** The token table was
+  .NET-cased — `MM` month, `mm` *minutes* — but DAX pictures are neither, and
+  lower-case `m` is a MONTH. `mmmm` matched `mm` twice and rendered `0000`
+  instead of `July`; every `mm/dd/yyyy` came out `00/19/2021` and every
+  `yyyy-mm-dd` as `2021-00-19`. `m`, `d`, `Long Date` and `Short Date` fell
+  through as literal text. Desktop:
+  `mmmm`→July, `mmm`→Jul, `mm`→07, `m`→7, `d`→19,
+  `dddd, mmmm dd, yyyy`→Monday, July 19, 2021, `Long Date`→Monday, July 19,
+  2021, `Short Date`→7/19/2021, and `m/d/yyyy` on 2021-03-05 →3/5/2021.
+  `m` means minutes only when it FOLLOWS an hour token, which Desktop pins in a
+  single picture: `FORMAT(<noon>, "mm hh:mm")` is `07 12:00`. The .NET
+  spellings still work, since the scan is now case-insensitive.
+
+  Worth recording how nearly this escaped: `0000` is exactly as wide as `July`,
+  so the capture harness's LEN fallback — the rule that accepts a truncated
+  capture when the lengths agree — was structurally blind to it, and the diff
+  display truncated both sides to an identical-looking prefix.
+
 ### Filter propagation
 
 - **`ALL(Table)` suppresses only the filters it actually cleared.** The
