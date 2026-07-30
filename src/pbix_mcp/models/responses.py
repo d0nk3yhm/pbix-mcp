@@ -7,9 +7,28 @@ inspect success/failure programmatically without string parsing.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def json_safe_number(value: Any) -> Any:
+    """Replace a non-finite float with a JSON-legal token.
+
+    DAX's `/` operator does not blank a divide-by-zero the way DIVIDE() does --
+    Desktop returns an IEEE special, so the engine does too (5/0 -> inf,
+    0/0 -> nan). Python's json.dumps happily writes those as the bare literals
+    `Infinity` and `NaN`, which are NOT valid JSON: a strict client parser
+    (JSON.parse, encoding/json, serde_json) rejects the ENTIRE response, so one
+    infinite cell would take the whole tool result down. Emit the value as a
+    string instead -- lossy in type, but readable and parseable.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
+    return value
 
 # Warnings raised deep inside an operation, to be attached to whatever response
 # that operation ends up returning.
@@ -102,6 +121,11 @@ class DAXResult(BaseModel):
     value: Any = None
     status: str = "ok"  # "ok" | "blank" | "unsupported" | "error"
     error_message: str | None = None
+
+    @field_validator("value")
+    @classmethod
+    def _finite_value(cls, v: Any) -> Any:
+        return json_safe_number(v)
 
     @property
     def is_blank(self) -> bool:

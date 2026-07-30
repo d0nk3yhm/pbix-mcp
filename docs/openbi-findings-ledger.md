@@ -26,17 +26,16 @@ These produce a plausible answer with no error, which is why they survived so lo
 - [ ] **issues-3** -- set_visual_property / update_visual_json on a CLASSIC layout do not recompile query+dataTransforms, so Desktop renders the old field
 - [ ] **issues-7** -- "measure not found" is indistinguishable from a genuine BLANK; needs a typed DAXError
 - [ ] **issues-9** -- default-filter behaviour differs between pbix_evaluate_dax and pbix_evaluate_dax_per_dimension
-- [ ] **issues-15** -- residual COALESCE(ExplicitName, InferredName) instance
+- [x] **issues-15** -- residual COALESCE(ExplicitName, InferredName) instances (fixed 0.9.61). Four sites audited and corrected: `pbix_get_hierarchies`'
+      level query, `_report_type_resolver`'s Type IN (1,2,4) scan,
+      `_detect_field_parameter_shape` (whose `ExplicitName NOT LIKE` also
+      dropped the NULL rows outright), and the perspective column list.
 - [ ] **issues-5** -- lat/long in X/Y value roles must AVERAGE, not Sum
 
-- [ ] **issues-9 (follow-on)** -- Agents_Performance must match Desktop on ALL
-      SIX affected measures, not five. Three root causes found and fixed so far
-      (unreleased): relationships to a calculated-table column read as
-      `ToColumn=None` so date filters never propagated; the `{...}` table
-      constructor and its implicit `''[Value]` column were unimplemented; and
-      MAXX/MINX dropped DATE values, collapsing to 0. Remaining: `CALCULATETABLE`
-      is unsupported, which `CF Table` and `Table MTD Sales` reach once the
-      guard evaluates. Also still blocks enabling the `IN` operator generally.
+- [x] **issues-9 (follow-on)** -- CLOSED. Agents_Performance matches Desktop on
+      all 102 measures, `CALCULATETABLE` is implemented, and the `IN` operator is
+      enabled generally. The corpus-wide Desktop diff that followed (0.9.61)
+      took every other file to 1:1 as well.
 
 ## Open: Desktop fidelity
 

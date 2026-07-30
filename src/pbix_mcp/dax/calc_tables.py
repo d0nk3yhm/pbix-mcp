@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
 import zipfile
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
@@ -1655,6 +1656,14 @@ def evaluate_row_context_column(
             "expression contains a reserved __AGG/__CALC/__REL/__LV token, "
             "which this engine uses internally")
     engine = dax_engine.DAXEngine()
+    # Arm the SAME wall-clock guard measures get. It was never armed here,
+    # because this path calls _eval_expr directly and the deadline is set by
+    # evaluate_measure at depth 1. MS_Covid_Tracking's COVID[Daily cases] is a
+    # per-row CALCULATE/FILTER over 1,740,185 rows: it ran for over two hours
+    # at 4 GB before being killed by hand, with no output and no way for a
+    # caller to tell a hang from slow progress. A refusal is a usable answer;
+    # an unbounded hang is not.
+    engine._deadline = time.monotonic() + engine._max_eval_seconds
     values: list = []
     unresolved: set = set()
     # LOOKUPVALUE reads ANOTHER table, so it is neither row-substitutable nor a
@@ -1747,6 +1756,11 @@ def evaluate_row_context_column(
         engine._current_var_scope = base_scope or None
 
     for row in rows:
+        if time.monotonic() > engine._deadline:
+            return None, (
+                f"evaluation budget exceeded after {engine._max_eval_seconds:.0f}s "
+                f"({len(values)} of {len(rows)} rows); raise PBIX_DAX_MAX_SECONDS "
+                f"to allow longer")
         row_data = {cn: row[ci] for ci, cn in enumerate(columns)}
         if memo_cols is not None:
             key = tuple(_lv_key(row_data.get(c)) for c in memo_cols)
