@@ -3613,36 +3613,7 @@ class DAXEngine:
                                 groups[key] = []
                             groups[key].append(row_item['__value__'])
                     if groups:
-                        if '__row__' in first:
-                            # A MULTI-COLUMN row set REPLACES the whole filter
-                            # context of the tables it covers, propagation
-                            # included -- exactly as a bare ALL(Table) does a few
-                            # branches up. Only adding the row values left the
-                            # related dimension's filter in force on top of them,
-                            # so `CALCULATE(AVERAGE('Cases'[CSAT]),
-                            #    FILTER(ALL('Cases'), ...))` under a filter on the
-                            # related Owners[Manager] averaged that manager's
-                            # 3,914 rows instead of all 10,000. Desktop returns
-                            # the global 4.2706 for it and 10,000 for the row
-                            # count, so the row set was never the problem -- the
-                            # leftover propagation was. MS_AI_Sample's four
-                            # [CSAT Impact*] measures are 1 - AllAvgExcept/AllAvg
-                            # over that shape and came out +-0.03 where Desktop
-                            # gives exactly 0.
-                            #
-                            # A SINGLE-column row set (ALL(T[Col]), VALUES) is
-                            # deliberately NOT included: it replaces the filter on
-                            # that one column, and filters reaching the table
-                            # through a relationship still apply.
-                            tbls = {r['__table__'] for r in result
-                                    if isinstance(r, dict) and '__table__' in r}
-                            new_ctx = new_ctx.without_filters(
-                                [k for k in new_ctx.filter_context
-                                 if any(k.startswith(f"{t}.") for t in tbls)])
-                            new_ctx = new_ctx.with_filters(groups)
-                            new_ctx._no_propagate = new_ctx._no_propagate | tbls
-                        else:
-                            new_ctx = new_ctx.with_filters(groups)
+                        new_ctx = new_ctx.with_filters(groups)
                 continue
 
             # Any boolean predicate: =, <>, >, >=, <, <=, IN {...}, with NOT and
