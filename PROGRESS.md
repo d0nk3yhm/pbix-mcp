@@ -213,9 +213,43 @@ its own context rule here, or that the measure depends on a Desktop behaviour
 this engine models differently. Do not assume, as this note previously did, that
 one of our two behaviours must simply be wrong.
 
-Ready to run -- `verify_live.ps1 -File test_corpus/MS_Employee_Hiring.pbix`
-against this, which answers it in one pass. **The single decisive cell is the
-second one:**
+**ANSWERED (Desktop, MS_Employee_Hiring). The rule is TABLE EXPANSION, and both
+of the "contradictory" anchors are correct.**
+
+```
+MAX('Date'[PeriodNumber])                                        201612
+CALCULATE(MAX('Date'[PeriodNumber]),
+          FILTER(Employee, ISBLANK(Employee[TermDate])))         201412   <-- restricts Date
+CALCULATE(MAX('Date'[PeriodNumber]), Employee[FP] = "FT")        201612   <-- does NOT
+[Actives]                                                         32401
+MAX(Employee[date])                                          2014-12-01
+```
+
+A filter applied to a TABLE on the many side expands to that table's EXPANDED
+TABLE, which includes the one-side dimensions it points at -- so
+`FILTER(Employee, ...)` legitimately restricts `Date`, and `MAX(PeriodNumber)`
+drops to 201412 where Employee's data actually ends. A filter on a COLUMN does
+not expand: `Employee[FP] = "FT"` leaves Date at 201612. Desktop returns both,
+in the same model, in the same query.
+
+That is the narrower formulation the direction rule needed, and it reconciles
+the two anchors that looked incompatible:
+
+| shape | reaches the ONE side? | anchor |
+|---|---|---|
+| `CALCULATE(..., FILTER(Employee, ...))` -- table filter | YES (expansion) | `[Actives]` = 32,401 |
+| `CALCULATE(..., DimStore[StoreType]="Catalog")` -- column filter | NO | Agents `SELECTEDVALUE` = BLANK |
+
+So the fix is NOT "never propagate many -> one". It is: **a COLUMN filter does
+not propagate many -> one; a TABLE filter argument does, because it filters the
+expanded table.** Our symmetric index gets the first wrong and the second right;
+the reverted directional commit got the first right and the second wrong. Neither
+is the whole rule. Implement expansion-awareness at the point the filter is
+registered -- a table-valued filter argument should mark the tables its expanded
+table covers -- and both anchors can hold at once.
+
+The probe that produced this, for re-running after a change --
+`verify_live.ps1 -File test_corpus/MS_Employee_Hiring.pbix`:
 
 ```
 EVALUATE ROW("max_period_plain", MAX('Date'[PeriodNumber]))
