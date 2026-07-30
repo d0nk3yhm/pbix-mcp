@@ -155,10 +155,18 @@ re-confirm each before spending time on it.
 - **MS_Competitive_Marketing `% Units Market Share SPLY @ MfgisVanArsdel=Yes`**
   Desktop 1, we return 0; and `@Indicator05` Desktop 2, we return 1. Both are
   SPLY-family; re-measure against the DATEADD fix before investigating.
-- **Two capture artefacts, not engine bugs**: `Employee Name @ StoreType=Catalog`
-  and `Date Range Previous Period @ QuarterName=Q1` compare via the LEN
-  fallback because the captured value was truncated; confirm against Desktop's
-  own LEN before treating either as a defect.
+- **`Employee Name @ StoreType=Catalog` is a REAL defect, not the capture
+  artefact it was filed as.** Desktop's own `LEN` of that cell is 1 -- a single
+  space, the same "empty" marker it returns for `StoreType=Store` -- and we
+  return `'Jan Dryml'`, 9 characters. The measure is a RANKX/`IN` chain over
+  `'Top-Bottom-N'[Top-Bottom-N Value]`, a PARAMETER SCALAR, so it belongs with
+  the `Rank Filtering *` cluster above and with ledger item L1b, not with the
+  truncated captures. Checking Desktop's LEN is what distinguished them.
+- **`Date Range Previous Period @ QuarterName=Q1` now MATCHES** and is closed.
+  It was a truncated capture; comparing Desktop's own `LEN` gives 13 against our
+  `' - 12/31/2024'`, also 13. The v8 sweep saw LEN 20 because the period-outside
+  -the-calendar defect was still feeding it a non-blank date -- the empty-period
+  fix closed this one as a side effect.
 
 ## Known limits (deliberate, documented)
 
