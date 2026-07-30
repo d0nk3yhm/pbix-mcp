@@ -614,6 +614,8 @@ class DAXDateTime(_datetime.datetime):
     rounded serial, exactly as before.
     """
     __slots__ = ('oa_serial',)
+    # Annotation only -- no assignment, so __slots__ still governs storage.
+    oa_serial: float
 
 
 def _oa_date_to_python(oa_days: float):
@@ -638,8 +640,21 @@ def _reconstruct_value_encoded(n, data_type: str):
     ``n = (data_id + BaseId) / Magnitude`` (already applied by the caller). This
     then maps ``n`` to the column's declared type. Verified byte-for-byte against
     pbixray over the whole corpus (Int64 keys/counts, DateTime) — e.g. an OLE
-    serial 45748 -> 2025-04-01. Magnitude carries the decimal/currency scale, so
-    ``n`` is the final numeric value for Float64/Decimal (do NOT divide again).
+    serial 45748 -> 2025-04-01.
+
+    Magnitude is a common-factor COMPRESSION of the stored integer, not the
+    decimal scale. A Decimal (fixed decimal / currency) column is stored as its
+    value times 10,000 whichever way it is encoded, so it needs the same
+    ``/ 10000`` the dictionary path applies in _reconstruct_value -- this
+    branch returned ``float(n)`` and every value-encoded Decimal column read
+    10,000x too large.
+
+    Proved without Desktop by decoding the SAME 397-row AdventureWorks Product
+    table out of two corpus files, one dictionary-encoded and one value-encoded:
+        MS_AdventureWorks_Sales  Product[List Price]  2.29 .. 3578.27
+        MS_AdventureWorks_DW     Product[List Price]  22900.0 .. 35782700.0
+    Magnitude differs across the affected columns (1.0, 0.01, 0.0001, 1e-06) and
+    the factor is 10,000 in every case, which is what rules Magnitude out.
     """
     if data_type == "DateTime":
         return _oa_date_to_python(n)
@@ -647,7 +662,9 @@ def _reconstruct_value_encoded(n, data_type: str):
         return bool(int(round(n)))
     if data_type == "Int64":
         return int(round(n))
-    if data_type in ("Float64", "Decimal"):
+    if data_type == "Decimal":
+        return float(n) / 10000.0
+    if data_type == "Float64":
         return float(n)
     return n
 
