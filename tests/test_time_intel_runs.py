@@ -109,6 +109,48 @@ class TestContiguousSelectionIsUnchanged:
         assert got == datetime(2024, 1, 31)
 
 
+class TestPeriodOutsideTheCalendarIsBlank:
+    """A shifted period with no dates behind it is an EMPTY filter, and an
+    empty filter means BLANK -- never "no filter".
+
+    Ecommerce_Conversion's calendar starts 2025-01-01, so under QuarterName=Q1
+    `DATEADD(dimDate[Date],-1,QUARTER)` asks for Oct-Dec 2024. Desktop returns
+    BLANK for [Page_Views_PMTD/PQTD]; applying no filter returned 14,548,763,
+    and the three *_%Delta measures divide by it and came out exactly -1.0 --
+    DIVIDE(BLANK - P, P) -- against Desktop's BLANK.
+
+    The TABLE form was already right: COUNTROWS of the same DATEADD was blank.
+    Only the CALCULATE filter path skipped the empty result.
+    """
+
+    ROWS = []
+    _d = datetime(2025, 1, 1)
+    while _d < datetime(2025, 7, 1):
+        ROWS.append([_d, (_d.month - 1) // 3 + 1, 1])
+        _d += timedelta(days=1)
+    TABLES = {"D": {"columns": ["Date", "Qtr", "v"], "rows": ROWS}}
+
+    def test_a_period_before_the_calendar_is_blank(self):
+        got = _ev(self.TABLES,
+                  "CALCULATE(SUM('D'[v]), DATEADD('D'[Date], -1, QUARTER))",
+                  {"D.Qtr": [1]})
+        assert got is None
+
+    def test_sameperiodlastyear_outside_the_calendar_is_blank(self):
+        got = _ev(self.TABLES,
+                  "CALCULATE(SUM('D'[v]), SAMEPERIODLASTYEAR('D'[Date]))",
+                  {"D.Qtr": [1]})
+        assert got is None
+
+    def test_a_period_inside_the_calendar_still_answers(self):
+        """The guard must not blanket-blank: Q2 shifted back one quarter IS
+        Q1, which exists -- 90 days of v=1."""
+        got = _ev(self.TABLES,
+                  "CALCULATE(SUM('D'[v]), DATEADD('D'[Date], -1, QUARTER))",
+                  {"D.Qtr": [2]})
+        assert got == 90
+
+
 class TestTwoIsolatedDaysDoNotSpanTheGap:
     """The sharpest discriminator: two single-day runs far apart.
 
