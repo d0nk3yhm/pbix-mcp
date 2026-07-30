@@ -158,11 +158,38 @@ Any future change here must keep BOTH anchors at once:
 
 **STILL OPEN.**
 
-- **Agents_Performance `Rank Filtering *` under `StoreType=Catalog`.** Desktop 0,
-  we return 1. Three measures: `Dynamics`, `Employyees MTD`, `Employyees MTD%`
-  (the misspelling is the model's). They wrap IN around a RANKX/TOPN chain --
-  see the note in `TestInMachinery` about why IN is deliberately not wired into
-  the expression planner.
+- **Agents_Performance `Rank Filtering *` + `Employee Name` under
+  `StoreType=Catalog` — ROOT CAUSE FOUND, and it is not the RANKX chain.**
+  We propagate a filter from the MANY side of a relationship to the ONE side.
+  Desktop does not, and both directions are now pinned:
+
+  ```
+  relationship: DimStore[EmployeeKey] -> DimEmployee[EmployeeKey]   (many -> one)
+
+  COUNTROWS(DimEmployee)                                    Desktop 293
+  CALCULATE(COUNTROWS(DimEmployee), DimStore[StoreType]="Catalog")
+                                                            Desktop 293  UNCHANGED
+  CALCULATE(SELECTEDVALUE(DimEmployee[EmployeeKey]), same)   Desktop BLANK, ours 213
+  CALCULATE(COUNTROWS(DimStore), DimEmployee[EmployeeKey]=213)
+                                                            Desktop 1    one->many DOES flow
+  ```
+
+  The measure is `SWITCH(TRUE(), SELECTEDVALUE(DimEmployee[EmployeeKey]) IN
+  _Rank_Asc, 1, ... , 0)`. With `SELECTEDVALUE` wrongly resolving to 213 instead
+  of BLANK, the first branch matches and the answer is 1 where Desktop says 0.
+  Desktop's `RANKX(ALL(DimEmployee[EmployeeKey]), [MTD Total Sales], , DESC)`
+  under Catalog is 2 -- not `N+1`/`N+2` -- so its third branch is FALSE too.
+
+  Two things this rules OUT, both of which were previously suspected:
+  `[MTD Total Sales] @ Catalog` is 1783540.7792 in Desktop and 1783540.7792
+  here, and the non-blank-MTD employee count is 1 in both. The TOPN is not
+  "legitimately empty" as the older note in `TestInMachinery` guessed -- the
+  filter context feeding SELECTEDVALUE is simply wrong.
+
+  A fix has to make propagation directional (one -> many only, unless
+  `CrossFilteringBehavior` is bidirectional) and is broad enough to need the
+  whole corpus as its check: reverse propagation may currently be load-bearing
+  for measures that match today.
 - ~~MS_Employee_Hiring `AVG Tenure Days` / `AVG Tenure Months`~~ -- CLOSED,
   both against the captured Desktop values rather than a remembered range.
   `AVG Tenure Days @ Qtr=2` is 2952.93278336456, Desktop's value to every digit
