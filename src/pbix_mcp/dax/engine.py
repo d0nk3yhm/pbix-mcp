@@ -4433,16 +4433,93 @@ class DAXEngine:
 
     # DAX date format tokens -> strftime. Ordered longest-first so "MMMM" isn't
     # eaten by "MM" (dict preserves insertion order).
-    _DATE_FMT_TOKENS = (
-        ('yyyy', '%Y'), ('yy', '%y'), ('MMMM', '%B'), ('MMM', '%b'), ('MM', '%m'),
-        ('dddd', '%A'), ('ddd', '%a'), ('dd', '%d'), ('HH', '%H'), ('hh', '%I'),
-        ('mm', '%M'), ('ss', '%S'), ('AM/PM', '%p'), ('am/pm', '%p'),
-        # Power BI accepts the upper-case spellings too. Without them
-        # FORMAT(d, "YYYY-MM-DD") returned the literal "YYYY-01-DD": only MM
-        # matched, and the rest of the picture was copied through verbatim.
-        ('YYYY', '%Y'), ('YY', '%y'), ('DDDD', '%A'), ('DDD', '%a'),
-        ('DD', '%d'), ('SS', '%S'),
-    )
+    # Named pictures, matched case-insensitively before the token scan.
+    # Desktop: FORMAT(DATE(2021,7,19), "Long Date")  -> "Monday, July 19, 2021"
+    #          FORMAT(DATE(2021,7,19), "Short Date") -> "7/19/2021"
+    _NAMED_DATE_FMTS = {
+        'long date': 'dddd, mmmm d, yyyy',
+        'medium date': 'dd-mmm-yy',
+        'short date': 'm/d/yyyy',
+        'general date': 'm/d/yyyy h:nn:ss AM/PM',
+        'long time': 'h:nn:ss AM/PM',
+        'medium time': 'h:nn AM/PM',
+        'short time': 'HH:nn',
+    }
+
+    def _format_datetime_pattern(self, val, fmt_str: str) -> str:
+        """Render a DAX/VBA date picture.
+
+        The old table was .NET-cased -- `MM` month, `mm` MINUTES -- but DAX
+        pictures are VBA-style and case-INSENSITIVE, where lower-case `m` is a
+        MONTH. `mmmm` therefore matched `mm` twice and rendered "0000" instead
+        of "July", and every `mm/dd/yyyy` came out "00/19/2021". Desktop:
+
+            mmmm -> July     mmm -> Jul     mm -> 07     m -> 7
+            d -> 19          m/d/yyyy on 2021-03-05 -> 3/5/2021
+
+        `m` means minutes only when it FOLLOWS an hour token, which is what
+        Desktop's "mm hh:mm" -> "07 12:00" pins: the first is a month, the one
+        after `hh:` is minutes. `nn` is always minutes.
+        """
+        named = self._NAMED_DATE_FMTS.get(fmt_str.strip().lower())
+        if named:
+            fmt_str = named
+        if isinstance(val, datetime):
+            hh24, mi, ss = val.hour, val.minute, val.second
+        else:
+            hh24 = mi = ss = 0
+        h12 = hh24 % 12 or 12
+        out: list = []
+        prev = ''          # last TOKEN emitted, separators ignored
+        i, n = 0, len(fmt_str)
+        while i < n:
+            low = fmt_str[i:].lower()
+            if low.startswith('am/pm') or low.startswith('a/p'):
+                tok = 'am/pm' if low.startswith('am/pm') else 'a/p'
+                src = fmt_str[i:i + len(tok)]
+                ampm = 'AM' if hh24 < 12 else 'PM'
+                if tok == 'a/p':
+                    ampm = ampm[0]
+                out.append(ampm if src[0].isupper() else ampm.lower())
+                i += len(tok); prev = 'ampm'; continue
+            ch = low[0]
+            run = 0
+            while i + run < n and fmt_str[i + run].lower() == ch:
+                run += 1
+            if ch == 'y':
+                out.append(f"{val.year % 100:02d}" if run <= 2
+                           else f"{val.year:04d}")
+            elif ch == 'd':
+                out.append({1: str(val.day), 2: f"{val.day:02d}"}.get(
+                    run, calendar.day_abbr[val.weekday()] if run == 3
+                    else calendar.day_name[val.weekday()]))
+            elif ch == 'n':
+                out.append(f"{mi:02d}" if run >= 2 else str(mi))
+            elif ch == 'h':
+                use24 = fmt_str[i].isupper()
+                v = hh24 if use24 else h12
+                out.append(f"{v:02d}" if run >= 2 else str(v))
+            elif ch == 's':
+                out.append(f"{ss:02d}" if run >= 2 else str(ss))
+            elif ch == 'm':
+                if prev == 'h':                      # minutes only after hours
+                    out.append(f"{mi:02d}" if run >= 2 else str(mi))
+                    ch = 'n'
+                elif run == 1:
+                    out.append(str(val.month))
+                elif run == 2:
+                    out.append(f"{val.month:02d}")
+                elif run == 3:
+                    out.append(calendar.month_abbr[val.month])
+                else:
+                    out.append(calendar.month_name[val.month])
+            else:
+                out.append(fmt_str[i:i + run])
+                i += run
+                continue                              # separators keep `prev`
+            i += run
+            prev = ch
+        return ''.join(out)
 
     def _fn_format(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
@@ -4456,26 +4533,16 @@ class DAXEngine:
         # "2015-01-01T00:00:00" instead of "January" — a silently wrong value,
         # which is worse than an error because nothing surfaces it.
         if fmt and isinstance(val, str) and not isinstance(val, (datetime, date)):
-            if any(tok in str(fmt) for tok, _strf in self._DATE_FMT_TOKENS):
+            _f = str(fmt).strip().lower()
+            if (_f in self._NAMED_DATE_FMTS
+                    or any(t in _f for t in ('yy', 'mm', 'dd', 'hh', 'nn',
+                                             'ss', 'am/pm'))):
                 coerced = _as_datetime(val)
                 if coerced is not None:
                     val = coerced
-        # Datetime formatting (NOW()/TODAY()/date columns): translate the DAX
-        # date pattern to strftime token by token.
+        # Datetime formatting (NOW()/TODAY()/date columns).
         if isinstance(val, (datetime, date)) and fmt:
-            out = ''
-            fmt_str = str(fmt)
-            i = 0
-            while i < len(fmt_str):
-                for tok, strf in self._DATE_FMT_TOKENS:
-                    if fmt_str.startswith(tok, i):
-                        out += val.strftime(strf)
-                        i += len(tok)
-                        break
-                else:
-                    out += fmt_str[i]
-                    i += 1
-            return out
+            return self._format_datetime_pattern(val, str(fmt))
         if fmt and isinstance(val, (int, float)) and not isinstance(val, bool):
             out = _format_number(float(val), str(fmt))
             if out is not None:
