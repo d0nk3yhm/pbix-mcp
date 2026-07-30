@@ -163,10 +163,11 @@ Any future change here must keep BOTH anchors at once:
   (the misspelling is the model's). They wrap IN around a RANKX/TOPN chain --
   see the note in `TestInMachinery` about why IN is deliberately not wired into
   the expression planner.
-- **MS_Employee_Hiring `AVG Tenure Days @ Qtr=2`** Desktop 2952.93, we return
-  None, and `AVG Tenure Months @ Qtr=N` returned -1 against Desktop's 91-99.5.
-  `AVG Tenure Days` is `AVERAGE([TenureDays])` -- a bare column reference, so
-  start with home-table resolution rather than the date logic.
+- ~~MS_Employee_Hiring `AVG Tenure Days` / `AVG Tenure Months`~~ -- CLOSED,
+  both against the captured Desktop values rather than a remembered range.
+  `AVG Tenure Days @ Qtr=2` is 2952.93278336456, Desktop's value to every digit
+  (it was None). `AVG Tenure Months` per quarter is 99.5 / 97.4 / 94.1 / 91.3
+  against Desktop's 99.5 / 97.4 / 94.1 / 91.3 (it was -1).
 - ~~MS_Competitive_Marketing `% Units Market Share SPLY` / `@Indicator05`~~ --
   CLOSED. Both were SPLY-family and the DATEADD run fix resolved them; the file
   is 88/88 under filter context.
