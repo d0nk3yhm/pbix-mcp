@@ -5,10 +5,19 @@ and how, what is left, and the traps already hit so they are not re-hit.
 
 ## Where things stand
 
-**0.9.61 is the last RELEASED version.** Five further Desktop-verified fixes are
-committed on top of it and are NOT released yet — see the `[Unreleased]` section
-of CHANGELOG.md. A sixth (directional filter propagation) was landed and
-reverted; the write-up below is the one to read before re-attempting it.
+**0.9.62 is released** (PyPI + GitHub, 2026-07-31), verified by installing it
+from PyPI into a clean venv: `pbix_mcp 0.9.62` on Python 3.13, pure-Python, and
+`FORMAT(DATE(2021,7,19),"mmmm dd, yyyy")` returns `July 19, 2021` from the
+published artifact.
+
+**Note on 0.9.61: it was never published.** This file previously called it "the
+last released version". There is no `v0.9.61` tag, no GitHub release, and PyPI
+goes 0.9.60 -> 0.9.62. It was a version-bump commit only; its CHANGELOG section
+documents work that actually shipped inside 0.9.62. The last release before
+today was **0.9.60**.
+
+A sixth fix (directional filter propagation) was landed and reverted this cycle;
+the write-up below is the one to read before re-attempting it.
 
 | verification | scale | result |
 |---|---|---|
