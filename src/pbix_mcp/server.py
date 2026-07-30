@@ -12080,6 +12080,9 @@ def _get_dax_context(alias: str) -> dict:
         'tables': tables,
         'measure_defs': measure_defs,
         'measure_tables': measure_tables,
+        # The MODEL's own column list. `tables` above is a materialized subset,
+        # so it cannot be used to decide that a reference is unresolvable.
+        'model_columns': model.all_column_names,
         'date_table': date_table,
         'date_column': date_column,
         'relationships': relationships,
@@ -12297,7 +12300,8 @@ def pbix_evaluate_dax(
             measure_names, ctx['tables'], ctx['measure_defs'],
             fc, ctx['date_table'], ctx['date_column'],
             ctx.get('relationships'), simulate_row_context=False,
-            measure_tables=ctx.get('measure_tables')
+            measure_tables=ctx.get('measure_tables'),
+            model_columns=ctx.get('model_columns')
         )
 
         # Build structured response with DAXResult objects

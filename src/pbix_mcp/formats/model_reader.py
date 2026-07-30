@@ -234,6 +234,33 @@ class ModelReader:
         return rows
 
     @property
+    def all_column_names(self) -> dict:
+        """{table name: {column names}} for EVERY column in the model.
+
+        Distinct from `dax_columns`, which returns only CALCULATED columns.
+        The DAX engine materializes a SUBSET of tables and columns, so
+        "not in the loaded table" does not mean "not in the model" -- deciding
+        that a reference is unresolvable needs the model's own schema or it
+        will refuse measures Desktop evaluates perfectly well.
+        """
+        if "all_column_names" in self._metadata_cache:
+            return self._metadata_cache["all_column_names"]
+        out: dict = {}
+        try:
+            rows = self._query_metadata(
+                "SELECT t.Name AS TableName, "
+                "       COALESCE(c.ExplicitName, c.InferredName) AS ColumnName "
+                "FROM [Column] c JOIN [Table] t ON t.ID = c.TableID")
+            for r in rows:
+                tn, cn = r.get("TableName"), r.get("ColumnName")
+                if tn and cn:
+                    out.setdefault(tn, set()).add(cn)
+        except Exception:
+            out = {}          # unreadable metadata: refuse nothing, not everything
+        self._metadata_cache["all_column_names"] = out
+        return out
+
+    @property
     def dax_columns(self) -> list[dict]:
         """
         Get all DAX calculated columns from the model.
