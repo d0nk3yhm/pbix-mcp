@@ -129,12 +129,33 @@ restriction, against Desktop's 32,401.
 
 That is the real design problem: `_no_propagate` cannot tell "suppress the
 filters that already existed when ALL was applied" from "block a filter created
-LATER inside a nested CALCULATE". DAX only means the first. The existing
-`ALL(Table)` branch sets the same sticky flag, so `CALCULATE([EmpCount],
-ALL(Employee))` is presumably wrong the same way today -- untested, worth a
-Desktop probe. Any fix has to scope the suppression to the filters live at the
-moment ALL is applied, and must be checked against `[Actives]` = 32,401 and
-`CALCULATE(AVERAGE('Cases'[CSAT]), FILTER(ALL('Cases'),1=1))` = 4.2706 together.
+LATER inside a nested CALCULATE". DAX only means the first.
+
+**This is a PRE-EXISTING defect in the `ALL(Table)` branch, now Desktop-verified
+and open on its own account** -- it is not something the reverted commit
+introduced. On MS_AI_Sample:
+
+    CALCULATE(AVERAGE('Cases'[CSAT]), 'Owners'[Manager]="Low, Spencer")
+        Desktop 4.13796627491058   ours 4.1379  OK
+    CALCULATE(CALCULATE(AVERAGE('Cases'[CSAT]), 'Owners'[Manager]="Low, Spencer"),
+              ALL('Cases'))
+        Desktop 4.13796627491058   ours 4.2706  WRONG
+    ...the same nested COUNTROWS: Desktop 3914, ours 10000.
+
+Desktop keeps the inner filter's propagation even though the outer CALCULATE
+applied ALL('Cases'). The minimal repro needs no corpus file:
+
+    Fact(k,v) = [a,10],[b,20];  Dim(k,grp) = [a,X],[b,Y];  Fact.k -> Dim.k
+    CALCULATE(CALCULATE(SUM(Fact[v]), Dim[grp]="X"), ALL(Fact))
+        DAX says 10 (only row a);  we return 30.
+
+The fix is to make suppression remember WHICH filter keys were live when ALL was
+applied, instead of flagging the table forever: propagation from those keys is
+dropped, propagation from keys created later is not. That also makes the CSAT
+case fall out correctly, because there the Owners filter IS live at the moment
+`FILTER(ALL('Cases'),...)` is applied. Check any attempt against BOTH anchors:
+`[Actives]` = 32,401 and
+`CALCULATE(AVERAGE('Cases'[CSAT]), FILTER(ALL('Cases'),1=1))` = 4.2706.
 - **MS_AI_Sample `CSAT Impact` / `- Agent` / `- Products` / `- Subject` per
   Manager.** Desktop 0, we return +-0.03. All four share one shape:
   `VAR AllAvg = CALCULATE(AVERAGE(Cases[CSAT]), ALL(Cases))`
