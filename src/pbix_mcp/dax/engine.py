@@ -176,6 +176,7 @@ _P_CONCAT = 12    # & with precomputed parts
 _P_NEG = 13       # unary minus
 _P_FUNC = 14      # FUNC(args), name + args text precomputed
 _P_TAIL = 15      # bare table name / final BLANK
+_P_IN = 16        # <scalar> IN <set>; may return None -> fall through
 
 _PLAN_CACHE: dict = {}
 
@@ -185,6 +186,8 @@ _BRACKET2_RE = re.compile(r'^\[[^\]]+\]$')
 _NOT_PREFIX_RE = re.compile(r'(?i)^not\s+(.+)$')
 _FUNC_CALL_RE = re.compile(r'([A-Za-z_]\w*)\s*\(')
 _TCOL_RE = re.compile(r"(?:'([^'\[\]]+)'|([^\W\d][\w .]*))\s*\[([^\]]+)\]$")
+_CALC_PRED_RE = re.compile(
+    r"^'?([^'\[\]]+?)'?\s*\[([^\]]+)\]\s*(<>|>=|<=|>|<|=)\s*(.+)$", re.S)
 _VAR_KW_RE = re.compile(r'\bVAR\b', re.IGNORECASE)
 _RETURN_KW_RE = re.compile(r'\bRETURN\b', re.IGNORECASE)
 
@@ -309,6 +312,24 @@ def _analyze_expr(raw):
         return ((_P_NOT, m.group(1).strip()),)
 
     steps = []
+    # NOTE: `IN` as a general expression operator is deliberately NOT registered
+    # here yet, though _eval_in below is implemented and unit-tested (including
+    # DAX's BLANK semantics: BLANK() IN {1,2} is FALSE).
+    #
+    # Enabling it made seven Agents_Performance corpus measures go from BLANK to
+    # a CONFIDENTLY WRONG value: Desktop returns 0 / "black" / $19,260,877 where
+    # this engine then returned 1 / "white" / a placeholder. Verified against
+    # Desktop's own msmdsrv, and NOT a slicer-default artifact -- the mismatch
+    # holds with apply_default_filters False, which is the same empty context
+    # Desktop's EVALUATE ROW(...) uses.
+    #
+    # The fault is not in IN. Those measures wrap it around RANKX / TOPN over a
+    # parameter-table scalar, and that chain is independently inaccurate here;
+    # IN merely stopped masking it. A blank is a visible non-answer, a wrong
+    # number is not, so this stays off until the RANKX chain matches Desktop.
+    # CALCULATE's own IN support does not depend on this step -- see
+    # _calculate_filter_spec, which calls _split_in_scan directly.
+
     for op in ('<>', '>=', '<=', '>', '<', '='):
         if len(DAXEngine._split_operators_scan(expr, op)) == 2:
             # Conditional: a comparison with a non-comparable side evaluates
@@ -559,6 +580,13 @@ def make_value_matcher(spec):
     if "is_blank" in spec:
         want = bool(spec["is_blank"])
         tests.append(lambda c: (c is None or str(c) == "") is want)
+    if "all" in spec:
+        # Conjunction of whole specs, which the flat keys cannot express: two
+        # comparisons on one column ({"op": ">"} AND {"op": "<"}) would collide
+        # on the "op" key. CALCULATE builds this when it is given several
+        # predicates for the same column, since DAX intersects them.
+        subs = [make_value_matcher(s) for s in spec["all"]]
+        tests.append(lambda c: all(m(c) for m in subs))
     if not tests:
         raise ValueError(f"filter predicate {spec!r} has no recognized keys")
     return lambda cell: all(t(cell) for t in tests)
@@ -1370,6 +1398,11 @@ class DAXEngine:
             if kind == _P_BINARY:
                 op, parts = data
                 return self._fold_arith(parts, op, ctx, var_scope)
+            if kind == _P_IN:
+                result = self._eval_in(data[0], data[1], ctx, var_scope)
+                if result is not None:
+                    return result
+                continue  # unparseable set: fall through, do not guess
             if kind == _P_CMP:
                 result = self._eval_comparison(data, ctx, var_scope)
                 if result is not None:
@@ -1544,6 +1577,49 @@ class DAXEngine:
         """Split function arguments at top-level commas."""
         return self._split_top_level(args_str, ',')
 
+    @staticmethod
+    @lru_cache(maxsize=100_000)
+    def _split_in_scan(expr: str) -> tuple:
+        """Find a TOP-LEVEL ``IN`` word operator: ``(left, right)`` or ``()``.
+
+        A word operator cannot be found by substring scanning -- "MIN(", "IN"
+        inside an identifier and the text of a string literal all contain it --
+        so this requires non-word characters on both sides and skips anything
+        nested in (), [], {} or quotes. Braces count as nesting so the SET on the
+        right of an IN is never mistaken for a second operator.
+        """
+        depth = 0
+        in_string = False
+        quote = ''
+        i = 0
+        n = len(expr)
+        while i < n:
+            ch = expr[i]
+            if in_string:
+                if ch == quote:
+                    in_string = False
+                i += 1
+                continue
+            if ch in ('"', "'"):
+                in_string, quote = True, ch
+                i += 1
+                continue
+            if ch in '([{':
+                depth += 1
+            elif ch in ')]}':
+                depth -= 1
+            elif (depth == 0 and (ch == 'I' or ch == 'i')
+                    and i + 1 < n and expr[i + 1] in ('N', 'n')):
+                before = expr[i - 1] if i > 0 else ' '
+                after = expr[i + 2] if i + 2 < n else ' '
+                if (not (before.isalnum() or before in '_.')
+                        and not (after.isalnum() or after in '_.')):
+                    left, right = expr[:i].strip(), expr[i + 2:].strip()
+                    if left and right:
+                        return (left, right)
+            i += 1
+        return ()
+
     def _split_top_level(self, expr: str, delimiter: str) -> list:
         """Split expression at top-level delimiter, respecting parens and strings.
 
@@ -1568,9 +1644,13 @@ class DAXEngine:
                 current.append(ch)
                 i += 1
                 continue
-            if ch == '(':
+            # Braces nest too: a table constructor `{1,2,3}` is ONE argument, and
+            # splitting inside it turned `IN {"Lead","Proposal"}` into two
+            # arguments, which is why IN over a literal set silently matched
+            # nothing.
+            if ch == '(' or ch == '{':
                 depth += 1
-            elif ch == ')':
+            elif ch == ')' or ch == '}':
                 depth -= 1
 
             if depth == 0 and expr[i:i+len(delimiter)] == delimiter:
@@ -1760,6 +1840,76 @@ class DAXEngine:
                     return None
                 acc = left / right
         return acc
+
+    def _in_set_values(self, right: str, ctx: DAXContext,
+                       var_scope: dict | None = None) -> list | None:
+        """The right-hand side of an IN, as a flat list of scalars.
+
+        Two shapes, both of which Desktop accepts:
+          ``{"Lead", "Proposal"}``   table constructor -- each element evaluated
+          ``VALUES(T[C])``          any single-column table expression
+
+        Returns None when the shape is not understood, so the caller can fall
+        through instead of silently answering FALSE (which is what an empty set
+        would mean) -- a wrong FALSE here is exactly the class of silent error
+        this whole path is fixing.
+        """
+        right = right.strip()
+        if right.startswith('{') and right.endswith('}'):
+            inner = right[1:-1].strip()
+            if not inner:
+                return []
+            out = []
+            for elem in self._split_top_level(inner, ','):
+                elem = elem.strip()
+                # A row constructor -- {(1,"a"),(2,"b")} -- is multi-column and
+                # only meaningful for a multi-column IN, which this does not
+                # implement. Refuse the whole set rather than compare against
+                # the tuple text.
+                if elem.startswith('('):
+                    return None
+                out.append(self._eval_expr(elem, ctx, var_scope))
+            return out
+        # A table expression: reuse the engine's row-dict convention.
+        result = self._eval_expr(right, ctx, var_scope)
+        if isinstance(result, list):
+            if not result:
+                # An EMPTY table expression is ambiguous here. Real DAX would say
+                # FALSE, but this engine also returns [] for a table function it
+                # cannot evaluate in the current scope -- VALUES(T[C]) yields []
+                # inside a row context, for instance. Answering FALSE would turn
+                # that limitation into a confident wrong answer, so report
+                # "unknown" and let the caller fall through to BLANK. A literal
+                # `{}` is handled above and DOES mean the empty set.
+                return None
+            vals = []
+            for row in result:
+                if isinstance(row, dict):
+                    if '__value__' in row:
+                        vals.append(row['__value__'])
+                        continue
+                    cols = [k for k in row if not k.startswith('__')]
+                    if len(cols) != 1:
+                        return None
+                    vals.append(row[cols[0]])
+                else:
+                    vals.append(row)
+            return vals
+        return None
+
+    def _eval_in(self, left: str, right: str, ctx: DAXContext,
+                 var_scope: dict | None = None) -> Any:
+        """``<scalar> IN <set>`` -- TRUE when the left value is in the set.
+
+        Membership uses the engine's usual value comparison (numeric when both
+        sides are numbers, date-aware when both parse as dates, else text), so
+        ``1 IN {1}`` and ``"1" IN {1}`` both hold, matching Desktop.
+        """
+        values = self._in_set_values(right, ctx, var_scope)
+        if values is None:
+            return None
+        lval = self._eval_expr(left.strip(), ctx, var_scope)
+        return any(_compare(lval, '=', v) for v in values)
 
     def _eval_comparison(self, expr: str, ctx: DAXContext, var_scope: dict | None = None) -> Any:
         """Evaluate comparison operators."""
@@ -2104,6 +2254,12 @@ class DAXEngine:
 
         base_expr = args[0].strip()
         new_ctx = ctx
+        # Keys this CALL has filtered, so two predicates on the SAME column
+        # INTERSECT (DAX ANDs multiple filter arguments) while a predicate on a
+        # column the OUTER context already filtered still REPLACES it -- that
+        # override is the entire point of CALCULATE, so the two cases must not be
+        # confused by reading them both out of filter_context.
+        applied_here: dict = {}
 
         # Process filter arguments
         for i in range(1, len(args)):
@@ -2221,6 +2377,19 @@ class DAXEngine:
                         new_ctx = new_ctx.with_filters(groups)
                 continue
 
+            # Any boolean predicate: =, <>, >, >=, <, <=, IN {...}, with NOT and
+            # KEEPFILTERS peeled. Handled BEFORE the legacy equality regex below,
+            # which would otherwise match the wrapper text of NOT(T[C] = v) and
+            # register a filter on a column named "NOT(T".
+            spec = self._calculate_filter_spec(filter_arg, new_ctx)
+            if spec:
+                key, value = spec
+                if key in applied_here:
+                    value = {"all": [applied_here[key], value]}
+                applied_here[key] = value
+                new_ctx = new_ctx.with_filters({key: value})
+                continue
+
             # Simple column = value filter: Table[Col] = value
             eq_match = re.match(r"'?([^'\[\]]+)'?\s*\[([^\]]+)\]\s*=\s*(.*)", filter_arg)
             if eq_match:
@@ -2246,6 +2415,91 @@ class DAXEngine:
         finally:
             new_ctx._outer_ctx = _prev_outer
             new_ctx._current_row = _prev_row
+
+    @staticmethod
+    def _peel_call(arg: str, names: tuple) -> tuple:
+        """``NOT(x)`` -> ``('NOT', 'x')``; ``NOT x`` -> ``('NOT', 'x')``.
+
+        Returns ``('', arg)`` when no wrapper applies. The closing paren must be
+        the LAST character, i.e. the call has to wrap the whole argument -- a
+        substring match would peel ``NOT(a) && b`` down to ``a``.
+        """
+        s = arg.strip()
+        for name in names:
+            if not s[:len(name)].upper() == name:
+                continue
+            rest = s[len(name):]
+            if rest.startswith('('):
+                depth, in_str = 0, False
+                for i, ch in enumerate(rest):
+                    if ch == '"':
+                        in_str = not in_str
+                    elif in_str:
+                        continue
+                    elif ch == '(':
+                        depth += 1
+                    elif ch == ')':
+                        depth -= 1
+                        if depth == 0:
+                            return (name, rest[1:i].strip()) if i == len(rest) - 1 \
+                                else ('', s)
+            elif rest[:1].isspace():
+                return (name, rest.strip())
+        return ('', s)
+
+    def _calculate_filter_spec(self, filter_arg: str, ctx: DAXContext,
+                               var_scope: dict | None = None) -> tuple:
+        """A CALCULATE boolean filter argument as ``(key, spec)``, or ``()``.
+
+        Only ``Table[Col] = value`` used to be honoured; every other predicate
+        fell off the end of the filter loop adding NO filter and NO warning, so
+        CALCULATE quietly returned the UNFILTERED total (OpenBI findings #9 #5b).
+        The filter context already evaluates structured predicates natively via
+        :func:`make_value_matcher`, so this only has to translate into that form.
+
+        ``NOT`` is folded into the operator rather than wrapped, and
+        ``KEEPFILTERS`` is peeled: both used to be swallowed by the equality
+        regex, which matched the WRAPPER text and registered a filter on a column
+        named e.g. ``KEEPFILTERS(T``.
+        """
+        wrapper, inner = self._peel_call(filter_arg, ('KEEPFILTERS',))
+        negate = False
+        while True:
+            wrapper, peeled = self._peel_call(inner, ('NOT',))
+            if not wrapper:
+                break
+            negate = not negate
+            inner = peeled
+
+        m = _CALC_PRED_RE.match(inner)
+        if m:
+            tbl, col, op, val_text = (m.group(1).strip(), m.group(2).strip(),
+                                      m.group(3), m.group(4).strip())
+            val = self._eval_expr(val_text, ctx, var_scope)
+            if val is None:
+                return ()
+            if negate:
+                op = {'=': '<>', '<>': '=', '>': '<=', '<=': '>',
+                      '>=': '<', '<': '>='}[op]
+            key = f"{tbl}.{col}"
+            # Plain equality keeps the historical In-set list form: it is what
+            # every existing caller and test expects, and make_value_matcher
+            # treats a list as string membership.
+            if op == '=':
+                return (key, [val])
+            return (key, {"op": op, "value": val})
+
+        in_parts = self._split_in_scan(inner)
+        if in_parts:
+            left = in_parts[0].strip()
+            lm = re.match(r"^'?([^'\[\]]+?)'?\s*\[([^\]]+)\]$", left)
+            if lm:
+                vals = self._in_set_values(in_parts[1], ctx, var_scope)
+                if vals is None:
+                    return ()
+                key = f"{lm.group(1).strip()}.{lm.group(2).strip()}"
+                return (key, {"not_in" if negate else "in": vals})
+        return ()
 
     @staticmethod
     def _two_col_refs(filter_arg: str) -> list:

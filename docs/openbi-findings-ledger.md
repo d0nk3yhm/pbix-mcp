@@ -19,12 +19,19 @@ the GitHub tracker; these docs are a separate stream.
 
 These produce a plausible answer with no error, which is why they survived so long.
 
-- [ ] **issues-9** -- CALCULATE boolean filter args other than `Col = value` are silently dropped; the `IN` operator is unimplemented engine-wide
+- [x] **issues-9** -- CALCULATE boolean filter args other than `Col = value` were silently dropped (fixed 0.9.60, Desktop-verified). The `IN` operator is
+      implemented and used by CALCULATE but deliberately NOT enabled for
+      general expressions -- it unmasks an inaccurate RANKX/TOPN chain that
+      then returns confidently wrong values instead of BLANK. See below.
 - [ ] **issues-3** -- set_visual_property / update_visual_json on a CLASSIC layout do not recompile query+dataTransforms, so Desktop renders the old field
 - [ ] **issues-7** -- "measure not found" is indistinguishable from a genuine BLANK; needs a typed DAXError
 - [ ] **issues-9** -- default-filter behaviour differs between pbix_evaluate_dax and pbix_evaluate_dax_per_dimension
 - [ ] **issues-15** -- residual COALESCE(ExplicitName, InferredName) instance
 - [ ] **issues-5** -- lat/long in X/Y value roles must AVERAGE, not Sum
+
+- [ ] **issues-9 (follow-on)** -- the RANKX/TOPN-over-parameter-scalar chain is
+      inaccurate: `Table MTD Sales` returns BLANK where Desktop returns
+      $19,260,877. Blocks enabling the `IN` operator generally.
 
 ## Open: Desktop fidelity
 
