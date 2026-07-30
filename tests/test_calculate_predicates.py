@@ -102,12 +102,19 @@ class TestUnchangedBehaviour:
         assert ev(C + pred + ")") == want
 
     @pytest.mark.parametrize("pred", ['P[Nope] > 1', 'P[Nope] = 1'])
-    def test_missing_column_is_ignored(self, pred):
-        """PRE-EXISTING, verified against the unpatched engine: a filter naming a
-        column that does not exist is silently ignored, for `=` too. Pinned here
-        so a change in that behaviour is a deliberate decision, not a surprise --
-        it is NOT desirable."""
-        assert ev(C + pred + ")") == TOTAL
+    def test_missing_column_refuses_rather_than_being_ignored(self, pred):
+        """This test used to pin the OPPOSITE, flagged there as "NOT desirable"
+        and to be changed deliberately. This is that change.
+
+        A filter naming a column that does not exist was silently dropped, so
+        CALCULATE returned the UNFILTERED total -- a confident wrong number.
+        Desktop refuses the expression ("Column 'X' in table 'Y' cannot be found
+        or may not be used in this expression"); the engine now does too, which
+        surfaces as BLANK rather than a plausible figure. MS_Life_Expectancy is
+        the corpus case: five measures sum a column the model does not have, and
+        [Health] answered 3,104,480 where Desktop cannot evaluate it at all.
+        """
+        assert ev(C + pred + ")") is None
 
 
 class TestInMachinery:

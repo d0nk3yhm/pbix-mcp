@@ -2226,7 +2226,19 @@ class DAXEngine:
                     for _mn in ctx.measures:
                         if _mn.lower() == col_name.lower():
                             return self.evaluate_measure(_mn, ctx)
-                    return None
+                    # Neither a column of that table nor a measure: the
+                    # reference cannot be resolved AT ALL, and Desktop refuses
+                    # the whole expression rather than evaluating around it
+                    # ("Column 'X' in table 'Y' cannot be found or may not be
+                    # used in this expression"). Degrading it to BLANK let the
+                    # rest of the arithmetic proceed and produce a CONFIDENT
+                    # WRONG NUMBER -- MS_Life_Expectancy's [Health] returned
+                    # 3,104,480 and [Health Expenditure] 222 for measures
+                    # Desktop cannot evaluate at all.
+                    from pbix_mcp.errors import DAXEvaluationError
+                    raise DAXEvaluationError(
+                        f"Column '{col_name}' in table '{table_name}' cannot be "
+                        f"found or may not be used in this expression")
                 return (table_name, col_name)
             if kind == _P_BRACKET1:
                 if (data not in ctx.measures and ctx._current_row
@@ -3008,6 +3020,35 @@ class DAXEngine:
             return (home, name)
         return None
 
+    def _require_real_column(self, col, ctx: DAXContext) -> None:
+        """Refuse a (table, column) reference whose column does not exist.
+
+        The plain aggregates parse their argument with a pure REGEX, so
+        `SUM(T[No Such Column])` produced a syntactically fine reference,
+        get_column_data returned nothing, and the aggregate came back BLANK --
+        which `+` then folds to 0, so the surrounding arithmetic carried on and
+        produced a CONFIDENT WRONG NUMBER. MS_Life_Expectancy's [Health] sums
+        eight columns of which one does not exist: Desktop refuses the whole
+        measure ("Column 'Deaths due to HIV/AIDS (per 100 000 population)' in
+        table 'Indicators' cannot be found") and we answered 3,104,480.
+
+        Only refuses when the TABLE exists -- an unknown table is a different
+        shape (a table expression, a variable) that other branches handle.
+        """
+        if not col:
+            return
+        tbl = ctx.tables.get(col[0])
+        if tbl is None:
+            return
+        if ctx._find_col_idx(tbl.get('columns') or [], col[1]) >= 0:
+            return
+        if self._measure_exists(col[1], ctx):
+            return          # Table[Measure] is a legal qualified reference
+        from pbix_mcp.errors import DAXEvaluationError
+        raise DAXEvaluationError(
+            f"Column '{col[1]}' in table '{col[0]}' cannot be found or may not "
+            f"be used in this expression")
+
     def _charge_eval(self, ctx: DAXContext) -> None:
         """Charge one unit of the eval budget (same accounting _eval_expr does).
 
@@ -3038,6 +3079,7 @@ class DAXEngine:
         col = self._parse_column_ref(args_str)
         if col is not None:
             self._charge_eval(ctx)
+            self._require_real_column(col, ctx)
         if col is None:
             ref = self._eval_expr(args_str.strip(), ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
@@ -3052,6 +3094,7 @@ class DAXEngine:
         col = self._parse_column_ref(args_str)
         if col is not None:
             self._charge_eval(ctx)
+            self._require_real_column(col, ctx)
         if col is None:
             ref = self._eval_expr(args_str.strip(), ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
@@ -3071,6 +3114,7 @@ class DAXEngine:
         col = self._parse_column_ref(args_str)
         if col is not None:
             self._charge_eval(ctx)
+            self._require_real_column(col, ctx)
         if col is None:
             ref = self._eval_expr(args_str.strip(), ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
@@ -3114,6 +3158,7 @@ class DAXEngine:
         col = self._parse_column_ref(args[0])
         if col is not None:
             self._charge_eval(ctx)
+            self._require_real_column(col, ctx)
         if col is None:
             ref = self._eval_expr(args[0].strip(), ctx)
             col = ref if isinstance(ref, tuple) and len(ref) == 2 else None
@@ -3163,6 +3208,7 @@ class DAXEngine:
         col = self._parse_column_ref(args_str)
         if col is not None:
             self._charge_eval(ctx)
+            self._require_real_column(col, ctx)
         if col is None:
             ref = self._eval_expr(args_str.strip(), ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
@@ -3183,6 +3229,7 @@ class DAXEngine:
         col = self._parse_column_ref(args_str)
         if col is not None:
             self._charge_eval(ctx)
+            self._require_real_column(col, ctx)
         if col is None:
             ref = self._eval_expr(args_str.strip(), ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
@@ -3200,6 +3247,7 @@ class DAXEngine:
         col = self._parse_column_ref(args_str)
         if col is not None:
             self._charge_eval(ctx)
+            self._require_real_column(col, ctx)
         if col is None:
             ref = self._eval_expr(args_str.strip(), ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
