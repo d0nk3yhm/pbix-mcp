@@ -213,6 +213,29 @@ its own context rule here, or that the measure depends on a Desktop behaviour
 this engine models differently. Do not assume, as this note previously did, that
 one of our two behaviours must simply be wrong.
 
+Ready to run -- `verify_live.ps1 -File test_corpus/MS_Employee_Hiring.pbix`
+against this, which answers it in one pass. **The single decisive cell is the
+second one:**
+
+```
+EVALUATE ROW("max_period_plain", MAX('Date'[PeriodNumber]))
+EVALUATE ROW("max_period_under_employee_filter",
+  CALCULATE(MAX('Date'[PeriodNumber]),
+            FILTER(Employee, ISBLANK(Employee[TermDate]))))
+EVALUATE ROW("empcount_plain", [EmpCount])
+EVALUATE ROW("actives", [Actives])
+EVALUATE ROW("employee_rows_in_201612",
+  CALCULATE(COUNTROWS(Employee), 'Date'[PeriodNumber] = 201612))
+```
+
+If `max_period_under_employee_filter` is **201412**, Desktop DOES carry that
+filter many -> one into Date and our symmetric index is right for this shape --
+the direction rule then needs a narrower formulation than "never many -> one".
+If it is **201612**, Desktop reaches 32,401 some other way and `[EmpCount]`
+itself is what to model next. Either answer closes the question; guessing does
+not. (Deferred only because the corpus sweep had the machine: 3.4 GB free of
+31.9 GB, and Desktop wants several for this file.)
+
 Two anchors, both required, and neither is optional:
 `[Actives]` = 32,401 (MS_Employee_Hiring) and
 `CALCULATE(SELECTEDVALUE(DimEmployee[EmployeeKey]), DimStore[StoreType]="Catalog")`
