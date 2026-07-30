@@ -21,8 +21,21 @@ These produce a plausible answer with no error, which is why they survived so lo
 
 - [x] **issues-9** -- CALCULATE boolean filter args other than `Col = value` were silently dropped (fixed 0.9.60, Desktop-verified). The `IN` operator is
       implemented and used by CALCULATE but deliberately NOT enabled for
-      general expressions -- it unmasks an inaccurate RANKX/TOPN chain that
-      then returns confidently wrong values instead of BLANK. See below.
+      general expressions.
+      **CORRECTION (2026-07-30): the stated reason was wrong.** It was recorded
+      here, and in `TestInMachinery`, that enabling `IN` "unmasks an inaccurate
+      RANKX/TOPN chain". Measured against Desktop on Agents_Performance, the
+      chain is NOT inaccurate: `[MTD Total Sales] @ StoreType=Catalog` is
+      1783540.7792 in Desktop and identical here, and the non-blank-MTD employee
+      count is 1 in both. What is wrong is REVERSE FILTER PROPAGATION -- our
+      single-hop relationship index is symmetric, so filtering the many side
+      restricts the one side, and `SELECTEDVALUE(DimEmployee[EmployeeKey])`
+      answers 213 where Desktop answers BLANK. That is what makes the measure
+      return 1 instead of 0. A directional fix takes Agents_Performance to
+      408/408 but breaks MS_Employee_Hiring's `[Actives]` (32,401 -> None) and
+      was reverted; the full write-up and the resume point are in PROGRESS.md.
+      Whether `IN` can then be enabled generally is a SEPARATE question that has
+      not been re-tested since.
 - [x] **issues-3** -- set_visual_property / update_visual_json on a CLASSIC layout now recompile query+dataTransforms (0.9.61), so Desktop no longer renders the old field
 - [ ] **issues-7** -- "measure not found" is indistinguishable from a genuine BLANK; needs a typed DAXError
 - [x] **issues-9** -- default-filter behaviour differs between pbix_evaluate_dax and pbix_evaluate_dax_per_dimension.

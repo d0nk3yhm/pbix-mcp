@@ -121,9 +121,19 @@ class TestInMachinery:
     """``_eval_in`` / ``_in_set_values`` back CALCULATE's IN support. They are
     also correct as a general operator, but that is deliberately NOT wired into
     the expression planner -- see the comment in _analyze_expr. Enabling it made
-    seven Agents_Performance measures return a CONFIDENTLY WRONG value instead of
-    BLANK, because they wrap IN around a RANKX/TOPN chain that is independently
-    inaccurate. These tests keep the machinery honest for the day that lands.
+    seven Agents_Performance measures return a CONFIDENTLY WRONG value instead
+    of BLANK. These tests keep the machinery honest for the day that lands.
+
+    The REASON recorded here was wrong, and the correction is worth keeping.
+    It said those measures "wrap IN around a RANKX/TOPN chain that is
+    independently inaccurate". Measured against Desktop on 2026-07-30, the chain
+    is not inaccurate: `[MTD Total Sales] @ StoreType=Catalog` is 1783540.7792
+    in Desktop and identical here, and the non-blank-MTD employee count is 1 in
+    both. The defect is REVERSE FILTER PROPAGATION -- our single-hop
+    relationship index is symmetric, so filtering the many side restricts the
+    one side and `SELECTEDVALUE(DimEmployee[EmployeeKey])` answers 213 where
+    Desktop answers BLANK. See PROGRESS.md; a directional fix reached 408/408 on
+    that file but broke MS_Employee_Hiring's [Actives] and was reverted.
     """
 
     def _ctx(self):
