@@ -650,7 +650,12 @@ class TestWallClockGuard:
         from pbix_mcp.dax.engine import DAXContext, DAXEngine
         tables, measures, rels = self._model()
         eng = DAXEngine()
-        eng._max_eval_seconds = 0.3   # tiny budget forces the guard
+        # A budget of zero forces the guard deterministically. It used to be 0.3s
+        # and rely on this model genuinely taking longer than that -- but the
+        # 0.9.61 filter-index work made SUMX(ALL(Dim), CALCULATE(...)) over
+        # 300 dims x 50k facts fast enough to finish inside 0.3s, so the fixture
+        # stopped exercising the guard and the test passed for the wrong reason.
+        eng._max_eval_seconds = 0.0
         c = DAXContext(tables, measures, None, None, None, rels)
         t0 = _t.monotonic()
         result = eng.evaluate_measure("slow", c)
