@@ -112,6 +112,61 @@ class TestAllVersusAllSelected:
                   filters=self.FILTERS) == 10
 
 
+class TestTableFilterReplacesPropagation:
+    """A MULTI-COLUMN table filter argument replaces the whole filter context
+    of the table it covers -- propagation included -- exactly as ALL(Table)
+    does. Only adding the row values left the related dimension's filter in
+    force on top of them.
+
+    Verified against Power BI Desktop on MS_AI_Sample, filtering the related
+    Owners[Manager]:
+
+        CALCULATE(AVERAGE('Cases'[CSAT]), FILTER(ALL('Cases'), 1=1)) = 4.2706
+        CALCULATE(COUNTROWS('Cases'),     FILTER(ALL('Cases'), 1=1)) = 10000
+        AVERAGE('Cases'[CSAT])  (no ALL)                  = 4.13796627491058
+
+    The TABLE EXPRESSION was never wrong: COUNTROWS(FILTER(ALL('Cases'), ...))
+    already returned 10,000 and SELECTEDVALUE already returned BLANK. What was
+    wrong is the filter context that row set establishes -- an aggregate inside
+    the CALCULATE was still evaluated against that manager's 3,914 rows, so the
+    CALCULATE form of the same count was 3,914 too. The four [CSAT Impact*]
+    measures are 1 - AllAvgExcept/AllAvg over this shape and came out +-0.03
+    where Desktop gives exactly 0.
+    """
+
+    FILTERS = {"Dim.grp": ["X"]}
+
+    def test_filter_over_all_clears_the_propagated_filter(self):
+        assert ev("CALCULATE(SUM(Fact[v]), FILTER(ALL(Fact), 1=1))",
+                  filters=self.FILTERS) == 30
+
+    def test_it_agrees_with_the_bare_all(self):
+        bare = ev("CALCULATE(SUM(Fact[v]), ALL(Fact))", filters=self.FILTERS)
+        wrapped = ev("CALCULATE(SUM(Fact[v]), FILTER(ALL(Fact), 1=1))",
+                     filters=self.FILTERS)
+        assert bare == wrapped == 30
+
+    def test_the_calculate_form_counts_every_row(self):
+        """Desktop: CALCULATE(COUNTROWS('Cases'), FILTER(ALL('Cases'),1=1))
+        = 10000 under the Owners[Manager] filter. Ours answered 3,914."""
+        assert ev("CALCULATE(COUNTROWS(Fact), FILTER(ALL(Fact), 1=1))",
+                  filters=self.FILTERS) == 2
+
+    def test_the_bare_table_expression_was_already_right(self):
+        """COUNTROWS(FILTER(ALL(T), ...)) counts the returned TABLE and needed
+        no fix -- it returned 10,000 before and after. Keeping it here stops a
+        future change to the table path from being blamed on this one."""
+        assert ev("COUNTROWS(FILTER(ALL(Fact), 1=1))",
+                  filters=self.FILTERS) == 2
+
+    def test_a_single_column_filter_does_NOT_suppress_propagation(self):
+        """ALL(Fact[v]) replaces the filter on ONE column; a filter reaching
+        the table through a relationship still applies, so only row 'a' is
+        visible. Suppressing here would have been the over-broad fix."""
+        assert ev("CALCULATE(SUM(Fact[v]), ALL(Fact[v]))",
+                  filters=self.FILTERS) == 10
+
+
 class TestOneRowTableIsAScalar:
     """A measure must evaluate to a value. `LASTDATE('Year'[Date])` returned
     the internal row-dict list, whose str() leaked 72 characters of Python
