@@ -31,6 +31,7 @@ Supports 150+ DAX functions:
 - String concatenation with &
 """
 
+import calendar
 import json
 import math
 import os
@@ -337,23 +338,20 @@ def _analyze_expr(raw):
         return ((_P_NOT, m.group(1).strip()),)
 
     steps = []
-    # NOTE: `IN` as a general expression operator is deliberately NOT registered
-    # here yet, though _eval_in below is implemented and unit-tested (including
-    # DAX's BLANK semantics: BLANK() IN {1,2} is FALSE).
+    # IN is a comparison-class operator and, like the others, is conditional: an
+    # unparseable set falls through rather than inventing an answer. Checked
+    # before the symbolic comparisons because `x IN {1,2}` contains none of them,
+    # while `NOT x IN {...}` has already been peeled by the NOT branch above
+    # (DAX: NOT binds looser than a comparison).
     #
-    # Enabling it made seven Agents_Performance corpus measures go from BLANK to
-    # a CONFIDENTLY WRONG value: Desktop returns 0 / "black" / $19,260,877 where
-    # this engine then returned 1 / "white" / a placeholder. Verified against
-    # Desktop's own msmdsrv, and NOT a slicer-default artifact -- the mismatch
-    # holds with apply_default_filters False, which is the same empty context
-    # Desktop's EVALUATE ROW(...) uses.
-    #
-    # The fault is not in IN. Those measures wrap it around RANKX / TOPN over a
-    # parameter-table scalar, and that chain is independently inaccurate here;
-    # IN merely stopped masking it. A blank is a visible non-answer, a wrong
-    # number is not, so this stays off until the RANKX chain matches Desktop.
-    # CALCULATE's own IN support does not depend on this step -- see
-    # _calculate_filter_spec, which calls _split_in_scan directly.
+    # This was held back for one release. Enabling it while RANKX still returned
+    # dead-last for a non-member value turned seven Agents_Performance measures
+    # from BLANK into confidently WRONG values. It is on now because the chain
+    # underneath -- DATEADD's month shift, RANKX's competition ranking, date-aware
+    # filter matching -- matches Desktop measure for measure.
+    in_parts = DAXEngine._split_in_scan(expr)
+    if in_parts:
+        steps.append((_P_IN, in_parts))
 
     for op in ('<>', '>=', '<=', '>', '<', '='):
         if len(DAXEngine._split_operators_scan(expr, op)) == 2:
@@ -549,6 +547,39 @@ def _relative_date_bounds(spec: dict):
     return anchor - span, anchor
 
 
+_SHARED_FILTER_CACHES: dict = {}
+_SHARED_FILTER_CACHE_MAX = 4
+
+
+def _shared_filter_cache(tables) -> dict:
+    """One filter-index cache per model, shared by EVERY context over it.
+
+    Assigning the cache at each derived-context construction site does not hold:
+    there are a dozen of them across engine.py and calc_tables.py, and the two
+    that were missed silently created a private cache per row, so an iterator
+    rebuilt 200k-row index maps for every row it visited. Keying on the identity
+    of the tables mapping makes sharing automatic and future construction sites
+    correct by default.
+
+    The row COUNTS are part of the key so a rewritten table cannot be served
+    stale indices; a fresh tables mapping (which is what happens when the model
+    is edited and the DAX context is rebuilt) gets a fresh identity anyway. A
+    handful of models are retained, FIFO, to bound memory.
+    """
+    try:
+        fp = (id(tables), tuple(sorted(
+            (k, len(v.get('rows') or ())) for k, v in tables.items()
+            if isinstance(v, dict))))
+    except (AttributeError, TypeError):
+        return {}
+    hit = _SHARED_FILTER_CACHES.get(fp)
+    if hit is None:
+        if len(_SHARED_FILTER_CACHES) >= _SHARED_FILTER_CACHE_MAX:
+            _SHARED_FILTER_CACHES.pop(next(iter(_SHARED_FILTER_CACHES)), None)
+        hit = _SHARED_FILTER_CACHES[fp] = {'__tables_ref__': tables}
+    return hit
+
+
 def _extremum(cur, cand, want_max: bool):
     """Running MAX/MIN across the types DAX's MAXX/MINX accept.
 
@@ -591,7 +622,25 @@ def make_value_matcher(spec):
     if not isinstance(spec, dict):
         values = spec if isinstance(spec, (list, tuple, set)) else [spec]
         allowed = {str(v) for v in values}
-        return lambda cell: str(cell) in allowed
+        # A date reaches us in more than one representation and str() of two
+        # equal dates need not match: a Date table column holds datetime
+        # objects, while DATESMTD/DATESYTD and caller-supplied filter_context
+        # entries produce ISO strings -- '2009-12-01 00:00:00' vs '2009-12-01'.
+        # That mismatch made CALCULATE([Sales], DATESMTD(...)) select ZERO rows
+        # and return BLANK where Desktop returns $19,260,877. _as_date only
+        # accepts date/datetime/ISO-ish text, never a bare number, so a numeric
+        # filter cannot be reinterpreted as a date serial by accident.
+        allowed_dates = {d for d in (_as_date(v) for v in values) if d is not None}
+        if not allowed_dates:
+            return lambda cell: str(cell) in allowed
+
+        def _match_with_dates(cell):
+            if str(cell) in allowed:
+                return True
+            cd = _as_date(cell)
+            return cd is not None and cd in allowed_dates
+
+        return _match_with_dates
 
     tests = []
     if "op" in spec:
@@ -695,6 +744,10 @@ class DAXContext:
         # win: a measure like MIN(T[Col]) under one outer context rebuilt the
         # same filtered list on every one of thousands of per-row calls.
         self._column_data_cache: dict = {}
+        # Per-filter row-index sets. Keyed on the identity of the tables
+        # mapping, so EVERY context over the same model shares one cache without
+        # each construction site having to remember to pass it along.
+        self._filter_idx_cache: dict = _shared_filter_cache(tables)
         # __init__ assigned filter_context BEFORE this cache existed, so the
         # property setter could not clear it. Nothing is cached yet, so there is
         # nothing to lose -- but keep this after the cache is created.
@@ -824,6 +877,11 @@ class DAXContext:
         Get ALL cross-table filters that apply to a target table.
         Uses model relationships to propagate dimension filters to fact tables.
         Returns list of (allowed_values_set, fact_col_idx) tuples.
+
+        Memoized on the shared cache: this walks the relationship graph and reads
+        intermediate tables, and every get_column_data / get_filtered_rows call
+        asked for it again. One measure evaluation asks ~7 times, so an iterator
+        over a dimension paid for the same propagation hundreds of times.
         """
         if not self.filter_context:
             return []
@@ -831,6 +889,23 @@ class DAXContext:
         tbl = self.tables.get(table_name)
         if not tbl:
             return []
+
+        ck = None
+        try:
+            ck = (id(tbl), 'xtf', tuple(sorted(
+                (k, self._filter_sig(v)) for k, v in self.filter_context.items())))
+        except TypeError:
+            ck = None
+        if ck is not None:
+            hit = self._filter_idx_cache.get(ck)
+            if hit is not None:
+                return list(hit)
+            out = self._get_cross_table_filters_uncached(table_name, tbl)
+            self._filter_idx_cache[ck] = out
+            return out
+        return self._get_cross_table_filters_uncached(table_name, tbl)
+
+    def _get_cross_table_filters_uncached(self, table_name: str, tbl: dict) -> list:
 
         result_filters = []
 
@@ -1041,6 +1116,152 @@ class DAXContext:
         self._column_data_cache[_ck] = out
         return out
 
+    @staticmethod
+    def _filter_sig(allowed):
+        """A hashable signature for one filter's value set, or None when it is
+        too large to be worth hashing (the scan is then done uncached)."""
+        if isinstance(allowed, dict):
+            try:
+                return ('d', json.dumps(allowed, sort_keys=True, default=str))
+            except (TypeError, ValueError):
+                return None
+        if isinstance(allowed, (list, tuple, set, frozenset)):
+            if len(allowed) > 4096:
+                return None
+            try:
+                return ('l', tuple(sorted(str(v) for v in allowed)))
+            except TypeError:
+                return None
+        return ('s', str(allowed))
+
+    def _value_index_map(self, tbl: dict, col_idx: int) -> dict:
+        """``{value-key: frozenset(row indices)}`` for one column, built once.
+
+        Keyed by ``str(value)`` and, for a date-ish value, additionally by its ISO
+        date, so the date-aware In-set semantics survive the index lookup: a
+        filter carrying '2009-12-01' still finds cells holding
+        ``datetime(2009, 12, 1)``, whose str() is '2009-12-01 00:00:00'.
+        """
+        key = (id(tbl), 'vmap', col_idx)
+        vmap = self._filter_idx_cache.get(key)
+        if vmap is None:
+            rows = tbl['rows']
+            # Only pay for the ISO alias on a column that actually holds dates.
+            # _as_date on a plain string tries five strptime formats, so doing it
+            # per cell of a 200k-row text column costs more than the scan it is
+            # meant to replace. Sample first.
+            dateish = False
+            for row in rows[:64]:
+                v = row[col_idx]
+                if v is None:
+                    continue
+                if isinstance(v, (datetime, date)):
+                    dateish = True
+                elif isinstance(v, str):
+                    dateish = _as_date(v) is not None
+                break
+            acc: dict = {}
+            if dateish:
+                for i, row in enumerate(rows):
+                    v = row[col_idx]
+                    sv = str(v)
+                    acc.setdefault(sv, []).append(i)
+                    dv = _as_date(v)
+                    if dv is not None:
+                        iso = dv.isoformat()
+                        if iso != sv:
+                            acc.setdefault(iso, []).append(i)
+            else:
+                for i, row in enumerate(rows):
+                    acc.setdefault(str(row[col_idx]), []).append(i)
+            vmap = {k: frozenset(v) for k, v in acc.items()}
+            self._filter_idx_cache[key] = vmap
+        return vmap
+
+    def _indices_for_values(self, tbl: dict, col_idx: int, allowed):
+        """Row indices matching an In-SET filter, via the column's value map --
+        dict lookups instead of a scan. None when the filter is not a plain set
+        (a structured predicate), so the caller falls back to the matcher.
+
+        This is what makes an iterator over a dimension affordable: RANKX walking
+        261 employees used to trigger 261 separate 200k-row scans of the fact
+        table, one per employee's propagated key set. Now the fact table is
+        traversed ONCE per join column and each employee costs a few lookups.
+        """
+        if isinstance(allowed, dict):
+            return None
+        values = allowed if isinstance(allowed, (list, tuple, set, frozenset)) \
+            else [allowed]
+        vmap = self._value_index_map(tbl, col_idx)
+        keys = set()
+        for v in values:
+            keys.add(str(v))
+            dv = _as_date(v)
+            if dv is not None:
+                keys.add(dv.isoformat())
+        found = [vmap[k] for k in keys if k in vmap]
+        if not found:
+            return frozenset()
+        if len(found) == 1:
+            return found[0]
+        return frozenset().union(*found)
+
+    def _surviving_indices(self, table_name: str, tbl: dict):
+        """Indices of ``tbl['rows']`` that satisfy the filter context, or None
+        when nothing filters this table.
+
+        Each individual filter's index set is cached and the sets are
+        INTERSECTED. That matters because sibling contexts usually differ in ONE
+        filter: RANKX iterating 261 employees re-applied the identical 31-date
+        set to a 200k-row fact table 261 times, ~31 ms each. Now the date set is
+        scanned once and reused, and only the employee predicate is new.
+        The cache is shared down the derivation tree (see with_filters).
+        """
+        cols = tbl['columns']
+        rows = tbl['rows']
+        cache = self._filter_idx_cache
+        sets = []
+        for fk, allowed in self.filter_context.items():
+            parts = fk.split('.', 1)
+            if len(parts) != 2 or parts[0] != table_name:
+                continue
+            filt_idx = self._find_col_idx(cols, parts[1])
+            if filt_idx < 0:
+                continue
+            hit = self._indices_for_values(tbl, filt_idx, allowed)
+            if hit is None:
+                sig = self._filter_sig(allowed)
+                key = (id(tbl), 'd', filt_idx, sig) if sig is not None else None
+                hit = cache.get(key) if key is not None else None
+                if hit is None:
+                    _m = make_value_matcher(allowed)
+                    hit = frozenset(i for i, row in enumerate(rows)
+                                    if _m(row[filt_idx]))
+                    if key is not None:
+                        cache[key] = hit
+            sets.append(hit)
+        for allowed_vals, join_idx in self._get_cross_table_filters(table_name):
+            hit = self._indices_for_values(tbl, join_idx, allowed_vals)
+            if hit is None:
+                sig = self._filter_sig(allowed_vals)
+                key = (id(tbl), 'x', join_idx, sig) if sig is not None else None
+                hit = cache.get(key) if key is not None else None
+                if hit is None:
+                    hit = frozenset(i for i, row in enumerate(rows)
+                                    if str(row[join_idx]) in allowed_vals)
+                    if key is not None:
+                        cache[key] = hit
+            sets.append(hit)
+        if not sets:
+            return None
+        sets.sort(key=len)
+        keep = sets[0]
+        for s in sets[1:]:
+            keep &= s
+            if not keep:
+                break
+        return keep
+
     def _get_column_data_uncached(self, table_name: str, column_name: str) -> list:
         tbl = self.tables.get(table_name)
         if not tbl:
@@ -1051,22 +1272,10 @@ class DAXContext:
             return []
 
         rows = tbl['rows']
-
-        # Apply ALL direct filters for this table (not just the target column)
-        for fk, allowed_values in self.filter_context.items():
-            parts = fk.split('.', 1)
-            if parts[0] == table_name and len(parts) == 2:
-                filt_col = parts[1]
-                filt_idx = self._find_col_idx(cols, filt_col)
-                if filt_idx >= 0:
-                    _m = make_value_matcher(allowed_values)
-                    rows = [row for row in rows if _m(row[filt_idx])]
-
-        # Apply ALL cross-table filters (star-schema propagation via relationships)
-        for allowed_vals, join_idx in self._get_cross_table_filters(table_name):
-            rows = [row for row in rows if str(row[join_idx]) in allowed_vals]
-
-        return [row[col_idx] for row in rows]
+        keep = self._surviving_indices(table_name, tbl)
+        if keep is None:
+            return [row[col_idx] for row in rows]
+        return [rows[i][col_idx] for i in sorted(keep)]
 
     def get_filtered_rows(self, table_name: str) -> list:
         """Get rows of a table after applying filter context."""
@@ -1074,24 +1283,10 @@ class DAXContext:
         if not tbl:
             return []
         rows = tbl['rows']
-        cols = tbl['columns']
-
-        # Apply all direct filters for this table
-        filtered = rows
-        for fk, allowed_values in self.filter_context.items():
-            parts = fk.split('.', 1)
-            if parts[0] == table_name and len(parts) == 2:
-                col_name = parts[1]
-                col_idx = self._find_col_idx(cols, col_name)
-                if col_idx >= 0:
-                    _m = make_value_matcher(allowed_values)
-                    filtered = [r for r in filtered if _m(r[col_idx])]
-
-        # Apply ALL cross-table filters via relationships
-        for allowed_vals, join_idx in self._get_cross_table_filters(table_name):
-            filtered = [row for row in filtered if str(row[join_idx]) in allowed_vals]
-
-        return filtered
+        keep = self._surviving_indices(table_name, tbl)
+        if keep is None:
+            return rows
+        return [rows[i] for i in sorted(keep)]
 
     def with_filters(self, extra_filters: dict) -> 'DAXContext':
         """Create a new context with additional filters applied."""
@@ -1099,7 +1294,14 @@ class DAXContext:
         new_filters.update(extra_filters)
         ctx = DAXContext(self.tables, self.measures, self.date_table,
                          self.date_column, new_filters, self.relationships)
-        ctx._measure_cache = {}
+        ctx._filter_idx_cache = self._filter_idx_cache
+        # Share the measure memo by REFERENCE across the derivation family. Its
+        # key already carries a filter-context fingerprint, so entries are
+        # scoped to the context that produced them and cannot leak between
+        # siblings. It used to be reset to {} here, which meant RANKX evaluating
+        # the same measure for the same 261 employees in two different VARs paid
+        # for all of it twice.
+        ctx._measure_cache = self._measure_cache
         return ctx
 
     def without_filters(self, keys: list) -> 'DAXContext':
@@ -1107,6 +1309,7 @@ class DAXContext:
         new_filters = {k: v for k, v in self.filter_context.items() if k not in keys}
         ctx = DAXContext(self.tables, self.measures, self.date_table,
                          self.date_column, new_filters, self.relationships)
+        ctx._filter_idx_cache = self._filter_idx_cache
         return ctx
 
 
@@ -1191,6 +1394,14 @@ class DAXEngine:
             'CONTAINS': self._fn_contains,
             # --- Filter ---
             'CALCULATE': self._fn_calculate,
+            # CALCULATETABLE has the same contract as CALCULATE -- apply the
+            # filter arguments, perform the row->filter transition, evaluate
+            # argument 1 -- and differs only in that argument 1 is a table
+            # expression, which _eval_expr already returns as row dicts. Sharing
+            # the implementation means the filter-argument handling (boolean
+            # predicates, NOT/KEEPFILTERS peeling, ALL/REMOVEFILTERS, DATEADD,
+            # USERELATIONSHIP) cannot drift between the two.
+            'CALCULATETABLE': self._fn_calculate,
             'REMOVEFILTERS': self._fn_removefilters,
             'ALL': self._fn_all,
             'ALLEXCEPT': self._fn_allexcept,
@@ -2595,8 +2806,10 @@ class DAXEngine:
             new_rels.append(r)
         if not changed:
             return ctx
-        return DAXContext(ctx.tables, ctx.measures, ctx.date_table,
+        _nc = DAXContext(ctx.tables, ctx.measures, ctx.date_table,
                           ctx.date_column, ctx.filter_context, new_rels)
+        _nc._filter_idx_cache = ctx._filter_idx_cache
+        return _nc
 
     def _apply_crossfilter(self, filter_arg: str, ctx: DAXContext) -> DAXContext:
         """CROSSFILTER(col1, col2, direction): override the cross-filter
@@ -2627,8 +2840,10 @@ class DAXEngine:
             new_rels.append(r)
         if not changed:
             return ctx
-        return DAXContext(ctx.tables, ctx.measures, ctx.date_table,
+        _nc = DAXContext(ctx.tables, ctx.measures, ctx.date_table,
                           ctx.date_column, ctx.filter_context, new_rels)
+        _nc._filter_idx_cache = ctx._filter_idx_cache
+        return _nc
 
     def _apply_dateadd_filter(self, expr: str, ctx: DAXContext) -> DAXContext:
         """Apply DATEADD as a filter context modification."""
@@ -2641,6 +2856,21 @@ class DAXEngine:
         date_col = match.group(2).strip()
         offset = int(match.group(3))
         interval = match.group(4).upper()
+
+        # Every interval, via the same shift the table-expression form uses.
+        # Only YEAR was implemented below, and only when the date table happened
+        # to have a "Year" column, so DATEADD(..., -1, MONTH) was a silent no-op:
+        # PMTD came back equal to MTD, and month-over-month measures built on it
+        # collapsed to 0.
+        shifted = self._dateadd_dates(date_table, date_col, offset, interval, ctx)
+        if shifted:
+            new_filters = {k: v for k, v in ctx.filter_context.items()
+                           if not k.startswith(f"{date_table}.")}
+            new_filters[f"{date_table}.{date_col}"] = shifted
+            _nc = DAXContext(ctx.tables, ctx.measures, ctx.date_table,
+                              ctx.date_column, new_filters, ctx.relationships)
+            _nc._filter_idx_cache = ctx._filter_idx_cache
+            return _nc
 
         # Get all date values from the date table
         tbl = ctx.tables.get(date_table)
@@ -2696,8 +2926,10 @@ class DAXEngine:
                     del new_filters[k]
                 # Set the shifted date filter
                 new_filters[f"{date_table}.{date_col}"] = shifted_dates
-                return DAXContext(ctx.tables, ctx.measures, ctx.date_table,
+                _nc = DAXContext(ctx.tables, ctx.measures, ctx.date_table,
                                   ctx.date_column, new_filters, ctx.relationships)
+                _nc._filter_idx_cache = ctx._filter_idx_cache
+                return _nc
 
         return ctx
 
@@ -2741,12 +2973,92 @@ class DAXEngine:
         # Fallback: marker for CALCULATE
         return ('__ALL__', ref)
 
+    @staticmethod
+    def _shift_date(d, offset: int, interval: str):
+        """One DATEADD step. Month-family arithmetic is calendar-correct and
+        clamps to the last day of the target month, as DAX does when the source
+        day does not exist there (31 Mar -1 MONTH -> 28/29 Feb)."""
+        if interval == 'DAY':
+            return d + timedelta(days=offset)
+        if interval == 'WEEK':
+            return d + timedelta(weeks=offset)
+        months = {'MONTH': 1, 'QUARTER': 3, 'YEAR': 12}.get(interval)
+        if months is None:
+            return None
+        total = (d.month - 1) + months * offset
+        year, month = d.year + total // 12, total % 12 + 1
+        day = min(d.day, calendar.monthrange(year, month)[1])
+        return datetime(year, month, day)
+
+    def _dateadd_dates(self, date_table: str, date_col: str, offset: int,
+                       interval: str, ctx: DAXContext) -> list:
+        """The date values DATEADD yields: every VISIBLE date shifted by
+        offset x interval, kept only where the shifted date exists in the date
+        table -- DAX drops shifts that fall outside it.
+
+        Shared by the table-expression form and CALCULATE's filter fast path so
+        the two can never disagree.
+        """
+        tbl = ctx.tables.get(date_table)
+        if not tbl:
+            return []
+        idx = ctx._find_col_idx(tbl['columns'], date_col)
+        if idx < 0:
+            return []
+        universe: dict = {}
+        for row in tbl['rows']:
+            dv = _as_date(row[idx])
+            if dv is not None:
+                universe.setdefault(dv, row[idx])
+        visible = ctx.get_column_data(date_table, date_col)
+        if not visible:
+            visible = [row[idx] for row in tbl['rows']]
+        out, seen = [], set()
+        for v in visible:
+            dv = _as_datetime(v)
+            if dv is None:
+                continue
+            shifted = self._shift_date(dv, offset, interval)
+            if shifted is None:
+                continue
+            key = shifted.date() if isinstance(shifted, datetime) else shifted
+            if key in universe and key not in seen:
+                seen.add(key)
+                out.append(universe[key])
+        return out
+
+    _DATEADD_ARGS_RE = re.compile(
+        r"'?([^'\[]+)'?\s*\[([^\]]+)\]\s*,\s*(-?\d+)\s*,\s*(\w+)", re.IGNORECASE)
+
     def _fn_dateadd(self, args_str: str, ctx: DAXContext) -> Any:
-        """DATEADD — returns a marker for CALCULATE to process."""
-        return ('__DATEADD__', args_str.strip())
+        """DATEADD(<dates>, offset, interval) as a real TABLE.
+
+        It used to always return a ('__DATEADD__', text) marker, interpreted only
+        when it sat DIRECTLY as a CALCULATE filter argument. Anywhere else -- and
+        Power BI's own generated measures do
+        ``CALCULATE([MTD], CALCULATETABLE(DATEADD('Date'[Date], -1, MONTH), ...))``
+        -- the marker leaked: COUNTROWS(DATEADD(...)) was 0 and the shift silently
+        did nothing, so PMTD equalled MTD and every month-over-month measure built
+        on it collapsed.
+        """
+        m = self._DATEADD_ARGS_RE.match(args_str.strip())
+        if not m:
+            return ('__DATEADD__', args_str.strip())
+        dt, dc = m.group(1).strip(), m.group(2).strip()
+        dates = self._dateadd_dates(dt, dc, int(m.group(3)),
+                                    m.group(4).upper(), ctx)
+        return [{'__table__': dt, '__column__': dc, '__value__': v}
+                for v in dates]
 
     def _fn_sameperiodlastyear(self, args_str: str, ctx: DAXContext) -> Any:
-        return ('__DATEADD__', args_str.strip())
+        """SAMEPERIODLASTYEAR(<dates>) == DATEADD(<dates>, -1, YEAR)."""
+        ref = args_str.strip()
+        m = re.match(r"'?([^'\[]+)'?\s*\[([^\]]+)\]", ref)
+        if not m:
+            return ('__DATEADD__', ref)
+        dt, dc = m.group(1).strip(), m.group(2).strip()
+        return [{'__table__': dt, '__column__': dc, '__value__': v}
+                for v in self._dateadd_dates(dt, dc, -1, 'YEAR', ctx)]
 
     def _fn_values(self, args_str: str, ctx: DAXContext) -> Any:
         ref = self._eval_expr(args_str.strip(), ctx)
@@ -3814,6 +4126,7 @@ class DAXEngine:
                           if k in keep_cols or not k.startswith(f"{table_name}.")}
             new_ctx = DAXContext(ctx.tables, ctx.measures, ctx.date_table,
                                 ctx.date_column, new_filters, ctx.relationships)
+            new_ctx._filter_idx_cache = ctx._filter_idx_cache
             rows = new_ctx.get_filtered_rows(table_name)
             cols = tbl['columns']
             if rows and len(cols) > 0:
@@ -4379,18 +4692,22 @@ class DAXEngine:
         if not all_vals:
             return 1
 
-        # Sort and find rank
+        # DAX RANKX is COMPETITION ranking (ties='SKIP' by default): the rank is
+        # one plus the number of values that beat it, so equal values share a rank
+        # and the next distinct value skips ahead. It also ranks a value that is
+        # not a MEMBER of the set, which is the normal case -- the value being
+        # ranked is the expression evaluated in the CURRENT context, and here that
+        # is the grand total, not any single row.
+        #
+        # The old code did dense ranking over the DISTINCT values and, when the
+        # value was absent, returned len(unique) + 1 -- i.e. dead last. On
+        # Agents_Performance that made every RANKX return 262 (261 rows + 1)
+        # regardless of the ranking expression, where Desktop returns 136.
         if is_desc:
-            all_vals.sort(reverse=True)
+            beat = sum(1 for v in all_vals if v > current_val)
         else:
-            all_vals.sort()
-
-        # Dense ranking
-        unique_sorted = sorted(set(all_vals), reverse=is_desc)
-        for i, v in enumerate(unique_sorted):
-            if abs(v - current_val) < 0.0001:
-                return i + 1
-        return len(unique_sorted) + 1
+            beat = sum(1 for v in all_vals if v < current_val)
+        return beat + 1
 
     def _fn_pathcontains(self, args_str: str, ctx: DAXContext) -> Any:
         """PATHCONTAINS(path, item) — check if pipe-delimited path contains item."""
