@@ -172,24 +172,46 @@ and an empty `timed_out` set.
 So the rule is right and our engine still depends on breaking it. Reverted,
 because it costs ~30 cells to buy 4.
 
-**Where to start next time, with the measurement already done.** `[EmpCount]` is
-`CALCULATE(COUNT([EmplID]), FILTER(ALL('Date'[PeriodNumber]),
-'Date'[PeriodNumber] = MAX('Date'[PeriodNumber])))`, and the model has a direct
-`Employee[date] -> Date[Date]` (Employee many, Date one), so `Date -> Employee`
-is a LEGAL one->many direction and `_rel_dir[('Employee','Date')]` exists -- the
-lookup is not what fails. The thing to explain first:
+**Where to start next time. MEASURED, and it corrects what was written here
+first.** An earlier draft of this note said
+`CALCULATE(COUNTROWS(Employee), 'Date'[PeriodNumber] = 201612)` returning BLANK
+proved the propagation was "already broken". It is not broken -- that BLANK is
+CORRECT, and the data says so:
 
 ```
-CALCULATE(COUNTROWS(Employee), 'Date'[PeriodNumber] = 201612)
-    is None on BOTH 3d0c2f2 and 6a4896a
+Employee[date]            2011-01-01 .. 2014-12-01   (month starts, 48 distinct)
+Date[Date]                2010-01-01 .. 2016-12-31
+MAX('Date'[PeriodNumber])                    201612
 ```
 
-That propagation is ALREADY broken in the green build, which means `[Actives]`
-reaches 32,401 by some other route that the symmetric index enables. Find that
-route before re-landing the direction rule. Note the join column (`Date[Date]`)
-is NOT the filtered column (`Date[PeriodNumber]`), so the direct path has to
-filter the dimension and then map through the join key -- that is the first
-place to look.
+Employee has NO row dated in Dec 2016, so filtering to period 201612 legitimately
+selects nothing. The dimension predicate is fine too -- it selects 31 Date rows.
+
+That reframes why the directional fix blanked `[Actives]`:
+
+```
+[Actives]  = CALCULATE([EmpCount], FILTER(Employee, ISBLANK(Employee[TermDate])))
+[EmpCount] = CALCULATE(COUNT([EmplID]),
+               FILTER(ALL('Date'[PeriodNumber]),
+                      'Date'[PeriodNumber] = MAX('Date'[PeriodNumber])))
+```
+
+`MAX('Date'[PeriodNumber])` is 201612 unless something restricts the Date table.
+Our SYMMETRIC index lets the outer `FILTER(Employee, ...)` propagate MANY -> ONE
+into Date, which drops the max to 201412 -- the last period Employee actually
+covers -- and the count then comes out at Desktop's 32,401. Make propagation
+directional and that restriction disappears, the max stays 201612, Employee has
+nothing there, and the whole family blanks.
+
+So reverse propagation is not incidental here; it is load-bearing for this
+measure. **The open question is how Desktop gets 32,401 without it**, since
+Employee is the many side and a single-direction relationship should not carry
+that filter to Date. Answer that before re-attempting the direction rule --
+possibilities worth testing against Desktop: that the `FILTER(Employee, ...)`
+table argument restricts Date some other way, that `MAX` over a date column has
+its own context rule here, or that the measure depends on a Desktop behaviour
+this engine models differently. Do not assume, as this note previously did, that
+one of our two behaviours must simply be wrong.
 
 Two anchors, both required, and neither is optional:
 `[Actives]` = 32,401 (MS_Employee_Hiring) and
