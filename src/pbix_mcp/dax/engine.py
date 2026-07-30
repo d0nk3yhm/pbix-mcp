@@ -3052,7 +3052,17 @@ class DAXEngine:
             return None
         total = (d.month - 1) + months * offset
         year, month = d.year + total // 12, total % 12 + 1
-        day = min(d.day, calendar.monthrange(year, month)[1])
+        last_target = calendar.monthrange(year, month)[1]
+        # A month END shifts to a month END. Clamping the day alone sent
+        # 30-Nov -> 30-Oct, so a window ending at November's last day produced an
+        # October window of 1..30: DATESMTD then dropped 31-Oct entirely and
+        # per-employee PMTD came up short (employee 84: 19,839.8 vs Desktop's
+        # 35,439.8 -- exactly the 15,600 booked on 31-Oct). This is also what
+        # EDATE and Desktop's own DATEADD do.
+        if d.day == calendar.monthrange(d.year, d.month)[1]:
+            day = last_target
+        else:
+            day = min(d.day, last_target)
         return datetime(year, month, day)
 
     def _dateadd_dates(self, date_table: str, date_col: str, offset: int,
