@@ -56,24 +56,6 @@ Desktop's answer, taken from the workspace `msmdsrv` over ADOMD.
 
 ### Filter propagation
 
-- **A filter flows from the ONE side of a relationship to the MANY side, not
-  back.** The single-hop relationship index was built symmetrically, so
-  filtering the many side restricted the one side. On `Agents_Performance`,
-  where `DimStore[EmployeeKey] → DimEmployee[EmployeeKey]`, Desktop's
-  `COUNTROWS(DimEmployee)` under `DimStore[StoreType]="Catalog"` is 293 — the
-  unfiltered total — and `SELECTEDVALUE(DimEmployee[EmployeeKey])` there is
-  BLANK. We answered 213, which made the first branch of
-  `[Rank Filtering Employyees MTD]`'s `SWITCH` match and return 1 where Desktop
-  returns 0; `[Rank Filtering Dynamics]`, `[… MTD%]` and `[Employee Name]` all
-  turn on the same `SELECTEDVALUE`.
-
-  The multi-hop adjacency already had the rule right — one → many, plus the
-  reverse edge only when `CrossFilteringBehavior` is bidirectional — so this
-  makes the single-hop path agree with it. An invalid direction now falls
-  through to the multi-hop search instead of propagating anyway. Desktop
-  confirms the other direction still flows: `COUNTROWS(DimStore)` under
-  `DimEmployee[EmployeeKey]=213` is 1.
-
 - **`ALL(Table)` suppresses only the filters it actually cleared.** The
   suppression flagged a table for the rest of the evaluation, so a filter
   created LATER inside a nested `CALCULATE` could never propagate into it.
