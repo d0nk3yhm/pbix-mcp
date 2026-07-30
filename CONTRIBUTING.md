@@ -63,6 +63,18 @@ tests/
                          #   python scripts/download_test_corpus.py)
 ```
 
+## Where the open work is
+
+Two independent issue streams, and "everything is closed" has to mean both:
+
+- **GitHub issues** — `gh issue list`.
+- **OpenBI findings** — the OpenBI front-end drives the whole engine to build real
+  reports, so it is where real-world bugs surface. It reports them as numbered
+  markdown in its own repo, NOT here. [docs/openbi-findings-ledger.md](docs/openbi-findings-ledger.md)
+  is the audited status of every item ever reported that way. Findings #18 sat
+  unimplemented through four releases because nothing tracked it; that ledger is
+  the fix. Re-audit before declaring the queue clear.
+
 ## Commit Messages
 
 Use conventional format:
