@@ -107,15 +107,34 @@ the related Owners[Manager], and we return that manager's 4.1379. Suppressing
 propagation for every MULTI-COLUMN row set fixed all four [CSAT Impact*]
 measures but broke MS_Employee_Hiring far worse: `[Actives]` went from
 Desktop's exact 32,401 to 1,260,817, and ~20 dependent measures with it.
-Cause: `EmpCount` is
-`CALCULATE(COUNT([EmplID]), FILTER(ALL('Date'[PeriodNumber]), ...))` -- a
-SINGLE-column ALL that our engine still materialises as `__row__` dicts, so the
-"multi-column" test matched it and cleared the period restriction. The scoping
-test I wrote asserted the single-column case as `ALL(Fact[v])` directly and
-never wrapped it in FILTER, so it passed while the real shape broke.
-A narrower fix must key off what the row set actually SPANS (all columns of the
-table) rather than the presence of `__row__`, and must be checked against
-`[Actives]` = 32,401 before anything else.
+Cause -- and the first explanation written here was WRONG, so it is worth
+stating what was actually measured. The row shapes are:
+
+    FILTER(ALL(Cases), 1=1)                    __row__=True   23 of 23 cols
+    FILTER(ALL('Date'[PeriodNumber]), ...)     __row__=FALSE   0 cols
+    FILTER(Employee, ISBLANK(...))             __row__=True   16 of 16 cols
+
+So the single-column ALL never carried `__row__` and never matched the branch;
+"multi-column vs single-column" is NOT the distinction that broke this, and
+keying a narrower fix off how many columns the row set spans would not help.
+
+What actually happened: `[Actives]` is
+`CALCULATE([EmpCount], FILTER(Employee, ISBLANK(Employee[TermDate])))`, the
+third shape, so the branch fired and set `_no_propagate = {Employee}`. That
+flag then PERSISTED into the nested `[EmpCount]` =
+`CALCULATE(COUNT([EmplID]), FILTER(ALL('Date'[PeriodNumber]), ... = MAX(...)))`
+and blocked the Date -> Employee propagation that restricts the count to the
+latest period. 1,260,817 is exactly the blank-TermDate row count with NO period
+restriction, against Desktop's 32,401.
+
+That is the real design problem: `_no_propagate` cannot tell "suppress the
+filters that already existed when ALL was applied" from "block a filter created
+LATER inside a nested CALCULATE". DAX only means the first. The existing
+`ALL(Table)` branch sets the same sticky flag, so `CALCULATE([EmpCount],
+ALL(Employee))` is presumably wrong the same way today -- untested, worth a
+Desktop probe. Any fix has to scope the suppression to the filters live at the
+moment ALL is applied, and must be checked against `[Actives]` = 32,401 and
+`CALCULATE(AVERAGE('Cases'[CSAT]), FILTER(ALL('Cases'),1=1))` = 4.2706 together.
 - **MS_AI_Sample `CSAT Impact` / `- Agent` / `- Products` / `- Subject` per
   Manager.** Desktop 0, we return +-0.03. All four share one shape:
   `VAR AllAvg = CALCULATE(AVERAGE(Cases[CSAT]), ALL(Cases))`
