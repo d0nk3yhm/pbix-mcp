@@ -1819,6 +1819,18 @@ class DAXEngine:
                 # friends) where Desktop shows nothing.
                 _t = ctx.tables.get(table_name)
                 if _t is not None and ctx._find_col_idx(_t['columns'], col_name) < 0:
+                    # `Table[Name]` where Name is not a column is DAX's
+                    # fully-qualified MEASURE reference. Agents_Performance reads
+                    # 'Top-Bottom-N'[Top-Bottom-N Value] and that is the measure
+                    # (= 10), not a column: Desktop resolves it, so its
+                    # TOPN(10, ...) returns 10 rows and the middle-bar test is
+                    # `1 IN {11, 12}` -> FALSE -> 0. Treating it as BLANK made the
+                    # test `1 IN {1, 2}` -> TRUE and the measure returned 1.
+                    if col_name in ctx.measures:
+                        return self.evaluate_measure(col_name, ctx)
+                    for _mn in ctx.measures:
+                        if _mn.lower() == col_name.lower():
+                            return self.evaluate_measure(_mn, ctx)
                     return None
                 return (table_name, col_name)
             if kind == _P_BRACKET1:
@@ -2286,14 +2298,14 @@ class DAXEngine:
         result = self._eval_expr(right, ctx, var_scope)
         if isinstance(result, list):
             if not result:
-                # An EMPTY table expression is ambiguous here. Real DAX would say
-                # FALSE, but this engine also returns [] for a table function it
-                # cannot evaluate in the current scope -- VALUES(T[C]) yields []
-                # inside a row context, for instance. Answering FALSE would turn
-                # that limitation into a confident wrong answer, so report
-                # "unknown" and let the caller fall through to BLANK. A literal
-                # `{}` is handled above and DOES mean the empty set.
-                return None
+                # DAX: membership in an empty table is FALSE. Reporting "unknown"
+                # here (to hedge against a table function this engine cannot
+                # evaluate in the current scope) was worse: the IN step fell
+                # through to the next plan step, which could answer with
+                # something truthy. Rank Filtering Employyees MTD then returned 1
+                # where Desktop returns 0, because TOPN(BLANK, ...) is legitimately
+                # empty and both its IN tests should simply be FALSE.
+                return []
             vals = []
             for row in result:
                 if isinstance(row, dict):
@@ -3732,8 +3744,17 @@ class DAXEngine:
                         # Single-column row dict from ALL(Table[Column]) or VALUES
                         table_name = row_item['__table__']
                         col_name = row_item['__column__']
-                        val = row_item['__value__']
-                        row_ctx = ctx.with_filters({f"{table_name}.{col_name}": [val]})
+                        # _make_row_context, not a bare with_filters: it also
+                        # BINDS the row, which is what lets a column reference in
+                        # the condition resolve to this row's value. Without the
+                        # binding, `DimEmployee[EmployeeKey]` fell through to an
+                        # unresolved ('Table','Column') marker, so ISBLANK said
+                        # False and the BLANK (unknown) member survived
+                        # `NOT ISBLANK(DimEmployee[EmployeeKey])` -- FILTER
+                        # returned 262 rows where Desktop has 261, which pushed
+                        # Rank MTD Asc to 128 against Desktop's 127. Every other
+                        # iterator (MAXX/MINX/RANKX) already used this helper.
+                        row_ctx = self._make_row_context(row_item, ctx)
                         cond = self._eval_expr(args[1].strip(), row_ctx)
                         if cond:
                             filtered.append(row_item)
