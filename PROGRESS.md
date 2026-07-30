@@ -139,9 +139,24 @@ Any future change here must keep BOTH anchors at once:
 `[Actives]` = 32,401 and
 `CALCULATE(AVERAGE('Cases'[CSAT]), FILTER(ALL('Cases'),1=1))` = 4.2706.
 
-**STILL OPEN.** Every one is a Desktop disagreement under a filter context, and
-every one was measured BEFORE the four fixes above -- re-run the sweep and
-re-confirm each before spending time on it.
+- **`FORMAT` date pictures were .NET-cased**, so `mmmm` rendered `0000` instead
+  of `July` and every `mm/dd/yyyy` came out `00/19/2021`. Commit 72c0afc. Only
+  ONE corpus measure uses a real date picture (`MS_Covid_Tracking[Updated]`),
+  which is why the blast radius was small -- a scan of every FORMAT call in all
+  25 files confirmed it, and `Date Range Previous Period` renders its dates by
+  `&` concatenation, not FORMAT, so it is a different path.
+
+**Re-verified after the fixes, with the sweep's own rules:**
+
+| file | filter-context cells |
+|---|---|
+| MS_AI_Sample | 44/44 |
+| Ecommerce_Conversion | 132/132 |
+| MS_Competitive_Marketing | 88/88 |
+| MS_Covid_Tracking | 22/22 |
+| Agents_Performance | 404/408 (the 4 below) |
+
+**STILL OPEN.**
 
 - **Agents_Performance `Rank Filtering *` under `StoreType=Catalog`.** Desktop 0,
   we return 1. Three measures: `Dynamics`, `Employyees MTD`, `Employyees MTD%`
@@ -152,9 +167,9 @@ re-confirm each before spending time on it.
   None, and `AVG Tenure Months @ Qtr=N` returned -1 against Desktop's 91-99.5.
   `AVG Tenure Days` is `AVERAGE([TenureDays])` -- a bare column reference, so
   start with home-table resolution rather than the date logic.
-- **MS_Competitive_Marketing `% Units Market Share SPLY @ MfgisVanArsdel=Yes`**
-  Desktop 1, we return 0; and `@Indicator05` Desktop 2, we return 1. Both are
-  SPLY-family; re-measure against the DATEADD fix before investigating.
+- ~~MS_Competitive_Marketing `% Units Market Share SPLY` / `@Indicator05`~~ --
+  CLOSED. Both were SPLY-family and the DATEADD run fix resolved them; the file
+  is 88/88 under filter context.
 - **`Employee Name @ StoreType=Catalog` is a REAL defect, not the capture
   artefact it was filed as.** Desktop's own `LEN` of that cell is 1 -- a single
   space, the same "empty" marker it returns for `StoreType=Store` -- and we
