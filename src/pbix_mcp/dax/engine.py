@@ -1774,6 +1774,12 @@ class DAXEngine:
     def __init__(self):
         self._current_var_scope = None  # Active variable scope during VAR/RETURN eval
         self.unsupported_functions: set[str] = set()  # Track unsupported DAX functions hit
+        # Measures abandoned on the wall-clock budget. They return BLANK like
+        # any other failure, and BLANK is ALSO what a legitimately empty measure
+        # returns -- so without this the caller cannot tell "no value" from "we
+        # gave up", which is the one distinction that matters when the number is
+        # going into a report.
+        self.timed_out: set[str] = set()
         # Wall-clock budget per outermost measure, enforced on the ENGINE (not
         # the context) because iterators spawn a fresh sub-context per row —
         # a context-local timer/counter would reset every row and never fire.
@@ -2096,8 +2102,10 @@ class DAXEngine:
             # plausible WRONG number (0.0, 0.2808) for a measure that had simply
             # been cut off. Propagate until the outermost measure, which reports
             # BLANK -- a visible non-answer -- instead.
-            if getattr(_exc, "_pbix_deadline", False) and self._eval_depth > 1:
-                raise
+            if getattr(_exc, "_pbix_deadline", False):
+                if self._eval_depth > 1:
+                    raise
+                self.timed_out.add(measure_name)
             # Graceful degradation
             return None
         finally:
