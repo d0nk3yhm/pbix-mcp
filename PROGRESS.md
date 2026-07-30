@@ -101,13 +101,43 @@ session starts from evidence rather than from scratch.
   Desktop -- a blank month probably has to poison the whole DATE(), and the
   DATESBETWEEN that follows.
 - **MS_AI_Sample `CSAT Impact` / `- Agent` / `- Products` / `- Subject` per
-  Manager.** Desktop 0, we return +-0.03.
+  Manager.** Desktop 0, we return +-0.03. All four share one shape:
+  `VAR AllAvg = CALCULATE(AVERAGE(Cases[CSAT]), ALL(Cases))`
+  `VAR AllAvgExcept = CALCULATE(AVERAGE(Cases[CSAT]),`
+  `    FILTER(ALL(Cases), Cases[X] <> SELECTEDVALUE(Cases[X])))`
+  `RETURN 1 - (AllAvgExcept / AllAvg)`, X = Topic/Agent/ProductSeq/Subject.
+  Desktop's exact 0 means AllAvgExcept == AllAvg, i.e. the predicate drops NO
+  row. Two things were checked and one hypothesis was KILLED:
+  - NOT the FILTER row-substitution guard (`_AGG_CALL_RE`, engine.py:4688).
+    `SELECTEDVALUE` is absent from that regex, so the obvious theory was that
+    the iterated row's value gets substituted. A 4-row fixture refutes it: our
+    `SELECTEDVALUE` inside `FILTER(ALL(T), ...)` returns BLANK either way.
+  - It exposed a DIFFERENT bug instead. CALCULATE's filter arguments are
+    evaluated in the OUTER context, so with `Topic` pinned outside,
+    `SELECTEDVALUE(Cases[Topic])` must be "A" and the measure non-zero. We
+    return 0.0 there too -- our `ALL(Cases)` clears the column BEFORE the
+    SELECTEDVALUE in the predicate is evaluated. Fixture, hand-checkable:
+    4 rows [A,5],[B,3],[A,4],[B,2]; pinned Topic=A -> 1 - 2.5/3.5 = 0.2857.
+  - So the +-0.03 is most likely rows dropped by `Col <> BLANK()` where the
+    column HAS blanks. Next step needs a real probe of the four VARs on the
+    file. `pbix_evaluate_dax` takes MEASURE NAMES, not expressions -- probe by
+    adding temp measures, or build the DAXContext the way `cmp_ctx.py` does.
 - **Agents_Performance `Rank Filtering *` under `StoreType=Catalog`.** Desktop 0,
   we return 1.
-- **MS_Employee_Hiring `New Hires SPLY @ Qtr=3`** 13840 vs 43120, and
-  `Bad Hires YoY Var @ Qtr=N` 0 vs a negative number. Check these AFTER the
-  timeout rerun -- the same file's grand-total cluster turned out to be budget
-  timeouts, not arithmetic.
+- **MS_Employee_Hiring `New Hires SPLY` — the quarter filter is DROPPED, not
+  mis-computed.** Desktop 11601 @ Qtr=2 and 13840 @ Qtr=3; we return **43120 for
+  both**, and 43120 is the measure's GRAND TOTAL. A constant answer across
+  filter values is the signature of a filter that never reached the
+  evaluation, so look at the SPLY/SAMEPERIODLASTYEAR path dropping the
+  incoming context, NOT at the arithmetic. `Bad Hires YoY Var @ Qtr=N`
+  (Desktop 0, we return +2466 / -7104) is built on it and should follow.
+  This is NOT the earlier budget-timeout cluster in the same file -- a timeout
+  yields None, and these are confident numbers.
+- **MS_Employee_Hiring `AVG Tenure Days @ Qtr=2`** Desktop 2952.93, we return
+  None; same family as the `AVG Tenure Months @ Qtr=N` -1 above.
+- **MS_Competitive_Marketing `% Units Market Share SPLY @ MfgisVanArsdel=Yes`**
+  Desktop 1, we return 0; and `@Indicator05` Desktop 2, we return 1. Both are
+  SPLY-family, so check them against the same root cause as New Hires SPLY.
 - **Two capture artefacts, not engine bugs**: `Employee Name @ StoreType=Catalog`
   and `Date Range Previous Period @ QuarterName=Q1` compare via the LEN
   fallback because the captured value was truncated; confirm against Desktop's
