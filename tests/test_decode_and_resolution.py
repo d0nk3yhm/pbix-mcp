@@ -112,6 +112,44 @@ class TestAllVersusAllSelected:
                   filters=self.FILTERS) == 10
 
 
+class TestAllOnlySuppressesTheFiltersItCleared:
+    """ALL(Table) stops the propagation that was LIVE when it ran -- not
+    propagation from a filter created LATER inside a nested CALCULATE.
+
+    The suppression used to flag the table for the rest of the evaluation.
+    Verified against Power BI Desktop on MS_AI_Sample, where Cases relates to
+    Owners:
+
+        CALCULATE(AVERAGE('Cases'[CSAT]), 'Owners'[Manager]="Low, Spencer")
+            = 4.13796627491058
+        CALCULATE(CALCULATE(AVERAGE('Cases'[CSAT]),
+                            'Owners'[Manager]="Low, Spencer"), ALL('Cases'))
+            = 4.13796627491058   <- we returned the global 4.2706
+        ...the same nested COUNTROWS: Desktop 3914, we returned 10000.
+
+    This was NOT introduced by the reverted table-filter change; it was found
+    while diagnosing why that change broke [Actives], and it predates it.
+    """
+
+    FILTERS = {"Dim.grp": ["X"]}
+
+    def test_a_filter_created_inside_all_still_propagates(self):
+        assert ev('CALCULATE(CALCULATE(SUM(Fact[v]), Dim[grp] = "X"), '
+                  'ALL(Fact))') == 10
+
+    def test_all_still_clears_a_filter_that_was_live(self):
+        """The behaviour ALL exists for, and the MS_Covid_Tracking case: a
+        filter already in force when ALL runs IS cleared, propagation and all."""
+        assert ev("CALCULATE(SUM(Fact[v]), ALL(Fact))",
+                  filters=self.FILTERS) == 30
+
+    def test_the_two_rules_compose(self):
+        """Outer Dim filter cleared by ALL, inner Dim filter re-applied: the
+        inner one wins, so this is row 'a' only."""
+        assert ev('CALCULATE(CALCULATE(SUM(Fact[v]), Dim[grp] = "X"), '
+                  'ALL(Fact))', filters={"Dim.grp": ["Y"]}) == 10
+
+
 class TestOneRowTableIsAScalar:
     """A measure must evaluate to a value. `LASTDATE('Year'[Date])` returned
     the internal row-dict list, whose str() leaked 72 characters of Python
