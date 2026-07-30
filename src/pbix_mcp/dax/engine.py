@@ -392,6 +392,24 @@ def _analyze_expr(raw):
     return tuple(steps)
 
 
+@lru_cache(maxsize=100_000)
+def _as_date_str(s: str):
+    """The strptime half of _as_date, memoized.
+
+    Date filters carry the same few hundred date strings over and over -- a
+    DATEADD range is ~1000 values and every filter application re-parsed all of
+    them. strptime dominated the per-row profile of an iterator over a dimension
+    (2455 calls, the single largest cost after the index union).
+    """
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
+                "%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s[:len(fmt) + 2].strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
 def _as_date(v):
     """Best-effort date coercion from a value or ISO-ish string."""
     if isinstance(v, datetime):
@@ -399,13 +417,7 @@ def _as_date(v):
     if isinstance(v, date):
         return v
     if isinstance(v, str):
-        s = v.strip()
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
-                    "%d/%m/%Y", "%m/%d/%Y"):
-            try:
-                return datetime.strptime(s[:len(fmt) + 2].strip(), fmt).date()
-            except ValueError:
-                continue
+        return _as_date_str(v.strip())
     return None
 
 
@@ -1219,7 +1231,13 @@ class DAXContext:
             return frozenset()
         if len(found) == 1:
             return found[0]
-        return frozenset().union(*found)
+        # Accumulate into ONE mutable set. frozenset().union(*found) allocates a
+        # new frozenset per operand, which is the dominant cost when a date
+        # filter carries ~1000 single-value index sets.
+        acc: set = set()
+        for f in found:
+            acc |= f
+        return frozenset(acc)
 
     def _surviving_indices(self, table_name: str, tbl: dict):
         """Indices of ``tbl['rows']`` that satisfy the filter context, or None
@@ -1341,7 +1359,15 @@ class DAXEngine:
         # the top and shared across every sub-context; _time_counter is a global
         # throttle so the time check runs regardless of which context is active.
         try:
-            self._max_eval_seconds = float(os.environ.get("PBIX_DAX_MAX_SECONDS", "20"))
+            # A HANG guard, not a performance target. At 20s legitimate measures
+            # were being cut off mid-flight and, worse, the partial result
+            # surfaced as a NUMBER: Agents_Performance
+            # "Employees Avg MTD % change PM" returned 0.2808 where Desktop
+            # gives 0.2438, and "Number of Employees with Positive change PM"
+            # returned 0.0 for 0.3754. Desktop answers these instantly; this
+            # engine needs ~20-25s, so the cap has to clear that comfortably.
+            self._max_eval_seconds = float(
+                os.environ.get("PBIX_DAX_MAX_SECONDS", "300"))
         except (TypeError, ValueError):
             self._max_eval_seconds = 20.0
         self._deadline = None
@@ -1594,7 +1620,14 @@ class DAXEngine:
             if cache_key:
                 ctx._measure_cache[cache_key] = result
             return result
-        except Exception:
+        except Exception as _exc:
+            # A DEADLINE abort must not be swallowed here. Returning None for a
+            # nested measure let the caller keep computing and hand back a
+            # plausible WRONG number (0.0, 0.2808) for a measure that had simply
+            # been cut off. Propagate until the outermost measure, which reports
+            # BLANK -- a visible non-answer -- instead.
+            if getattr(_exc, "_pbix_deadline", False) and self._eval_depth > 1:
+                raise
             # Graceful degradation
             return None
         finally:
@@ -1625,10 +1658,14 @@ class DAXEngine:
         if (self._deadline is not None and (self._time_counter & 0x3F) == 0
                 and time.monotonic() > self._deadline):
             from pbix_mcp.errors import DAXEvaluationError
-            raise DAXEvaluationError(
+            _err = DAXEvaluationError(
                 "DAX evaluation time budget exceeded (measure too slow to "
                 "evaluate — e.g. a rank/iterator scanning a large fact table)"
             )
+            # setattr, not attribute assignment: DAXEvaluationError declares no
+            # such field and mypy rejects the direct form.
+            setattr(_err, "_pbix_deadline", True)  # never swallowed by a nested measure
+            raise _err
 
         # Merge explicit var_scope with instance-level scope (from VAR/RETURN blocks).
         # Explicit var_scope takes priority; instance scope provides fallback so
