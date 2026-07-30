@@ -85,6 +85,34 @@ scratchpad/cmp_ctx.py              diff, with the same rules as the totals sweep
   Python's microsecond datetime cannot hold — the decoder now carries the
   original stored serial on the value.
 
+## Still open (found by the filter-context sweep, NOT yet fixed)
+
+Every one of these is a measure where Desktop and this engine disagree under a
+FILTER CONTEXT. They are recorded with their root-cause class so the next
+session starts from evidence rather than from scratch.
+
+- **Ecommerce_Conversion `*_PMTD/PQTD` and `*_%Delta` under `QuarterName=Q1`.**
+  Desktop BLANK, we return a value (and the `%Delta` measures built on them come
+  out -1.0). The chain is
+  `_FirstDatePrevtQTD = CALCULATE(MAX(dimDate[FirstOfMonth]), DATEADD(dimDate[Date],-1,QUARTER))`
+  which is correctly BLANK in Q1 (the previous quarter is outside the calendar),
+  then `_LastDatePrevQ = DATE(YEAR(_Max_Date), MONTH(_FirstDatePrevtQTD), DAY(_Max_Date))`.
+  Start by checking `MONTH(BLANK())` and `DATE()` with a blank part against
+  Desktop -- a blank month probably has to poison the whole DATE(), and the
+  DATESBETWEEN that follows.
+- **MS_AI_Sample `CSAT Impact` / `- Agent` / `- Products` / `- Subject` per
+  Manager.** Desktop 0, we return +-0.03.
+- **Agents_Performance `Rank Filtering *` under `StoreType=Catalog`.** Desktop 0,
+  we return 1.
+- **MS_Employee_Hiring `New Hires SPLY @ Qtr=3`** 13840 vs 43120, and
+  `Bad Hires YoY Var @ Qtr=N` 0 vs a negative number. Check these AFTER the
+  timeout rerun -- the same file's grand-total cluster turned out to be budget
+  timeouts, not arithmetic.
+- **Two capture artefacts, not engine bugs**: `Employee Name @ StoreType=Catalog`
+  and `Date Range Previous Period @ QuarterName=Q1` compare via the LEN
+  fallback because the captured value was truncated; confirm against Desktop's
+  own LEN before treating either as a defect.
+
 ## Known limits (deliberate, documented)
 
 - `COVID[Daily cases]` — a per-row CALCULATE/FILTER over 1.74M rows evaluates at
