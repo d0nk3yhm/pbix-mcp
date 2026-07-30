@@ -5,6 +5,70 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.60] - 2026-07-30
+
+Closes OpenBI findings **#9 #5b**, the highest-severity item in the newly audited
+findings ledger: CALCULATE silently ignored every boolean filter argument except
+`Table[Col] = value`.
+
+### CALCULATE honours the whole predicate family
+
+`<>`, `>`, `>=`, `<`, `<=` and `IN {...}` used to fall off the end of CALCULATE's
+filter loop adding NO filter and NO warning, so the measure returned the
+UNFILTERED total with `unsupported_functions` empty:
+
+```
+CALCULATE(SUM(P[V]), P[S] <> "Lead")   -> 650   should be 550
+CALCULATE(SUM(P[V]), P[V] > 100)       -> 650   should be 500
+CALCULATE(SUM(P[V]), P[S] IN {"Lead","Proposal"}) -> 650  should be 400
+```
+
+The filter context already evaluated structured predicates natively
+(`make_value_matcher`), so CALCULATE now translates into that tested mechanism
+rather than growing a second evaluator.
+
+- `NOT` is folded into the operator, and `KEEPFILTERS` is peeled. Both were
+  previously swallowed by the equality regex, which matched the WRAPPER text and
+  registered a filter on a column named `NOT(P` or `KEEPFILTERS(P`.
+- Several predicates on the SAME column now intersect, as DAX does. Two
+  comparisons cannot share a flat spec (both need the `"op"` key), so
+  `make_value_matcher` gained an `{"all": [...]}` conjunction.
+- A predicate on a column the OUTER context already filters still REPLACES it --
+  that override is the point of CALCULATE, and it must not be confused with the
+  sibling-argument case.
+
+**Desktop-verified on the corpus.** Five `Agents_Performance` measures that
+returned BLANK now return exactly what Power BI Desktop's own engine returns:
+`CF Table` -> "black", the three `Rank Filtering ...` measures -> 0,
+`Employee Name` -> blank. Confirmed against the live msmdsrv, and checked with
+`apply_default_filters` both ways so the match is not a slicer-default artifact.
+201 corpus measures compared against 0.9.59: no regressions; the only other
+movement is five RAND-based GeoSales measures, which differ run to run.
+
+### `IN` as a general operator: implemented, deliberately not enabled
+
+`_eval_in` / `_in_set_values` are implemented and unit-tested, including DAX's
+BLANK rule (`BLANK() IN {1,2}` is FALSE) and a refusal to treat an unevaluable
+table expression as an empty set. CALCULATE uses them.
+
+They are NOT wired into the expression planner yet. Enabling `IN` in arbitrary
+expressions made seven `Agents_Performance` measures return a CONFIDENTLY WRONG
+value where they had returned BLANK -- 1 instead of Desktop's 0, "white" instead
+of "black". The fault is not in `IN`: those measures wrap it around a RANKX/TOPN
+chain over a parameter-table scalar that is independently inaccurate here, and
+`IN` merely stopped masking it. A blank is a visible non-answer; a wrong number
+is not. It stays off until that chain matches Desktop, and the reason is recorded
+at the decision point in `_analyze_expr`.
+
+As a consequence `FILTER(t, col IN {...})` remains unsupported (returns no rows)
+— unchanged from 0.9.59, not a new limitation.
+
+### Also
+
+A table constructor `{1,2,3}` is now ONE argument to the expression splitter.
+Braces did not nest, so `IN {"Lead","Proposal"}` was split at its comma into two
+arguments.
+
 ## [0.9.59] - 2026-07-30
 
 Closes the guard rail requested in OpenBI findings **#18**: re-pointing one
