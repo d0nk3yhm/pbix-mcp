@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+**Four filter-context defects, found by widening the Desktop comparison past the
+grand total.** The grand total is one cell per measure and the cell where
+blank-propagation, relationship filtering and time intelligence trivially agree;
+comparing `measure x dimension value` is what exposed these. Every rule below is
+Desktop's answer, taken from the workspace `msmdsrv` over ADOMD.
+
+### Time intelligence
+
+- **`DATEADD` shifts each CONTIGUOUS RUN of the selection, not the overall
+  min..max range.** `'Date'[Qtr] = 2` selects seven DISJOINT quarters, and
+  shifting the single span from the first to the last swallowed every month in
+  between, so the filter degenerated to the whole table:
+  `[New Hires SPLY]` returned the GRAND TOTAL 43,120 under *every* quarter where
+  Desktop returns 11,601 for Q2 and 13,840 for Q3, and each YoY measure built on
+  a SPLY inherited it. Desktop's own COUNTROWS over the same shift is
+  546 = 91 x 6 — six shifted QUARTERS, not six years of dates — and 644 = 92 x 7
+  for a `-1 MONTH` shift. The range form is still used *within* a run, which is
+  what keeps a shifted period contiguous over the date table; mapping
+  date-by-date would leave holes wherever no source date lands on a target.
+- **A shifted period that falls OUTSIDE the date table is BLANK, not "no
+  filter".** `Ecommerce_Conversion`'s calendar starts 2025-01-01, so under
+  `QuarterName=Q1` a `-1 QUARTER` shift asks for Oct–Dec 2024.
+  `[Page_Views_PMTD/PQTD]` answered 14,548,763 where Desktop is BLANK, and the
+  `*_%Delta` measures dividing by it came out exactly -1.0. The table form was
+  already correct — `COUNTROWS` of the same `DATEADD` was blank — so only the
+  CALCULATE filter path skipped the empty result.
+
+### Filter propagation
+
+- **`ALL(Table)` suppresses only the filters it actually cleared.** The
+  suppression flagged a table for the rest of the evaluation, so a filter
+  created LATER inside a nested `CALCULATE` could never propagate into it.
+  Desktop keeps it: with `Cases` related to `Owners`,
+  `CALCULATE(CALCULATE(AVERAGE('Cases'[CSAT]), 'Owners'[Manager]="Low, Spencer"),
+  ALL('Cases'))` is 4.13796627491058 there and was the global 4.2706 here (the
+  nested `COUNTROWS` was 3,914 against our 10,000). Suppression now carries a
+  snapshot of the filters live when `ALL` ran, key *and* value — re-filtering a
+  column `ALL` had cleared makes a NEW filter, which is why the value signature
+  is needed and not just the name.
+- **A multi-column table filter argument replaces propagation, like
+  `ALL(Table)`.** `CALCULATE(AVERAGE('Cases'[CSAT]), FILTER(ALL('Cases'), …))`
+  under a filter on the related `Owners[Manager]` averaged that manager's 3,914
+  rows instead of all 10,000; the row set and the `SELECTEDVALUE` inside it were
+  already right, only the filter context the row set establishes was wrong.
+  `MS_AI_Sample`'s four `[CSAT Impact*]` measures are `1 - AllAvgExcept/AllAvg`
+  over that shape and read ±0.03 where Desktop returns exactly 0. Scoped by the
+  same snapshot: a single-column filter (`ALL(T[Col])`, `VALUES`) still lets a
+  related table's filter through, and nothing is suppressed that was not live.
+
 ## [0.9.61] - 2026-07-30
 
 **Every measure of every corpus file now returns what Power BI Desktop returns.**
