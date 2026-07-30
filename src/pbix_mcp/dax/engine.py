@@ -1170,6 +1170,10 @@ class DAXContext:
         # Tables an enclosing ALL(Table)/REMOVEFILTERS(Table) made immune to
         # cross-table filter propagation (see _get_cross_table_filters).
         self._no_propagate: set = set()
+        # table -> the filter_context KEYS that were live when ALL(table)
+        # was applied. Only those are suppressed; a filter created later
+        # inside a nested CALCULATE still propagates, as Desktop does.
+        self._no_prop_keys: dict = {}
         # Pre-transition (outer) context, set by _make_row_context. In real DAX a
         # row context does NOT filter — only CALCULATE / a measure invocation
         # performs the row->filter transition. This engine applies the transition
@@ -1284,6 +1288,22 @@ class DAXContext:
                 return i
         return -1
 
+    def _filter_snapshot(self, table: str) -> dict:
+        """Signature of every filter NOT on `table`, as ALL(table) sees them.
+
+        Keyed by filter key -> value signature so that re-filtering the same
+        column later is recognised as a different filter.
+        """
+        snap = {}
+        for k, v in self.filter_context.items():
+            if k.startswith(f"{table}."):
+                continue
+            try:
+                snap[k] = self._filter_sig(v)
+            except TypeError:
+                snap[k] = None
+        return snap
+
     def _get_cross_table_filters(self, table_name: str) -> list:
         """
         Get ALL cross-table filters that apply to a target table.
@@ -1297,16 +1317,28 @@ class DAXContext:
         """
         if not self.filter_context:
             return []
-        if table_name in self._no_propagate:
-            # ALL(Table) / REMOVEFILTERS(Table) inside CALCULATE. Dropping only
-            # the DIRECT `Table.col` keys was not enough: a filter on a related
-            # dimension reaches this table through the relationship, and that
-            # propagated filter IS a filter on this table's columns, so ALL has
-            # to stop it too. MS_Covid_Tracking's
-            # `CALCULATE(MAX('COVID'[Date]), ALL('COVID'))` returned BLANK under
-            # a StateDim slice that matches no COVID row, where Desktop returns
-            # the global max.
-            return []
+        # ALL(Table) / REMOVEFILTERS(Table) inside CALCULATE. Dropping only the
+        # DIRECT `Table.col` keys is not enough: a filter on a related dimension
+        # reaches this table through the relationship, and that propagated
+        # filter IS a filter on this table's columns, so ALL has to stop it too.
+        # MS_Covid_Tracking's `CALCULATE(MAX('COVID'[Date]), ALL('COVID'))`
+        # returned BLANK under a StateDim slice that matches no COVID row, where
+        # Desktop returns the global max.
+        #
+        # But it stops only the filters that were LIVE when ALL ran. Blanking
+        # the table for the rest of the evaluation also blocked filters created
+        # LATER, inside a nested CALCULATE, which Desktop keeps:
+        #   CALCULATE(CALCULATE(AVERAGE('Cases'[CSAT]),
+        #                       'Owners'[Manager]="Low, Spencer"), ALL('Cases'))
+        #   Desktop 4.13796627491058, we returned the global 4.2706; the nested
+        #   COUNTROWS was 3914 in Desktop and 10000 here.
+        # `_no_prop_keys` carries that snapshot, and the loop below skips
+        # exactly those source keys.
+        if (table_name in self._no_propagate
+                and not self._no_prop_keys.get(table_name)):
+            # ALL applied with nothing live to suppress: later filters still
+            # propagate, so fall through rather than blanket-blocking.
+            pass
 
         tbl = self.tables.get(table_name)
         if not tbl:
@@ -1315,7 +1347,8 @@ class DAXContext:
         ck = None
         try:
             ck = (id(tbl), 'xtf', tuple(sorted(
-                (k, self._filter_sig(v)) for k, v in self.filter_context.items())))
+                (k, self._filter_sig(v)) for k, v in self.filter_context.items())),
+                tuple(sorted((self._no_prop_keys.get(table_name) or {}).items())))
         except TypeError:
             ck = None
         if ck is not None:
@@ -1333,7 +1366,19 @@ class DAXContext:
 
         # Group filter context entries by source table
         table_filters: dict = {}
+        # Filters this table's ALL() was clearing. Skipping them here (rather
+        # than blanking the whole table) is what lets a filter created LATER in
+        # a nested CALCULATE still reach this table, which is what Desktop does.
+        _suppressed = self._no_prop_keys.get(table_name) or {}
         for fk, values in self.filter_context.items():
+            # Suppress only if this key still holds the SAME filter ALL cleared.
+            # Re-filtering the column inside a nested CALCULATE makes a NEW
+            # filter, and Desktop lets it through: under an outer
+            # Owners[Manager]="Weiler, Anne", an inner "Low, Spencer" inside
+            # ALL('Cases') gives Spencer's 4.13796627491058 / 3914 rows, not
+            # Anne's and not the global.
+            if fk in _suppressed and _suppressed[fk] == self._filter_sig(values):
+                continue
             parts = fk.split('.', 1)
             if len(parts) == 2:
                 src_table, src_col = parts
@@ -1746,6 +1791,7 @@ class DAXContext:
                          self.date_column, new_filters, self.relationships)
         ctx._filter_idx_cache = self._filter_idx_cache
         ctx._no_propagate = set(self._no_propagate)
+        ctx._no_prop_keys = dict(self._no_prop_keys)
         ctx.measure_tables = self.measure_tables
         ctx.model_columns = self.model_columns
         # Share the measure memo by REFERENCE across the derivation family. Its
@@ -1764,6 +1810,7 @@ class DAXContext:
                          self.date_column, new_filters, self.relationships)
         ctx._filter_idx_cache = self._filter_idx_cache
         ctx._no_propagate = set(self._no_propagate)
+        ctx._no_prop_keys = dict(self._no_prop_keys)
         ctx.measure_tables = self.measure_tables
         ctx.model_columns = self.model_columns
         return ctx
@@ -3498,6 +3545,13 @@ class DAXEngine:
                         keys_to_remove = [k for k in new_ctx.filter_context if k.startswith(f"{table}.")]
                         new_ctx = new_ctx.without_filters(keys_to_remove)
                         new_ctx._no_propagate = new_ctx._no_propagate | {table}
+                        # Snapshot WHICH filters this ALL is clearing. The
+                        # direct Table.* keys are already gone above, so what
+                        # remains is exactly the propagation ALL must stop.
+                        new_ctx._no_prop_keys = {
+                            **new_ctx._no_prop_keys,
+                            table: new_ctx._filter_snapshot(table),
+                        }
                 continue
 
             # DATEADD
