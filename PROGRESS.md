@@ -186,26 +186,10 @@ Any future change here must keep BOTH anchors at once:
   "legitimately empty" as the older note in `TestInMachinery` guessed -- the
   filter context feeding SELECTEDVALUE is simply wrong.
 
-  FIXED by making single-hop propagation directional. Our own code already had
-  the right rule -- `_rel_adj`, used for MULTI-hop, propagates one -> many and
-  honours `CrossFilteringBehavior` -- but `_rel_index`, used for SINGLE-hop, was
-  built symmetrically. The two are now consistent, and an invalid direction
-  falls through to the multi-hop search rather than propagating anyway.
-
-  **It costs real time on this file, and that is the fix working.** Being
-  wrongly narrowed to ONE employee is what made the RANKX/TOPN measures cheap;
-  correctly seeing all 293 makes `cmp_ctx.py Agents_Performance` go from about
-  six minutes to well over twenty-five, pegged at 100% CPU. Do not read a slow
-  Agents run as a hang, and do not "optimise" it by restoring the narrowing.
-
-- **`RANKX` middle-empty-bar is off by one, still open.**
-  `CALCULATE(RANKX(ALL(DimEmployee[EmployeeKey]), [MTD Total Sales], , DESC),
-  DimStore[StoreType]="Catalog")` is **2** in Desktop and **1** here. It does
-  NOT affect `[Rank Filtering *]`, whose third SWITCH branch tests
-  `IN {N+1, N+2}` = `{11, 12}` and is FALSE either way -- which is exactly why
-  it is recorded here rather than left to be discovered as a passing test. The
-  likely cause is tie/blank handling in the dense-vs-competition ranking when
-  the measure is blank for most rows; check against Desktop before assuming.
+  A fix has to make propagation directional (one -> many only, unless
+  `CrossFilteringBehavior` is bidirectional) and is broad enough to need the
+  whole corpus as its check: reverse propagation may currently be load-bearing
+  for measures that match today.
 - ~~MS_Employee_Hiring `AVG Tenure Days` / `AVG Tenure Months`~~ -- CLOSED,
   both against the captured Desktop values rather than a remembered range.
   `AVG Tenure Days @ Qtr=2` is 2952.93278336456, Desktop's value to every digit
