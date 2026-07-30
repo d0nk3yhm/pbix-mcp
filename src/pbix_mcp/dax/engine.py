@@ -3013,19 +3013,26 @@ class DAXEngine:
         visible = ctx.get_column_data(date_table, date_col)
         if not visible:
             visible = [row[idx] for row in tbl['rows']]
-        out, seen = [], set()
-        for v in visible:
-            dv = _as_datetime(v)
-            if dv is None:
-                continue
-            shifted = self._shift_date(dv, offset, interval)
-            if shifted is None:
-                continue
-            key = shifted.date() if isinstance(shifted, datetime) else shifted
-            if key in universe and key not in seen:
-                seen.add(key)
-                out.append(universe[key])
-        return out
+        seen_src = [d for d in (_as_datetime(v) for v in visible) if d is not None]
+        if not seen_src:
+            return []
+        # Shift the RANGE, not each date independently. Mapping date-by-date
+        # leaves holes wherever no source date lands on a target: nothing shifts
+        # onto Jan 29-31 (there is no "Feb 31"), nor onto the 31st of any month
+        # whose successor has 30 days. Those holes silently dropped a day of
+        # sales each -- PM Total Sales came out 11.9M short of Desktop, and every
+        # PM/PQ/PY/MAT/YOY measure built on it inherited the error. DAX shifts the
+        # selected period and returns the corresponding period, so the result is
+        # contiguous over the date table.
+        lo = self._shift_date(min(seen_src), offset, interval)
+        hi = self._shift_date(max(seen_src), offset, interval)
+        if lo is None or hi is None:
+            return []
+        lo_d = lo.date() if isinstance(lo, datetime) else lo
+        hi_d = hi.date() if isinstance(hi, datetime) else hi
+        if lo_d > hi_d:
+            lo_d, hi_d = hi_d, lo_d
+        return [universe[k] for k in sorted(universe) if lo_d <= k <= hi_d]
 
     _DATEADD_ARGS_RE = re.compile(
         r"'?([^'\[]+)'?\s*\[([^\]]+)\]\s*,\s*(-?\d+)\s*,\s*(\w+)", re.IGNORECASE)
@@ -5245,9 +5252,17 @@ class DAXEngine:
                 new_year = d.year + (new_month - 1) // 12
                 new_month = ((new_month - 1) % 12) + 1
                 return datetime(new_year, new_month, 1)
-            q_start = shift_quarter(datetime(min_date.year, ((min_date.month - 1) // 3) * 3 + 1, 1), offset)
-            q_end_month = q_start.month + 2
-            q_end_year = q_start.year
+            # Span the shifted MIN quarter through the shifted MAX quarter. This
+            # used to shift only min_date's quarter and return that ONE quarter,
+            # so a multi-quarter selection collapsed: over a three-year range the
+            # single shifted quarter fell outside the date table, the result was
+            # empty, no filter was applied at all, and PQC Total Sales returned
+            # the GRAND TOTAL instead of the previous quarter's.
+            q_start = shift_quarter(
+                datetime(min_date.year, ((min_date.month - 1) // 3) * 3 + 1, 1), offset)
+            q_last = shift_quarter(
+                datetime(max_date.year, ((max_date.month - 1) // 3) * 3 + 1, 1), offset)
+            q_end_month, q_end_year = q_last.month + 2, q_last.year
             if q_end_month > 12:
                 q_end_month -= 12
                 q_end_year += 1
@@ -5524,6 +5539,19 @@ class DAXEngine:
 
         if start_date > end_date:
             start_date, end_date = end_date, start_date
+
+        # The far boundary is EXCLUSIVE: DATESINPERIOD(..., -1, YEAR) from
+        # 2009-12-31 is 2009-01-01..2009-12-31, a 365-day window, NOT 366 starting
+        # at 2008-12-31. The DAY branch already applied this (offset +/- 1); the
+        # MONTH/QUARTER/YEAR branches did not, so each returned one day too many
+        # and MAT Total Sales came out 745,963 above Desktop.
+        if interval not in ('DAY', 'DAYS'):
+            if offset >= 0:
+                end_date = end_date - timedelta(days=1)
+            else:
+                start_date = start_date + timedelta(days=1)
+            if start_date > end_date:
+                return []
 
         all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
         in_period = [d for d in all_dates if start_date <= d <= end_date]

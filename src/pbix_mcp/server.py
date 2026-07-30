@@ -12091,6 +12091,21 @@ def _parse_measure_names(measures: str, measure_defs: dict) -> list[str]:
     so a typo is distinguishable from a measure that genuinely returns BLANK.
     """
     lower_map = {k.lower(): k for k in measure_defs}
+
+    # A measure NAME may itself contain a comma -- Power BI allows it, and
+    # Agents_Performance really does have "KPI, Avg MTD Sales towards Target".
+    # Splitting first made every such measure unevaluable: the pieces ('KPI',
+    # 'Avg MTD Sales towards Target') are not measures, so the call failed with
+    # MEASURE_NOT_FOUND even though the measure exists. Applying this function's
+    # own rule -- an exact model match always wins -- to the WHOLE string before
+    # splitting fixes it without affecting genuine comma-separated lists, which
+    # cannot match a single measure name.
+    whole = (measures or "").strip()
+    if whole in measure_defs:
+        return [whole]
+    if whole.lower() in lower_map:
+        return [lower_map[whole.lower()]]
+
     names = []
     unknown = []
     for raw in _split_measure_list(measures):
