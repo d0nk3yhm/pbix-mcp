@@ -43,6 +43,26 @@ grouping there is no scope beyond the filter context the tool was handed.
 
 ## Known Limitations
 
+### `FORMAT` date pictures
+
+Pictures are VBA-style and **case-insensitive**, matching Power BI:
+
+| picture | `DATE(2021,7,19)` |
+|---|---|
+| `mmmm` / `mmm` / `mm` / `m` | `July` / `Jul` / `07` / `7` |
+| `dddd` / `ddd` / `dd` / `d` | `Monday` / `Mon` / `19` / `19` |
+| `yyyy` / `yy` | `2021` / `21` |
+| `mm/dd/yyyy` | `07/19/2021` |
+| `dddd, mmmm dd, yyyy` | `Monday, July 19, 2021` |
+| `Long Date` / `Short Date` | `Monday, July 19, 2021` / `7/19/2021` |
+
+`m` is a **month** except when it follows an hour token, where it is minutes —
+`FORMAT(<noon>, "mm hh:mm")` is `07 12:00`. Use `nn` when you want minutes
+unambiguously. Single-letter tokens do not zero-pad: `m/d/yyyy` on 2021-03-05
+is `3/5/2021`. The .NET spellings (`MMMM`, `DD`, `YYYY`) also work.
+
+### Other limitations
+
 - **Date-table detection** uses heuristics (looks for columns named "Date" or "Calendar")
 - **Unsupported functions** return `None` with status `"unsupported"` and are tracked in `unsupported_functions`
 - **Circular references** raise `DAXEvaluationError` (caught by graceful degradation → returns `None`)
