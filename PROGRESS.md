@@ -1,721 +1,99 @@
-# Session progress — 2026-07-28 → 07-29
+# Session progress — 2026-07-28 → 07-30
 
 Working note for picking this back up. Records what was done, what is verified
 and how, what is left, and the traps already hit so they are not re-hit.
 
 ## Where things stand
 
-| issue | state |
-|---|---|
-| **#3** service verification of the rebuild path | **CLOSED** — all 3 schema eras verified live in Power BI Desktop |
-| **#4** calc columns blocking corpus files | groups (a) `.[Date]`, (b) LOOKUPVALUE + RELATED, (c) CALCULATE/FILTER all **DONE** |
-| **#5** columns fail to decode | **root-caused, fixed, tested, committed** |
-| **#6** DAX perf / compiled expression tree | **CLOSED** in 0.9.55 — plan cache + row-context calc columns; 1053s -> 183s; 520/544 measures byte-identical, the rest classified |
-| **#7** calc groups, translations, detail-rows | **DONE** — verified live in Desktop via INFO.CALCULATIONGROUPS() |
+**0.9.61 is the corpus-parity release.** Every measure of every corpus file was
+compared against the value Power BI Desktop's own engine returns for it, and the
+sixteen defects that came out of it are fixed. Details in CHANGELOG.md.
 
-Released 07-28/29: **0.9.50-0.9.55**. Every GitHub issue is CLOSED (#3-#7).
-
-**Corpus: 23 of 24 rebuild** (was 11). The one refusal is MS_Perf_Analyzer's
- = , a genuine table scan this engine does not
-implement -- refused deliberately, not a bug.
-
-## Verifying against Desktop WITHOUT opening Desktop
-
-The single most valuable tool this session. The corpus files were authored in
-Power BI Desktop, so a calculated column's **stored VertiPaq values ARE
-Desktop's answer**. Recomputing from the DAX and diffing them is exact ground
-truth, needs no GUI, and covers hundreds of thousands of rows at once.
-
-```
-scratchpad/gt_all.py    every calc column in the corpus vs Desktop's stored values
-scratchpad/lv_gt.py     the cross-table (LOOKUPVALUE / RELATED) subset
-```
-
-It found **four silent-wrong-value bugs the whole unit suite missed**. Run it
-after any change to the DAX engine or the calc-column evaluator.
-
-Two rules learned the hard way:
-
-* **Skip volatile expressions.** A `TODAY()` column's stored values were
-  computed when the file was last refreshed. `MS_AI_Sample`
-  `Opportunities[Days Remaining In Pipeline]` read as a 2467-row MISMATCH that
-  was purely the 973 days since authoring — every difference was exactly -973,
-  and the 2467 rows were exactly the `Status="Open"` ones. Not a bug.
-* **Qualify bare references first**, as `_materialize_table_calc_columns` does.
-  Without it the tool reports failures the real path never has.
-
-## Verifying against a LIVE Desktop (when the GUI is needed)
-
-Everything below was checked against **Power BI Desktop's own Analysis Services
-engine**, not against documentation and not against expectations.
-
-```
-scratchpad/verify_live.ps1   open a .pbix, wait for the window title, run DAX
-scratchpad/live_dax.ps1      find the msmdsrv port, connect ADOMD, run a .dax file
-scratchpad/diff_meta.py      field-level metadata diff between two .pbix (name-matched)
-scratchpad/calc_ground_truth.py  our re-materialized calc columns vs Desktop's stored ones
-```
-
-Two hard-won details:
-
-* Desktop opens some files behind a modal **"Enter your email address"** sign-in
-  prompt that blocks the model load forever. `verify_live.ps1` dismisses it with
-  Cancel after 25s. Never sign in.
-* Screenshot pixels are **not** desktop coordinates. The virtual screen starts at
-  x=-2560 on this machine, so every synthetic click must add `VirtualScreen.Left`.
-  Clicks also need `AttachThreadInput` + `SetForegroundWindow` or Windows drops
-  them silently. `click_shot.ps1` handles both.
-
-**Always compare an edit against a CONTROL** (open + save, no edit), never
-against the original — saving legitimately rewrites members on its own. The
-control has been byte-clean on every metadata table all session.
-
-## What was fixed
-
-### Issue #3 (closed) — four reasons Desktop refused a rebuilt file
-
-1. **metadata.sqlitedb sized from a stale record.** The VirtualDirectory's size
-   was updated but not the BackupLog's, and **AS sizes the file from the
-   BackupLog** → truncated SQLite → "The database disk image is malformed.
-   SQLite Error Code=11". Two causes: a `len(old)==len(new)` guard skipped any
-   size whose digit count changed, and the two regions have **different
-   encodings in one file** (VirtualDirectory UTF-8, BackupLog UTF-16-LE).
-2. **Legacy `Type=1` (Query) partitions rewritten to inline M**, orphaning the
-   DataMashup query → empty Data pane + "pending changes in your queries".
-3. **Two columns claimed to be the key.** The builder marks every RowNumber
-   `IsKey`; corpus ground truth across 248 RowNumber columns says `IsKey` is 0
-   for exactly the 14 whose table has another key column.
-4. **Calc-table columns lost their table qualifier** (`DateAutoTemplate[Year]`
-   became `[Year]`) → "Relationship points to deleted column".
-
-Plus: measures/hierarchies kept only name and expression (89 of 102 measures
-lost their DisplayFolder), and **Windows joined the CI matrix** — three unclosed
-SQLite handles made every calc-column edit fail on Windows while Ubuntu-only CI
-stayed green.
-
-### Silently-wrong-value bugs (the class this project treats as unacceptable)
-
-* **`INT` truncated instead of flooring.** `INT(-1.5)` gave -1, Desktop gives -2.
-  Worst in the binning idiom Power BI's own "New group" generates:
-  `INT(-1612/5)*5` → we said -1610, Desktop says -1615. **Wrong bin.**
-* **BLANK did not compare like DAX.** DAX coerces BLANK to the *zero of the other
-  operand's type*; we returned BLANK so every test fell to ELSE. On
-  `IF(T[x]<30,20,IF(T[x]<45,30,80))` every blank row scored 80 where Desktop
-  scores 20. `Indicators[Basic drinking water services]` disagreed with Desktop
-  on **70,562 of 72,645 rows**.
-* **A double quote in the data deleted the whole value.** DAX escapes quotes by
-  doubling, so `6" pipe` has four quote chars; the parser demanded exactly two.
-* **`//` or `--` inside a string truncated the expression**, deleting whole
-  column references. The unresolved-reference check was structurally blind: it
-  only sees text *after* comment stripping.
-* **11% of every model's data columns silently dropped on read.**
-  `read_table_from_abf` skipped any column whose IDFMETA said `is_row_number` —
-  a flag Desktop leaves 0 on ordinary columns. 126 of 1121 user columns across
-  the corpus, including `IT_Support` `dim_Date[Date]`, the column its
-  relationships join on, in a file every check called clean.
-
-### Issue #5 — root cause found (this is the important one)
-
-`primary_segment_size` in an IDF segment is the **allocated capacity** of the
-primary array, not the number of entries in use. It is always a power of two
-(16, 32, 64, 256, 2048, 4096, 8192) while the used entries are far fewer. The
-real entries end **exactly when their run lengths sum to the segment's row
-count**; the slots after that are sub-segment bytes that read as nonsensical
-`(data_value, repeat)` pairs.
-
-Reading the full capacity summed garbage run lengths. It only surfaced when the
-garbage was large, which is why it looked column-specific: on the 1,290,259-row
-`Employee` table, 13 columns decoded fine while `date`, `Gender` and `FP` blew
-past the sanity limit — `Gender` summed to **93,629,586,803 rows**.
-
-Verified on all 16 columns of that table: **every one reaches exactly 1,290,259
-and stops.** Same root cause as the four `Fact` columns of
-`MS_Corporate_Spend.pbix` this issue was opened for.
-
-Fix: `_decode_idf_segment_at` stops consuming entries once the segment's rows
-are complete; per-segment record counts are threaded through for multi-segment
-columns.
-
-**Offline verification:**
-* structural — run lengths sum to exactly the row count on all 16 columns;
-* referential — 6 of 7 `Fact` relationships resolve with **0 orphans**;
-* semantic — ages 14..96, 2 genders, dates in range.
-
-**GUI-CONFIRMED 2026-07-29 (this was the outstanding gap; it is now closed).**
-Both files opened in Power BI Desktop and its own engine queried over ADOMD.
-Every value matches our decode exactly:
-
-`MS_Corporate_Spend` `Fact` — all 8 agree, including the full-precision sum:
-rows 166,216 · SUM 4203674047.3179 · MIN -68,912,000 · MAX 58,173,000 ·
-DISTINCTCOUNT Value 35,807 / Department 410 / Cost Element ID 240 / Scenario 5.
-
-`MS_Employee_Hiring` `Employee` (1,290,259 rows) — all 9 agree:
-DISTINCTCOUNT Gender 2 · FP 2 · date 48 · EmplID 61,843 · Age 14..96 ·
-date range 2011-01-01..2014-12-01.
-
-And, because equal aggregates can still hide unequal data, a **value-level**
-check on the three columns the bug actually corrupted:
-
-| column | Desktop | ours |
+| verification | scale | result |
 |---|---|---|
-| Gender | C 590,639 · D 699,620 | identical |
-| FP | F 631,127 · P 659,132 | identical |
-| date (6 earliest) | 18,972 / 19,075 / 19,287 / 19,547 / 19,845 / 20,177 | identical |
-| Age | SUM 50,965,422 · AVG 39.5001484198134 · COUNT 1,290,259 | identical |
+| measures at the grand total | 547 measures, 24 files | 1:1 with Desktop |
+| measures UNDER A FILTER CONTEXT | ~1,700 measure x dimension-value cells | see `cmp_ctx.py` |
+| calculated columns vs stored VertiPaq values | ~400 columns | 0 mismatches |
+| unit tests | 1,280 | pass (`pytest -m "not slow"`) |
 
-`Gender` is the column that summed to 93,629,586,803 rows before the fix.
+Earlier issues #3-#7 all remain CLOSED. The OpenBI findings ledger
+(`docs/openbi-findings-ledger.md`) is the authority on what is still open.
 
-Note on the modal: Desktop opens both files behind the "Enter your email
-address" prompt, which blocks the model load indefinitely. Dismiss with
-**Cancel** (never sign in). The click must be guarded — verify
-`WindowFromPoint` belongs to the PBIDesktop process before pressing, or a
-synthetic click can land in whatever window happens to be in front.
+## Verifying against Desktop — the three ground truths
 
-The 7th relationship (`Fact[Cost Element ID]`) orphans because the **model
-itself** declares it String while `Cost Element[Cost Element ID]` is Double — a
-type mismatch in the source file, not a decode fault. Confirmed from metadata.
+Ranked by cost. Use the cheapest one that can answer the question.
 
-**DONE** — the queries at `scratchpad/q_cs.dax` / `q_eh.dax` (plus
-`q_eh_vals.dax` for the value-level breakdown) were run against Desktop's live
-engine on 2026-07-29; results above. Nothing outstanding on #5.
-
-## What is left
-
-### Issue #4 — 3 groups, smallest first
-
-1. **Auto-date variation accessor** (1 file). `MS_Revenue_Opportunities.pbix`
-   has `Fact[Date] = 'Fact'[EstimatedCloseDate].[Date]` — the `.[Date]` drills
-   into the hidden LocalDateTable for that column. Smallest remaining piece.
-   **Semantics already VERIFIED: `X.[Date]` is the date part of X — 458/458
-   exact against Desktop's own stored `Fact[Date]` values.** A `Variation` row
-   links ColumnID -> RelationshipID -> the LocalDateTable, but the value needs
-   no traversal at evaluation time. Only `.[Date]` is verified; refuse the other
-   parts (`.[Year]`, `.[Month]`, ...) until each is checked — they map to
-   auto-date template columns with locale-dependent display strings.
-2. **Cross-table references** (5 files) — `RELATED`, `LOOKUPVALUE`, or
-   `'Other'[Col]` directly. Needs relationship traversal in row context; the
-   graph is already available via `_relationships_from_metadata`.
-3. **CALCULATE / FILTER** (3 files) — needs a real filter context per row. The
-   largest single piece of work left.
-
-### The calculated-column gate is deliberately narrow
-
-Only `MIN`, `MAX`, `SUM`, `AVERAGE`, **single argument, one column of the target
-table**. An adversarial review of a broader first cut (61 agents; 19 candidates
-→ 3 confirmed, 16 refuted) demonstrated six ways it would write wrong values.
-Do not widen it without re-checking each:
-
-| shape | what it did |
-|---|---|
-| `MIN(T[Amount], 0)` | the two-argument **scalar** overload — 0 on every row |
-| `COUNTROWS(Other)` | a bare table name is invisible to the cross-table check |
-| `MIN([Yeer])` | a typo'd column answers 0 rather than failing |
-| `DISTINCTCOUNT`/`COUNT`/`COUNTA`/`COUNTBLANK` | disagree with DAX on BLANK/`""` |
-| `STDEV.P`, `VAR.S`, `PERCENTILEX.INC` | DAX spells these with a **dot** |
-| `[Total Count (n)]` | a column *named* after an aggregate got chopped |
-
-The scalar overload IS allowed when neither argument reads a column — that is how
-Power BI's own binning clamps a bin number, `MIN(__BinNumber, __Count - 1)`.
-
-### Issues #6 and #7
-
-Untouched. #6 is gated on baselining every corpus measure first and asserting
-byte-identical results, per its own terms. #7 needs a .pbix authored in Desktop
-containing a calculation group, perspective, detail rows and a translation.
-
-## Traps already hit
-
-* **Do not trust a green-looking CI without opening the run.** CI was red for
-  0.9.50 and 0.9.51 and was reported here as green. Two real bugs were hiding in
-  it: a Windows stale-cache race (a slicer edit rewrites the layout to the *same*
-  byte length, so inside one mtime tick the change-stamp was identical and the
-  next evaluate served the previous slicer's answer) and an unbounded
-  `mcp>=1.0.0` that let **mcp 2.0.0 break `pip install pbix-mcp` outright**
-  (it removed `mcp.server.fastmcp`). Now pinned `<2`.
-* **The corpus sweep writes a temp dir of rebuilt .pbix per run.** Dozens of runs
-  filled C: to 0.2 GB free. Clean `%LOCALAPPDATA%\Temp\tmp*` dirs containing
-  `o*.pbix`, and `pytest-of-*`. (~10.8 GB of Visual Studio installer cache also
-  sits there — not ours.)
-* **Every new test must be confirmed to FAIL against the previous release.**
-  Several "passing" tests turned out to assert behaviour that never worked.
-* Run the sweep **uncontended**. With ~20 stray Python processes the slow suite
-  took 2 hours instead of 13 minutes.
-
-## Issue #6 — the bottleneck is measured, and it is not where you'd guess
-
-Measured 2026-07-29 on this machine. The full corpus sweep went from ~25 min to
-**3.3+ CPU-hours** once the Issue #5 decode fix made three 1.29M-row tables
-readable for the first time. Breaking that down:
-
-| stage | measured | @ 1,290,259 rows |
-|---|---|---|
-| VertiPaq decode | 14.2 s for 1.29M rows | linear, fine |
-| builder encode | 3.0 s / 100k rows (flat from 10k→200k) | ~39 s, linear, fine |
-| **calc-column evaluation** | **13.6 s / 100k rows** | **~2.9 min PER COLUMN** |
-
-`MS_Employee_Hiring.Employee` has **5** calculated columns, and the sweep builds
-each file twice (control + edit), so that one table alone is ~30 minutes; two
-files with the same shape is an hour before anything else runs.
-
-Decode and encode are both linear with small constants — they are not the
-problem. The calc-column path costs ~136 microseconds **per row per column**
-because `evaluate_row_context_column` string-substitutes the row's values into
-the expression and **re-parses the whole DAX string for every row**.
-
-That is precisely what issue #6 asks for: parse once into an expression tree,
-then evaluate the tree per row. The correctness gate for that work already
-exists — `scratchpad/calc_ground_truth.py` compares our re-materialized values
-against Desktop's own stored values, and the corpus files whose calc columns are
-already verified exact (MS_Employee_Hiring MonthIncrementNumber 13/13,
-MS_Life_Expectancy binning 250/250 and its BLANK-comparison columns 400/400,
-MS_Regional_Sales Weeks Open 12/12) make a ready-made byte-identical baseline.
-
-Practical note: until this is fixed, do NOT run the full 24-file sweep as a
-routine gate. Run it excluding MS_Employee_Hiring / MS_Human_Resources /
-MS_Corporate_Spend for a fast regression signal, and run those three separately
-when specifically testing them.
-
-
-## Done 2026-07-29 (early hours)
-
-* **#5 decode fix** implemented + 8 regression tests (all confirmed failing
-  without it). `MS_Employee_Hiring`, `MS_Human_Resources` and
-  `MS_Corporate_Spend` all decode now. Uncommitted, pending the sweep.
-* **#4 group (a) — auto-date `.[Date]` accessor DONE.** `expand_variation_accessors`
-  in `dax/calc_tables.py` rewrites `X.[Date]` to
-  `DATE(YEAR(X), MONTH(X), DAY(X))` — verified primitives only. Applied in BOTH
-  the gate and the evaluator so they cannot disagree.
-  * **458/458 exact** against Desktop's own stored `Fact[Date]`.
-  * `.[Year]`, `.[Month]`, `.[Quarter]`, `.[Day]`, `.[MonthNo]` deliberately
-    NOT expanded — they map to auto-date template columns with locale-dependent
-    display strings. Each is confirmed to **refuse**, never materialize a guess.
-  * 8 tests; 3 fail against the previous release.
-  * `MS_Revenue_Opportunities.pbix` now **OK** → **15/24**. Sweep clean:
-    0 fidelity findings.
-* **Ordering fix in `_materialize_table_calc_columns`** — expand the accessor
-  BEFORE `_qualify_bare_column_refs`. This is a *separate latent* bug, NOT what
-  unblocked the file above (I first claimed it was; wrong — see the trap below).
-  When the table also has a real column named `Date`, the qualifier reads the
-  accessor's own `[Date]` as a bare same-table reference and rewrites it to
-  `'T'[Close].'T'[Date]`, which stops matching `_VARIATION_ACCESSOR` — expansion
-  silently stops firing and the column is refused. Common shape on fact tables.
-
-### Trap: a repro built with inputs the real path never passes
-
-I diagnosed the above from a hand-built `col_names` that included `Date`, saw
-`'Fact'[EstimatedCloseDate].'Fact'[Date]`, and concluded that was why the file
-was refused. Instrumenting the **real** call showed `col_names` has no `Date`
-at that point, so the qualifier leaves the accessor alone. Reverting only the
-server.py edit still left the file OK — the `calc_tables.py` expansion alone
-fixed it.
-
-The first regression test I wrote passed with AND without the fix, because it
-inherited the same wrong `col_names`. **A test that passes both ways proves
-nothing** — always run it against the reverted fix. The kept test uses
-`col_names` containing `Date` and is confirmed to fail without the ordering fix.
-
-* Gates at this point: ruff clean, mypy 140 (baseline), **1009 unit tests pass**.
-
-Next: release #5 + `.[Date]` together, close #5, then #4 group (b) cross-table
-refs.
-
----
-
-# Session 2026-07-29 — issue #4 finished, four engine bugs found
-
-## Issue #4 is complete: all three groups
-
-**(a) auto-date `.[Date]`** — `expand_variation_accessors` rewrites `X.[Date]`
-to `DATE(YEAR(X), MONTH(X), DAY(X))`. Applied in BOTH the gate and the
-evaluator so they cannot disagree, and **before** `_qualify_bare_column_refs`
-(see the trap below). Only `.[Date]` is expanded; `.[Year]`, `.[Month]`,
-`.[Quarter]`, `.[Day]`, `.[MonthNo]` map to auto-date template columns with
-locale-dependent display strings and are confirmed to REFUSE.
-
-**(b) cross-table refs** — LOOKUPVALUE and RELATED.
-
-* Both are parsed, validated against the model's real tables/columns, and
-  MASKED so the cross-table scan never sees them; the value sub-expressions are
-  pulled back out and re-gated on their own, so masking cannot smuggle an
-  unsupported expression past the gate.
-* Indexes are built ONCE per column, not per row.
-* LOOKUPVALUE: several matching rows are fine when they agree; genuinely
-  ambiguous matches are an ERROR in DAX, so the column is refused rather than
-  picking one. A miss yields the alternate result if supplied, else BLANK.
-  String matching is case-INSENSITIVE (Power BI's default collation).
-* RELATED walks many-to-one only (From → To in AMO) across ACTIVE
-  relationships. Two paths, no path, wrong direction, a bare `RELATED([Col])`,
-  or an inactive relationship are each refused, never guessed.
-* A caller that supplies neither `known_tables` nor `relationships` keeps the
-  old strictly-safe refusal, so nothing regressed for pure-python callers.
-
-**(c) CALCULATE / FILTER** — the semantic that makes it tractable: in a
-calculated column CALCULATE performs context transition, and a FILTER over that
-SAME table replaces the transitioned filter entirely. So `FILTER(T, cond)` and
-`FILTER(ALL(T), cond)` both reduce to *aggregate every row of T satisfying
-cond*. Confirmed against Desktop's stored values, not assumed.
-
-Performance mattered: `MS_Covid_Tracking`'s COVID table has **1,740,185 rows**,
-so a literal per-row scan is ~3e12 operations. The predicate is COMPILED
-instead:
-
-* equality terms → a hash index, one dict lookup per row;
-* one inequality → a prefix aggregate over each group sorted by that column,
-  answered with a bisect;
-* right-hand sides are memoised on just the columns they mention, so
-  `DATEADD(COVID[Date], -1, DAY)` costs one evaluation per distinct date.
-
-`VAR`s are inlined into the predicate so scoping is not reimplemented.
-
-## Four silent-wrong-value bugs the unit suite never saw
-
-All four were found by diffing against Desktop's stored values, and all four
-now have tests that fail against the previous code.
-
-1. **`-` and `/` were RIGHT-associative.** `_eval_binary` evaluated `parts[0]`
-   against the REJOINED tail: `10 - 3 - 2` → 9 instead of 5, `20 / 4 / 5` → 25
-   instead of 1. This hit **every measure and calculated column** containing a
-   repeated subtraction or division. Found because
-   `MS_Competitive_Marketing` `Date[Rolling Period]` disagreed with Desktop on
-   1096 of 6209 rows. Splitting on `+` before `-` is still correct, because
-   `a - b + c` groups as `(a - b) + c`; only the fold had to become left-to-right.
-2. **`&` rendered every FALSY value as empty** — `str(v or '')`. The
-   zero-padding idiom `RIGHT("0" & n, 2)` lost its pad on exactly the rows
-   where n was 0: `'P-00'` became `'P-0'`, 93 rows.
-3. **A DATE is a number in DAX** (days since 1899-12-30) but `_as_number`
-   returned None for one, so `[Timestamp] * 86400000` was BLANK on every row.
-   Dates reach the evaluator as ISO strings; `_as_datetime` also truncated the
-   fractional seconds, leaving timestamps rounded to the whole second.
-4. **FORMAT** ignored leading-zero pictures (`FORMAT(1, "000")` → `"1"`, not
-   `"001"` — which changes sort order, not just display) and recognised only
-   lower-case date tokens, so `FORMAT(d, "YYYY-MM-DD")` returned the literal
-   `"YYYY-01-DD"`.
-
-Plus a fifth, in the new code: an **unresolved column reference** inside a
-LOOKUPVALUE search value or a FILTER right-hand side reads as blank, matches
-nothing, and materialises BLANK rather than failing. `Events[ParentIndex]` was
-blank on 102 of 117 rows where Desktop had a value. Both paths now check
-`_unresolved_refs` after substitution and refuse.
-
-## Traps hit this session
-
-**A repro built with inputs the real path never passes.** I diagnosed the
-`.[Date]` refusal from a hand-built `col_names` that contained `Date`, saw the
-qualifier mangle the accessor, and concluded that was the cause. Instrumenting
-the REAL call showed `col_names` has no `Date` there. Reverting only the
-server.py edit left the file still OK — the `calc_tables.py` expansion alone
-fixed it. The ordering fix is real but guards a DIFFERENT, latent case (a table
-that also has a column named `Date`).
-
-**A test that passes both ways proves nothing.** The first regression test for
-that fix inherited the same wrong `col_names` and passed with AND without the
-fix. Always run a new test against the reverted fix.
-
-**The engine can answer with a non-scalar and not flag it.** `DATEADD` returns
-a marker tuple `('__DATEADD__', ...)` and registers nothing in
-`unsupported_functions`. Compared against index keys it simply never matched,
-so the CALCULATE collapsed to its empty result on every row. Filter values are
-now required to be scalars.
-
-## Known limitation
-
-DateTime columns decode to Python `datetime` (microsecond resolution) while
-VertiPaq stores a double serial. Scaling a timestamp to milliseconds therefore
-differs from Desktop in the sub-microsecond digits — e.g. `3796149882573.3325`
-vs `3796149882573.333`. Visible on `MS_Perf_Analyzer`'s trace tables, which are
-refused for other reasons (RANKX, PATH/PATHITEM) anyway.
-
-## Issue #7 — calculation groups now survive a rebuild
-
-The issue asked for a .pbix authored in Desktop. Not needed: this project's own
-`pbix_datamodel_add_calculation_group` builds one, which is also the exact case
-the issue calls out ("a model this project itself created can contain
-calculation groups that a later rebuild-path edit would drop").
-
-Reproduced first. Authoring a group on `GeoSales_Dashboard` and then editing a
-table dropped `CalculationGroup`, `CalculationItem`, `[Table]
-.CalculationGroupID` and the Type=7 partition **to zero**, with `success: true`
-and an empty warnings list.
-
-All 14 tables from the issue are now in `_CARRY_SPEC`. Two things the generic
-carry could not do on its own:
-
-* **A calculation group is wired from BOTH ends.** `[Table].CalculationGroupID`
-  points back at the group, and the partition must be `Type=7`. Without them the
-  group's table loads present but inert.
-* **Optional self-references (`self:X?`) were declared but never worked** — the
-  snapshot built its remap key from the raw kind string, so it looked for a
-  table literally called `FormatStringDefinition?`. Now a calculation item
-  survives losing its format string instead of vanishing with it.
-
-### The Desktop-only failure
-
-Every metadata check passed — referential integrity clean, no dangling keys,
-all four counts restored, doctor reporting nothing the source file did not
-already have — and Power BI **still refused the file**:
-
-> Partition 'Time Intelligence' in table 'Time Intelligence' has the
-> QueryDefinition property set which is not a valid field for this partition type.
-
-The rebuild writes an Enter-data M query for every partition; setting `Type=7`
-left it in place. Ground truth from an authored group: a Type=7 partition
-carries NO `QueryDefinition`, and every other field already matched byte for
-byte. **Only opening the file in Desktop found this** — a standing argument for
-the GUI check even when every offline gate is green.
-
-Now verified against Desktop's own engine: the report opens, and
-`INFO.CALCULATIONGROUPS()` / `INFO.CALCULATIONITEMS()` answer **1 group, 2
-items** — `Current` ordinal 0, `YTD` ordinal 1 — after a rebuild.
-
-## Shipped
-
-**0.9.54** is on PyPI and GitHub, all 8 CI cells green, F: mirror synced.
-Issues **#3, #4, #5, #7 are CLOSED**. Only **#6** remains open.
-
-## Next: issue #6, the only one left
-
-Memoization (landed) only helps where inputs repeat. The underlying cost is
-unchanged: the evaluator **re-parses the expression text for every distinct
-input**, because `_subst_row` builds a different string per row and
-`_eval_expr` parses it fresh. A column whose inputs are nearly all distinct — a
-timestamp difference, a high-cardinality key — saves nothing.
-
-The fix is to parse ONCE into a tree of closures over column indices and
-evaluate per row with no parsing. The CALCULATE/FILTER compiler added for #4 is
-that idea applied to one construct and is a reasonable template.
-
-**Gate any such change on byte-identical output**: `scratchpad/gt_all.py` diffs
-every calculated column in the corpus against Desktop's stored values. That
-tool is what found the four silent-wrong-value bugs; it is the right gate.
-
-Current timings to beat (24-report corpus, 23/24 rebuild):
-`MS_Employee_Hiring` 1053s, `MS_Human_Resources` 1046s, `MS_Life_Expectancy`
-415s, `MS_Store_Sales` 222s, everything else seconds.
-
----
-
-# Session 2026-07-29 (later) — 0.9.55: issue #6 closed, ZERO issues open
-
-## What shipped
-
-Compiled expression plans (analysis cached per expression; calc columns
-evaluate the SAME text per row via ctx._current_row + mask VARIABLES), a
-per-context column-data cache, and — exposed by the corpus-wide verification
-the rewrite enabled — **two operator-precedence bugs and a
-parens-in-column-name bug**, all Desktop-probed:
-
-* Split order IS precedence, loosest first: `|| && NOT cmp & +- */`.
-  The old chain split arithmetic before comparison: `a - b < 0` parsed as
-  `a - (b < 0)` — Employee[TenureDays] sign-flipped on 1.25M rows; GeoSales
-  CF measures answered #D64550 where Desktop answers #118DFF (verified live).
-* The TCOL guard `'(' not in expr` made `[... (% of population)]` columns
-  read BLANK — every Life_Expectancy bucket column mis-bucketed.
-
-Plus: three pbix_doctor false-positive classes fixed (Kind validity instead
-of the disproven DataMashup theory; storage matched by TABLE ID, not
-sanitized display name; NULL-expression measures no longer crash the check —
-doctor now ALL CLEAN on five corpus files), set_incremental_refresh writes
-Kind=0 (TOM's ExpressionKind has only M=0; Kind=1 was the real
-PFE_TM_ENUM_VALUES_VALIDATION_FAILED trigger), pbix_open work dirs are
-pid+uuid unique, the release pipeline is GATED (ruff+pytest before build,
-github-release after publish-pypi, fail_on_unmatched_files), the CI mypy
-gate no longer swallows crashes, and seven verified-stale doc claims fixed.
-
-## Verification ledger for 0.9.55
-
-* 1089 unit tests green; 17 of the new tests fail against 0.9.54.
-* Measures: all 24 files baselined before/after with unique aliases —
-  520/544 byte-identical; 24 diffs = 5 RAND-volatile + 2 path artifacts +
-  17 precedence-class, EACH classified against its DAX body.
-* Calc columns: 395 match Desktop's stored values exactly, 0 logic
-  mismatches; 4 sub-microsecond DateTime-serial diffs (documented).
-* Sweep 23/24 OK, 0 findings; Employee_Hiring 183s (was 1053s).
-* Adversarial review (3 skeptics, repro required) found ONE real bug —
-  nested-mask stale scope — fixed pre-release, repro kept as a test.
-* CI 8/8 green (read the run); release pipeline gate/build/publish/release
-  all green; PyPI install of 0.9.55 verified; F: synced.
-
-## Traps hit (recorded so they are not re-hit)
-
-* **My baseline harness raced itself**: 4 processes × same alias → same
-  work dir (second-granular timestamp) → cross-contaminated captures AND a
-  bogus "path traversal" refusal. The product fix (pid+uuid) came from a
-  harness bug — but only because the anomaly was chased, not shrugged off.
-* **A YAML block scalar ate a literal newline** from a patch script's 
-:
-  the workflow failed in 0s. Validate workflow files with yaml.safe_load
-  before pushing.
-* **Python 3.14 was advertised then rolled back**: xmhuffman has no cp314
-  wheel and a broken sdist. Do not advertise a version the package cannot
-  install on; the matrix comment records the re-add condition.
-
-## Nothing is open
-
-`gh issue list --state open` returns nothing. Remaining known limits are
-documented in docs/limitations.md (PATH/RANKX refusals on MS_Perf_Analyzer,
-DateTime sub-microsecond serials, xmhuffman/3.14).
-
----
-
-# Session 2026-07-29 (evening) — 0.9.56 / 0.9.57
-
-## 0.9.56 — verification + sync
-
-Issue #5's fix had never been GUI-confirmed (PROGRESS.md said so and listed the
-check as outstanding). Done now: both files opened in Power BI Desktop, engine
-queried over ADOMD. `MS_Corporate_Spend` `Fact` matches on all 8 aggregates
-including `SUM 4203674047.3179` to the last digit; `MS_Employee_Hiring`
-`Employee` matches on all 9 across 1,290,259 rows. Because equal aggregates can
-hide unequal data, also VALUE-level on the three columns the bug corrupted:
-`Gender` C 590,639 / D 699,620, `FP` F 631,127 / P 659,132, the six earliest
-dates with exact counts, `Age` SUM/AVG/COUNT. Every distinct value and row
-count identical.
-
-Also a genuine sync gap: `v0.9.55` sat two doc commits behind `main`, so tag,
-branch and package pointed at three different trees. A published tag cannot be
-moved (PyPI rejects a duplicate version; pinned consumers break), so 0.9.56 was
-cut from the tip. **And the F: mirror was 26 files stale** — every earlier
-"F: synced" had copied a hand-picked list, never the full tracked set. Now
-audited file-by-file (0 of 118 out-of-sync) and re-checked AFTER the version
-bump, which caught 4 more the bump had just invalidated.
-
-## 0.9.57 — issue #8, field-parameter visual binding
-
-From OpenBI findings #19, which arrived with Desktop-authored ground truth.
-`pbix_datamodel_add_field_parameter` owned the model half; there was no way to
-author the REPORT half, and the naive shape (the parameter's display column
-straight into a projection) makes Desktop silently degrade the well to an
-implicit "Count of Metric" — plausible bars, wrong semantics, no error.
-
-`pbix_bind_field_parameter` authors all five pieces; each was structurally
-diffed against the ground truth and came back IDENTICAL (projections,
-`queryFieldParametersByRole`, `columnProperties`, the compiled query's
-parameter join + `Where` over the hidden `"<name> Fields"` column with the
-NAMEOF triple-quoted literal, and `dataTransforms.sourceFieldParameters`).
-The compile lives in `report_binding.compile_visual_binding`, so future
-recompile paths preserve the wiring instead of dropping it.
-
-Desktop-verified: a from-scratch file renders "Revenue, Units and Profit by
-Month" with all three parameter fields as series — the real expansion, not the
-Count. `pbix_add_visual`/`pbix_update_visual_json` now warn on the naive shape,
-including after the compiler has wrapped it in implicit `CountNonNull(...)`
-(the degradation in flight). 127 tools; shape documented in rich-content.md.
-
-## Traps hit
-
-* **A cancelled release almost shipped a CHANGELOG-less tree.** The heredoc
-  writing the 0.9.57 entry died on the triple-quoted NAMEOF literal, so the
-  commit landed without it and the tag was already pushed. Caught it in the
-  Release run's first seconds, cancelled before `publish-pypi`, wrote the entry
-  via a file-based patch (never a shell heredoc for content with quotes), then
-  moved the tag. Verified afterwards that the SHIPPED sdist contains the entry.
-* **An empty workflow result is not a clean bill of health.** The adversarial
-  review of the new tool returned `{actionable: [], speculative: []}` — because
-  all three agents died on API 529 before running. Read the failures block, not
-  just the result.
-* GUI automation: dismissing Desktop's "Enter your email address" modal needs a
-  click GUARDED by `WindowFromPoint` resolving to the PBIDesktop process. An
-  unguarded `SendKeys` went to the user's browser instead.
-
-# 0.9.58 — the two defects my own tests missed
-
-The 0.9.57 tests covered the happy path and the refusals. Probing the shapes
-they did NOT cover found two real defects in `pbix_bind_field_parameter`.
-
-## Rebinding a sorted well left a dangling OrderBy
-
-`pbix_bind_field_parameter` drops the select it replaces. A prior
-`pbix_set_visual_sort` on that field then left the compiled query ordering by a
-field no longer in `Select`:
+**1. Stored calculated-column values (no GUI, no Desktop process).**
+The corpus files were authored in Desktop, so a Type=2 column's stored VertiPaq
+values ARE Desktop's answer. Recomputing from the DAX and diffing is exact and
+covers hundreds of thousands of rows at once.
 
 ```
-sort   Y (Sales[Total Revenue]) desc
-rebind Y -> Sales[Total Units]
-  Select  = [Sales.Month, Sales.Total Units]
-  OrderBy = Sales.Total Revenue          <-- dangling
+scratchpad/gt_all.py [file...]     every calc column vs Desktop's stored values
 ```
 
-The rebind now re-points such an OrderBy at the newly bound field. Re-pointing
-beats dropping: the sort was on this role's field and the role still has one, so
-the user's intent (sort by the value axis) survives.
+**2. The workspace engine, at the grand total.**
+Desktop starts an `msmdsrv` for an open .pbix; querying it over ADOMD is
+Desktop's own evaluator, not a re-implementation.
 
-Desktop-verified with a fixture whose rows make the two orders OPPOSITE —
-Revenue desc would be Mar, Jan, Feb; Units desc is Feb, Jan, Mar. Desktop
-rendered Feb (30), Jan (20), Mar (10), so the sort field is unambiguous on
-screen rather than inferred. `workspace/fp_sort_rebind.pbix` carries a slicer,
-so the field-swap is clickable.
+```
+scratchpad/gen_all.py              emit gt_<file>.dax (+ .names) for every measure
+scratchpad/capture_all.ps1         open each file in Desktop, run the queries
+scratchpad/cmp_all_files.py        diff every captured answer against ours
+```
 
-## Binding to a visual with no field wells "succeeded"
+**3. The workspace engine, UNDER A FILTER CONTEXT.**
+The grand total is one cell per measure, and the cell least likely to expose a
+bug: relationship propagation, ALLSELECTED, time intelligence and the blank
+(unknown) member only diverge once something is filtered. This widens the
+comparison to `measure x a few values of a real dimension column`, and it found
+bugs the totals sweep could not — `ALL(Table)` was not clearing a filter that
+reached the table through a relationship.
 
-A textbox bind returned `success=True` and left the textbox carrying a `query`,
-`dataTransforms` and a `Y` projection — incoherent, and `pbix_doctor` does not
-flag it. Now refused for the built-in types that provably have no data roles
-(`textbox`, `image`, `shape`, `basicShape`, `actionButton`). Deliberately
-narrow: an unrecognized type (any custom visual) is assumed to have wells, so it
-still binds. The refusal is asserted not to mutate the visual.
+```
+scratchpad/gen_ctx.py              pick a dimension column mechanically, emit the DAX
+scratchpad/capture_ctx.ps1         capture; -Prefix gt_ctxlen for the LEN companion
+scratchpad/cmp_ctx.py              diff, with the same rules as the totals sweep
+```
 
-## Traps hit
+## Traps already hit — do not re-hit
 
-* **`grep -c` and `str.count` count substrings, not decorators.** Both reported
-  128 `@mcp.tool()` for a 127-tool surface; the 128th is the string inside a
-  docstring. Matching on the STRIPPED line (`== "@mcp.tool()"`) and resolving
-  each to its following `def` gives 127 with no duplicates. The category counts
-  in tool-contracts.md sum to exactly 127, which is the real cross-check.
-* **Stale counts survive a "stale-claim sweep".** README and architecture.md
-  still claimed 126 tools. Two of the stale mentions were verification-SCOPE
-  claims tied to the 0.9.39 parity audit, so they were re-scoped ("the 126 tools
-  present at the 0.9.39 audit") rather than bumped to 127 — bumping them would
-  have claimed the newer tools were audited when they were not. These landed
-  AFTER the v0.9.58 tag, so the 0.9.58 artifacts still carry the old counts.
+- **Desktop's sign-in modal opens BEHIND the browser.** The old dismissal was a
+  synthetic click at fixed screen coordinates; its process guard correctly
+  refused, silently, and 7 of 18 captures timed out at 240s. `pbi_windows.ps1
+  -CloseDialogs` sends WM_CLOSE to a handle already proven to belong to
+  PBIDesktop — no focus, no cursor, and it cannot land on another application.
+  Never sign in; closing the dialog is Cancel.
+- **`powershell` is 5.1 and reads files in the ANSI codepage.** A measure named
+  `△ Sales dummy` arrived as `â–³ Sales dummy` and every query for it failed, so
+  7 measures silently had no ground truth. Use `pwsh` and `-Encoding UTF8`.
+- **The capture prints one line per row**, so a value containing a newline
+  arrives cut off. Compare Desktop's own `LEN()` when the printed length
+  disagrees with it.
+- **`EVALUATE ROW()` applies no slicer defaults**; `pbix_evaluate_dax` does.
+  Always pass `apply_default_filters=False` when comparing.
+- **A `&& echo OK` after a linter prints nothing on FAILURE.** Print the exit
+  code explicitly: `ruff check src/ tests/; echo "RUFF=$?"`.
+- **Bit-identical float agreement is not achievable, and chasing it is wrong.**
+  VertiPaq sums a column in parallel segments. On `MS_Corporate_Spend[Var LE1]`
+  the exact decimal answer is 14,697,755.96505, this engine returns
+  ...965050012 (correctly rounded) and Desktop returns ...9650462 — Desktop is
+  300x further from the truth. The harness uses a 1e-9 relative band and LISTS
+  every measure that needed it.
+  What IS fixable, and was: rounding TWICE (`total_seconds()/86400` lands on the
+  wrong double for 27% of timestamps), and the .NET 100-ns tick precision
+  Python's microsecond datetime cannot hold — the decoder now carries the
+  original stored serial on the value.
 
-# 0.9.59 — OpenBI findings #18 (the guard rail), and the #19 verdict
+## Known limits (deliberate, documented)
 
-Asked whether findings #19 was fully closed. Verified it, and in checking whether
-anything ELSE was outstanding found that #18 was not — it had been read as "no
-action needed" because OpenBI had already fixed their own side, but its suggested
-guard rail was never implemented here, and the defect was live in 0.9.58.
-
-## #19 — closed, verified against Desktop's own binding
-
-Diffed the SHIPPED 0.9.58 output against the Desktop-authored ground truth in
-OpenBI's `workspace/field_param_demo.pbix` (visual index 1) — the file a human
-rebound by hand in Desktop and saved. All 8 sub-pieces of the 5 documented pieces
-MATCH: projections.Y, NativeReferenceName, Select node kind,
-queryFieldParametersByRole, columnProperties, query From entities, the Where
-clause, sourceFieldParameters. Suggestions 1-3 all delivered (helper, warning on
-the naive shape in both add_visual and update_visual_json, docs).
-
-The one item not implemented is by-NAME visual addressing (`visual_index/name`).
-That is not a gap: all seven sibling visual-targeting tools
-(format_visual, set_visual_property, remove_visual, update_visual_json,
-move_visual, set_visual_sort, get_visual_detail) are index-only, so adding it to
-this one tool alone would break the convention.
-
-## #18 — was NOT closed; now fixed
-
-`get_column_data`'s memo was keyed `(table, column)` with no filter component,
-while `_measure_cache`'s key already carried a filter fingerprint. That asymmetry
-was the defect: re-pointing one context per grouping served the first grouping's
-members forever. Reproduced on shipped 0.9.58, fixed by making `filter_context` a
-property whose setter clears the column memo, re-verified on shipped 0.9.59.
-
-`_measure_cache` is deliberately left alone — its entries are filter-tagged, so
-clearing it would only cost the fast path. Two of the four regression tests exist
-purely to hold that line (memo still serves repeat calls; measure cache survives
-assignment); they pass both pre- and post-fix by design.
-
-## Traps hit
-
-* **"All issues closed" meant the GitHub tracker only.** The OpenBI findings docs
-  (`D:\OpenBIv2\openbi\openbi\docs\pbix-mcp-issues-*.md`) are a separate stream,
-  and #18 was sitting in it unaddressed. Check both before claiming clear.
-* **"Not a request to change behaviour" is not the same as "nothing to do".**
-  #18 opened by saying OpenBI had already worked around it; the actionable part
-  was three suggested guard rails further down. A report that is polite about its
-  own severity still has to be read to the end.
-* **A hand-built DAXContext fixture failed for the wrong reason.** `tables[t]
-  ["columns"]` is a list of NAME STRINGS, not column dicts; passing dicts blew up
-  in `_auto_detect_date_table` with `'dict' object has no attribute 'lower'`, so
-  the new tests failed even WITH the fix. Copy an existing fixture's shape rather
-  than inventing one, and always check that a new test fails for the reason you
-  intend.
+- `COVID[Daily cases]` — a per-row CALCULATE/FILTER over 1.74M rows evaluates at
+  1.3 rows/sec (≈15 days). The calculated-column path now enforces the same
+  wall-clock budget measures have and refuses with a row count instead of
+  hanging; it previously ran 2+ hours at 4 GB with no output.
+- MS_Perf_Analyzer's `PATH` / `PATHITEM` / `RANKX` calculated columns are
+  refused deliberately: they need a table scan this engine does not implement.
+  Refused, never silently wrong.
+- Measures whose definition reaches a `RAND()` through any chain of references
+  cannot be compared by value at all and are excluded by name, never counted as
+  matches.

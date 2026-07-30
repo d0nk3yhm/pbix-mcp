@@ -32,6 +32,7 @@ Supports 150+ DAX functions:
 """
 
 import calendar
+import decimal
 import json
 import math
 import os
@@ -50,6 +51,10 @@ from typing import Any, Optional
 # of falling through and mis-parsing the expression as a bare function call
 # (which would return just the numerator).
 _NOT_APPLICABLE = object()
+
+# Cache-miss sentinel, distinct from a cached None (which is a real answer:
+# "this bare column name resolves to nothing").
+_MISSING = object()
 
 # An aggregation call in a FILTER condition aggregates over the context rather
 # than the iterated row, so its column references must NOT be substituted with
@@ -72,6 +77,37 @@ _ISO_DATEISH = re.compile(
     r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?$")
 
 
+_DAX_EPOCH_DT = datetime(1899, 12, 30)
+
+
+def _dax_serial(dt: datetime) -> float:
+    """A datetime as its DAX serial, CORRECTLY ROUNDED.
+
+    The obvious `(dt - epoch).total_seconds() / 86400.0` rounds TWICE -- once
+    building the seconds float, once dividing -- and lands on the wrong double
+    for 27% of microsecond-precision timestamps (54,550 of 200,000 random
+    instants). Integer microseconds divided by an integer is rounded once, and
+    Python's int/int is correctly rounded, so this is the nearest double to the
+    true value -- which is the one Desktop stores.
+
+    It matters because the serial is routinely scaled back up:
+    MS_Perf_Analyzer's `[start] * 86400000` turned a 1-ULP serial error into
+    0.0005 ms, and `([end] - [start]) * 86400000` cancelled the two into
+    99.99945759773254 against Desktop's 100.00008624047041 -- a visible,
+    wrong duration.
+    """
+    exact = getattr(dt, 'oa_serial', None)
+    if isinstance(exact, float):
+        # The decoder kept the ORIGINAL stored double (see
+        # vertipaq_decoder.DAXDateTime): .NET ticks are 100 ns and Python's
+        # datetime resolves to 1 us, so reconstructing the serial from the
+        # datetime cannot round-trip a sub-microsecond timestamp at all.
+        return exact
+    d = dt - _DAX_EPOCH_DT
+    us = d.days * 86_400_000_000 + d.seconds * 1_000_000 + d.microseconds
+    return us / 86_400_000_000
+
+
 def _as_number(v):
     """Best-effort numeric coercion; None when the value isn't numeric.
 
@@ -89,7 +125,7 @@ def _as_number(v):
     if isinstance(v, (int, float)):
         return float(v)
     if isinstance(v, datetime):
-        return (v - datetime(1899, 12, 30)).total_seconds() / 86400.0
+        return _dax_serial(v)
     if isinstance(v, date):
         return float((v - date(1899, 12, 30)).days)
     if isinstance(v, str):
@@ -118,12 +154,201 @@ def _iso_serial(s: str):
     got = _as_datetime(s)
     if got is None:
         return None
-    return (got - datetime(1899, 12, 30)).total_seconds() / 86400.0
+    return _dax_serial(got)
 
 
 # A whole expression that is exactly one DAX string literal. Interior quotes
 # must be DOUBLED, which is how DAX escapes them.
 _FULL_STRING_LITERAL = re.compile(r'^"(?:[^"]|"")*"$')
+_STRING_LIT_RE = re.compile(r'"(?:[^"]|"")*"')
+
+# `'Online Sales'[Purchase date].[Date]` -- the auto date/time hierarchy
+# accessor. Resolved through the relationship to the hidden LocalDateTable, see
+# DAXEngine._expand_variation_refs.
+_VARIATION_REF_RE = re.compile(
+    r"(?:'([^']+)'|\b([A-Za-z_][\w ]*))\s*\[([^\]]+)\]\s*\.\s*\[([^\]]+)\]")
+
+
+_DAX_NUM_CTX = decimal.Context(prec=15, rounding=decimal.ROUND_HALF_EVEN)
+
+
+def _dax_number_str(v: float) -> str:
+    """Render a float the way DAX's implicit string conversion does.
+
+    Python's ``str`` prints the shortest round-trippable form (up to 17
+    significant digits); DAX prints at most 15 and then decides between fixed
+    and scientific notation by WIDTH, not by exponent alone. Both halves were
+    read off the live Desktop engine:
+
+        1/3          -> 0.333333333333333     (15 sig digits, fixed)
+        1561.09*1    -> 1561.09               (not 1561.0900000000001)
+        1/30         -> 3.33333333333333E-02  (16 decimals needed -> scientific)
+        1.234567E-9  -> 0.000000001234567     (15 decimals -> still fixed)
+        1.2345678E-9 -> 1.2345678E-09         (16 -> scientific)
+        5E-15        -> 0.000000000000005     boundary, fixed
+        5E-16        -> 5E-16                 boundary, scientific
+        123456789012345 -> 123456789012345    (15 integer digits, fixed)
+        1E+15        -> 1E+15                 (16 -> scientific)
+        4.0          -> 4                     0*-1.0 -> -0
+
+    So: round to 15 significant digits, then use fixed notation iff it needs at
+    most 15 decimal places AND at most 15 integer digits. This matters well
+    beyond cosmetics -- the corpus's SVG and HTML measures paste numbers into
+    markup, and Python's extra digits made four of them differ from Desktop by
+    exactly the surplus character count.
+    """
+    if math.isnan(v):
+        return '-nan(ind)'               # what Desktop's `&` produces
+    if math.isinf(v):
+        return 'inf' if v > 0 else '-inf'
+    if v == 0:
+        return '-0' if math.copysign(1.0, v) < 0 else '0'
+    d = _DAX_NUM_CTX.create_decimal(repr(v)).normalize(_DAX_NUM_CTX)
+    nsig = len(d.as_tuple().digits)
+    adj = d.adjusted()                   # floor(log10(|value|))
+    decimals = max(0, nsig - 1 - adj)
+    int_digits = adj + 1 if adj >= 0 else 1
+    if decimals <= 15 and int_digits <= 15:
+        return format(d, 'f')
+    mantissa = format(d.scaleb(-adj, _DAX_NUM_CTX), 'f')
+    return f"{mantissa}E{'+' if adj >= 0 else '-'}{abs(adj):02d}"
+
+
+_DAX_EPOCH = date(1899, 12, 30)          # DAX serial 0
+
+
+def _dax_time_str(t) -> str:
+    """A time as DAX renders it: 12-hour, no leading hour zero, AM/PM."""
+    if t is None:
+        return '12:00:00 AM'
+    hour12 = t.hour % 12 or 12
+    return f"{hour12}:{t.minute:02d}:{t.second:02d} " \
+           f"{'AM' if t.hour < 12 else 'PM'}"
+
+
+def _dax_datetime_str(v) -> str:
+    """Render a date/datetime the way DAX's `&` operator does.
+
+    Verified against Desktop:
+        DATE(2025,7,1)          -> 7/1/2025             (no leading zeros)
+        DATE(2025,12,25)        -> 12/25/2025
+        DATE(2025,7,1) + 0.5    -> 7/1/2025 12:00:00 PM
+        DATE(2025,7,1) + 0.25   -> 7/1/2025 6:00:00 AM
+        DATE(1899,12,30)        -> 12:00:00 AM          (serial 0 is a TIME)
+        TIME(13,5,9)            -> 1:05:09 PM
+
+    Python's str() gives "2025-07-01 00:00:00", which is why
+    Ecommerce_Conversion's [Date Range Selected Period] read
+    "2025-10-01 00:00:00 - 2025-10-04 00:00:00" where Desktop shows
+    "10/1/2025 - 10/4/2025".
+    """
+    if isinstance(v, datetime):
+        dpart, tpart = v.date(), v.time()
+    else:
+        dpart, tpart = v, None
+    if dpart == _DAX_EPOCH:
+        # A serial below 1 carries no date, so Desktop prints the time alone.
+        return _dax_time_str(tpart)
+    out = f"{dpart.month}/{dpart.day}/{dpart.year}"
+    if tpart and (tpart.hour or tpart.minute or tpart.second):
+        out += ' ' + _dax_time_str(tpart)
+    return out
+
+
+_FMT_RUN_RE = re.compile(r'[#0][#0,.]*')
+
+# FORMAT's named formats, as the ones Power BI itself generates.
+_NAMED_FORMATS = {
+    'general number': '',
+    'currency': '$#,##0.00',
+    'fixed': '0.00',
+    'standard': '#,##0.00',
+    'percent': '0.00%',
+    'scientific': '0.00E+00',
+}
+
+
+def _format_number(val: float, fmt: str):
+    """FORMAT() for a numeric custom format string. None = not understood.
+
+    Implements the parts of the VB/Excel numeric format that Power BI's own
+    generated measures actually use:
+
+      * `;`-separated sections -- positive;negative;zero. The negative section
+        carries its own sign, so the value is formatted from its magnitude.
+      * a `,` BETWEEN digit placeholders turns on thousands grouping;
+        a `,` immediately before the decimal point (or at the end of the digit
+        run) SCALES the value down by 1000 for each such comma. This is the one
+        that mattered: `FORMAT(2297200.9, "$#,##0,.0K")` is "$2,297.2K" in
+        Desktop, and reading the comma as grouping produced "$2,297,200.90K" --
+        which is how two GeoSales_Dashboard SVG measures came out longer than
+        Desktop's by exactly the surplus digits.
+      * `%` scales by 100 and stays in the output.
+      * `0` is a required digit (FORMAT(1,"000") is "001"), `#` an optional one,
+        so trailing `#` decimals drop rather than pad.
+      * anything outside the digit run is a literal prefix/suffix.
+    """
+    named = _NAMED_FORMATS.get(fmt.strip().lower())
+    if named is not None:
+        if named == '':
+            return _dax_number_str(val)
+        fmt = named
+    sections = fmt.split(';')
+    if val < 0 and len(sections) > 1 and sections[1]:
+        section, explicit_sign = sections[1], True
+        val = abs(val)
+    elif val == 0 and len(sections) > 2 and sections[2]:
+        section, explicit_sign = sections[2], True
+    else:
+        section, explicit_sign = sections[0], False
+    m = _FMT_RUN_RE.search(section)
+    if not m:
+        # A section with no digit placeholder is a pure literal, which is how
+        # the zero section is normally written: Desktop renders
+        # FORMAT(0, "0.0;(0.0);zero") as "zero".
+        return section if explicit_sign else None
+    prefix, run, suffix = section[:m.start()], m.group(0), section[m.end():]
+    if '%' in prefix or '%' in suffix:
+        val *= 100
+    int_pat, _dot, dec_pat = run.partition('.')
+    # Trailing commas on the integer pattern are scaling, not grouping.
+    scale = 0
+    while int_pat.endswith(','):
+        int_pat = int_pat[:-1]
+        scale += 1
+    if scale:
+        val /= 1000 ** scale
+    grouping = ',' in int_pat
+    int_pat = int_pat.replace(',', '')
+    max_dec = len(dec_pat)
+    min_dec = dec_pat.count('0')
+    min_int = int_pat.count('0')
+
+    neg = val < 0
+    # HALF AWAY FROM ZERO, not Python's banker's rounding. Desktop:
+    #   FORMAT(1234.5, "#,##0") -> 1,235   (banker's would give 1,234)
+    #   FORMAT(0.125,  "0.00")  -> 0.13    (banker's would give 0.12)
+    rounded = decimal.Decimal(repr(abs(val))).quantize(
+        decimal.Decimal(1).scaleb(-max_dec), rounding=decimal.ROUND_HALF_UP)
+    body = f"{rounded:,.{max_dec}f}" if grouping else f"{rounded:.{max_dec}f}"
+    int_part, _d, dec_part = body.partition('.')
+    # `#` decimals are optional: drop trailing zeros down to the required count.
+    while len(dec_part) > min_dec and dec_part.endswith('0'):
+        dec_part = dec_part[:-1]
+    digits = int_part.replace(',', '')
+    if len(digits) < min_int:
+        digits = '0' * (min_int - len(digits)) + digits
+        int_part = f"{int(digits):,}" if grouping else digits
+    elif not min_int and digits == '0':
+        # "#.##" shows ".5", not "0.5"; "0.##" keeps the leading zero.
+        int_part = ''
+    # A format that HAS a decimal section keeps its separator even when every
+    # optional decimal dropped -- Desktop renders FORMAT(2, "0.##") as "2.".
+    tail = ('.' + dec_part) if (max_dec and (dec_part or _dot)) else ''
+    out = prefix + int_part + tail + suffix
+    if neg and not explicit_sign:
+        out = '-' + out
+    return out
 
 
 def _concat_str(v):
@@ -132,14 +357,17 @@ def _concat_str(v):
     `str(v or '')` dropped every FALSY value, so `"0" & 0` produced "0" instead
     of "00" -- and the zero-padding idiom RIGHT("0" & n, 2) silently lost its
     pad on exactly the rows where n was 0. Only BLANK renders as empty.
-    A whole float renders without the ".0" tail, as Power BI does.
+    Numbers go through _dax_number_str, which reproduces Desktop's 15-digit
+    fixed/scientific choice instead of Python's 17-digit repr.
     """
     if v is None:
         return ''
     if isinstance(v, bool):
         return 'TRUE' if v else 'FALSE'
-    if isinstance(v, float) and v.is_integer():
-        return str(int(v))
+    if isinstance(v, float):
+        return _dax_number_str(v)
+    if isinstance(v, (datetime, date)):
+        return _dax_datetime_str(v)
     return str(v)
 
 
@@ -188,6 +416,11 @@ _BRACKET2_RE = re.compile(r'^\[[^\]]+\]$')
 _NOT_PREFIX_RE = re.compile(r'(?i)^not\s+(.+)$')
 _FUNC_CALL_RE = re.compile(r'([A-Za-z_]\w*)\s*\(')
 _TCOL_RE = re.compile(r"(?:'([^'\[\]]+)'|([^\W\d][\w .]*))\s*\[([^\]]+)\]$")
+# The same shape, anchored at BOTH ends. ALL/ALLSELECTED matched their argument
+# with an unanchored pattern, which quietly accepted only the first column of a
+# multi-column call and only the base column of `T[C].[Part]`.
+_WHOLE_TCOL_RE = re.compile(
+    r"^\s*(?:'([^'\[\]]+)'|([^\W\d][\w .]*))\s*\[([^\]]+)\]\s*$")
 _CALC_PRED_RE = re.compile(
     r"^'?([^'\[\]]+?)'?\s*\[([^\]]+)\]\s*(<>|>=|<=|>|<|=)\s*(.+)$", re.S)
 _VAR_KW_RE = re.compile(r'\bVAR\b', re.IGNORECASE)
@@ -423,7 +656,7 @@ def _analyze_expr(raw):
     if in_parts:
         steps.append((_P_IN, in_parts))
 
-    for op in ('<>', '>=', '<=', '>', '<', '='):
+    for op in ('==', '<>', '>=', '<=', '>', '<', '='):
         if len(DAXEngine._split_operators_scan(expr, op)) == 2:
             # Conditional: a comparison with a non-comparable side evaluates
             # to None at runtime and falls through to the next-tighter level.
@@ -515,7 +748,56 @@ def _as_datetime(v):
                 return datetime.strptime(s[:len(fmt) + 2].strip(), fmt)
             except ValueError:
                 continue
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        # A DATE IS A NUMBER in DAX -- the serial day count from 1899-12-30 --
+        # and a model can store one as Int64. IT_Support does exactly that:
+        # fact_IT_Support[Date] is ExplicitDataType 6, so the engine sees 45292
+        # where the date dimension holds a datetime. With no numeric branch here
+        # DATEDIFF returned BLANK on all 11,923 rows, which made five measures
+        # blank and turned `DATEDIFF(...) <= 3` into a filter that kept every
+        # row (BLANK <= 3 is TRUE), so [% Closed Within 3 Days] read 1.0 against
+        # Desktop's 0.7987. The fraction is kept, unlike _parse_date's int(),
+        # because a serial carries the time of day.
+        try:
+            return datetime(1899, 12, 30) + timedelta(days=float(v))
+        except (ValueError, OverflowError, OSError):
+            return None
     return None
+
+
+def _join_key_aliases(v) -> set:
+    """Every spelling a relationship join key can legitimately arrive in.
+
+    A model is free to store the SAME key with different storage types on the
+    two sides of a relationship. IT_Support does: dim_Date[Date] holds real
+    datetimes while fact_IT_Support[Date] is an Int64 Excel serial, so
+    str(dim value) is "2024-01-01 00:00:00" and str(fact value) is "45292" --
+    a per-side str() never matched, every dim_Date filter reduced the fact to
+    ZERO rows, and measures that should read 11,923 tickets read blank.
+
+    Aliases are only ever expanded on the DIMENSION side, which has few rows;
+    the fact side keeps its single str() lookup.
+    """
+    out = {str(v)}
+    if isinstance(v, (datetime, date)) and not isinstance(v, bool):
+        dt = v if isinstance(v, datetime) else datetime(v.year, v.month, v.day)
+        out.add(dt.isoformat())
+        out.add(dt.date().isoformat())
+        serial = _dax_serial(dt)
+        if serial == int(serial):
+            out.add(str(int(serial)))
+            out.add(str(float(serial)))
+    elif isinstance(v, (int, float)) and not isinstance(v, bool):
+        dt = _as_datetime(v)
+        if dt is not None:
+            out.add(str(dt))
+            out.add(dt.isoformat())
+            out.add(dt.date().isoformat())
+        if isinstance(v, float) and v == int(v):
+            out.add(str(int(v)))
+        elif isinstance(v, int):
+            out.add(str(float(v)))
+    return out
 
 
 def _blank_zero_of(other):
@@ -578,7 +860,27 @@ def _coerce_blanks_for_compare(left, right):
                     datetime(other.year, other.month, other.day)
                 return (as_dt, other_dt) if isinstance(left, str) \
                     else (other_dt, as_dt)
+    # A NUMBER against a DATE: a date IS a number in DAX (the serial day count
+    # from 1899-12-30), so a model that stores a date column as Int64 still
+    # compares equal to a DATE() literal. IT_Support stores
+    # fact_IT_Support[Date] as Int64, and `fact[Date] = DATE(2024,1,1)` matched
+    # nothing at all until this. Compared as serials, so the arithmetic stays
+    # exact.
+    l_isdt = isinstance(left, (datetime, date)) and not isinstance(left, bool)
+    r_isdt = isinstance(right, (datetime, date)) and not isinstance(right, bool)
+    l_isnum = isinstance(left, (int, float)) and not isinstance(left, bool)
+    r_isnum = isinstance(right, (int, float)) and not isinstance(right, bool)
+    if l_isdt and r_isnum:
+        return _to_serial(left), float(right)
+    if r_isdt and l_isnum:
+        return float(left), _to_serial(right)
     return left, right
+
+
+def _to_serial(v) -> float:
+    """A date/datetime as its DAX serial (days since 1899-12-30)."""
+    dt = v if isinstance(v, datetime) else datetime(v.year, v.month, v.day)
+    return _dax_serial(dt)
 
 
 def _compare(cell, op: str, target) -> bool:
@@ -840,6 +1142,9 @@ class DAXContext:
             self.date_table = self._auto_detect_date_table(tables, self.relationships)
         # Set during row iteration (SUMX, AVERAGEX, etc.)
         self._current_row: Optional[dict] = None
+        # Tables an enclosing ALL(Table)/REMOVEFILTERS(Table) made immune to
+        # cross-table filter propagation (see _get_cross_table_filters).
+        self._no_propagate: set = set()
         # Pre-transition (outer) context, set by _make_row_context. In real DAX a
         # row context does NOT filter — only CALCULATE / a measure invocation
         # performs the row->filter transition. This engine applies the transition
@@ -967,6 +1272,16 @@ class DAXContext:
         """
         if not self.filter_context:
             return []
+        if table_name in self._no_propagate:
+            # ALL(Table) / REMOVEFILTERS(Table) inside CALCULATE. Dropping only
+            # the DIRECT `Table.col` keys was not enough: a filter on a related
+            # dimension reaches this table through the relationship, and that
+            # propagated filter IS a filter on this table's columns, so ALL has
+            # to stop it too. MS_Covid_Tracking's
+            # `CALCULATE(MAX('COVID'[Date]), ALL('COVID'))` returned BLANK under
+            # a StateDim slice that matches no COVID row, where Desktop returns
+            # the global max.
+            return []
 
         tbl = self.tables.get(table_name)
         if not tbl:
@@ -1048,7 +1363,9 @@ class DAXContext:
             # dimension selection must filter the fact to zero rows (BLANK), not
             # be dropped (which would leave the fact unfiltered -> grand total).
             # Mirrors the multi-hop path's empty-set handling.
-            allowed_keys = set(str(r[dim_join_idx]) for r in filtered_dim_rows)
+            allowed_keys = set()
+            for r in filtered_dim_rows:
+                allowed_keys |= _join_key_aliases(r[dim_join_idx])
             result_filters.append((allowed_keys, fact_join_idx))
 
         return result_filters
@@ -1105,7 +1422,9 @@ class DAXContext:
             cur_idx = self._find_col_idx(frontier_tbl['columns'], col_cur)
             if cur_idx < 0:
                 return None
-            allowed_keys = set(str(r[cur_idx]) for r in frontier_rows)
+            allowed_keys = set()
+            for r in frontier_rows:
+                allowed_keys |= _join_key_aliases(r[cur_idx])
             nxt_tbl = self.tables.get(nxt_name)
             if not nxt_tbl:
                 return None
@@ -1116,9 +1435,12 @@ class DAXContext:
                 # Resolve the unknown member: keys present on the far side that
                 # match no row of this dimension. Adding them to allowed_keys
                 # selects exactly the rows DAX attributes to the blank row.
-                member_keys = {str(r[cur_idx]) for r in frontier_tbl['rows']}
-                allowed_keys |= {str(r[nxt_idx]) for r in nxt_tbl['rows']
-                                 if str(r[nxt_idx]) not in member_keys}
+                member_keys = set()
+                for r in frontier_tbl['rows']:
+                    member_keys |= _join_key_aliases(r[cur_idx])
+                for r in nxt_tbl['rows']:
+                    if str(r[nxt_idx]) not in member_keys:
+                        allowed_keys |= _join_key_aliases(r[nxt_idx])
             first_hop = False
             if nxt_name == target_table:
                 # Final hop: emit the filter for the fact table (empty set is OK).
@@ -1398,6 +1720,7 @@ class DAXContext:
         ctx = DAXContext(self.tables, self.measures, self.date_table,
                          self.date_column, new_filters, self.relationships)
         ctx._filter_idx_cache = self._filter_idx_cache
+        ctx._no_propagate = set(self._no_propagate)
         # Share the measure memo by REFERENCE across the derivation family. Its
         # key already carries a filter-context fingerprint, so entries are
         # scoped to the context that produced them and cannot leak between
@@ -1413,6 +1736,7 @@ class DAXContext:
         ctx = DAXContext(self.tables, self.measures, self.date_table,
                          self.date_column, new_filters, self.relationships)
         ctx._filter_idx_cache = self._filter_idx_cache
+        ctx._no_propagate = set(self._no_propagate)
         return ctx
 
 
@@ -1443,6 +1767,15 @@ class DAXEngine:
         self._deadline = None
         self._eval_depth = 0
         self._time_counter = 0
+        # Bare `[Column]` -> owning table, memoized per model (see
+        # _resolve_bare_column): the lookup scans every table's column list and
+        # runs inside per-row iteration.
+        self._bare_col_cache: dict = {}
+        # `T[C].[Part]` -> `'LocalDateTable_x'[Part]`, memoized per expression.
+        self._variation_cache: dict = {}
+        # Filter context of the OUTERMOST measure -- the query/slicer selection
+        # that ALLSELECTED restores (see _selected_ctx).
+        self._query_filters: dict | None = None
         self._func_map = {
             # --- Aggregation ---
             'SUM': self._fn_sum,
@@ -1452,8 +1785,11 @@ class DAXEngine:
             'MIN': self._fn_min,
             'MAX': self._fn_max,
             'DISTINCTCOUNT': self._fn_distinctcount,
+            'DISTINCTCOUNTNOBLANK': self._fn_distinctcountnoblank,
+            'COUNTA': self._fn_counta,
             'PRODUCT': self._fn_product,
             'MEDIAN': self._fn_median,
+            'MEDIANX': self._fn_medianx,
             # --- Iteration ---
             'SUMX': self._fn_sumx,
             'MAXX': self._fn_maxx,
@@ -1466,6 +1802,7 @@ class DAXEngine:
             'DIVIDE': self._fn_divide,
             'ABS': self._fn_abs,
             'ROUND': self._fn_round,
+            'MROUND': self._fn_mround,
             'ROUNDDOWN': self._fn_rounddown,
             'ROUNDUP': self._fn_roundup,
             'INT': self._fn_int,
@@ -1524,6 +1861,10 @@ class DAXEngine:
             'HASONEVALUE': self._fn_hasonevalue,
             'HASONEFILTER': self._fn_hasonefilter,
             'ISFILTERED': self._fn_isfiltered,
+            'ISINSCOPE': self._fn_isinscope,
+            'ERROR': self._fn_error,
+            'FIRSTNONBLANK': self._fn_firstnonblank,
+            'LASTNONBLANK': self._fn_lastnonblank,
             'ISCROSSFILTERED': self._fn_iscrossfiltered,
             'USERELATIONSHIP': self._fn_userelationship,
             'EARLIER': self._fn_earlier,
@@ -1640,6 +1981,24 @@ class DAXEngine:
 
     def evaluate_measure(self, measure_name: str, ctx: DAXContext) -> Any:
         """Evaluate a named measure in the given context."""
+        # DAX identifiers are CASE-INSENSITIVE. Canonicalize to the model's own
+        # spelling before anything else, so the cache key, the circular-reference
+        # stack and the definition lookup all agree.
+        #
+        # Without this, `[TOTAL UNITS]` against a measure named `Total Units`
+        # passed the case-insensitive existence check and then missed the exact
+        # dict lookup below, returning a SILENT BLANK. That single misspelling in
+        # MS_Competitive_Marketing blanked nine measures: the whole
+        # SAMEPERIODLASTYEAR family (1,299,599 and 49,832 read as blank), the
+        # variance measures built on them, and @Indicator03, which answered 2
+        # where Desktop answers 1. The fully-qualified `Table[Measure]` path
+        # already had this fallback; the bare `[Measure]` path did not.
+        if measure_name not in ctx.measures:
+            lowered = measure_name.lower()
+            for _name in ctx.measures:
+                if _name.lower() == lowered:
+                    measure_name = _name
+                    break
         # Check cache
         try:
             # A filter value is a list (In-set) or a dict (structured
@@ -1674,10 +2033,19 @@ class DAXEngine:
         if expr is None:
             ctx._eval_stack.discard(measure_name)
             return None
+        # Resolve auto date/time hierarchy accessors once, here, so every
+        # downstream consumer -- including the ones that regex the raw argument
+        # text (_fn_dateadd, _fn_all) rather than evaluating it -- sees a plain
+        # `'Table'[Column]` reference.
+        expr = self._expand_variation_refs(expr, ctx)
 
         # Engine-level wall-clock deadline, set once at the true outermost
         # measure and shared across every sub-context iterators create.
         self._eval_depth += 1
+        if self._eval_depth == 1:
+            # Snapshot what ALLSELECTED must restore, before any CALCULATE in
+            # this measure has had a chance to modify the context.
+            self._query_filters = dict(ctx.filter_context)
         if self._eval_depth == 1:
             self._deadline = time.monotonic() + self._max_eval_seconds
         # A measure invocation IS the row->filter context transition (implicit
@@ -1837,6 +2205,15 @@ class DAXEngine:
                 if (data not in ctx.measures and ctx._current_row
                         and data in ctx._current_row):
                     return ctx._current_row[data]
+                if not self._measure_exists(data, ctx):
+                    # Not a measure: DAX resolves a bare [Column] against the
+                    # model. Hand back the same (table, column) marker a
+                    # qualified reference produces, so the plain aggregates
+                    # (SUM/MIN/MAX/...) pick it up through their existing
+                    # fallback instead of aggregating a missing measure to 0.
+                    col = self._resolve_bare_column(data, ctx)
+                    if col is not None:
+                        return col
                 return self.evaluate_measure(data, ctx)
             if kind == _P_MAYBEVAR:
                 if var_scope:
@@ -1872,6 +2249,10 @@ class DAXEngine:
                 if (data not in ctx.measures and ctx._current_row
                         and data in ctx._current_row):
                     return ctx._current_row[data]
+                if not self._measure_exists(data, ctx):
+                    col = self._resolve_bare_column(data, ctx)
+                    if col is not None:
+                        return col
                 return self.evaluate_measure(data, ctx)
             if kind == _P_NONE:
                 return None
@@ -2112,7 +2493,7 @@ class DAXEngine:
         """
         parts: list = []
         cur: list = []
-        dp = db = 0
+        dp = db = dbr = 0
         insq = indq = False
         i, n = 0, len(expr)
         while i < n:
@@ -2133,7 +2514,17 @@ class DAXEngine:
                 db += 1; cur.append(ch); i += 1; continue
             if ch == ']':
                 db -= 1; cur.append(ch); i += 1; continue
-            if dp == 0 and db == 0 and expr[i:i + len(op)] == op:
+            # Braces nest too. Without this a table constructor's contents were
+            # scanned as top level, so `x IN { _A + 1, _A + 2 }` also produced a
+            # bogus `+` split. It was harmless only because the IN step is tried
+            # first; the moment IN falls through (an unparseable set) the
+            # fall-back computed arithmetic straight across the IN operator.
+            # _split_toplevel_scan and _split_in_scan already track them.
+            if ch == '{':
+                dbr += 1; cur.append(ch); i += 1; continue
+            if ch == '}':
+                dbr -= 1; cur.append(ch); i += 1; continue
+            if dp == 0 and db == 0 and dbr == 0 and expr[i:i + len(op)] == op:
                 prev = ''.join(cur)
                 nxt = expr[i + len(op):i + len(op) + 1]
                 skip = False
@@ -2143,8 +2534,11 @@ class DAXEngine:
                         skip = True                       # unary sign
                     elif len(p) >= 2 and p[-1] in 'eE' and p[-2].isdigit():
                         skip = True                       # exponent 1e-5
-                elif op == '=' and prev[-1:] in ('<', '>'):
-                    skip = True                           # part of <= / >=
+                elif op == '=' and (prev[-1:] in ('<', '>', '=') or nxt == '='):
+                    # part of <= / >= / <> ... or one half of the STRICT
+                    # equality operator ==, which is its own operator and must
+                    # not be shredded into two single '=' splits.
+                    skip = True
                 elif op == '<' and nxt in ('=', '>'):
                     skip = True                           # part of <= / <>
                 elif op == '>' and nxt == '=':
@@ -2241,7 +2635,24 @@ class DAXEngine:
         acc = self._eval_expr(parts[0].strip(), ctx, var_scope)
         for p in parts[1:]:
             rhs = self._eval_expr(p.strip(), ctx, var_scope)
-            # DAX: BLANK is 0 in arithmetic.
+            # BLANK acts as 0 for + and -, but not for * and /. Every rule
+            # below was read off the live Desktop engine (msmdsrv), not the
+            # docs:
+            #   BLANK()+100  -> 100        BLANK()-100  -> -100
+            #   BLANK()*100  -> BLANK      100*BLANK()  -> BLANK
+            #   BLANK()*0    -> BLANK      BLANK()*BLANK() -> BLANK
+            #   BLANK()/100  -> BLANK      BLANK()/BLANK() -> BLANK
+            #   100/BLANK()  -> inf        -100/BLANK() -> -inf
+            #   5/0          -> inf        0/0 and 0/BLANK() -> nan
+            # We folded a blank to 0 for * and /, so MS_Sales_Returns'
+            # [% Return Rate Value] (SELECTEDVALUE(...)/100 over a blank) read
+            # 0.0 where Desktop is blank, as did the WIF measures.
+            if op == '*' and (acc is None or rhs is None):
+                return None
+            if op == '/' and acc is None:
+                # A blank NUMERATOR wins over everything, including a blank
+                # denominator -- BLANK()/BLANK() is BLANK, not nan.
+                return None
             left = 0 if acc is None else acc
             right = 0 if rhs is None else rhs
             if not (isinstance(left, (int, float))
@@ -2261,7 +2672,16 @@ class DAXEngine:
                 acc = left * right
             else:
                 if right == 0:
-                    return None
+                    # Desktop does NOT blank a divide-by-zero on the bare `/`
+                    # operator (that is what DIVIDE() is for) -- it returns an
+                    # IEEE special, and ISBLANK() on it is FALSE:
+                    #   5/0 -> inf   -100/BLANK() -> -inf   0/0 -> nan
+                    # Returning None here made `[x] / [y]` blank where Desktop
+                    # shows infinity, which also flipped every downstream
+                    # comparison against it.
+                    if left == 0:
+                        return float('nan')
+                    return float('inf') if left > 0 else float('-inf')
                 acc = left / right
         return acc
 
@@ -2336,18 +2756,37 @@ class DAXEngine:
         return any(_compare(lval, '=', v) for v in values)
 
     def _eval_comparison(self, expr: str, ctx: DAXContext, var_scope: dict | None = None) -> Any:
-        """Evaluate comparison operators."""
-        for op_str, op_fn in [('<>', lambda a, b: a != b), ('>=', lambda a, b: a >= b),
-                               ('<=', lambda a, b: a <= b), ('>', lambda a, b: a > b),
-                               ('<', lambda a, b: a < b), ('=', lambda a, b: a == b)]:
+        """Evaluate comparison operators.
+
+        `==` is checked FIRST and is STRICT: it is the one comparison that does
+        NOT coerce a blank. Desktop, side by side:
+
+            BLANK() =  0   TRUE        BLANK() ==  0        FALSE
+            BLANK() =  ""  TRUE        BLANK() ==  ""       FALSE
+                                       BLANK() ==  BLANK()  TRUE
+
+        It was not implemented at all, so `1==1` evaluated to BLANK and
+        MS_Covid_Tracking's [Drill-through button text] --
+        `IF(SELECTEDVALUE(StateDim[State],0)==0, ...)` -- took the wrong branch
+        and then concatenated a 57-row table into the string.
+        """
+        for op_str, op_fn in [('==', lambda a, b: a == b),
+                              ('<>', lambda a, b: a != b), ('>=', lambda a, b: a >= b),
+                              ('<=', lambda a, b: a <= b), ('>', lambda a, b: a > b),
+                              ('<', lambda a, b: a < b), ('=', lambda a, b: a == b)]:
             parts = self._split_operators(expr, op_str)
             if len(parts) == 2:
                 left = self._eval_expr(parts[0].strip(), ctx, var_scope)
                 right = self._eval_expr(parts[1].strip(), ctx, var_scope)
-                # BLANK does not propagate through a comparison in DAX; it
-                # takes the zero of the other operand's type. See
-                # _blank_zero_of for the Desktop-verified table.
-                left, right = _coerce_blanks_for_compare(left, right)
+                if op_str == '==':
+                    # Strict: a blank equals only a blank.
+                    if left is None or right is None:
+                        return left is None and right is None
+                else:
+                    # BLANK does not propagate through a comparison in DAX; it
+                    # takes the zero of the other operand's type. See
+                    # _blank_zero_of for the Desktop-verified table.
+                    left, right = _coerce_blanks_for_compare(left, right)
                 if left is not None and right is not None:
                     try:
                         return op_fn(left, right)
@@ -2371,6 +2810,166 @@ class DAXEngine:
         if m:
             return m.group(1).strip(), m.group(2).strip()
         return None
+
+    def _expand_variation_refs(self, expr: str, ctx: DAXContext) -> str:
+        """Rewrite `'T'[C].[Part]` to the auto-date table column it names.
+
+        The auto date/time hierarchy stores its columns in a hidden
+        `LocalDateTable_<guid>` joined to `T[C]`, and `.[Date]` / `.[Year]` /
+        `.[Month]` read THAT table. Nothing here understood the accessor, so:
+
+          * `_DATEADD_ARGS_RE` did not match, `_fn_dateadd` returned its
+            unresolved marker, and the shift silently did nothing --
+            MS_Blog_2020_Sep's [Revenue YoY%] read 0.0 against Desktop's 0.6253;
+          * `_fn_all`'s unanchored pattern read `ALL('Calendar'[Date].[Month])`
+            as `ALL('Calendar'[Date])`, removing filters from the wrong column.
+
+        The mapping is not guessed: it is the ACTIVE relationship from `T[C]` to
+        a date table that actually has a column called `Part`. With no such
+        relationship the text is left alone, so an unknown accessor stays
+        visibly unresolved instead of resolving to the wrong column.
+        """
+        if '].[' not in expr.replace(' ', ''):
+            return expr
+        key = (expr, id(ctx.relationships))
+        hit = self._variation_cache.get(key, _MISSING)
+        if hit is not _MISSING:
+            return hit
+
+        def _one(seg: str) -> str:
+            def _sub(m):
+                tname = (m.group(1) or m.group(2) or '').strip()
+                col, part = m.group(3).strip(), m.group(4).strip()
+                for rel in (ctx.relationships or []):
+                    if (str(rel.get('FromTable')) == tname
+                            and str(rel.get('FromColumn')) == col
+                            and rel.get('IsActive', 1)):
+                        to_t = str(rel.get('ToTable'))
+                        tbl = ctx.tables.get(to_t)
+                        if tbl and ctx._find_col_idx(
+                                tbl.get('columns') or [], part) >= 0:
+                            return f"'{to_t}'[{part}]"
+                return m.group(0)
+            return _VARIATION_REF_RE.sub(_sub, seg)
+
+        # Only outside string literals: an SVG measure can carry "].[" in text.
+        out, last = [], 0
+        for m in _STRING_LIT_RE.finditer(expr):
+            out.append(_one(expr[last:m.start()]))
+            out.append(m.group(0))
+            last = m.end()
+        out.append(_one(expr[last:]))
+        result = ''.join(out)
+        self._variation_cache[key] = result
+        return result
+
+    def _selected_ctx(self, ctx: DAXContext) -> DAXContext:
+        """The filter context ALLSELECTED restores.
+
+        ALLSELECTED keeps the filters that came from OUTSIDE the measure --
+        the query/slicer selection -- and drops the ones CALCULATE applied
+        inside it. This engine snapshots the outermost measure's filter context
+        for exactly that purpose. Approximating ALLSELECTED as VALUES (which is
+        what it did) meant it never removed a filter on its own column, so
+        `CALCULATE(COUNTROWS(ALLSELECTED(T[Queue])), T[Queue]="IT Support")`
+        answered 1 where Desktop answers 10.
+        """
+        outer = self._query_filters
+        if outer is None or outer == ctx.filter_context:
+            return ctx
+        return DAXContext(ctx.tables, ctx.measures, ctx.date_table,
+                          ctx.date_column, dict(outer), ctx.relationships)
+
+    def _multi_column_all(self, ref: str, ctx: DAXContext, selected: bool):
+        """ALL/ALLSELECTED over SEVERAL columns -> their distinct combinations.
+
+        Both used an UNANCHORED regex on the raw argument text, so every column
+        after the first was silently dropped:
+        `ALLSELECTED(fact[Cluster_ID], fact[Queue])` returned the 8 Cluster_IDs
+        instead of the 74 real pairs, and a SUMMARIZE over it then found no
+        [Queue] column and produced no rows at all.
+
+        Returns None when this is not the multi-column shape, so the callers
+        fall through to their single-column and table-level paths.
+        """
+        args = self._split_args(ref)
+        if len(args) < 2:
+            return None
+        cols = []
+        for a in args:
+            m = _WHOLE_TCOL_RE.match(a.strip())
+            if not m:
+                return None
+            cols.append(((m.group(1) or m.group(2) or '').strip(),
+                         m.group(3).strip()))
+        table_name = cols[0][0]
+        if any(t != table_name for t, _c in cols):
+            return None            # cross-table combinations are not modelled
+        tbl = ctx.tables.get(table_name)
+        if not tbl:
+            return None
+        idxs = [ctx._find_col_idx(tbl['columns'], c) for _t, c in cols]
+        if any(i < 0 for i in idxs):
+            return None
+        rows = (tbl['rows'] if not selected
+                else self._selected_ctx(ctx).get_filtered_rows(table_name))
+        seen, out = set(), []
+        for row in rows:
+            key = tuple(row[i] for i in idxs)
+            if key in seen:
+                continue
+            seen.add(key)
+            rd = {'__table__': table_name, '__row__': True}
+            for (_t, c), v in zip(cols, key):
+                rd[c] = v
+            out.append(rd)
+        return out
+
+    @staticmethod
+    def _measure_exists(name: str, ctx: DAXContext) -> bool:
+        """Is `name` a measure in this model? Case-insensitively, like DAX.
+
+        Gates the bare-[Column] fallback: a measure ALWAYS wins over a column of
+        the same name, so a model that has both keeps its old behaviour.
+        """
+        if name in ctx.measures:
+            return True
+        lowered = name.lower()
+        return any(m.lower() == lowered for m in ctx.measures)
+
+    def _resolve_bare_column(self, name: str, ctx: DAXContext):
+        """A bare ``[Column]`` reference -> a (table, column) marker.
+
+        DAX lets a measure reference a column without the table qualifier, and
+        Power BI's own generated measures rely on it. MS_Corporate_Spend's
+        [Amount] is literally ``TOTALYTD(SUM([Value]), 'Date'[Date])*.3``:
+        reading [Value] as a MISSING MEASURE made SUM return 0, so all 15
+        measures in that file read 0.0 against Desktop's real totals
+        (Amount alone is 1,261,102,214.20). MS_Perf_Analyzer's
+        ``FILTER('Events', [component] = "...")`` failed the same way.
+
+        The current row's own table wins, then a model-wide lookup. Ambiguity is
+        NOT guessed at: a name owned by more than one table resolves to nothing,
+        which is also what Desktop does (it refuses the expression rather than
+        picking a table).
+        """
+        row = ctx._current_row
+        if row:
+            rt = row.get('__table__')
+            rtbl = ctx.tables.get(rt) if rt else None
+            if rtbl is not None and ctx._find_col_idx(rtbl.get('columns') or [],
+                                                      name) >= 0:
+                return (rt, name)
+        # Memoized per model: this runs inside per-row iteration, and scanning
+        # every table's column list on each row was measurable.
+        key = (id(ctx.tables), name)
+        hit = self._bare_col_cache.get(key, _MISSING)
+        if hit is _MISSING:
+            owners = [tn for tn, t in ctx.tables.items()
+                      if ctx._find_col_idx(t.get('columns') or [], name) >= 0]
+            hit = (owners[0], name) if len(owners) == 1 else None
+            self._bare_col_cache[key] = hit
+        return hit
 
     def _charge_eval(self, ctx: DAXContext) -> None:
         """Charge one unit of the eval budget (same accounting _eval_expr does).
@@ -2405,7 +3004,7 @@ class DAXEngine:
         if col is None:
             ref = self._eval_expr(args_str.strip(), ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
-                return 0
+                return None
             col = ref
         values = self._agg_ctx(ctx).get_column_data(*col)
         nums = [v for v in values if isinstance(v, (int, float))]
@@ -2419,11 +3018,17 @@ class DAXEngine:
         if col is None:
             ref = self._eval_expr(args_str.strip(), ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
-                return 0
+                return None
             col = ref
         values = [v for v in self._agg_ctx(ctx).get_column_data(*col)
                   if isinstance(v, (int, float))]
-        return sum(values) / len(values) if values else 0
+        # Every aggregate is BLANK over an empty set, never 0. Verified on
+        # Desktop with CALCULATE(<agg>, FILTER(ALL(T), FALSE())): COUNT,
+        # COUNTA, COUNTROWS, COUNTBLANK, DISTINCTCOUNT, MIN, COUNTX,
+        # AVERAGEX, SUMX, MINX and MEDIANX all came back BLANK. A 0 is the
+        # worst kind of wrong here: it reads as a measured zero, and it is
+        # what ISBLANK() is testing for.
+        return sum(values) / len(values) if values else None
 
     def _fn_count(self, args_str: str, ctx: DAXContext) -> Any:
         col = self._parse_column_ref(args_str)
@@ -2432,20 +3037,21 @@ class DAXEngine:
         if col is None:
             ref = self._eval_expr(args_str.strip(), ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
-                return 0
+                return None
             col = ref
-        return len([v for v in self._agg_ctx(ctx).get_column_data(*col)
-                    if v is not None])
+        n = len([v for v in self._agg_ctx(ctx).get_column_data(*col)
+                 if v is not None])
+        return n or None
 
     def _fn_countrows(self, args_str: str, ctx: DAXContext) -> Any:
         # Try evaluating as an expression first (handles TOPN, FILTER, etc.)
         result = self._eval_expr(args_str.strip(), ctx)
         if isinstance(result, list):
-            return len(result)
+            return len(result) or None
         # Fall back to table name lookup
         table_name = args_str.strip().strip("'")
         rows = ctx.get_filtered_rows(table_name)
-        return len(rows)
+        return len(rows) or None
 
     @staticmethod
     def _comparable_values(data: Any) -> list:
@@ -2478,7 +3084,9 @@ class DAXEngine:
             return None
         values = self._comparable_values(
             self._agg_ctx(ctx).get_column_data(*col))
-        return pick(values) if values else 0
+        # MIN/MAX over no rows is BLANK, like every other aggregate
+        # (Desktop: CALCULATE(MIN(T[c]), FILTER(ALL(T), FALSE())) is BLANK).
+        return pick(values) if values else None
 
     @staticmethod
     def _minmax_pair(a, b, pick):
@@ -2488,7 +3096,7 @@ class DAXEngine:
             if isinstance(a, kinds) and isinstance(b, kinds) \
                     and not isinstance(a, bool) and not isinstance(b, bool):
                 return pick(a, b)
-        return 0
+        return None
 
     def _fn_min(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
@@ -2500,7 +3108,7 @@ class DAXEngine:
             return self._minmax_pair(
                 self._eval_expr(args[0].strip(), ctx),
                 self._eval_expr(args[1].strip(), ctx), min)
-        return 0
+        return None
 
     def _fn_max(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
@@ -2512,7 +3120,7 @@ class DAXEngine:
             return self._minmax_pair(
                 self._eval_expr(args[0].strip(), ctx),
                 self._eval_expr(args[1].strip(), ctx), max)
-        return 0
+        return None
 
     def _fn_distinctcount(self, args_str: str, ctx: DAXContext) -> Any:
         col = self._parse_column_ref(args_str)
@@ -2521,10 +3129,47 @@ class DAXEngine:
         if col is None:
             ref = self._eval_expr(args_str.strip(), ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
-                return 0
+                return None
             col = ref
         values = self._agg_ctx(ctx).get_column_data(*col)
-        return len(set(str(v) for v in values if v is not None))
+        # DAX COUNTS THE BLANK as one distinct value -- that is exactly what
+        # DISTINCTCOUNTNOBLANK exists to avoid. MS_Blog_2020_Sep's
+        # DISTINCTCOUNT('Online Sales'[Customer]) is 119387 in Desktop over a
+        # column with 119386 distinct customers and 8 blank rows; we reported
+        # 119386 by dropping the blank.
+        distinct = {str(v) for v in values if v is not None}
+        n = len(distinct) + (1 if any(v is None for v in values) else 0)
+        return n or None
+
+    def _fn_distinctcountnoblank(self, args_str: str, ctx: DAXContext) -> Any:
+        """DISTINCTCOUNTNOBLANK(column) — distinct values, blank NOT counted."""
+        col = self._parse_column_ref(args_str)
+        if col is not None:
+            self._charge_eval(ctx)
+        if col is None:
+            ref = self._eval_expr(args_str.strip(), ctx)
+            if not (isinstance(ref, tuple) and len(ref) == 2):
+                return None
+            col = ref
+        values = self._agg_ctx(ctx).get_column_data(*col)
+        return len({str(v) for v in values if v is not None}) or None
+
+    def _fn_counta(self, args_str: str, ctx: DAXContext) -> Any:
+        """COUNTA(column) — count of non-blank values, ANY type.
+
+        COUNT is numeric-oriented; COUNTA counts text and logicals too. Both
+        end up as "rows where the column is not blank" here.
+        """
+        col = self._parse_column_ref(args_str)
+        if col is not None:
+            self._charge_eval(ctx)
+        if col is None:
+            ref = self._eval_expr(args_str.strip(), ctx)
+            if not (isinstance(ref, tuple) and len(ref) == 2):
+                return None
+            col = ref
+        return len([v for v in self._agg_ctx(ctx).get_column_data(*col)
+                    if v is not None]) or None
 
     def _fn_divide(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
@@ -2534,10 +3179,15 @@ class DAXEngine:
         denominator = self._eval_expr(args[1].strip(), ctx)
         # DAX: the alternate result defaults to BLANK (None), not 0.
         alt = self._eval_expr(args[2].strip(), ctx) if len(args) > 2 else None
-        # DAX treats a BLANK numerator as 0; a BLANK/zero denominator yields the
-        # alternate (BLANK by default) — NOT the numerator.
+        # A BLANK NUMERATOR makes the whole division BLANK, and it does NOT
+        # fall back to the alternate result. Verified against Desktop:
+        #   DIVIDE(BLANK(), 100)     -> BLANK
+        #   DIVIDE(BLANK(), 100, 42) -> BLANK   (not 42)
+        #   DIVIDE(BLANK(), BLANK()) -> BLANK
+        # Coercing the numerator to 0 returned 0.0 and made MS_Sales_Returns'
+        # blank-driven ratios read as a real zero.
         if numerator is None:
-            numerator = 0
+            return None
         if isinstance(numerator, (int, float)) and isinstance(denominator, (int, float)):
             if denominator == 0:
                 return alt
@@ -2699,12 +3349,30 @@ class DAXEngine:
                 if inner_match:
                     table = inner_match.group(1).strip()
                     col = inner_match.group(2)
+                    selected = filter_arg.upper().startswith('ALLSELECTED')
                     if col:
                         new_ctx = new_ctx.without_filters([f"{table}.{col}"])
+                    elif selected:
+                        # ALLSELECTED(Table) RESTORES the query/slicer context;
+                        # it does not clear it. Drop only what a CALCULATE inside
+                        # this measure added, and leave propagation from related
+                        # tables alone -- MS_Perf_Analyzer's
+                        # `CALCULATE(MIN(EventEdges[timestampMs]),
+                        #  ALLSELECTED(EventEdges))` must still see the
+                        # component filter that reaches EventEdges through
+                        # EventTypes, so the measure reads 0, not 440.
+                        outer = self._query_filters or {}
+                        new_ctx = new_ctx.without_filters(
+                            [k for k in new_ctx.filter_context
+                             if k.startswith(f"{table}.") and k not in outer])
                     else:
-                        # Remove all filters for this table
+                        # ALL(Table) / REMOVEFILTERS(Table) clear the table
+                        # outright -- both the DIRECT `Table.col` keys and the
+                        # ones a related dimension propagates onto it, which are
+                        # equally filters on this table's columns.
                         keys_to_remove = [k for k in new_ctx.filter_context if k.startswith(f"{table}.")]
                         new_ctx = new_ctx.without_filters(keys_to_remove)
+                        new_ctx._no_propagate = new_ctx._no_propagate | {table}
                 continue
 
             # DATEADD
@@ -2754,6 +3422,18 @@ class DAXEngine:
             fa_upper = filter_arg.upper().split('(')[0].strip()
             if fa_upper in ti_prefixes:
                 result = self._eval_expr(filter_arg, new_ctx)
+                if isinstance(result, list) and not result:
+                    # A period that falls OUTSIDE the date table is an empty
+                    # filter table, and an empty filter table means BLANK -- the
+                    # same rule the generic FILTER branch below documents.
+                    # Skipping it applied no filter at all and returned the
+                    # GRAND TOTAL: MS_Sales_Returns' Calendar spans
+                    # 2019-01-01..06-30, so PREVIOUSMONTH of the first month has
+                    # no rows and Desktop shows [Net Sales PM] blank, while we
+                    # reported the full 1,248,013 -- and every Variance /
+                    # Indicator / "Last 2 Months" measure built on it inherited
+                    # that wrong number.
+                    return None
                 if isinstance(result, list) and result:
                     # Time-intelligence returns list of date-row dicts
                     first = result[0]
@@ -3103,11 +3783,15 @@ class DAXEngine:
         table expression (e.g. ALL('table'[column])) returns all distinct
         values of that column ignoring any active filters."""
         ref = args_str.strip()
+        multi = self._multi_column_all(ref, ctx, selected=False)
+        if multi is not None:
+            return multi
         # Try to parse as a column reference: 'table'[column]
-        col_match = re.match(r"'?([^'\[\]]+)'?\s*\[([^\]]+)\]", ref)
+        col_match = _WHOLE_TCOL_RE.match(ref)
         if col_match:
-            table_name = col_match.group(1).strip()
-            col_name = col_match.group(2).strip()
+            # groups: 'quoted name' | bare name | column
+            table_name = (col_match.group(1) or col_match.group(2) or '').strip()
+            col_name = col_match.group(3).strip()
             # Return all values ignoring filters — use raw table data
             tbl = ctx.tables.get(table_name)
             if tbl:
@@ -3501,50 +4185,11 @@ class DAXEngine:
                     out += fmt_str[i]
                     i += 1
             return out
-        if fmt and isinstance(val, (int, float)):
-            # Handle common DAX format strings
-            fmt_str = str(fmt)
-            # "0" or "0.0" or "#,##0" style — count decimal places
-            if re.match(r'^[#0,.]+$', fmt_str):
-                # Count digits after decimal point
-                if '.' in fmt_str:
-                    decimals = len(fmt_str.split('.')[-1])
-                else:
-                    decimals = 0
-                use_comma = ',' in fmt_str
-                # Leading zeros: each '0' LEFT of the decimal point is a digit
-                # that must always be shown. FORMAT(1, "000") is "001", not
-                # "1" -- the padded form is how Power BI's own "New group"
-                # and sort-key columns are built, so getting it wrong changes
-                # sort order as well as display.
-                min_int = fmt_str.split('.')[0].count('0')
-                neg = val < 0
-                body = (f"{abs(val):,.{decimals}f}" if use_comma
-                        else f"{abs(val):.{decimals}f}")
-                int_part, _dot, dec_part = body.partition('.')
-                digits = int_part.replace(',', '')
-                if len(digits) < min_int:
-                    digits = '0' * (min_int - len(digits)) + digits
-                    int_part = (f"{int(digits):,}" if use_comma else digits)
-                formatted = int_part + ('.' + dec_part if dec_part else '')
-                return ('-' + formatted) if neg else formatted
-            # "0.0%" style
-            if fmt_str.endswith('%'):
-                inner_fmt = fmt_str[:-1]
-                if '.' in inner_fmt:
-                    decimals = len(inner_fmt.split('.')[-1])
-                else:
-                    decimals = 0
-                return f"{val * 100:.{decimals}f}%"
-            # "$#,##0" or "$#,##0.00" style
-            if fmt_str.startswith('$'):
-                inner = fmt_str[1:]
-                if '.' in inner:
-                    decimals = len(inner.split('.')[-1])
-                else:
-                    decimals = 0
-                return f"${val:,.{decimals}f}"
-        return str(val)
+        if fmt and isinstance(val, (int, float)) and not isinstance(val, bool):
+            out = _format_number(float(val), str(fmt))
+            if out is not None:
+                return out
+        return _concat_str(val)
 
     def _fn_concatenate(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
@@ -3555,11 +4200,12 @@ class DAXEngine:
         """SUMX(table_expression, expression) — iterate over table rows, sum expression."""
         args = self._split_args(args_str)
         if len(args) < 2:
-            return 0
+            return None
         table_ref = self._eval_expr(args[0].strip(), ctx)
         row_expr = args[1].strip()
         if isinstance(table_ref, list):
-            total = 0
+            total: float = 0
+            seen = False
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
                     row_ctx = self._make_row_context(row_item, ctx)
@@ -3567,18 +4213,22 @@ class DAXEngine:
                     result = self._resolve_row_result(result, row_item, row_ctx)
                     if isinstance(result, (int, float)):
                         total += result
+                        seen = True
                 else:
                     result = self._eval_expr(row_expr, ctx)
                     if isinstance(result, (int, float)):
                         total += result
-            return total
-        return 0
+                        seen = True
+            # SUMX over nothing is BLANK, matching SUM and Desktop
+            # (SUMX(FILTER({1,2,3}, FALSE()), 1) is BLANK, not 0).
+            return total if seen else None
+        return None
 
     def _fn_maxx(self, args_str: str, ctx: DAXContext) -> Any:
         """MAXX(table_expression, expression) — iterate over table rows, return max."""
         args = self._split_args(args_str)
         if len(args) < 2:
-            return 0
+            return None
         table_ref = self._eval_expr(args[0].strip(), ctx)
         row_expr = args[1].strip()
         if isinstance(table_ref, list):
@@ -3592,18 +4242,18 @@ class DAXEngine:
                 else:
                     result = self._eval_expr(row_expr, ctx)
                     max_val = _extremum(max_val, result, True)
-            return max_val if max_val is not None else 0
+            return max_val
         # Fallback: if table_ref is a column ref, get max of column
         if isinstance(table_ref, tuple) and len(table_ref) == 2:
             values = [v for v in ctx.get_column_data(table_ref[0], table_ref[1]) if isinstance(v, (int, float))]
-            return max(values) if values else 0
-        return 0
+            return max(values) if values else None
+        return None
 
     def _fn_minx(self, args_str: str, ctx: DAXContext) -> Any:
         """MINX(table_expression, expression) — iterate over table rows, return min."""
         args = self._split_args(args_str)
         if len(args) < 2:
-            return 0
+            return None
         table_ref = self._eval_expr(args[0].strip(), ctx)
         row_expr = args[1].strip()
         if isinstance(table_ref, list):
@@ -3620,17 +4270,17 @@ class DAXEngine:
                 else:
                     result = self._eval_expr(row_expr, ctx)
                     min_val = _extremum(min_val, result, False)
-            return min_val if min_val is not None else 0
+            return min_val
         if isinstance(table_ref, tuple) and len(table_ref) == 2:
             values = [v for v in ctx.get_column_data(table_ref[0], table_ref[1]) if isinstance(v, (int, float))]
-            return min(values) if values else 0
-        return 0
+            return min(values) if values else None
+        return None
 
     def _fn_averagex(self, args_str: str, ctx: DAXContext) -> Any:
         """AVERAGEX(table_expression, expression) — iterate over table rows, average expression."""
         args = self._split_args(args_str)
         if len(args) < 2:
-            return 0
+            return None
         table_ref = self._eval_expr(args[0].strip(), ctx)
         row_expr = args[1].strip()
         values = []
@@ -3646,13 +4296,13 @@ class DAXEngine:
                     result = self._eval_expr(row_expr, ctx)
                     if isinstance(result, (int, float)):
                         values.append(result)
-        return sum(values) / len(values) if values else 0
+        return sum(values) / len(values) if values else None
 
     def _fn_countx(self, args_str: str, ctx: DAXContext) -> Any:
         """COUNTX(table_expression, expression) — count non-blank numeric results per row."""
         args = self._split_args(args_str)
         if len(args) < 2:
-            return 0
+            return None
         table_ref = self._eval_expr(args[0].strip(), ctx)
         row_expr = args[1].strip()
         count = 0
@@ -3666,7 +4316,7 @@ class DAXEngine:
                     result = self._eval_expr(row_expr, ctx)
                 if result is not None and result != '':
                     count += 1
-        return count
+        return count or None
 
     def _fn_countax(self, args_str: str, ctx: DAXContext) -> Any:
         """COUNTAX(table_expression, expression) — count non-blank results (like COUNTX but counts text too)."""
@@ -3678,8 +4328,8 @@ class DAXEngine:
         ref = self._eval_expr(args_str.strip(), ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             values = ctx.get_column_data(ref[0], ref[1])
-            return sum(1 for v in values if v is None or v == '')
-        return 0
+            return sum(1 for v in values if v is None or v == '') or None
+        return None
 
     def _fn_product(self, args_str: str, ctx: DAXContext) -> Any:
         """PRODUCT(column) — multiply all values in column."""
@@ -3687,12 +4337,12 @@ class DAXEngine:
         if isinstance(ref, tuple) and len(ref) == 2:
             values = [v for v in ctx.get_column_data(ref[0], ref[1]) if isinstance(v, (int, float))]
             if not values:
-                return 0
+                return None
             result = 1
             for v in values:
                 result *= v
             return result
-        return 0
+        return None
 
     def _fn_median(self, args_str: str, ctx: DAXContext) -> Any:
         """MEDIAN(column) — return median value."""
@@ -3700,9 +4350,160 @@ class DAXEngine:
         if isinstance(ref, tuple) and len(ref) == 2:
             values = sorted(v for v in ctx.get_column_data(ref[0], ref[1]) if isinstance(v, (int, float)))
             if not values:
-                return 0
+                return None
             return statistics.median(values)
-        return 0
+        return None
+
+    def _fn_medianx(self, args_str: str, ctx: DAXContext) -> Any:
+        """MEDIANX(table, expression) — median of the per-row expression.
+
+        Missing entirely before: IT_Support's "2- Median Color Coding" feeds it
+        into `>=` comparisons, so a BLANK made every branch fall through to the
+        same colour.
+        """
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return None
+        table_ref = self._eval_expr(args[0].strip(), ctx)
+        row_expr = args[1].strip()
+        if not isinstance(table_ref, list):
+            return None
+        values = []
+        for row_item in table_ref:
+            if isinstance(row_item, dict) and '__table__' in row_item:
+                row_ctx = self._make_row_context(row_item, ctx)
+                result = self._eval_expr(row_expr, row_ctx)
+                result = self._resolve_row_result(result, row_item, row_ctx)
+            else:
+                result = self._eval_expr(row_expr, ctx)
+            if isinstance(result, (int, float)) and not isinstance(result, bool):
+                values.append(result)
+        # MEDIANX over no rows is BLANK, so ISBLANK fires.
+        return statistics.median(sorted(values)) if values else None
+
+    def _fn_mround(self, args_str: str, ctx: DAXContext) -> Any:
+        """MROUND(number, multiple) — round to the nearest multiple of `multiple`.
+
+        DAX rounds HALF AWAY FROM ZERO (MROUND(2.5, 1) = 3), unlike Python's
+        banker's rounding, and MROUND(x, 0) is 0.
+        """
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return None
+        num = self._eval_expr(args[0].strip(), ctx)
+        mult = self._eval_expr(args[1].strip(), ctx)
+        if not isinstance(num, (int, float)) or not isinstance(mult, (int, float)):
+            return None
+        if mult == 0:
+            return 0                     # Desktop: MROUND(7, 0) is 0
+        if num != 0 and (num > 0) != (mult > 0):
+            # Desktop REFUSES a sign mismatch ("an argument to MROUND has the
+            # wrong data type, or the result is too large or too small"), so
+            # returning a number here would be inventing an answer.
+            from pbix_mcp.errors import DAXEvaluationError
+            raise DAXEvaluationError(
+                f"MROUND({num}, {mult}): number and multiple must have the "
+                "same sign")
+        q = num / mult
+        rounded = math.floor(q + 0.5) if q >= 0 else math.ceil(q - 0.5)
+        return rounded * mult
+
+    def _fn_firstnonblank(self, args_str: str, ctx: DAXContext) -> Any:
+        """FIRSTNONBLANK(column, expression) — first value whose expr is non-blank.
+
+        Returns a ONE-ROW TABLE, like Desktop: it is normally used as a
+        CALCULATE filter or wrapped in a scalar conversion.
+        """
+        return self._first_last_nonblank(args_str, ctx, last=False)
+
+    def _fn_lastnonblank(self, args_str: str, ctx: DAXContext) -> Any:
+        """LASTNONBLANK(column, expression) — last value whose expr is non-blank."""
+        return self._first_last_nonblank(args_str, ctx, last=True)
+
+    def _first_last_nonblank(self, args_str: str, ctx: DAXContext, last: bool) -> Any:
+        """Shared body for FIRST/LASTNONBLANK.
+
+        Both were unimplemented, which is worse than it sounds: MS_Life_Expectancy
+        uses LASTNONBLANK as a CALCULATE filter argument, and a BLANK filter
+        argument applied NO filter at all, so six measures returned the grand
+        total instead of the last populated year.
+        """
+        args = self._split_args(args_str)
+        if not args:
+            return []
+        col = self._parse_column_ref(args[0]) or self._as_column_ref(args[0], ctx)
+        if col is None:
+            return []
+        table_name, col_name = col
+        expr = args[1].strip() if len(args) > 1 else None
+        values = []
+        seen = set()
+        for v in ctx.get_column_data(table_name, col_name):
+            key = str(v)
+            if key in seen:
+                continue
+            seen.add(key)
+            values.append(v)
+        values = [v for v in values if v is not None]
+        try:
+            values.sort(key=lambda v: (v is None, v))
+        except TypeError:
+            values.sort(key=lambda v: (v is None, str(v)))
+        if last:
+            values.reverse()
+        for v in values:
+            if expr is None:
+                return self._one_row_table(table_name, col_name, v)
+            row_item = {'__table__': table_name, '__column__': col_name,
+                        '__value__': v}
+            row_ctx = self._make_row_context(row_item, ctx)
+            probe = self._eval_expr(expr, row_ctx)
+            probe = self._resolve_row_result(probe, row_item, row_ctx)
+            if probe is not None and probe != '':
+                return self._one_row_table(table_name, col_name, v)
+        return []
+
+    @staticmethod
+    def _one_row_table(table_name: str, col_name: str, value: Any) -> list:
+        return [{'__table__': table_name, '__column__': col_name,
+                 '__value__': value}]
+
+    def _as_column_ref(self, text: str, ctx: DAXContext):
+        """`text` as a (table, column) pair, however it is written."""
+        ref = self._eval_expr(text.strip(), ctx)
+        if isinstance(ref, tuple) and len(ref) == 2:
+            return ref
+        return None
+
+    def _fn_isinscope(self, args_str: str, ctx: DAXContext) -> Any:
+        """ISINSCOPE(column) — is the column a GROUPING level of this query?
+
+        Always FALSE here, and that is the faithful answer, not a stub: ISINSCOPE
+        asks about the query's group-by axes, which a single-cell measure
+        evaluation has none of. It is NOT the same question as ISFILTERED --
+        Desktop, over the same model, answers
+
+            CALCULATE(ISINSCOPE('Risk'[Location]), 'Risk'[Location] = "x")  FALSE
+            CALCULATE(ISFILTERED('Risk'[Location]), 'Risk'[Location] = "x")  TRUE
+
+        so delegating to ISFILTERED would flip every filtered evaluation the
+        wrong way. Desktop's grand total also answers FALSE, which is the cell
+        this engine reproduces. The argument is still evaluated so a malformed
+        reference is not silently accepted.
+        """
+        self._eval_expr(args_str.strip(), ctx)
+        return False
+
+    def _fn_error(self, args_str: str, ctx: DAXContext) -> Any:
+        """ERROR("message") — raise a DAX error.
+
+        Quick measures generate `IF(<misuse>, ERROR("..."), <real body>)` guard
+        clauses. Reaching it means the guard tripped, which Desktop surfaces as
+        an error rather than a value.
+        """
+        from pbix_mcp.errors import DAXEvaluationError
+        msg = self._eval_expr(args_str.strip(), ctx) if args_str.strip() else ''
+        raise DAXEvaluationError(f"DAX ERROR(): {msg}")
 
     def _fn_filter(self, args_str: str, ctx: DAXContext) -> Any:
         """FILTER(table, condition) — returns filtered table rows."""
@@ -3735,6 +4536,19 @@ class DAXEngine:
                         if substitute_row_values:
                             row_cond = _substitute_row_refs(
                                 cond_expr, table_name, row_item)
+                            # Text substitution only rewrites the QUALIFIED
+                            # form. Bind the row as well so an UNQUALIFIED
+                            # `[Col]` resolves to this row's value: Desktop
+                            # accepts both, and MS_Perf_Analyzer's
+                            # FILTER('Events', [component] = "Change Detection")
+                            # counted 0 rows against Desktop's 3 because the
+                            # bare reference read as a missing measure.
+                            # Only under the same no-aggregation guard --
+                            # binding a row while the condition contains
+                            # SUM(T[c]) would collapse the aggregate to the
+                            # row's own value.
+                            row_ctx._current_row = row_item
+                            row_ctx._outer_ctx = ctx
                         else:
                             row_cond = cond_expr
                         cond = self._eval_expr(row_cond, row_ctx)
@@ -3847,6 +4661,35 @@ class DAXEngine:
         table_name = args[0].strip().strip("'")
         rows = ctx.get_filtered_rows(table_name)
         tbl = ctx.tables.get(table_name)
+        if tbl is None:
+            # A table EXPRESSION, not a table name. Only a bare name was ever
+            # accepted, so `SUMMARIZE(ALLSELECTED(f[a], f[b]), f[a], f[b], ...)`
+            # -- the shape a quick measure generates -- produced NO ROWS at all
+            # and every VAR built on it went blank.
+            src = self._eval_expr(args[0].strip(), ctx)
+            if not isinstance(src, list) or not src:
+                return []
+            first = src[0]
+            if not isinstance(first, dict) or '__table__' not in first:
+                return []
+            table_name = first['__table__']
+            tbl = ctx.tables.get(table_name)
+            if tbl is None:
+                return []
+            cols = tbl['columns']
+            rows = []
+            for rd in src:
+                if not isinstance(rd, dict):
+                    continue
+                if '__row__' in rd or '__column__' not in rd:
+                    rows.append([rd.get(c) for c in cols])
+                else:
+                    # Single-column shape: place the value in its own column.
+                    row = [None] * len(cols)
+                    ci = ctx._find_col_idx(cols, rd.get('__column__', ''))
+                    if ci >= 0:
+                        row[ci] = rd.get('__value__')
+                    rows.append(row)
         if not tbl or not rows:
             return []
 
@@ -4374,11 +5217,15 @@ class DAXEngine:
         # NOTE: True ALLSELECTED requires distinguishing external vs internal filters,
         # which is not tracked in this simplified engine. We approximate with VALUES behavior.
         ref = args_str.strip()
-        col_match = re.match(r"'?([^'\[\]]+)'?\s*\[([^\]]+)\]", ref)
+        multi = self._multi_column_all(ref, ctx, selected=True)
+        if multi is not None:
+            return multi
+        col_match = _WHOLE_TCOL_RE.match(ref)
         if col_match:
-            table_name = col_match.group(1).strip()
-            col_name = col_match.group(2).strip()
-            values = ctx.get_column_data(table_name, col_name)
+            # groups: 'quoted name' | bare name | column
+            table_name = (col_match.group(1) or col_match.group(2) or '').strip()
+            col_name = col_match.group(3).strip()
+            values = self._selected_ctx(ctx).get_column_data(table_name, col_name)
             unique = [v for v in set(values) if v is not None]
             out = [{'__table__': table_name, '__column__': col_name,
                     '__value__': v} for v in unique]
@@ -4942,7 +5789,17 @@ class DAXEngine:
         # value was absent, returned len(unique) + 1 -- i.e. dead last. On
         # Agents_Performance that made every RANKX return 262 (261 rows + 1)
         # regardless of the ranking expression, where Desktop returns 136.
-        if is_desc:
+        #
+        # The fifth argument selects between the two. It was PARSED BUT NEVER
+        # READ, so `...,DESC,Dense)` still ranked by SKIP: IT_Support's
+        # [2- Ranking Subjects] came out 6578 (10,808 subjects, 6,577 of them
+        # above the ranked value) where Desktop answers 6 -- there are only 10
+        # DISTINCT values and 5 of them beat it.
+        ties = args[4].strip().strip('"\'').upper() if len(args) > 4 else 'SKIP'
+        if ties == 'DENSE':
+            beat = len({v for v in all_vals
+                        if (v > current_val if is_desc else v < current_val)})
+        elif is_desc:
             beat = sum(1 for v in all_vals if v > current_val)
         else:
             beat = sum(1 for v in all_vals if v < current_val)
@@ -5369,7 +6226,14 @@ class DAXEngine:
         table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
         if not dates:
             return []
-        max_date = max(dates)
+        # DAX anchors PREVIOUS* on the FIRST date of the input, not the
+        # last (NEXT* uses the last). Confirmed against Desktop on a
+        # Calendar spanning 2019-01-01..06-30: PREVIOUSQUARTER is BLANK
+        # there, which is only possible from the first date (Q4-2018,
+        # outside the table) -- anchored on the last it would have
+        # returned Q1-2019, which exists. Using max() made [Net Sales PM]
+        # and friends return numbers where Desktop returns BLANK.
+        max_date = min(dates)
         # Previous month
         if max_date.month == 1:
             prev_year, prev_month = max_date.year - 1, 12
@@ -5384,7 +6248,14 @@ class DAXEngine:
         table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
         if not dates:
             return []
-        max_date = max(dates)
+        # DAX anchors PREVIOUS* on the FIRST date of the input, not the
+        # last (NEXT* uses the last). Confirmed against Desktop on a
+        # Calendar spanning 2019-01-01..06-30: PREVIOUSQUARTER is BLANK
+        # there, which is only possible from the first date (Q4-2018,
+        # outside the table) -- anchored on the last it would have
+        # returned Q1-2019, which exists. Using max() made [Net Sales PM]
+        # and friends return numbers where Desktop returns BLANK.
+        max_date = min(dates)
         current_q = (max_date.month - 1) // 3 + 1
         if current_q == 1:
             prev_q_start = datetime(max_date.year - 1, 10, 1)
@@ -5404,7 +6275,14 @@ class DAXEngine:
         table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
         if not dates:
             return []
-        max_date = max(dates)
+        # DAX anchors PREVIOUS* on the FIRST date of the input, not the
+        # last (NEXT* uses the last). Confirmed against Desktop on a
+        # Calendar spanning 2019-01-01..06-30: PREVIOUSQUARTER is BLANK
+        # there, which is only possible from the first date (Q4-2018,
+        # outside the table) -- anchored on the last it would have
+        # returned Q1-2019, which exists. Using max() made [Net Sales PM]
+        # and friends return numbers where Desktop returns BLANK.
+        max_date = min(dates)
         prev_year = max_date.year - 1
         all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
         prev = [d for d in all_dates if d.year == prev_year]

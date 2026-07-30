@@ -94,10 +94,20 @@ class TestBlankHandling:
         assert result == 5  # BLANK + 5 = 5 (BLANK is 0 in arithmetic)
 
     def test_blank_in_divide(self, engine, tables, rels):
-        """DIVIDE with BLANK numerator returns BLANK/0."""
+        """A BLANK numerator makes DIVIDE blank, and skips the alternate.
+
+        Read off the live Desktop engine, which contradicts the "BLANK is 0"
+        shorthand this test used to assert:
+            DIVIDE(BLANK(), 100)     -> BLANK
+            DIVIDE(BLANK(), 100, 42) -> BLANK   (NOT the alternate)
+            DIVIDE(BLANK(), BLANK()) -> BLANK
+        """
         c = ctx(tables, rels, {'M': 'DIVIDE(BLANK(), 10)'})
-        result = engine.evaluate_measure('M', c)
-        assert result == 0  # DIVIDE(BLANK, 10) = DIVIDE(0, 10) = 0
+        assert engine.evaluate_measure('M', c) is None
+        c2 = ctx(tables, rels, {'M': 'DIVIDE(BLANK(), 10, 42)'})
+        assert engine.evaluate_measure('M', c2) is None
+        c3 = ctx(tables, rels, {'M': 'DIVIDE(BLANK(), BLANK())'})
+        assert engine.evaluate_measure('M', c3) is None
 
     def test_if_blank_check(self, engine, tables, rels):
         """IF(ISBLANK(x), ...) pattern."""
@@ -119,10 +129,28 @@ class TestBlankHandling:
         c = ctx(tables, rels, {'M': 'DIVIDE(10, 2)'})
         assert engine.evaluate_measure('M', c) == 5.0
 
-    def test_binary_divide_by_zero_is_blank_not_numerator(self, engine, tables, rels):
-        """Spaced `a / b` with b==0 returns BLANK, not the numerator (regression)."""
+    def test_binary_divide_by_zero_is_infinity_not_numerator(self, engine, tables, rels):
+        """The bare `/` operator does NOT blank a divide-by-zero.
+
+        DIVIDE() is the safe-divide function; `/` returns an IEEE special, and
+        every value below came from the live Desktop engine:
+            5/0 -> inf     -100/BLANK() -> -inf
+            0/0 -> nan     0/BLANK()    -> nan
+            BLANK()/100 -> BLANK   BLANK()/BLANK() -> BLANK
+        What must never happen is returning the NUMERATOR (the original bug).
+        """
+        import math
         c = ctx(tables, rels, {'M': '10 / 0'})
-        assert engine.evaluate_measure('M', c) is None
+        assert engine.evaluate_measure('M', c) == float('inf')
+        cneg = ctx(tables, rels, {'M': '-10 / 0'})
+        assert engine.evaluate_measure('M', cneg) == float('-inf')
+        czz = ctx(tables, rels, {'M': '0 / 0'})
+        assert math.isnan(engine.evaluate_measure('M', czz))
+        # A blank NUMERATOR wins over a zero/blank denominator.
+        cbn = ctx(tables, rels, {'M': 'BLANK() / 0'})
+        assert engine.evaluate_measure('M', cbn) is None
+        cbb = ctx(tables, rels, {'M': 'BLANK() / BLANK()'})
+        assert engine.evaluate_measure('M', cbb) is None
         c2 = ctx(tables, rels, {'M': '10 / 2'})
         assert engine.evaluate_measure('M', c2) == 5.0
 

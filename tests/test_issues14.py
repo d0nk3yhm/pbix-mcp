@@ -131,8 +131,11 @@ class TestCalcTableEvaluator:
         assert res["columns"] == cols
 
     def test_unsupported_function_refused(self):
+        # NATURALINNERJOIN, not MEDIANX: MEDIANX is implemented now (Desktop
+        # parity work), and this test is about the REFUSAL path, so it needs a
+        # function the engine genuinely does not have.
         res, err = evaluate_calc_table_expression(
-            "MEDIANX(Sales, Sales[Amount])", SALES)
+            "NATURALINNERJOIN(Sales, Sales)", SALES)
         assert res is None and "unsupported" in err
 
     def test_calendar_date_table(self):

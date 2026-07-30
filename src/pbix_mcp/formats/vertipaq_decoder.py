@@ -21,6 +21,7 @@ read_table_from_abf(abf_bytes, table_name, metadata_db_bytes) -> dict
 
 from __future__ import annotations
 
+import datetime as _datetime
 import math
 import os
 import sqlite3
@@ -596,12 +597,35 @@ def _decode_idf_segment_at(
 # Value reconstruction helpers
 # ---------------------------------------------------------------------------
 
+class DAXDateTime(_datetime.datetime):
+    """A datetime that remembers the EXACT OLE serial it was decoded from.
+
+    .NET DateTime counts 100-nanosecond ticks; Python's datetime resolves to 1
+    microsecond, ten times coarser. Converting the stored serial to a datetime
+    therefore loses up to half a microsecond, and DAX routinely scales the
+    serial straight back up: MS_Perf_Analyzer's `[start] * 86400000` turned that
+    half-microsecond into 0.0005 ms, and `([end] - [start]) * 86400000` cancelled
+    two of them into 113.3329700678587 against Desktop's 113.33359871059656.
+
+    Carrying the original double costs one attribute per DISTINCT value (the
+    column is dictionary-encoded, so not one per row) and makes the round trip
+    exact. Everything that treats this as a datetime keeps working -- it IS one;
+    arithmetic on it returns a plain datetime, which simply degrades to the
+    rounded serial, exactly as before.
+    """
+    __slots__ = ('oa_serial',)
+
+
 def _oa_date_to_python(oa_days: float):
     """Convert OLE Automation date (days since 1899-12-30) to Python datetime."""
     import datetime as _dt
     epoch = _dt.datetime(1899, 12, 30)
     try:
-        return epoch + _dt.timedelta(days=oa_days)
+        dt = epoch + _dt.timedelta(days=oa_days)
+        out = DAXDateTime(dt.year, dt.month, dt.day, dt.hour, dt.minute,
+                          dt.second, dt.microsecond)
+        out.oa_serial = float(oa_days)
+        return out
     except (OverflowError, ValueError):
         return oa_days  # Return raw value if conversion fails
 

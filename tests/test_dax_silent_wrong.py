@@ -457,9 +457,17 @@ class TestBlankDoesNotPropagateThroughAComparison:
             "IF(BLANK()<30,20,IF(BLANK()<45,30,IF(BLANK()<60,45,80)))", c) == 20
 
     @pytest.mark.parametrize("expr,want", [
+        # + and - fold a blank to 0; & folds it to "".
         ("BLANK() + 5", 5),
-        ("BLANK() * 5", 0),
+        ("BLANK() - 5", -5),
         ('BLANK() & "x"', "x"),
+        # * and / do NOT -- a blank operand makes the product blank, and a
+        # blank NUMERATOR makes the quotient blank. All Desktop-verified.
+        ("BLANK() * 5", None),
+        ("5 * BLANK()", None),
+        ("BLANK() * 0", None),
+        ("BLANK() / 5", None),
+        ("BLANK() / BLANK()", None),
     ])
     def test_arithmetic_is_untouched(self, ctx, expr, want):
         """Only COMPARISONS coerce; this guards against over-reaching."""

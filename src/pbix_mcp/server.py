@@ -1590,9 +1590,13 @@ def pbix_set_visual_property(
 
         # Write config back
         vc["config"] = json.dumps(config, ensure_ascii=False)
+        rebound = _recompile_classic_binding(info, vc, config)
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
-        return ToolResponse.ok(f"Set {property_path} = {value} on page {page_index}, visual {visual_index}").to_text()
+        note = " (data binding recompiled)" if rebound else ""
+        return ToolResponse.ok(
+            f"Set {property_path} = {value} on page {page_index}, "
+            f"visual {visual_index}{note}").to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
@@ -1632,14 +1636,54 @@ def pbix_update_visual_json(
             raise LayoutParseError(f"Invalid JSON: {e}")
 
         containers[visual_index]["config"] = json.dumps(new_config, ensure_ascii=False)
+        rebound = _recompile_classic_binding(
+            info, containers[visual_index], new_config)
         _set_layout(info["work_dir"], layout)
         _warn_unbound_field_parameters(info, new_config)
         info["modified"] = True
-        return ToolResponse.ok(f"Updated visual config on page {page_index}, visual {visual_index}").to_text()
+        note = " (data binding recompiled)" if rebound else ""
+        return ToolResponse.ok(
+            f"Updated visual config on page {page_index}, "
+            f"visual {visual_index}{note}").to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         raise LayoutParseError(str(e))
+
+
+def _recompile_classic_binding(info: dict, vc: dict, config: dict) -> bool:
+    """Re-derive query + dataTransforms after a CLASSIC layout config edit.
+
+    Power BI Desktop does not re-derive a visual's data binding from
+    ``config.singleVisual`` when it loads a classic ``Report/Layout``; it reads
+    the sibling ``query`` / ``dataTransforms`` blobs. Editing projections or
+    prototypeQuery through pbix_set_visual_property / pbix_update_visual_json
+    therefore changed the config and left the COMPILED binding pointing at the
+    old field, so Desktop kept rendering the previous column with no error
+    anywhere. The creation paths already compile; these two did not.
+
+    Returns True when a binding was written. Best-effort by design: a config
+    edit must never fail because the binding could not be compiled.
+    """
+    sv = (config or {}).get("singleVisual") or {}
+    if not (sv.get("prototypeQuery") and sv.get("projections")):
+        return False            # textbox / shape / image / button: no binding
+    try:
+        from pbix_mcp.report_binding import compile_visual_binding
+        q, dt = compile_visual_binding(sv, _report_type_resolver(info))
+        if q is None:
+            return False
+        vc["query"] = json.dumps(q, ensure_ascii=False)
+        vc["dataTransforms"] = json.dumps(dt, ensure_ascii=False)
+        vc.setdefault("filters", "[]")
+        # compile_visual_binding rewrites bare value-role columns to implicit
+        # Aggregations inside `sv` itself, so the config has to be re-serialized
+        # from the MUTATED object or the prototype and the compiled query
+        # disagree.
+        vc["config"] = json.dumps(config, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
 
 
 @mcp.tool()
@@ -2258,7 +2302,11 @@ def _report_type_resolver(info: dict):
             _AMO = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime",
                     10: "Decimal", 11: "Boolean"}
             for r in conn.execute(
-                "SELECT t.Name tn, c.ExplicitName cn, c.ExplicitDataType edt "
+                # COALESCE: Type 4 (calculated-table column) keeps its name
+                # in InferredName with ExplicitName NULL, so the key would be
+                # (table, None) and the type lookup would silently miss.
+                "SELECT t.Name tn, COALESCE(c.ExplicitName, c.InferredName) cn, "
+                "       c.ExplicitDataType edt "
                 "FROM [Column] c JOIN [Table] t ON t.ID = c.TableID "
                 "WHERE c.Type IN (1, 2, 4)"
             ):
@@ -7463,9 +7511,15 @@ def _detect_field_parameter_shape(conn, tid: int) -> dict | None:
     if prow is None or prow["Type"] != 2 or not prow["QueryDefinition"]:
         return None
     crows = conn.execute(
-        "SELECT ExplicitName, ExplicitDataType, InferredDataType FROM [Column] "
+        # COALESCE, and the RowNumber test has to run on the same expression:
+        # a Type 4 column has ExplicitName NULL, and `NULL NOT LIKE ...` is NULL
+        # (falsy), so the bare form dropped every calculated-table column from
+        # the shape check -- which is exactly what a field parameter is made of.
+        "SELECT COALESCE(ExplicitName, InferredName) AS ExplicitName, "
+        "       ExplicitDataType, InferredDataType FROM [Column] "
         "WHERE TableID = ? AND Type IN (1, 4) "
-        "AND ExplicitName NOT LIKE 'RowNumber%' ORDER BY ID",
+        "AND COALESCE(ExplicitName, InferredName) NOT LIKE 'RowNumber%' "
+        "ORDER BY ID",
         (tid,),
     ).fetchall()
     if len(crows) != 3:
@@ -14191,9 +14245,14 @@ def pbix_get_perspectives(alias: str) -> str:
                         lines.append(f"    {tname} (all columns/measures)")
                     else:
                         cols = conn.execute(
-                            "SELECT c.ExplicitName FROM PerspectiveColumn pc "
+                            # COALESCE: a perspective can include a
+                            # calculated-table column, whose name lives in
+                            # InferredName.
+                            "SELECT COALESCE(c.ExplicitName, c.InferredName) "
+                            "       AS ExplicitName FROM PerspectiveColumn pc "
                             "JOIN [Column] c ON pc.ColumnID = c.ID "
-                            "WHERE pc.PerspectiveTableID = ? ORDER BY c.ExplicitName", (ptid,)
+                            "WHERE pc.PerspectiveTableID = ? "
+                            "ORDER BY 1", (ptid,)
                         ).fetchall()
                         measures = conn.execute(
                             "SELECT m.Name FROM PerspectiveMeasure pm "
@@ -14402,7 +14461,14 @@ def pbix_get_hierarchies(alias: str) -> str:
                 lines.append(f"  {h['TableName']}.{h['Name']}{hidden}{desc}")
 
                 levels = conn.execute(
-                    "SELECT l.Ordinal, l.Name, c.ExplicitName as ColumnName "
+                    # COALESCE, for the same reason the rebuild path already
+                    # does (see _rebuild_datamodel's Level query): a
+                    # calculated-table or auto-date column keeps its name in
+                    # InferredName and leaves ExplicitName NULL, so reading only
+                    # ExplicitName reported every auto-date hierarchy level as
+                    # pointing at no column at all.
+                    "SELECT l.Ordinal, l.Name, "
+                    "       COALESCE(c.ExplicitName, c.InferredName) AS ColumnName "
                     "FROM Level l LEFT JOIN [Column] c ON l.ColumnID = c.ID "
                     "WHERE l.HierarchyID = ? ORDER BY l.Ordinal", (hid,)
                 ).fetchall()

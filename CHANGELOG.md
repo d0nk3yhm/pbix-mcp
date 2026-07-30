@@ -5,6 +5,99 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.61] - 2026-07-30
+
+**Every measure of every corpus file now returns what Power BI Desktop returns.**
+
+The whole 24-file corpus was captured from Desktop's own engine — the workspace
+`msmdsrv` instance Desktop starts for an open .pbix, queried over ADOMD — and
+all 547 measures were diffed against it. Sixteen defects came out of that, every
+one of them producing a plausible value rather than an error. All the rules
+below are Desktop's answers, not the documentation's.
+
+### Storage and identifier bugs that blanked whole files
+
+- **A bare `[Measure]` reference is now resolved case-insensitively.** DAX
+  identifiers are case-insensitive; the fully-qualified `Table[Measure]` path
+  already knew that, the bare path did not. One `[TOTAL UNITS]` against a
+  measure named `Total Units` silently blanked NINE `MS_Competitive_Marketing`
+  measures — the whole SAMEPERIODLASTYEAR family (1,299,599 and 49,832 read as
+  blank), their variances, and an indicator that answered 2 where Desktop
+  answers 1.
+- **A date stored as an Int64 serial is a date.** `IT_Support` stores
+  `fact_IT_Support[Date]` as `ExplicitDataType 6`, so `DATEDIFF` returned BLANK
+  on all 11,923 rows — which also made `DATEDIFF(...) <= 3` keep every row
+  (`BLANK() <= 3` is TRUE) and `[% of Tickets Closed Within 3 Days]` read 1.0
+  against Desktop's 0.7987.
+- **Relationship join keys are matched across storage types.** The two sides
+  were each stringified, so a datetime dimension never joined an Int64 fact and
+  every date filter reduced the fact to zero rows.
+- **A bare `[Column]` reference resolves against the model.** Power BI's own
+  generated measures rely on it: `MS_Corporate_Spend`'s `[Amount]` is literally
+  `TOTALYTD(SUM([Value]), 'Date'[Date])*.3`, and reading `[Value]` as a missing
+  measure made all 15 of that file's measures read 0.0.
+- **`ALL` / `ALLSELECTED` keep every column argument**, and `SUMMARIZE` accepts
+  a table EXPRESSION, not only a table name. Both used an unanchored regex on
+  the raw argument text and silently dropped everything after the first column.
+- **`ALLSELECTED` restores the query context** instead of behaving like
+  `VALUES`, so it now removes a filter its own `CALCULATE` applied.
+- **Auto date/time hierarchy accessors** (`'T'[C].[Date]`) resolve through the
+  relationship to the hidden `LocalDateTable`. `DATEADD` over one had been
+  silently doing nothing.
+
+### Semantics corrected against the live engine
+
+| | was | Desktop |
+|---|---|---|
+| `BLANK() * 100`, `BLANK() / 100` | `0` | BLANK |
+| `DIVIDE(BLANK(), 100, 42)` | `0.0` | BLANK (the alternate is skipped) |
+| `5 / 0`, `0 / 0` | BLANK | `inf`, `nan` |
+| every aggregate over no rows | `0` | BLANK |
+| `DISTINCTCOUNT` over a column with blanks | excluded the blank | counts it |
+| `CALCULATE(m, PREVIOUSMONTH(...))` off the table | grand total | BLANK |
+| `1 == 1` | BLANK (`==` unimplemented) | TRUE, and strict about blanks |
+| `"" & (1/3)` | `0.3333333333333333` | `0.333333333333333` |
+| `"" & DATE(2025,7,1)` | `2025-07-01 00:00:00` | `7/1/2025` |
+| `FORMAT(2297200.9, "$#,##0,.0K")` | `$2,297,200.90K` | `$2,297.2K` |
+| `FORMAT(1234.5, "#,##0")` | `1,234` (banker's) | `1,235` |
+| `RANKX(..., Dense)` | ranked as SKIP | 6, not 6578 |
+
+`PREVIOUS*` also anchors on the FIRST date of its input, not the last.
+
+### New functions
+
+`COUNTA`, `DISTINCTCOUNTNOBLANK`, `MEDIANX`, `MROUND`, `FIRSTNONBLANK`,
+`LASTNONBLANK`, `ISINSCOPE`, `ERROR`. Four of the eight had been returning a
+confident wrong value rather than BLANK: `LASTNONBLANK` as a CALCULATE filter
+argument applied NO filter (grand total), `ISINSCOPE` in a `SWITCH(TRUE(), ...)`
+took the fallback branch every time, `MEDIANX` fed a `>=` that always won.
+`ISINSCOPE` answers FALSE and that is the faithful answer, not a stub — it asks
+about the query's grouping axes, which a single-cell evaluation has none of, and
+Desktop answers FALSE there too (it is NOT `ISFILTERED`).
+
+### Robustness
+
+- Non-finite results are serialized as `"Infinity"` / `"NaN"` strings. Python
+  writes the bare literals `Infinity` and `NaN`, which are not valid JSON — one
+  infinite cell would have failed the ENTIRE tool response for a strict client
+  parser.
+- The calculated-column evaluator now honours the same wall-clock budget
+  measures do. It never armed the deadline, so a per-row `CALCULATE`/`FILTER`
+  over 1.7M rows ran for over two hours at 4 GB with no output. It now refuses
+  with a row count and points at `PBIX_DAX_MAX_SECONDS`.
+
+### Verification
+
+547 measures across 24 files, each compared against Desktop's own answer with a
+1e-9 relative band for floats. Bit-identical float agreement is not achievable
+in principle — VertiPaq sums a column in parallel segments — and
+`MS_Corporate_Spend`'s `[Var LE1]` is the worked example: the exact decimal
+answer is 14,697,755.96505, this engine returns 14,697,755.965050012 (correctly
+rounded) and Desktop returns 14,697,755.9650462, which is 300× further from the
+truth. Measures whose definition reaches a `RAND()` through any chain of
+references are excluded by name and counted separately; they can never pad the
+score.
+
 ## [0.9.60] - 2026-07-30
 
 Closes OpenBI findings **#9 #5b**, the highest-severity item in the newly audited
