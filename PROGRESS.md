@@ -5,16 +5,23 @@ and how, what is left, and the traps already hit so they are not re-hit.
 
 ## Where things stand
 
-**0.9.61 is the corpus-parity release.** Every measure of every corpus file was
-compared against the value Power BI Desktop's own engine returns for it, and the
-sixteen defects that came out of it are fixed. Details in CHANGELOG.md.
+**0.9.61 is the last RELEASED version.** Five further Desktop-verified fixes are
+committed on top of it and are NOT released yet — see the `[Unreleased]` section
+of CHANGELOG.md. A sixth (directional filter propagation) was landed and
+reverted; the write-up below is the one to read before re-attempting it.
 
 | verification | scale | result |
 |---|---|---|
 | measures at the grand total | 547 measures, 24 files | 1:1 with Desktop |
-| measures UNDER A FILTER CONTEXT | ~1,700 measure x dimension-value cells | see `cmp_ctx.py` |
-| calculated columns vs stored VertiPaq values | ~400 columns | 0 mismatches |
-| unit tests | 1,280 | pass (`pytest -m "not slow"`) |
+| measures UNDER A FILTER CONTEXT | ~1,700 measure x dimension-value cells | see per-file table below |
+| calculated columns vs stored VertiPaq values | 397 columns, all 25 files | 0 mismatches, 8 deliberate refusals |
+| unit tests | 1,336 | pass (`pytest -m "not slow"`) |
+| ruff / mypy | — | clean / 140 (the standing baseline) |
+
+Filter-context comparisons re-run after the five landed fixes: MS_AI_Sample
+44/44, Ecommerce_Conversion 132/132, MS_Competitive_Marketing 88/88,
+MS_Covid_Tracking 22/22, MS_Sales_Returns 116/116, GeoSales_Dashboard 152/152,
+Agents_Performance 404/408 (the four in the reverted-propagation write-up).
 
 Earlier issues #3-#7 all remain CLOSED. The OpenBI findings ledger
 (`docs/openbi-findings-ledger.md`) is the authority on what is still open.
