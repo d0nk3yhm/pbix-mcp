@@ -22,7 +22,7 @@ from datetime import datetime
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ""))
-from tools.dax_conformance.fixture_def import (  # noqa: E402
+from tests.conformance.fixture_def import (  # noqa: E402
     FIXTURE_RELATIONSHIPS,
     FIXTURE_TABLES,
 )
