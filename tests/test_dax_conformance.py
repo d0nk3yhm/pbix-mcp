@@ -22,12 +22,11 @@ from datetime import datetime
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ""))
+from pbix_mcp.dax import engine as de  # noqa: E402
 from tests.conformance.fixture_def import (  # noqa: E402
     FIXTURE_RELATIONSHIPS,
     FIXTURE_TABLES,
 )
-
-from pbix_mcp.dax import engine as de  # noqa: E402
 
 GOLDEN = os.path.join(os.path.dirname(__file__), "conformance", "golden.json")
 
