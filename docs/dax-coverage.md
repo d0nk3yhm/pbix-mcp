@@ -12,10 +12,18 @@ the conformance fixture.
 |---|---|
 | DAX functions in the engine (March 2026 build) | **467** |
 | implemented and verified | **435** ([supported-dax.md](supported-dax.md)) |
-| classified out of authorable scope (Desktop's own error as evidence) | **26** |
-| open — week-grain family, needs calendar-object investigation | **8** |
+| classified out of authorable scope (Desktop's own error as evidence) | **32** |
+| open | **0** |
 
-Implemented-and-verified means one of two proof levels: **257** functions have
+**Every function in the live engine's DAX surface is accounted for**: it
+either matches Power BI Desktop through the per-function conformance
+harness, or Desktop/the engine itself refuses it in every authorable shape,
+with the refusal recorded. The exact tallies are derivable from the
+committed artifacts: 259 functions carry value goldens in
+`tests/conformance/golden.json`, 176 core functions predate the harness and
+are pinned by full-corpus parity, and 32 carry only Desktop-error records.
+
+Implemented-and-verified means one of two proof levels: **259** functions have
 per-function goldens captured from the live Desktop engine and replayed by
 `tests/test_dax_conformance.py` (the ratchet: no "unsupported" escape hatch,
 1e-9 relative tolerance), and **176** core functions predate the harness and
@@ -23,7 +31,12 @@ are pinned by full-corpus parity (every comparable cell of the 25-file corpus,
 v0.9.63). An unimplemented function returns `None` with status
 `"unsupported"`; it is never guessed.
 
-## Classified out of authorable scope (26)
+`CEILING.MATH` and `FLOOR.MATH` appear in some DAX documentation but are
+**not in the engine's MDSCHEMA_FUNCTIONS inventory at all** — Desktop cannot
+resolve the names in any context, because they are not engine functions.
+They count against nothing.
+
+## Classified out of authorable scope (32)
 
 Each of these was probed against live Desktop and refused with an explicit
 error; the error text is recorded in `tests/conformance/golden.json`. They are
@@ -48,17 +61,24 @@ in a query/measure context.
   `INFO.USERDEFINEDFUNCTIONS`
 - **Storage-mode-limited (1)** — `APPROXIMATEDISTINCTCOUNT` (DirectQuery
   sources only; refused against an import model)
-- **Name not resolvable (2)** — Desktop cannot resolve the name in any
-  context we could author: `CEILING.MATH`, `FLOOR.MATH`
-
-## Open items (8)
-
-- **Week-grain time intelligence (8)**: `CLOSINGBALANCEWEEK`, `DATESWTD`,
-  `ENDOFWEEK`, `NEXTWEEK`, `OPENINGBALANCEWEEK`, `PREVIOUSWEEK`,
-  `STARTOFWEEK`, `TOTALWTD`. Desktop refuses them without a calendar
-  reference (2025 calendar-object model feature). Under investigation:
-  whether the fixture can carry a calendar object, so these can be captured
-  and implemented — otherwise they finalize as needs-model-feature.
+- **Calendar-feature-gated (8)** — the week-grain time-intelligence family:
+  `CLOSINGBALANCEWEEK`, `DATESWTD`, `ENDOFWEEK`, `NEXTWEEK`,
+  `OPENINGBALANCEWEEK`, `PREVIOUSWEEK`, `STARTOFWEEK`, `TOTALWTD`.
+  Two-layer evidence, both from the live engine:
+  1. Each function refuses every date-column shape with *"parameter N must
+     be a calendar reference"* (recorded in `golden.json`).
+  2. A calendar reference requires a calendar object (TMSCHEMA
+     `Calendar`/`TimeUnitColumnAssociation`/`CalendarColumnReference`), and
+     the engine **refuses to accept one**: creating a complete, well-formed
+     custom calendar via TOM/XMLA (compatibility level raised to the
+     required 1701, three time-unit column groups with bound primary
+     columns) is rejected by msmdsrv with *"The model contains a custom
+     calendar. This feature is not supported."*
+  No model this project can author — by builder, metadata edit, or live
+  XMLA — can carry the object these functions need, so they are not
+  authorable against this engine build. The probes stay in the harness: a
+  future Desktop build that enables calendars will flip them to value
+  goldens on the next capture, and the family graduates to implementable.
 
 ## PATH and the builder hierarchy gap
 
