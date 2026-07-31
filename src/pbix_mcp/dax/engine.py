@@ -60,6 +60,22 @@ _MISSING = object()
 # An aggregation call in a FILTER condition aggregates over the context rather
 # than the iterated row, so its column references must NOT be substituted with
 # the row's values (see _fn_filter).
+
+# 1-arg math scalars for the conformance batch; domain errors return BLANK via
+# the ValueError guard in _fn_math1.
+_MATH1 = {
+    'ACOS': math.acos, 'ASIN': math.asin, 'ATAN': math.atan,
+    'ACOSH': math.acosh, 'ASINH': math.asinh, 'ATANH': math.atanh,
+    'COS': math.cos, 'SIN': math.sin, 'TAN': math.tan,
+    'COSH': math.cosh, 'SINH': math.sinh, 'TANH': math.tanh,
+    'COT': lambda x: math.cos(x) / math.sin(x),
+    'COTH': lambda x: math.cosh(x) / math.sinh(x),
+    'ACOT': lambda x: math.pi / 2 - math.atan(x),
+    'ACOTH': lambda x: math.atanh(1.0 / x),
+    'DEGREES': math.degrees, 'RADIANS': math.radians,
+    'SQRTPI': lambda x: math.sqrt(x * math.pi),
+}
+
 _AGG_CALL_RE = re.compile(
     r"\b(SUM|SUMX|AVERAGE|AVERAGEX|MIN|MINX|MAX|MAXX|COUNT|COUNTX|COUNTA|"
     r"COUNTROWS|COUNTBLANK|DISTINCTCOUNT|MEDIAN|MEDIANX|PRODUCT|PRODUCTX|"
@@ -431,7 +447,10 @@ _SCI_NUM_RE = re.compile(r'^[+-]?\d+(?:\.\d+)?[eE][+-]?\d+$')
 _IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 _BRACKET2_RE = re.compile(r'^\[[^\]]+\]$')
 _NOT_PREFIX_RE = re.compile(r'(?i)^not\s+(.+)$')
-_FUNC_CALL_RE = re.compile(r'([A-Za-z_]\w*)\s*\(')
+# Dots are legal inside DAX function names (STDEV.S, T.DIST.2T,
+# NORM.S.INV) -- the old \w* pattern matched only the prefix, so every
+# dotted function silently fell through to the unsupported path.
+_FUNC_CALL_RE = re.compile(r'([A-Za-z_][\w.]*)\s*\(')
 _TCOL_RE = re.compile(r"(?:'([^'\[\]]+)'|([^\W\d][\w .]*))\s*\[([^\]]+)\]$")
 # The same shape, anchored at BOTH ends. ALL/ALLSELECTED matched their argument
 # with an unanchored pattern, which quietly accepted only the first column of a
@@ -1947,6 +1966,71 @@ class DAXEngine:
             'PI': self._fn_pi,
             'CURRENCY': self._fn_currency,
             'FIXED': self._fn_fixed,
+            # --- conformance batch 1: math scalars ---
+            'ACOS': lambda a, c: self._fn_math1('ACOS', a, c),
+            'ACOSH': lambda a, c: self._fn_math1('ACOSH', a, c),
+            'ACOT': lambda a, c: self._fn_math1('ACOT', a, c),
+            'ACOTH': lambda a, c: self._fn_math1('ACOTH', a, c),
+            'ASIN': lambda a, c: self._fn_math1('ASIN', a, c),
+            'ASINH': lambda a, c: self._fn_math1('ASINH', a, c),
+            'ATAN': lambda a, c: self._fn_math1('ATAN', a, c),
+            'ATANH': lambda a, c: self._fn_math1('ATANH', a, c),
+            'COS': lambda a, c: self._fn_math1('COS', a, c),
+            'COSH': lambda a, c: self._fn_math1('COSH', a, c),
+            'COT': lambda a, c: self._fn_math1('COT', a, c),
+            'COTH': lambda a, c: self._fn_math1('COTH', a, c),
+            'SIN': lambda a, c: self._fn_math1('SIN', a, c),
+            'SINH': lambda a, c: self._fn_math1('SINH', a, c),
+            'TAN': lambda a, c: self._fn_math1('TAN', a, c),
+            'TANH': lambda a, c: self._fn_math1('TANH', a, c),
+            'DEGREES': lambda a, c: self._fn_math1('DEGREES', a, c),
+            'RADIANS': lambda a, c: self._fn_math1('RADIANS', a, c),
+            'SQRTPI': lambda a, c: self._fn_math1('SQRTPI', a, c),
+            'COMBIN': self._fn_combin,
+            'COMBINA': self._fn_combina,
+            'PERMUT': self._fn_permut,
+            'QUOTIENT': self._fn_quotient,
+            'BITAND': lambda a, c: self._fn_bitop('BITAND', a, c),
+            'BITOR': lambda a, c: self._fn_bitop('BITOR', a, c),
+            'BITXOR': lambda a, c: self._fn_bitop('BITXOR', a, c),
+            'BITLSHIFT': lambda a, c: self._fn_bitop('BITLSHIFT', a, c),
+            'BITRSHIFT': lambda a, c: self._fn_bitop('BITRSHIFT', a, c),
+            # --- conformance batch 1: distributions ---
+            'NORM.DIST': self._fn_norm_dist,
+            'NORM.INV': self._fn_norm_inv,
+            'NORM.S.DIST': self._fn_norm_s_dist,
+            'NORM.S.INV': self._fn_norm_s_inv,
+            'EXPON.DIST': self._fn_expon_dist,
+            'POISSON.DIST': self._fn_poisson_dist,
+            'BETA.DIST': self._fn_beta_dist,
+            'BETA.INV': self._fn_beta_inv,
+            'CHISQ.DIST': self._fn_chisq_dist,
+            'CHISQ.DIST.RT': self._fn_chisq_dist_rt,
+            'CHISQ.INV': self._fn_chisq_inv,
+            'CHISQ.INV.RT': self._fn_chisq_inv_rt,
+            'T.DIST': self._fn_t_dist,
+            'T.DIST.RT': self._fn_t_dist_rt,
+            'T.DIST.2T': self._fn_t_dist_2t,
+            'T.INV': self._fn_t_inv,
+            'T.INV.2T': self._fn_t_inv_2t,
+            'CONFIDENCE.NORM': self._fn_confidence_norm,
+            'CONFIDENCE.T': self._fn_confidence_t,
+            # --- conformance batch 1: column/iterator statistics ---
+            'PERCENTILE.INC': lambda a, c: self._fn_percentile('PERCENTILE.INC', a, c),
+            'PERCENTILE.EXC': lambda a, c: self._fn_percentile('PERCENTILE.EXC', a, c),
+            'PERCENTILEX.INC': lambda a, c: self._fn_percentilex('PERCENTILEX.INC', a, c),
+            'PERCENTILEX.EXC': lambda a, c: self._fn_percentilex('PERCENTILEX.EXC', a, c),
+            'GEOMEAN': self._fn_geomean,
+            'GEOMEANX': self._fn_geomeanx,
+            'STDEVX.S': lambda a, c: self._fn_stdevx('STDEVX.S', a, c),
+            'STDEVX.P': lambda a, c: self._fn_stdevx('STDEVX.P', a, c),
+            'VARX.S': lambda a, c: self._fn_stdevx('VARX.S', a, c),
+            'VARX.P': lambda a, c: self._fn_stdevx('VARX.P', a, c),
+            'RANK.EQ': self._fn_rank_eq,
+            'AVERAGEA': self._fn_averagea,
+            'DATEVALUE': self._fn_datevalue,
+            'TIMEVALUE': self._fn_timevalue,
+            'ISO.CEILING': self._fn_iso_ceiling,
             # --- Logic ---
             'IF': self._fn_if,
             'SWITCH': self._fn_switch,
@@ -5779,6 +5863,620 @@ class DAXEngine:
             return math.pow(base, exp)
         return None
 
+
+    # ------------------------------------------------------------------
+    # Conformance batch 1: trig/math scalars, bit ops, statistical
+    # distributions, and their iterator variants. Every function here has
+    # Desktop-captured golden values in tests/conformance/golden.json; the
+    # numerics (inverse normal, incomplete beta/gamma) are implemented to
+    # double precision so the goldens match at 1e-9 relative, not merely
+    # "close". CEILING.MATH / FLOOR.MATH are deliberately absent: Desktop
+    # itself cannot resolve those names in a query, DMV listing or not.
+    # ------------------------------------------------------------------
+
+    def _num1(self, args_str: str, ctx: DAXContext):
+        v = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        return float(v)
+
+    def _num_args(self, args_str: str, ctx: DAXContext, n: int):
+        parts = self._split_args(args_str)
+        if len(parts) < n:
+            return None
+        out = []
+        for prt in parts[:n]:
+            v = self._eval_expr(prt.strip(), ctx)
+            if isinstance(v, bool):
+                out.append(1.0 if v else 0.0)
+            elif isinstance(v, (int, float)):
+                out.append(float(v))
+            else:
+                return None
+        return out
+
+    def _fn_math1(self, name: str, args_str: str, ctx: DAXContext):
+        x = self._num1(args_str, ctx)
+        if x is None:
+            return None
+        try:
+            return _MATH1[name](x)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            return None
+
+    def _fn_combin(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 2)
+        if a is None:
+            return None
+        n, k = int(a[0]), int(a[1])
+        if k < 0 or n < 0 or k > n:
+            return None
+        return float(math.comb(n, k))
+
+    def _fn_combina(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 2)
+        if a is None:
+            return None
+        n, k = int(a[0]), int(a[1])
+        if n < 0 or k < 0 or (n == 0 and k > 0):
+            return None
+        return float(math.comb(n + k - 1, k))
+
+    def _fn_permut(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 2)
+        if a is None:
+            return None
+        n, k = int(a[0]), int(a[1])
+        if k < 0 or n < 0 or k > n:
+            return None
+        return float(math.perm(n, k))
+
+    def _fn_quotient(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 2)
+        if a is None or a[1] == 0:
+            return None
+        return float(math.trunc(a[0] / a[1]))
+
+    def _fn_bitop(self, name: str, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 2)
+        if a is None:
+            return None
+        x, y = int(a[0]), int(a[1])
+        if name in ('BITAND', 'BITOR', 'BITXOR'):
+            if x < 0 or y < 0:
+                return None
+            return float({'BITAND': x & y, 'BITOR': x | y,
+                          'BITXOR': x ^ y}[name])
+        if name == 'BITRSHIFT':
+            y = -y
+        if x < 0 or abs(y) > 53:
+            return None
+        return float(x << y if y >= 0 else x >> -y)
+
+    # ----------------------------------------------------- special functions
+
+    @staticmethod
+    def _norm_cdf(z: float) -> float:
+        return 0.5 * math.erfc(-z / math.sqrt(2.0))
+
+    @staticmethod
+    def _norm_pdf(z: float) -> float:
+        return math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+
+    @classmethod
+    def _norm_inv(cls, p: float) -> float:
+        """Acklam's rational approximation polished with two Halley steps."""
+        if not (0.0 < p < 1.0):
+            raise ValueError("p out of range")
+        a = (-3.969683028665376e+01, 2.209460984245205e+02,
+             -2.759285104469687e+02, 1.383577518672690e+02,
+             -3.066479806614716e+01, 2.506628277459239e+00)
+        b = (-5.447609879822406e+01, 1.615858368580409e+02,
+             -1.556989798598866e+02, 6.680131188771972e+01,
+             -1.328068155288572e+01)
+        c = (-7.784894002430293e-03, -3.223964580411365e-01,
+             -2.400758277161838e+00, -2.549732539343734e+00,
+             4.374664141464968e+00, 2.938163982698783e+00)
+        d = (7.784695709041462e-03, 3.224671290700398e-01,
+             2.445134137142996e+00, 3.754408661907416e+00)
+        plow, phigh = 0.02425, 1 - 0.02425
+        if p < plow:
+            q = math.sqrt(-2 * math.log(p))
+            x = ((((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
+                 / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1))
+        elif p <= phigh:
+            q = p - 0.5
+            r = q * q
+            x = ((((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q
+                 / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1))
+        else:
+            q = math.sqrt(-2 * math.log(1 - p))
+            x = -((((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
+                  / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1))
+        for _ in range(2):
+            e = cls._norm_cdf(x) - p
+            u = e / cls._norm_pdf(x)
+            x = x - u / (1 + x * u / 2)
+        return x
+
+    @staticmethod
+    def _betacf(a: float, b: float, x: float) -> float:
+        """Continued fraction for the incomplete beta (Lentz)."""
+        MAXIT, EPS, FPMIN = 300, 3e-16, 1e-300
+        qab, qap, qam = a + b, a + 1.0, a - 1.0
+        c = 1.0
+        d = 1.0 - qab * x / qap
+        if abs(d) < FPMIN:
+            d = FPMIN
+        d = 1.0 / d
+        h = d
+        for m in range(1, MAXIT + 1):
+            m2 = 2 * m
+            aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+            d = 1.0 + aa * d
+            if abs(d) < FPMIN:
+                d = FPMIN
+            c = 1.0 + aa / c
+            if abs(c) < FPMIN:
+                c = FPMIN
+            d = 1.0 / d
+            h *= d * c
+            aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+            d = 1.0 + aa * d
+            if abs(d) < FPMIN:
+                d = FPMIN
+            c = 1.0 + aa / c
+            if abs(c) < FPMIN:
+                c = FPMIN
+            d = 1.0 / d
+            de = d * c
+            h *= de
+            if abs(de - 1.0) < EPS:
+                break
+        return h
+
+    @classmethod
+    def _betainc(cls, a: float, b: float, x: float) -> float:
+        if x <= 0.0:
+            return 0.0
+        if x >= 1.0:
+            return 1.0
+        ln_bt = (math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+                 + a * math.log(x) + b * math.log1p(-x))
+        bt = math.exp(ln_bt)
+        if x < (a + 1.0) / (a + b + 2.0):
+            return bt * cls._betacf(a, b, x) / a
+        return 1.0 - bt * cls._betacf(b, a, 1.0 - x) / b
+
+    @classmethod
+    def _betainc_inv(cls, a: float, b: float, p: float) -> float:
+        if p <= 0.0:
+            return 0.0
+        if p >= 1.0:
+            return 1.0
+        x = a / (a + b)
+        for _ in range(100):
+            f = cls._betainc(a, b, x) - p
+            ln_pdf = (math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+                      + (a - 1) * math.log(x) + (b - 1) * math.log1p(-x))
+            df = math.exp(ln_pdf)
+            if df == 0:
+                break
+            nx = x - f / df
+            if nx <= 0:
+                nx = x / 2
+            elif nx >= 1:
+                nx = (x + 1) / 2
+            if abs(nx - x) < 1e-15:
+                x = nx
+                break
+            x = nx
+        return x
+
+    @staticmethod
+    def _gammainc_lower(s: float, x: float) -> float:
+        if x < 0 or s <= 0:
+            raise ValueError
+        if x == 0:
+            return 0.0
+        if x < s + 1.0:
+            term = 1.0 / s
+            total = term
+            n = s
+            for _ in range(500):
+                n += 1.0
+                term *= x / n
+                total += term
+                if abs(term) < abs(total) * 3e-16:
+                    break
+            return total * math.exp(-x + s * math.log(x) - math.lgamma(s))
+        FPMIN = 1e-300
+        b0 = x + 1.0 - s
+        c = 1.0 / FPMIN
+        d = 1.0 / b0
+        h = d
+        for i in range(1, 500):
+            an = -i * (i - s)
+            b0 += 2.0
+            d = an * d + b0
+            if abs(d) < FPMIN:
+                d = FPMIN
+            c = b0 + an / c
+            if abs(c) < FPMIN:
+                c = FPMIN
+            d = 1.0 / d
+            de = d * c
+            h *= de
+            if abs(de - 1.0) < 3e-16:
+                break
+        q = math.exp(-x + s * math.log(x) - math.lgamma(s)) * h
+        return 1.0 - q
+
+    @classmethod
+    def _gammainc_inv(cls, s: float, p: float) -> float:
+        if p <= 0.0:
+            return 0.0
+        lo, hi = 0.0, max(s, 1.0)
+        while cls._gammainc_lower(s, hi) < p:
+            hi *= 2
+            if hi > 1e10:
+                break
+        for _ in range(200):
+            mid = (lo + hi) / 2
+            if cls._gammainc_lower(s, mid) < p:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2
+
+    @classmethod
+    def _t_cdf(cls, t: float, df: float) -> float:
+        x = df / (df + t * t)
+        p = 0.5 * cls._betainc(df / 2.0, 0.5, x)
+        return 1.0 - p if t > 0 else p
+
+    # ------------------------------------------------------ dist functions
+
+    def _fn_norm_dist(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 4)
+        if a is None or a[2] <= 0:
+            return None
+        z = (a[0] - a[1]) / a[2]
+        if a[3]:
+            return self._norm_cdf(z)
+        return self._norm_pdf(z) / a[2]
+
+    def _fn_norm_inv(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 3)
+        if a is None or not (0 < a[0] < 1) or a[2] <= 0:
+            return None
+        return a[1] + a[2] * self._norm_inv(a[0])
+
+    def _fn_norm_s_dist(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 2)
+        if a is None:
+            return None
+        return self._norm_cdf(a[0]) if a[1] else self._norm_pdf(a[0])
+
+    def _fn_norm_s_inv(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 1)
+        if a is None or not (0 < a[0] < 1):
+            return None
+        return self._norm_inv(a[0])
+
+    def _fn_expon_dist(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 3)
+        if a is None or a[0] < 0 or a[1] <= 0:
+            return None
+        if a[2]:
+            return 1.0 - math.exp(-a[1] * a[0])
+        return a[1] * math.exp(-a[1] * a[0])
+
+    def _fn_poisson_dist(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 3)
+        if a is None or a[0] < 0 or a[1] < 0:
+            return None
+        k, lam = int(a[0]), a[1]
+
+        def pmf(i):
+            return math.exp(-lam + i * math.log(lam) - math.lgamma(i + 1))
+
+        if a[2]:
+            return sum(pmf(i) for i in range(k + 1))
+        return pmf(k)
+
+    def _fn_beta_dist(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        a = self._num_args(args_str, ctx, 4)
+        if a is None or a[1] <= 0 or a[2] <= 0:
+            return None
+        x, al, be, cum = a[0], a[1], a[2], a[3]
+        lo, hi = 0.0, 1.0
+        if len(parts) >= 6:
+            more = self._num_args(",".join(parts[4:6]), ctx, 2)
+            if more:
+                lo, hi = more
+        if hi <= lo:
+            return None
+        xx = (x - lo) / (hi - lo)
+        if cum:
+            return self._betainc(al, be, xx)
+        if not (0 <= xx <= 1):
+            return 0.0
+        ln = (math.lgamma(al + be) - math.lgamma(al) - math.lgamma(be)
+              + (al - 1) * math.log(xx) + (be - 1) * math.log1p(-xx))
+        return math.exp(ln) / (hi - lo)
+
+    def _fn_beta_inv(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        a = self._num_args(args_str, ctx, 3)
+        if a is None or not (0 < a[0] < 1) or a[1] <= 0 or a[2] <= 0:
+            return None
+        lo, hi = 0.0, 1.0
+        if len(parts) >= 5:
+            more = self._num_args(",".join(parts[3:5]), ctx, 2)
+            if more:
+                lo, hi = more
+        return lo + (hi - lo) * self._betainc_inv(a[1], a[2], a[0])
+
+    def _fn_chisq_dist(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 3)
+        if a is None or a[0] < 0 or a[1] < 1:
+            return None
+        x, df = a[0], a[1]
+        if a[2]:
+            return self._gammainc_lower(df / 2.0, x / 2.0)
+        return (x ** (df / 2.0 - 1) * math.exp(-x / 2.0)
+                / (2 ** (df / 2.0) * math.exp(math.lgamma(df / 2.0))))
+
+    def _fn_chisq_dist_rt(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 2)
+        if a is None or a[0] < 0 or a[1] < 1:
+            return None
+        return 1.0 - self._gammainc_lower(a[1] / 2.0, a[0] / 2.0)
+
+    def _fn_chisq_inv(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 2)
+        if a is None or not (0 <= a[0] < 1) or a[1] < 1:
+            return None
+        return 2.0 * self._gammainc_inv(a[1] / 2.0, a[0])
+
+    def _fn_chisq_inv_rt(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 2)
+        if a is None or not (0 < a[0] <= 1) or a[1] < 1:
+            return None
+        return 2.0 * self._gammainc_inv(a[1] / 2.0, 1.0 - a[0])
+
+    def _fn_t_dist(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 3)
+        if a is None or a[1] < 1:
+            return None
+        t, df = a[0], a[1]
+        if a[2]:
+            return self._t_cdf(t, df)
+        ln = (math.lgamma((df + 1) / 2.0) - math.lgamma(df / 2.0)
+              - 0.5 * math.log(df * math.pi)
+              - (df + 1) / 2.0 * math.log1p(t * t / df))
+        return math.exp(ln)
+
+    def _fn_t_dist_rt(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 2)
+        if a is None or a[1] < 1:
+            return None
+        return 1.0 - self._t_cdf(a[0], a[1])
+
+    def _fn_t_dist_2t(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 2)
+        if a is None or a[0] < 0 or a[1] < 1:
+            return None
+        return 2.0 * (1.0 - self._t_cdf(a[0], a[1]))
+
+    def _t_inv_left(self, p: float, df: float) -> float:
+        x = self._betainc_inv(df / 2.0, 0.5, 2.0 * min(p, 1.0 - p))
+        t = math.sqrt(df * (1.0 - x) / x) if x > 0 else float("inf")
+        return -t if p < 0.5 else t
+
+    def _fn_t_inv(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 2)
+        if a is None or not (0 < a[0] < 1) or a[1] < 1:
+            return None
+        return self._t_inv_left(a[0], a[1])
+
+    def _fn_t_inv_2t(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 2)
+        if a is None or not (0 < a[0] <= 1) or a[1] < 1:
+            return None
+        return self._t_inv_left(1.0 - a[0] / 2.0, a[1])
+
+    def _fn_confidence_norm(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 3)
+        if a is None or not (0 < a[0] < 1) or a[1] <= 0 or a[2] < 1:
+            return None
+        return self._norm_inv(1.0 - a[0] / 2.0) * a[1] / math.sqrt(int(a[2]))
+
+    def _fn_confidence_t(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 3)
+        if a is None or not (0 < a[0] < 1) or a[1] <= 0 or a[2] < 2:
+            return None
+        return (self._t_inv_left(1.0 - a[0] / 2.0, int(a[2]) - 1)
+                * a[1] / math.sqrt(int(a[2])))
+
+    # ------------------------------------------ column / iterator statistics
+
+    def _column_numbers(self, args_str: str, ctx: DAXContext):
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(ref, tuple) and len(ref) == 2:
+            return [float(v) for v in ctx.get_column_data(ref[0], ref[1])
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        return None
+
+    def _iter_numbers(self, args_str: str, ctx: DAXContext):
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return None
+        table_ref = self._eval_expr(args[0].strip(), ctx)
+        row_expr = args[1].strip()
+        if not isinstance(table_ref, list):
+            return None
+        values = []
+        for row_item in table_ref:
+            if isinstance(row_item, dict) and '__table__' in row_item:
+                row_ctx = self._make_row_context(row_item, ctx)
+                result = self._eval_expr(row_expr, row_ctx)
+                result = self._resolve_row_result(result, row_item, row_ctx)
+            else:
+                result = self._eval_expr(row_expr, ctx)
+            if isinstance(result, (int, float)) and not isinstance(result, bool):
+                values.append(float(result))
+        return values
+
+    @staticmethod
+    def _percentile_inc(values, k):
+        if not values or not (0.0 <= k <= 1.0):
+            return None
+        v = sorted(values)
+        pos = k * (len(v) - 1)
+        lo = int(math.floor(pos))
+        hi = min(lo + 1, len(v) - 1)
+        return v[lo] + (v[hi] - v[lo]) * (pos - lo)
+
+    @staticmethod
+    def _percentile_exc(values, k):
+        n = len(values)
+        if not values or not (1.0 / (n + 1) <= k <= n / (n + 1.0)):
+            return None
+        v = sorted(values)
+        pos = k * (n + 1) - 1
+        lo = int(math.floor(pos))
+        hi = min(lo + 1, n - 1)
+        return v[lo] + (v[hi] - v[lo]) * (pos - lo)
+
+    def _fn_percentile(self, name: str, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if len(parts) != 2:
+            return None
+        vals = self._column_numbers(parts[0], ctx)
+        k = self._num1(parts[1], ctx)
+        if vals is None or k is None:
+            return None
+        f = self._percentile_inc if name.endswith("INC") else self._percentile_exc
+        return f(vals, k)
+
+    def _fn_percentilex(self, name: str, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if len(parts) != 3:
+            return None
+        vals = self._iter_numbers(",".join(parts[:2]), ctx)
+        k = self._num1(parts[2], ctx)
+        if vals is None or k is None:
+            return None
+        f = self._percentile_inc if name.endswith("INC") else self._percentile_exc
+        return f(vals, k)
+
+    def _fn_geomean(self, args_str: str, ctx: DAXContext):
+        vals = self._column_numbers(args_str, ctx)
+        if not vals or any(v <= 0 for v in vals):
+            return None
+        return math.exp(sum(math.log(v) for v in vals) / len(vals))
+
+    def _fn_geomeanx(self, args_str: str, ctx: DAXContext):
+        vals = self._iter_numbers(args_str, ctx)
+        if not vals or any(v <= 0 for v in vals):
+            return None
+        return math.exp(sum(math.log(v) for v in vals) / len(vals))
+
+    def _fn_stdevx(self, name: str, args_str: str, ctx: DAXContext):
+        vals = self._iter_numbers(args_str, ctx)
+        if vals is None:
+            return None
+        sample = name.endswith(".S")
+        if len(vals) < (2 if sample else 1):
+            return None
+        var = (statistics.variance(vals) if sample
+               else statistics.pvariance(vals))
+        return math.sqrt(var) if "STDEV" in name else var
+
+    def _fn_rank_eq(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if len(parts) < 2:
+            return None
+        x = self._num1(parts[0], ctx)
+        vals = self._column_numbers(parts[1], ctx)
+        if x is None or not vals:
+            return None
+        order = None
+        if len(parts) >= 3:
+            order = self._num1(parts[2], ctx)
+        asc = bool(order)
+        v = sorted(vals, reverse=not asc)
+        for i, val in enumerate(v):
+            if val == x:
+                return float(i + 1)
+        return None
+
+    def _fn_averagea(self, args_str: str, ctx: DAXContext):
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if not (isinstance(ref, tuple) and len(ref) == 2):
+            return None
+        vals = []
+        for v in ctx.get_column_data(ref[0], ref[1]):
+            if v is None:
+                continue
+            if isinstance(v, bool):
+                vals.append(1.0 if v else 0.0)
+            elif isinstance(v, (int, float)):
+                vals.append(float(v))
+            else:
+                vals.append(0.0)
+        return sum(vals) / len(vals) if vals else None
+
+    def _fn_iso_ceiling(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        x = self._num1(parts[0], ctx)
+        if x is None:
+            return None
+        sig = 1.0
+        if len(parts) > 1:
+            s2 = self._num1(parts[1], ctx)
+            if s2 is None or s2 == 0:
+                return None
+            sig = abs(s2)
+        return math.ceil(x / sig) * sig
+
+    def _fn_datevalue(self, args_str: str, ctx: DAXContext):
+        v = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(v, datetime):
+            return datetime(v.year, v.month, v.day)
+        if not isinstance(v, str):
+            return None
+        d = None
+        # Model culture is en-US regardless of the machine locale: Desktop's
+        # golden reads "1/8/2009" as January 8. Month-first BEFORE the generic
+        # parser, which is day-first for ambiguous slash dates.
+        for fmt in ("%m/%d/%Y", "%m/%d/%y", "%d/%m/%Y"):
+            try:
+                d = datetime.strptime(v.strip(), fmt)
+                break
+            except ValueError:
+                continue
+        if d is None:
+            d = _as_datetime(v)
+        if d is None:
+            return None
+        return datetime(d.year, d.month, d.day)
+
+    def _fn_timevalue(self, args_str: str, ctx: DAXContext):
+        v = self._eval_expr(args_str.strip(), ctx)
+        if not isinstance(v, str):
+            return None
+        for fmt in ("%H:%M:%S", "%H:%M", "%I:%M:%S %p", "%I:%M %p"):
+            try:
+                t = datetime.strptime(v.strip(), fmt)
+                return datetime(1899, 12, 30, t.hour, t.minute, t.second)
+            except ValueError:
+                continue
+        return None
+
     def _fn_sqrt(self, args_str: str, ctx: DAXContext) -> Any:
         """SQRT(number) — square root."""
         val = self._eval_expr(args_str.strip(), ctx)
@@ -5922,6 +6620,11 @@ class DAXEngine:
         decimals = int(self._eval_expr(args[1].strip(), ctx)) if len(args) > 1 else 2
         no_commas = self._eval_expr(args[2].strip(), ctx) if len(args) > 2 else False
         if isinstance(val, (int, float)):
+            if decimals < 0:
+                # FIXED(1234.567, -2) rounds to the nearest 100 and shows no
+                # decimal places -- Desktop: "1200".
+                val = round(val / (10 ** -decimals)) * (10 ** -decimals)
+                decimals = 0
             if no_commas:
                 return f"{val:.{decimals}f}"
             return f"{val:,.{decimals}f}"

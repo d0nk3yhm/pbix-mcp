@@ -9,8 +9,9 @@ build the corpus is verified against, immune to documentation lag.
 | | count |
 |---|---|
 | DAX functions in the engine (March 2026 build) | **467** |
-| implemented and corpus-verified | **183** ([supported-dax.md](supported-dax.md)) |
-| not yet implemented | **285** |
+| implemented and verified | **245** ([supported-dax.md](supported-dax.md)) |
+| not yet implemented | **221** |
+| empirically not authorable (Desktop refuses in a query) | **2** (`CEILING.MATH`, `FLOOR.MATH`) |
 
 Corpus parity (v0.9.63) means every comparable cell of the 25-file test corpus
 matches Desktop. Full-surface parity — every function below, each verified

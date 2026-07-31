@@ -1,0 +1,616 @@
+{
+ "ACOS": [
+  {
+   "expr": "ACOS(0.5)",
+   "value": "1.0471975511966"
+  },
+  {
+   "expr": "ACOS(-1)",
+   "value": "3.14159265358979"
+  }
+ ],
+ "ACOSH": [
+  {
+   "expr": "ACOSH(1)",
+   "value": "0"
+  },
+  {
+   "expr": "ACOSH(2.5)",
+   "value": "1.56679923697241"
+  }
+ ],
+ "ACOT": [
+  {
+   "expr": "ACOT(1)",
+   "value": "0.785398163397448"
+  },
+  {
+   "expr": "ACOT(-2)",
+   "value": "2.67794504458899"
+  }
+ ],
+ "ACOTH": [
+  {
+   "expr": "ACOTH(2)",
+   "value": "0.549306144334055"
+  },
+  {
+   "expr": "ACOTH(-3)",
+   "value": "-0.346573590279973"
+  }
+ ],
+ "ASIN": [
+  {
+   "expr": "ASIN(0.5)",
+   "value": "0.523598775598299"
+  },
+  {
+   "expr": "ASIN(-1)",
+   "value": "-1.5707963267949"
+  }
+ ],
+ "ASINH": [
+  {
+   "expr": "ASINH(0)",
+   "value": "0"
+  },
+  {
+   "expr": "ASINH(-2.5)",
+   "value": "-1.6472311463711"
+  }
+ ],
+ "ATAN": [
+  {
+   "expr": "ATAN(1)",
+   "value": "0.785398163397448"
+  },
+  {
+   "expr": "ATAN(-0.5)",
+   "value": "-0.463647609000806"
+  }
+ ],
+ "ATANH": [
+  {
+   "expr": "ATANH(0.5)",
+   "value": "0.549306144334055"
+  },
+  {
+   "expr": "ATANH(-0.9)",
+   "value": "-1.47221948958322"
+  }
+ ],
+ "AVERAGEA": [
+  {
+   "expr": "AVERAGEA(N[i])",
+   "value": "3"
+  },
+  {
+   "expr": "AVERAGEA(N[b])",
+   "value": "0.6"
+  }
+ ],
+ "BETA.DIST": [
+  {
+   "expr": "BETA.DIST(0.4, 8, 10, TRUE)",
+   "value": "0.359492342933094"
+  },
+  {
+   "expr": "BETA.DIST(0.4, 8, 10, FALSE)",
+   "value": "3.21111706514227"
+  }
+ ],
+ "BETA.INV": [
+  {
+   "expr": "BETA.INV(0.685470581, 8, 10)",
+   "value": "0.499999999981571"
+  }
+ ],
+ "BITAND": [
+  {
+   "expr": "BITAND(13, 25)",
+   "value": "9"
+  },
+  {
+   "expr": "BITAND(0, 7)",
+   "value": "0"
+  }
+ ],
+ "BITLSHIFT": [
+  {
+   "expr": "BITLSHIFT(4, 2)",
+   "value": "16"
+  },
+  {
+   "expr": "BITLSHIFT(16, -2)",
+   "value": "4"
+  }
+ ],
+ "BITOR": [
+  {
+   "expr": "BITOR(13, 25)",
+   "value": "29"
+  }
+ ],
+ "BITRSHIFT": [
+  {
+   "expr": "BITRSHIFT(13, 2)",
+   "value": "3"
+  },
+  {
+   "expr": "BITRSHIFT(4, -2)",
+   "value": "16"
+  }
+ ],
+ "BITXOR": [
+  {
+   "expr": "BITXOR(13, 25)",
+   "value": "20"
+  }
+ ],
+ "CEILING.MATH": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 33) Kan ikke l\u00f8se navnet CEILING.MATH. Det er ikke et gyldig tabell-, variabel- eller funksjonsnavn.\"",
+   "expr": "CEILING.MATH(24.3, 5)"
+  },
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 33) Kan ikke l\u00f8se navnet CEILING.MATH. Det er ikke et gyldig tabell-, variabel- eller funksjonsnavn.\"",
+   "expr": "CEILING.MATH(-8.1, 2)"
+  }
+ ],
+ "CHISQ.DIST": [
+  {
+   "expr": "CHISQ.DIST(0.5, 1, TRUE)",
+   "value": "0.520499877813047"
+  },
+  {
+   "expr": "CHISQ.DIST(2, 3, FALSE)",
+   "value": "0.207553748710297"
+  }
+ ],
+ "CHISQ.DIST.RT": [
+  {
+   "expr": "CHISQ.DIST.RT(3, 4)",
+   "value": "0.557825400371075"
+  }
+ ],
+ "CHISQ.INV": [
+  {
+   "expr": "CHISQ.INV(0.93, 1)",
+   "value": "3.28302028675953"
+  }
+ ],
+ "CHISQ.INV.RT": [
+  {
+   "expr": "CHISQ.INV.RT(0.05, 10)",
+   "value": "18.3070380532751"
+  }
+ ],
+ "COMBIN": [
+  {
+   "expr": "COMBIN(8, 2)",
+   "value": "28"
+  },
+  {
+   "expr": "COMBIN(10, 10)",
+   "value": "1"
+  }
+ ],
+ "COMBINA": [
+  {
+   "expr": "COMBINA(4, 3)",
+   "value": "20"
+  },
+  {
+   "expr": "COMBINA(10, 3)",
+   "value": "220"
+  }
+ ],
+ "CONFIDENCE.NORM": [
+  {
+   "expr": "CONFIDENCE.NORM(0.05, 2.5, 50)",
+   "value": "0.692951912174839"
+  }
+ ],
+ "CONFIDENCE.T": [
+  {
+   "expr": "CONFIDENCE.T(0.05, 1, 50)",
+   "value": "0.28419685549573"
+  }
+ ],
+ "COS": [
+  {
+   "expr": "COS(0)",
+   "value": "1"
+  },
+  {
+   "expr": "COS(PI()/3)",
+   "value": "0.5"
+  }
+ ],
+ "COSH": [
+  {
+   "expr": "COSH(0)",
+   "value": "1"
+  },
+  {
+   "expr": "COSH(1.5)",
+   "value": "2.35240961524325"
+  }
+ ],
+ "COT": [
+  {
+   "expr": "COT(PI()/4)",
+   "value": "1"
+  },
+  {
+   "expr": "COT(1)",
+   "value": "0.642092615934331"
+  }
+ ],
+ "COTH": [
+  {
+   "expr": "COTH(1)",
+   "value": "1.31303528549933"
+  },
+  {
+   "expr": "COTH(-2)",
+   "value": "-1.03731472072755"
+  }
+ ],
+ "CURRENCY": [
+  {
+   "expr": "CURRENCY(1234.56789)",
+   "value": "1234.5679"
+  }
+ ],
+ "DATEVALUE": [
+  {
+   "expr": "DATEVALUE(\"2024-03-15\")",
+   "value": "03/15/2024 00:00:00"
+  },
+  {
+   "expr": "DATEVALUE(\"1/8/2009\")",
+   "value": "01/08/2009 00:00:00"
+  }
+ ],
+ "DEGREES": [
+  {
+   "expr": "DEGREES(PI())",
+   "value": "180"
+  },
+  {
+   "expr": "DEGREES(1)",
+   "value": "57.2957795130823"
+  }
+ ],
+ "EVEN": [
+  {
+   "expr": "EVEN(1.5)",
+   "value": "2"
+  },
+  {
+   "expr": "EVEN(-1)",
+   "value": "-2"
+  }
+ ],
+ "EXPON.DIST": [
+  {
+   "expr": "EXPON.DIST(0.2, 10, TRUE)",
+   "value": "0.864664716763387"
+  },
+  {
+   "expr": "EXPON.DIST(0.2, 10, FALSE)",
+   "value": "1.35335283236613"
+  }
+ ],
+ "FIXED": [
+  {
+   "expr": "FIXED(1234.567, 1)",
+   "value": "1,234.6"
+  },
+  {
+   "expr": "FIXED(1234.567, -2, TRUE)",
+   "value": "1200"
+  }
+ ],
+ "FLOOR.MATH": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 31) Kan ikke l\u00f8se navnet FLOOR.MATH. Det er ikke et gyldig tabell-, variabel- eller funksjonsnavn.\"",
+   "expr": "FLOOR.MATH(24.3, 5)"
+  },
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 31) Kan ikke l\u00f8se navnet FLOOR.MATH. Det er ikke et gyldig tabell-, variabel- eller funksjonsnavn.\"",
+   "expr": "FLOOR.MATH(-8.1, 2)"
+  }
+ ],
+ "GCD": [
+  {
+   "expr": "GCD(24, 36)",
+   "value": "12"
+  }
+ ],
+ "GEOMEAN": [
+  {
+   "expr": "GEOMEAN(N[i])",
+   "value": "2.60517108469735"
+  }
+ ],
+ "GEOMEANX": [
+  {
+   "expr": "GEOMEANX(N, N[i])",
+   "value": "2.60517108469735"
+  },
+  {
+   "expr": "GEOMEANX(N, N[i] * 2)",
+   "value": "5.2103421693947"
+  }
+ ],
+ "ISO.CEILING": [
+  {
+   "expr": "ISO.CEILING(4.3)",
+   "value": "5"
+  },
+  {
+   "expr": "ISO.CEILING(-4.3, 2)",
+   "value": "-4"
+  }
+ ],
+ "LCM": [
+  {
+   "expr": "LCM(4, 6)",
+   "value": "12"
+  }
+ ],
+ "MROUND": [
+  {
+   "expr": "MROUND(10, 3)",
+   "value": "9"
+  },
+  {
+   "expr": "MROUND(-10, -3)",
+   "value": "-9"
+  }
+ ],
+ "NORM.DIST": [
+  {
+   "expr": "NORM.DIST(42, 40, 1.5, TRUE)",
+   "value": "0.908788780274132"
+  },
+  {
+   "expr": "NORM.DIST(42, 40, 1.5, FALSE)",
+   "value": "0.109340049783996"
+  }
+ ],
+ "NORM.INV": [
+  {
+   "expr": "NORM.INV(0.908789, 40, 1.5)",
+   "value": "42.0000020095662"
+  }
+ ],
+ "NORM.S.DIST": [
+  {
+   "expr": "NORM.S.DIST(1.333333, TRUE)",
+   "value": "0.908788725604095"
+  },
+  {
+   "expr": "NORM.S.DIST(1.333333, FALSE)",
+   "value": "0.164010147569367"
+  }
+ ],
+ "NORM.S.INV": [
+  {
+   "expr": "NORM.S.INV(0.908789)",
+   "value": "1.33333467304411"
+  }
+ ],
+ "ODD": [
+  {
+   "expr": "ODD(1.5)",
+   "value": "3"
+  },
+  {
+   "expr": "ODD(-2)",
+   "value": "-3"
+  }
+ ],
+ "PERCENTILE.EXC": [
+  {
+   "expr": "PERCENTILE.EXC(N[i], 0.25)",
+   "value": "1.5"
+  },
+  {
+   "expr": "PERCENTILE.EXC(N[i], 0.5)",
+   "value": "3"
+  }
+ ],
+ "PERCENTILE.INC": [
+  {
+   "expr": "PERCENTILE.INC(N[i], 0.25)",
+   "value": "2"
+  },
+  {
+   "expr": "PERCENTILE.INC(N[i], 0.9)",
+   "value": "4.6"
+  }
+ ],
+ "PERCENTILEX.EXC": [
+  {
+   "expr": "PERCENTILEX.EXC(N, N[i], 0.5)",
+   "value": "3"
+  }
+ ],
+ "PERCENTILEX.INC": [
+  {
+   "expr": "PERCENTILEX.INC(N, N[i], 0.5)",
+   "value": "3"
+  },
+  {
+   "expr": "PERCENTILEX.INC(F, F[v], 0.75)",
+   "value": "225"
+  }
+ ],
+ "PERMUT": [
+  {
+   "expr": "PERMUT(8, 2)",
+   "value": "56"
+  },
+  {
+   "expr": "PERMUT(5, 0)",
+   "value": "1"
+  }
+ ],
+ "POISSON.DIST": [
+  {
+   "expr": "POISSON.DIST(2, 5, TRUE)",
+   "value": "0.124652019483081"
+  },
+  {
+   "expr": "POISSON.DIST(2, 5, FALSE)",
+   "value": "0.0842243374885683"
+  }
+ ],
+ "QUOTIENT": [
+  {
+   "expr": "QUOTIENT(10, 3)",
+   "value": "3"
+  },
+  {
+   "expr": "QUOTIENT(-10, 3)",
+   "value": "-3"
+  }
+ ],
+ "RADIANS": [
+  {
+   "expr": "RADIANS(180)",
+   "value": "3.14159265358979"
+  },
+  {
+   "expr": "RADIANS(90)",
+   "value": "1.5707963267949"
+  }
+ ],
+ "RANK.EQ": [
+  {
+   "expr": "RANK.EQ(3, N[i])",
+   "value": "3"
+  },
+  {
+   "expr": "RANK.EQ(2, F[k])",
+   "value": "2"
+  }
+ ],
+ "SIN": [
+  {
+   "expr": "SIN(0)",
+   "value": "0"
+  },
+  {
+   "expr": "SIN(PI()/6)",
+   "value": "0.5"
+  }
+ ],
+ "SINH": [
+  {
+   "expr": "SINH(0)",
+   "value": "0"
+  },
+  {
+   "expr": "SINH(1.5)",
+   "value": "2.12927945509482"
+  }
+ ],
+ "SQRTPI": [
+  {
+   "expr": "SQRTPI(1)",
+   "value": "1.77245385090552"
+  },
+  {
+   "expr": "SQRTPI(4)",
+   "value": "3.54490770181103"
+  }
+ ],
+ "STDEVX.P": [
+  {
+   "expr": "STDEVX.P(N, N[i])",
+   "value": "1.4142135623731"
+  }
+ ],
+ "STDEVX.S": [
+  {
+   "expr": "STDEVX.S(N, N[i])",
+   "value": "1.58113883008419"
+  }
+ ],
+ "T.DIST": [
+  {
+   "expr": "T.DIST(1.5, 10, TRUE)",
+   "value": "0.91774633677728"
+  },
+  {
+   "expr": "T.DIST(1.5, 10, FALSE)",
+   "value": "0.127444794287092"
+  }
+ ],
+ "T.DIST.2T": [
+  {
+   "expr": "T.DIST.2T(1.959999998, 60)",
+   "value": "0.054644929975921"
+  }
+ ],
+ "T.DIST.RT": [
+  {
+   "expr": "T.DIST.RT(1.959999998, 60)",
+   "value": "0.0273224649879605"
+  }
+ ],
+ "T.INV": [
+  {
+   "expr": "T.INV(0.75, 2)",
+   "value": "0.816496580927726"
+  }
+ ],
+ "T.INV.2T": [
+  {
+   "expr": "T.INV.2T(0.546449, 60)",
+   "value": "0.606533075825759"
+  }
+ ],
+ "TAN": [
+  {
+   "expr": "TAN(0)",
+   "value": "0"
+  },
+  {
+   "expr": "TAN(PI()/4)",
+   "value": "1"
+  }
+ ],
+ "TANH": [
+  {
+   "expr": "TANH(0)",
+   "value": "0"
+  },
+  {
+   "expr": "TANH(1.5)",
+   "value": "0.905148253644866"
+  }
+ ],
+ "TIMEVALUE": [
+  {
+   "expr": "TIMEVALUE(\"14:30:00\")",
+   "value": "12/30/1899 14:30:00"
+  }
+ ],
+ "VARX.P": [
+  {
+   "expr": "VARX.P(N, N[i])",
+   "value": "2"
+  }
+ ],
+ "VARX.S": [
+  {
+   "expr": "VARX.S(N, N[i])",
+   "value": "2.5"
+  }
+ ]
+}
