@@ -1,4 +1,16 @@
 {
+ "ACCRINT": [
+  {
+   "expr": "ACCRINT(DATE(2008,3,1), DATE(2008,8,31), DATE(2008,5,1), 0.1, 1000, 2, 0)",
+   "value": "16.6666666666667"
+  }
+ ],
+ "ACCRINTM": [
+  {
+   "expr": "ACCRINTM(DATE(2008,4,1), DATE(2008,6,15), 0.1, 1000, 3)",
+   "value": "20.5479452054795"
+  }
+ ],
  "ACOS": [
   {
    "expr": "ACOS(0.5)",
@@ -57,6 +69,18 @@
   {
    "expr": "COUNTROWS(ALLNOBLANKROW(K[grp]))",
    "value": "3"
+  }
+ ],
+ "AMORDEGRC": [
+  {
+   "expr": "AMORDEGRC(2400, DATE(2008,8,19), DATE(2008,12,31), 300, 1, 0.15, 1)",
+   "value": "776"
+  }
+ ],
+ "AMORLINC": [
+  {
+   "expr": "AMORLINC(2400, DATE(2008,8,19), DATE(2008,12,31), 300, 1, 0.15, 1)",
+   "value": "360"
   }
  ],
  "ASIN": [
@@ -293,6 +317,62 @@
    "value": "-1.03731472072755"
   }
  ],
+ "COUPDAYBS": [
+  {
+   "expr": "COUPDAYBS(DATE(2011,1,25), DATE(2011,11,15), 2, 1)",
+   "value": "71"
+  },
+  {
+   "expr": "COUPDAYBS(DATE(2011,1,25), DATE(2011,11,15), 2, 0)",
+   "value": "70"
+  }
+ ],
+ "COUPDAYS": [
+  {
+   "expr": "COUPDAYS(DATE(2011,1,25), DATE(2011,11,15), 2, 1)",
+   "value": "181"
+  },
+  {
+   "expr": "COUPDAYS(DATE(2011,1,25), DATE(2011,11,15), 2, 0)",
+   "value": "180"
+  }
+ ],
+ "COUPDAYSNC": [
+  {
+   "expr": "COUPDAYSNC(DATE(2011,1,25), DATE(2011,11,15), 2, 1)",
+   "value": "110"
+  }
+ ],
+ "COUPNCD": [
+  {
+   "expr": "COUPNCD(DATE(2011,1,25), DATE(2011,11,15), 2, 1)",
+   "value": "05/15/2011 00:00:00"
+  }
+ ],
+ "COUPNUM": [
+  {
+   "expr": "COUPNUM(DATE(2007,1,25), DATE(2008,11,15), 2, 1)",
+   "value": "4"
+  }
+ ],
+ "COUPPCD": [
+  {
+   "expr": "COUPPCD(DATE(2011,1,25), DATE(2011,11,15), 2, 1)",
+   "value": "11/15/2010 00:00:00"
+  }
+ ],
+ "CUMIPMT": [
+  {
+   "expr": "CUMIPMT(0.09/12, 360, 125000, 13, 24, 0)",
+   "value": "-11135.2321307508"
+  }
+ ],
+ "CUMPRINC": [
+  {
+   "expr": "CUMPRINC(0.09/12, 360, 125000, 13, 24, 0)",
+   "value": "-934.107123420898"
+  }
+ ],
  "CURRENCY": [
   {
    "expr": "CURRENCY(1234.56789)",
@@ -319,6 +399,26 @@
    "value": "01/08/2009 00:00:00"
   }
  ],
+ "DB": [
+  {
+   "expr": "DB(1000000, 100000, 6, 1, 7)",
+   "value": "186083.333333333"
+  },
+  {
+   "expr": "DB(1000000, 100000, 6, 2, 7)",
+   "value": "259639.416666667"
+  }
+ ],
+ "DDB": [
+  {
+   "expr": "DDB(2400, 300, 10, 1, 2)",
+   "value": "480"
+  },
+  {
+   "expr": "DDB(2400, 300, 10, 2)",
+   "value": "384"
+  }
+ ],
  "DEGREES": [
   {
    "expr": "DEGREES(PI())",
@@ -333,6 +433,44 @@
   {
    "expr": "COUNTROWS(DETAILROWS([Total V]))",
    "value": "4"
+  }
+ ],
+ "DISC": [
+  {
+   "expr": "DISC(DATE(2018,7,1), DATE(2048,1,1), 97.975, 100, 1)",
+   "value": "0.000686384169121348"
+  }
+ ],
+ "DOLLARDE": [
+  {
+   "expr": "DOLLARDE(1.02, 16)",
+   "value": "1.125"
+  },
+  {
+   "expr": "DOLLARDE(1.1, 32)",
+   "value": "1.3125"
+  }
+ ],
+ "DOLLARFR": [
+  {
+   "expr": "DOLLARFR(1.125, 16)",
+   "value": "1.02"
+  },
+  {
+   "expr": "DOLLARFR(1.09375, 32)",
+   "value": "1.03"
+  }
+ ],
+ "DURATION": [
+  {
+   "expr": "DURATION(DATE(2008,1,1), DATE(2016,1,1), 0.08, 0.09, 2, 1)",
+   "value": "5.99377495554519"
+  }
+ ],
+ "EFFECT": [
+  {
+   "expr": "EFFECT(0.0525, 4)",
+   "value": "0.0535426673707584"
   }
  ],
  "ENDOFWEEK": [
@@ -391,6 +529,16 @@
    "expr": "FLOOR.MATH(-8.1, 2)"
   }
  ],
+ "FV": [
+  {
+   "expr": "FV(0.06/12, 10, -200, -500, 1)",
+   "value": "2581.40337406012"
+  },
+  {
+   "expr": "FV(0.005, 10, -200)",
+   "value": "2045.60528163157"
+  }
+ ],
  "GCD": [
   {
    "expr": "GCD(24, 36)",
@@ -429,6 +577,22 @@
    "value": "3"
   }
  ],
+ "INTRATE": [
+  {
+   "expr": "INTRATE(DATE(2008,2,15), DATE(2008,5,15), 1000000, 1014420, 2)",
+   "value": "0.05768"
+  }
+ ],
+ "IPMT": [
+  {
+   "expr": "IPMT(0.1/12, 1, 36, 8000)",
+   "value": "-66.6666666666667"
+  },
+  {
+   "expr": "IPMT(0.1, 3, 3, 8000)",
+   "value": "-292.447129909366"
+  }
+ ],
  "ISDATETIME": [
   {
    "expr": "ISDATETIME(DATE(2024,1,1))",
@@ -459,10 +623,22 @@
    "value": "False"
   }
  ],
+ "ISPMT": [
+  {
+   "expr": "ISPMT(0.1/12, 1, 36, 8000000)",
+   "value": "-64814.8148148148"
+  }
+ ],
  "LCM": [
   {
    "expr": "LCM(4, 6)",
    "value": "12"
+  }
+ ],
+ "MDURATION": [
+  {
+   "expr": "MDURATION(DATE(2008,1,1), DATE(2016,1,1), 0.08, 0.09, 2, 1)",
+   "value": "5.73566981391884"
   }
  ],
  "MROUND": [
@@ -513,6 +689,12 @@
    "expr": "COUNTROWS(NEXTWEEK(D[Date]))"
   }
  ],
+ "NOMINAL": [
+  {
+   "expr": "NOMINAL(0.053543, 4)",
+   "value": "0.052500319868356"
+  }
+ ],
  "NONVISUAL": [
   {
    "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 40) NONVISUAL-funksjonen kan ikke brukes p\u00e5 kolonner som ikke er grupperte.\"",
@@ -551,6 +733,16 @@
    "value": "1.33333467304411"
   }
  ],
+ "NPER": [
+  {
+   "expr": "NPER(0.12/12, -100, -1000, 10000, 1)",
+   "value": "59.6738656742946"
+  },
+  {
+   "expr": "NPER(0.01, -100, -1000)",
+   "value": "-9.57859403981316"
+  }
+ ],
  "ODD": [
   {
    "expr": "ODD(1.5)",
@@ -561,10 +753,40 @@
    "value": "-3"
   }
  ],
+ "ODDFPRICE": [
+  {
+   "expr": "ODDFPRICE(DATE(2008,11,11), DATE(2021,3,1), DATE(2008,10,15), DATE(2009,3,1), 0.0785, 0.0625, 100, 2, 1)",
+   "value": "113.597717474079"
+  }
+ ],
+ "ODDFYIELD": [
+  {
+   "expr": "ODDFYIELD(DATE(2008,11,11), DATE(2021,3,1), DATE(2008,10,15), DATE(2009,3,1), 0.0575, 84.5, 100, 2, 0)",
+   "value": "0.0772455415972989"
+  }
+ ],
+ "ODDLPRICE": [
+  {
+   "expr": "ODDLPRICE(DATE(2008,2,7), DATE(2008,6,15), DATE(2007,10,15), 0.0375, 0.0405, 100, 2, 0)",
+   "value": "99.8782860147213"
+  }
+ ],
+ "ODDLYIELD": [
+  {
+   "expr": "ODDLYIELD(DATE(2008,4,20), DATE(2008,6,15), DATE(2007,12,24), 0.0375, 99.875, 100, 2, 0)",
+   "value": "0.0451922356291692"
+  }
+ ],
  "OPENINGBALANCEWEEK": [
   {
    "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 39) Det siste argumentet m\u00e5 v\u00e6re ett av disse n\u00f8kkelordene: DAY, MONTH, QUARTER eller YEAR.\"",
    "expr": "OPENINGBALANCEWEEK(SUM(F[v]), D[Date])"
+  }
+ ],
+ "PDURATION": [
+  {
+   "expr": "PDURATION(0.025, 2000, 2200)",
+   "value": "3.85986616262266"
   }
  ],
  "PERCENTILE.EXC": [
@@ -613,6 +835,16 @@
    "value": "1"
   }
  ],
+ "PMT": [
+  {
+   "expr": "PMT(0.08/12, 10, 10000)",
+   "value": "-1037.03208935915"
+  },
+  {
+   "expr": "PMT(0.08/12, 10, 10000, 0, 1)",
+   "value": "-1030.16432717797"
+  }
+ ],
  "POISSON.DIST": [
   {
    "expr": "POISSON.DIST(2, 5, TRUE)",
@@ -621,6 +853,16 @@
   {
    "expr": "POISSON.DIST(2, 5, FALSE)",
    "value": "0.0842243374885683"
+  }
+ ],
+ "PPMT": [
+  {
+   "expr": "PPMT(0.1/12, 1, 24, 2000)",
+   "value": "-75.6231860083663"
+  },
+  {
+   "expr": "PPMT(0.08, 10, 10, 200000)",
+   "value": "-27598.0534624214"
   }
  ],
  "PREVIOUSDAY": [
@@ -633,6 +875,34 @@
   {
    "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 56) PREVIOUSWEEKs parameter 1 m\u00e5 v\u00e6re en kalenderreferanse.\"",
    "expr": "COUNTROWS(PREVIOUSWEEK(D[Date]))"
+  }
+ ],
+ "PRICE": [
+  {
+   "expr": "PRICE(DATE(2008,2,15), DATE(2017,11,15), 0.0575, 0.065, 100, 2, 0)",
+   "value": "94.6343616213221"
+  }
+ ],
+ "PRICEDISC": [
+  {
+   "expr": "PRICEDISC(DATE(2008,2,16), DATE(2008,3,1), 0.0525, 100, 2)",
+   "value": "99.7958333333333"
+  }
+ ],
+ "PRICEMAT": [
+  {
+   "expr": "PRICEMAT(DATE(2008,2,15), DATE(2008,4,13), DATE(2007,11,11), 0.061, 0.061, 0)",
+   "value": "99.9844988755569"
+  }
+ ],
+ "PV": [
+  {
+   "expr": "PV(0.08/12, 240, 500)",
+   "value": "-59777.1458511878"
+  },
+  {
+   "expr": "PV(0.05, 10, -100, -1000, 1)",
+   "value": "1424.69542110516"
   }
  ],
  "QUOTIENT": [
@@ -665,10 +935,32 @@
    "value": "2"
   }
  ],
+ "RATE": [
+  {
+   "expr": "RATE(48, -200, 8000)",
+   "value": "0.00770147248820137"
+  },
+  {
+   "expr": "RATE(24, -250, 5000, 0, 1)",
+   "value": "0.016550119066712"
+  }
+ ],
+ "RECEIVED": [
+  {
+   "expr": "RECEIVED(DATE(2008,2,15), DATE(2008,5,15), 1000000, 0.0575, 2)",
+   "value": "1014584.6544071"
+  }
+ ],
  "ROLLUPADDISSUBTOTAL": [
   {
    "expr": "COUNTROWS(SUMMARIZECOLUMNS(ROLLUPADDISSUBTOTAL(K[grp], \"T\")))",
    "value": "4"
+  }
+ ],
+ "RRI": [
+  {
+   "expr": "RRI(96, 10000, 11000)",
+   "value": "0.00099330737629133"
   }
  ],
  "SIN": [
@@ -689,6 +981,12 @@
   {
    "expr": "SINH(1.5)",
    "value": "2.12927945509482"
+  }
+ ],
+ "SLN": [
+  {
+   "expr": "SLN(30000, 7500, 10)",
+   "value": "2250"
   }
  ],
  "SQRTPI": [
@@ -727,6 +1025,16 @@
   {
    "expr": "COUNTROWS(SUBSTITUTEWITHINDEX(F, \"i\", K, K[k], ASC))",
    "value": "4"
+  }
+ ],
+ "SYD": [
+  {
+   "expr": "SYD(30000, 7500, 10, 1)",
+   "value": "4090.90909090909"
+  },
+  {
+   "expr": "SYD(30000, 7500, 10, 10)",
+   "value": "409.090909090909"
   }
  ],
  "T.DIST": [
@@ -783,6 +1091,24 @@
    "value": "0.905148253644866"
   }
  ],
+ "TBILLEQ": [
+  {
+   "expr": "TBILLEQ(DATE(2008,3,31), DATE(2008,6,1), 0.0914)",
+   "value": "0.094151493565943"
+  }
+ ],
+ "TBILLPRICE": [
+  {
+   "expr": "TBILLPRICE(DATE(2008,3,31), DATE(2008,6,1), 0.09)",
+   "value": "98.45"
+  }
+ ],
+ "TBILLYIELD": [
+  {
+   "expr": "TBILLYIELD(DATE(2008,3,31), DATE(2008,6,1), 98.45)",
+   "value": "0.0914169629253426"
+  }
+ ],
  "TIMEVALUE": [
   {
    "expr": "TIMEVALUE(\"14:30:00\")",
@@ -809,6 +1135,46 @@
   {
    "expr": "VARX.S(N, N[i])",
    "value": "2.5"
+  }
+ ],
+ "VDB": [
+  {
+   "expr": "VDB(2400, 300, 10, 0, 1)",
+   "value": "480"
+  },
+  {
+   "expr": "VDB(2400, 300, 10, 1, 3)",
+   "value": "691.2"
+  }
+ ],
+ "XIRR": [
+  {
+   "expr": "XIRR(SELECTCOLUMNS(F, \"d\", DATE(2019 + F[k], 1, 1), \"cf\", IF(F[k] = 1, -F[v], F[v])), [cf], [d])",
+   "value": "1.22665349543095"
+  }
+ ],
+ "XNPV": [
+  {
+   "expr": "XNPV(F, F[v], F[d], 0.09)",
+   "value": "639.029409480885"
+  }
+ ],
+ "YIELD": [
+  {
+   "expr": "YIELD(DATE(2008,2,15), DATE(2016,11,15), 0.0575, 95.04287, 100, 2, 0)",
+   "value": "0.0650000068807314"
+  }
+ ],
+ "YIELDDISC": [
+  {
+   "expr": "YIELDDISC(DATE(2008,2,16), DATE(2008,3,1), 99.795, 100, 2)",
+   "value": "0.0528225719868583"
+  }
+ ],
+ "YIELDMAT": [
+  {
+   "expr": "YIELDMAT(DATE(2008,3,15), DATE(2008,11,3), DATE(2007,11,8), 0.0625, 100.0123, 0)",
+   "value": "0.0609543336915387"
   }
  ]
 }

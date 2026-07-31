@@ -2051,6 +2051,34 @@ class DAXEngine:
             'DETAILROWS': self._fn_detailrows,
             'NEXTDAY': self._fn_nextday,
             'PREVIOUSDAY': self._fn_previousday,
+            # --- conformance batch 3: financial ---
+            'PMT': self._fn_pmt, 'FV': self._fn_fv, 'PV': self._fn_pv,
+            'NPER': self._fn_nper, 'RATE': self._fn_rate,
+            'IPMT': self._fn_ipmt, 'PPMT': self._fn_ppmt,
+            'CUMIPMT': self._fn_cumipmt, 'CUMPRINC': self._fn_cumprinc,
+            'ISPMT': self._fn_ispmt,
+            'SLN': self._fn_sln, 'SYD': self._fn_syd, 'DDB': self._fn_ddb,
+            'DB': self._fn_db, 'VDB': self._fn_vdb,
+            'AMORDEGRC': self._fn_amordegrc, 'AMORLINC': self._fn_amorlinc,
+            'EFFECT': self._fn_effect, 'NOMINAL': self._fn_nominal,
+            'RRI': self._fn_rri, 'PDURATION': self._fn_pduration,
+            'DOLLARDE': self._fn_dollarde, 'DOLLARFR': self._fn_dollarfr,
+            'XNPV': self._fn_xnpv, 'XIRR': self._fn_xirr,
+            'ACCRINT': self._fn_accrint, 'ACCRINTM': self._fn_accrintm,
+            'COUPDAYBS': self._fn_coupdaybs, 'COUPDAYS': self._fn_coupdays,
+            'COUPDAYSNC': self._fn_coupdaysnc, 'COUPNCD': self._fn_coupncd,
+            'COUPNUM': self._fn_coupnum, 'COUPPCD': self._fn_couppcd,
+            'DISC': self._fn_disc, 'INTRATE': self._fn_intrate,
+            'RECEIVED': self._fn_received,
+            'PRICE': self._fn_price, 'PRICEDISC': self._fn_pricedisc,
+            'PRICEMAT': self._fn_pricemat,
+            'YIELD': self._fn_yield, 'YIELDDISC': self._fn_yielddisc,
+            'YIELDMAT': self._fn_yieldmat,
+            'TBILLEQ': self._fn_tbilleq, 'TBILLPRICE': self._fn_tbillprice,
+            'TBILLYIELD': self._fn_tbillyield,
+            'DURATION': self._fn_duration, 'MDURATION': self._fn_mduration,
+            'ODDLPRICE': self._fn_oddlprice, 'ODDLYIELD': self._fn_oddlyield,
+            'ODDFPRICE': self._fn_oddfprice, 'ODDFYIELD': self._fn_oddfyield,
             # --- Logic ---
             'IF': self._fn_if,
             'SWITCH': self._fn_switch,
@@ -6841,6 +6869,1019 @@ class DAXEngine:
                 return [{'__table__': t, '__column__': c,
                          '__value__': row[idx]}]
         return []
+
+
+    # ------------------------------------------------------------------
+    # Conformance batch 3: the financial family. Excel-compatible formulas,
+    # golden-pinned against Desktop at 1e-9. Day-count bases: 0=30/360 US,
+    # 1=actual/actual, 2=actual/360, 3=actual/365, 4=30E/360.
+    # ------------------------------------------------------------------
+
+    def _fin_args(self, args_str: str, ctx: DAXContext):
+        return [self._eval_expr(a.strip(), ctx)
+                for a in self._split_args(args_str)]
+
+    @staticmethod
+    def _fin_num(v, default=None):
+        if isinstance(v, bool):
+            return 1.0 if v else 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        return default
+
+    # ---- annuity family --------------------------------------------------
+
+    @staticmethod
+    def _annuity(rate, nper, pmt, pv, fv, typ):
+        """0 = pv*(1+r)^n + pmt*(1+r*typ)*((1+r)^n - 1)/r + fv"""
+        if rate == 0:
+            return pv + pmt * nper + fv
+        f = (1 + rate) ** nper
+        return pv * f + pmt * (1 + rate * typ) * (f - 1) / rate + fv
+
+    def _fn_pmt(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 3 or any(v is None for v in a[:3]):
+            return None
+        rate, nper, pv = a[0], a[1], a[2]
+        fv = a[3] if len(a) > 3 and a[3] is not None else 0.0
+        typ = a[4] if len(a) > 4 and a[4] is not None else 0.0
+        if rate == 0:
+            return -(pv + fv) / nper
+        f = (1 + rate) ** nper
+        return -(pv * f + fv) * rate / ((1 + rate * typ) * (f - 1))
+
+    def _fn_fv(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 3 or any(v is None for v in a[:3]):
+            return None
+        rate, nper, pmt = a[0], a[1], a[2]
+        pv = a[3] if len(a) > 3 and a[3] is not None else 0.0
+        typ = a[4] if len(a) > 4 and a[4] is not None else 0.0
+        return -self._annuity(rate, nper, pmt, pv, 0.0, typ)
+
+    def _fn_pv(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 3 or any(v is None for v in a[:3]):
+            return None
+        rate, nper, pmt = a[0], a[1], a[2]
+        fv = a[3] if len(a) > 3 and a[3] is not None else 0.0
+        typ = a[4] if len(a) > 4 and a[4] is not None else 0.0
+        if rate == 0:
+            return -(fv + pmt * nper)
+        f = (1 + rate) ** nper
+        return -(fv + pmt * (1 + rate * typ) * (f - 1) / rate) / f
+
+    def _fn_nper(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 3 or any(v is None for v in a[:3]):
+            return None
+        rate, pmt, pv = a[0], a[1], a[2]
+        fv = a[3] if len(a) > 3 and a[3] is not None else 0.0
+        typ = a[4] if len(a) > 4 and a[4] is not None else 0.0
+        if rate == 0:
+            if pmt == 0:
+                return None
+            return -(pv + fv) / pmt
+        adj = pmt * (1 + rate * typ) / rate
+        num = adj - fv
+        den = pv + adj
+        if num <= 0 or den == 0 or num / den <= 0:
+            # log of a non-positive: fall through to the general identity
+            try:
+                return math.log(num / den) / math.log(1 + rate)
+            except ValueError:
+                return None
+        return math.log(num / den) / math.log(1 + rate)
+
+    def _fn_rate(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 3 or any(v is None for v in a[:3]):
+            return None
+        nper, pmt, pv = a[0], a[1], a[2]
+        fv = a[3] if len(a) > 3 and a[3] is not None else 0.0
+        typ = a[4] if len(a) > 4 and a[4] is not None else 0.0
+        guess = a[5] if len(a) > 5 and a[5] is not None else 0.1
+        r = guess
+        for _ in range(200):
+            f0 = self._annuity(r, nper, pmt, pv, fv, typ)
+            h = max(abs(r), 1e-5) * 1e-6
+            f1 = self._annuity(r + h, nper, pmt, pv, fv, typ)
+            d = (f1 - f0) / h
+            if d == 0:
+                break
+            rn = r - f0 / d
+            if rn <= -1:
+                rn = (r - 1) / 2
+            if abs(rn - r) < 1e-14:
+                return rn
+            r = rn
+        return r
+
+    def _fn_ipmt(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 4 or any(v is None for v in a[:4]):
+            return None
+        rate, per, nper, pv = a[0], a[1], a[2], a[3]
+        fv = a[4] if len(a) > 4 and a[4] is not None else 0.0
+        typ = a[5] if len(a) > 5 and a[5] is not None else 0.0
+        pmt = self._pmt_val(rate, nper, pv, fv, typ)
+        if pmt is None:
+            return None
+        # balance still owed after per-1 payments; the interest on it is PAID,
+        # i.e. an outflow, hence the negation (Desktop: IPMT(...) = -66.67).
+        bal = self._fv_val(rate, per - 1, pmt, pv, typ)
+        ip = -bal * rate
+        if typ == 1:
+            if per == 1:
+                return 0.0
+            ip = ip / (1 + rate)
+        return ip
+
+    def _fn_ppmt(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 4 or any(v is None for v in a[:4]):
+            return None
+        rate, per, nper, pv = a[0], a[1], a[2], a[3]
+        fv = a[4] if len(a) > 4 and a[4] is not None else 0.0
+        typ = a[5] if len(a) > 5 and a[5] is not None else 0.0
+        pmt = self._pmt_val(rate, nper, pv, fv, typ)
+        if pmt is None:
+            return None
+        bal = self._fv_val(rate, per - 1, pmt, pv, typ)
+        ip = -bal * rate
+        if typ == 1:
+            ip = 0.0 if per == 1 else ip / (1 + rate)
+        return pmt - ip
+
+    @staticmethod
+    def _pmt_val(rate, nper, pv, fv, typ):
+        if rate == 0:
+            return -(pv + fv) / nper if nper else None
+        f = (1 + rate) ** nper
+        return -(pv * f + fv) * rate / ((1 + rate * typ) * (f - 1))
+
+    @staticmethod
+    def _fv_val(rate, nper, pmt, pv, typ):
+        """Balance (negated FV) after nper payments."""
+        if rate == 0:
+            return pv + pmt * nper
+        f = (1 + rate) ** nper
+        return pv * f + pmt * (1 + rate * typ) * (f - 1) / rate
+
+    def _fn_cumipmt(self, args_str: str, ctx: DAXContext):
+        return self._cum_i_p(args_str, ctx, interest=True)
+
+    def _fn_cumprinc(self, args_str: str, ctx: DAXContext):
+        return self._cum_i_p(args_str, ctx, interest=False)
+
+    def _cum_i_p(self, args_str: str, ctx: DAXContext, interest: bool):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 6 or any(v is None for v in a[:6]):
+            return None
+        rate, nper, pv, start, end, typ = a[:6]
+        if rate <= 0 or nper <= 0 or pv <= 0 or start < 1 or end < start:
+            return None
+        pmt = self._pmt_val(rate, nper, pv, 0.0, typ)
+        total = 0.0
+        for per in range(int(start), int(end) + 1):
+            bal = self._fv_val(rate, per - 1, pmt, pv, typ)
+            ip = -bal * rate
+            if typ == 1:
+                ip = 0.0 if per == 1 else ip / (1 + rate)
+            total += ip if interest else (pmt - ip)
+        return total
+
+    def _fn_ispmt(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 4 or any(v is None for v in a[:4]):
+            return None
+        rate, per, nper, pv = a[:4]
+        return pv * rate * (per / nper - 1)
+
+    # ---- depreciation ----------------------------------------------------
+
+    def _fn_sln(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 3 or any(v is None for v in a[:3]) or a[2] == 0:
+            return None
+        return (a[0] - a[1]) / a[2]
+
+    def _fn_syd(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 4 or any(v is None for v in a[:4]):
+            return None
+        cost, salvage, life, per = a[:4]
+        if life <= 0 or per < 1 or per > life:
+            return None
+        return (cost - salvage) * (life - per + 1) * 2 / (life * (life + 1))
+
+    def _fn_ddb(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 4 or any(v is None for v in a[:4]):
+            return None
+        cost, salvage, life, per = a[:4]
+        factor = a[4] if len(a) > 4 and a[4] is not None else 2.0
+        if life <= 0 or per < 1:
+            return None
+        rate = factor / life
+        book = cost
+        dep = 0.0
+        for _ in range(int(per)):
+            dep = min(book * rate, max(book - salvage, 0.0))
+            book -= dep
+        return dep
+
+    def _fn_db(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 4 or any(v is None for v in a[:4]):
+            return None
+        cost, salvage, life, per = a[:4]
+        month = a[4] if len(a) > 4 and a[4] is not None else 12.0
+        if cost <= 0 or life <= 0:
+            return None
+        rate = round(1 - (salvage / cost) ** (1.0 / life), 3)
+        dep_first = cost * rate * month / 12.0
+        if per == 1:
+            return dep_first
+        book = cost - dep_first
+        dep = dep_first
+        for _p in range(2, int(per) + 1):
+            if _p == int(life) + 1:
+                dep = book * rate * (12 - month) / 12.0
+            else:
+                dep = book * rate
+            book -= dep
+        return dep
+
+    def _fn_vdb(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 5 or any(v is None for v in a[:5]):
+            return None
+        cost, salvage, life, start, end = a[:5]
+        factor = a[5] if len(a) > 5 and a[5] is not None else 2.0
+        no_switch = bool(a[6]) if len(a) > 6 and a[6] is not None else False
+        rate = factor / life
+        book = cost
+        total = 0.0
+        per = 0
+        while per < end:
+            ddb = book * rate
+            remaining = life - per
+            sl = (book - salvage) / remaining if remaining > 0 else 0.0
+            dep = ddb if (no_switch or ddb >= sl) else sl
+            dep = min(dep, max(book - salvage, 0.0))
+            frac = min(1.0, end - per) - max(0.0, start - per)
+            if frac > 0:
+                total += dep * frac
+            book -= dep
+            per += 1
+        return total
+
+    def _fn_amordegrc(self, args_str: str, ctx: DAXContext):
+        vals = self._fin_args(args_str, ctx)
+        if len(vals) < 7:
+            return None
+        cost = self._fin_num(vals[0])
+        purch = _as_datetime(vals[1])
+        first = _as_datetime(vals[2])
+        salvage = self._fin_num(vals[3])
+        period = self._fin_num(vals[4])
+        rate = self._fin_num(vals[5])
+        basis = int(self._fin_num(vals[6], 0.0) or 0)
+        if None in (cost, purch, first, salvage, period, rate):
+            return None
+        life = 1.0 / rate
+        if life < 3:
+            coeff = 1.0
+        elif life < 5:
+            coeff = 1.5
+        elif life <= 6:
+            coeff = 2.0
+        else:
+            coeff = 2.5
+        drate = rate * coeff
+        frac = self._daycount_frac(purch, first, basis)
+        dep = cost * drate * frac
+        book = cost - dep
+        p = 0
+        while p < int(period):
+            dep = book * drate
+            rem = book - dep
+            if rem < salvage:
+                # the two special closing periods
+                if p == int(1.0 / drate) - 1:
+                    dep = book * 0.5
+                else:
+                    dep = 0.0
+            book -= dep
+            p += 1
+        return float(round(dep))
+
+    def _fn_amorlinc(self, args_str: str, ctx: DAXContext):
+        vals = self._fin_args(args_str, ctx)
+        if len(vals) < 7:
+            return None
+        cost = self._fin_num(vals[0])
+        purch = _as_datetime(vals[1])
+        first = _as_datetime(vals[2])
+        salvage = self._fin_num(vals[3])
+        period = self._fin_num(vals[4])
+        rate = self._fin_num(vals[5])
+        basis = int(self._fin_num(vals[6], 0.0) or 0)
+        if None in (cost, purch, first, salvage, period, rate):
+            return None
+        frac = self._daycount_frac(purch, first, basis)
+        dep0 = cost * rate * frac
+        full = cost * rate
+        total_periods = (cost - salvage - dep0) / full
+        if period == 0:
+            return dep0
+        if period <= total_periods:
+            return full
+        if period <= total_periods + 1:
+            return cost - salvage - dep0 - full * math.floor(total_periods)
+        return 0.0
+
+    # ---- rates & dollars -------------------------------------------------
+
+    def _fn_effect(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 2 or any(v is None for v in a[:2]) or a[0] <= 0 or a[1] < 1:
+            return None
+        npery = int(a[1])
+        return (1 + a[0] / npery) ** npery - 1
+
+    def _fn_nominal(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 2 or any(v is None for v in a[:2]) or a[0] <= 0 or a[1] < 1:
+            return None
+        npery = int(a[1])
+        return ((1 + a[0]) ** (1.0 / npery) - 1) * npery
+
+    def _fn_rri(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 3 or any(v is None for v in a[:3]) or a[0] <= 0 or a[1] == 0:
+            return None
+        return (a[2] / a[1]) ** (1.0 / a[0]) - 1
+
+    def _fn_pduration(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 3 or any(v is None for v in a[:3]) or a[0] <= 0 or a[1] <= 0 or a[2] <= 0:
+            return None
+        return (math.log(a[2]) - math.log(a[1])) / math.log(1 + a[0])
+
+    def _fn_dollarde(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 2 or any(v is None for v in a[:2]) or int(a[1]) <= 0:
+            return None
+        frac = int(a[1])
+        digits = math.ceil(math.log10(frac)) if frac > 1 else 0
+        whole = math.trunc(a[0])
+        return whole + (a[0] - whole) * (10 ** digits) / frac
+
+    def _fn_dollarfr(self, args_str: str, ctx: DAXContext):
+        a = [self._fin_num(v) for v in self._fin_args(args_str, ctx)]
+        if len(a) < 2 or any(v is None for v in a[:2]) or int(a[1]) <= 0:
+            return None
+        frac = int(a[1])
+        digits = math.ceil(math.log10(frac)) if frac > 1 else 0
+        whole = math.trunc(a[0])
+        return whole + (a[0] - whole) * frac / (10 ** digits)
+
+    # ---- cash flows ------------------------------------------------------
+
+    def _xcashflows(self, args_str: str, ctx: DAXContext, has_rate: bool):
+        parts = self._split_args(args_str)
+        need = 4 if has_rate else 3
+        if len(parts) < need:
+            return None
+        rows = self._table_rows(parts[0], ctx)
+        if rows is None:
+            return None
+        vals, dates = [], []
+        for r in rows:
+            row_ctx = self._make_row_context(r, ctx)
+            v = self._eval_expr(parts[1].strip(), row_ctx)
+            v = self._resolve_row_result(v, r, row_ctx)
+            d = self._eval_expr(parts[2].strip(), row_ctx)
+            d = self._resolve_row_result(d, r, row_ctx)
+            d = _as_datetime(d)
+            v = self._fin_num(v)
+            if v is None or d is None:
+                continue
+            vals.append(v)
+            dates.append(d)
+        if not vals:
+            return None
+        rate = None
+        if has_rate:
+            rate = self._fin_num(self._eval_expr(parts[3].strip(), ctx))
+            if rate is None:
+                return None
+        return vals, dates, rate
+
+    @staticmethod
+    def _xnpv_val(rate, vals, dates):
+        d0 = min(dates)
+        return sum(v / (1 + rate) ** ((d - d0).days / 365.0)
+                   for v, d in zip(vals, dates))
+
+    def _fn_xnpv(self, args_str: str, ctx: DAXContext):
+        got = self._xcashflows(args_str, ctx, has_rate=True)
+        if got is None:
+            return None
+        vals, dates, rate = got
+        return self._xnpv_val(rate, vals, dates)
+
+    def _fn_xirr(self, args_str: str, ctx: DAXContext):
+        got = self._xcashflows(args_str, ctx, has_rate=False)
+        if got is None:
+            return None
+        vals, dates, _ = got
+        if not (any(v > 0 for v in vals) and any(v < 0 for v in vals)):
+            return None
+        r = 0.1
+        for _ in range(100):
+            f0 = self._xnpv_val(r, vals, dates)
+            h = 1e-7
+            d = (self._xnpv_val(r + h, vals, dates) - f0) / h
+            if d == 0:
+                break
+            rn = r - f0 / d
+            if rn <= -0.999999:
+                rn = (r - 0.999999) / 2
+            if abs(rn - r) < 1e-12:
+                return rn
+            r = rn
+        return r
+
+    # ---- day-count / coupon kernel --------------------------------------
+
+    @staticmethod
+    def _days360(d1: datetime, d2: datetime, european: bool) -> int:
+        y1, m1, dd1 = d1.year, d1.month, d1.day
+        y2, m2, dd2 = d2.year, d2.month, d2.day
+        if european:
+            dd1 = min(dd1, 30)
+            dd2 = min(dd2, 30)
+        else:
+            last1 = calendar.monthrange(y1, m1)[1]
+            if dd1 == 31 or (m1 == 2 and dd1 == last1):
+                dd1 = 30
+            if dd2 == 31 and dd1 == 30:
+                dd2 = 30
+        return (y2 - y1) * 360 + (m2 - m1) * 30 + (dd2 - dd1)
+
+    @classmethod
+    def _daycount_frac(cls, d1: datetime, d2: datetime, basis: int) -> float:
+        if d2 < d1:
+            return -cls._daycount_frac(d2, d1, basis)
+        if basis == 0:
+            return cls._days360(d1, d2, european=False) / 360.0
+        if basis == 4:
+            return cls._days360(d1, d2, european=True) / 360.0
+        days = (d2 - d1).days
+        if basis == 2:
+            return days / 360.0
+        if basis == 3:
+            return days / 365.0
+        # basis 1: actual/actual -- year length from the anniversary span
+        # Excel uses average year length across the span for multi-year
+        span_years = d2.year - d1.year + 1
+        total = sum(366 if calendar.isleap(y) else 365
+                    for y in range(d1.year, d2.year + 1))
+        return days / (total / span_years)
+
+    @staticmethod
+    def _edate_months(d, months):
+        m0 = d.month - 1 + months
+        y = d.year + m0 // 12
+        m = m0 % 12 + 1
+        day = min(d.day, calendar.monthrange(y, m)[1])
+        # coupon schedules stick to month-end when maturity is month-end
+        return datetime(y, m, day)
+
+    @classmethod
+    def _coup_pcd_ncd(cls, settl, mat, freq):
+        """Previous and next coupon dates around settlement, stepping back
+        from maturity by 12/freq months."""
+        step = -int(12 / freq)
+        ncd = mat
+        while True:
+            pcd = cls._edate_months(ncd, step)
+            if pcd <= settl:
+                return pcd, ncd
+            ncd = pcd
+
+    @classmethod
+    def _coupdays_between(cls, d1, d2, basis):
+        if basis in (0, 4):
+            return cls._days360(d1, d2, european=(basis == 4))
+        return (d2 - d1).days
+
+    def _bond_args(self, args_str: str, ctx: DAXContext, n_dates: int, n_nums: int):
+        vals = self._fin_args(args_str, ctx)
+        if len(vals) < n_dates + n_nums:
+            return None
+        dates = [_as_datetime(v) for v in vals[:n_dates]]
+        nums = [self._fin_num(v) for v in vals[n_dates:n_dates + n_nums]]
+        rest = [self._fin_num(v) for v in vals[n_dates + n_nums:]]
+        if any(d is None for d in dates) or any(n is None for n in nums):
+            return None
+        return dates, nums, rest
+
+    def _fn_coupdaybs(self, args_str: str, ctx: DAXContext):
+        got = self._bond_args(args_str, ctx, 2, 1)
+        if got is None:
+            return None
+        (settl, mat), (freq,), rest = got
+        basis = int(rest[0]) if rest and rest[0] is not None else 0
+        pcd, _ = self._coup_pcd_ncd(settl, mat, int(freq))
+        return float(self._coupdays_between(pcd, settl, basis))
+
+    def _fn_coupdays(self, args_str: str, ctx: DAXContext):
+        got = self._bond_args(args_str, ctx, 2, 1)
+        if got is None:
+            return None
+        (settl, mat), (freq,), rest = got
+        basis = int(rest[0]) if rest and rest[0] is not None else 0
+        freq = int(freq)
+        pcd, ncd = self._coup_pcd_ncd(settl, mat, freq)
+        if basis == 1:
+            return float((ncd - pcd).days)
+        if basis == 3:
+            return 365.0 / freq
+        return 360.0 / freq
+
+    def _fn_coupdaysnc(self, args_str: str, ctx: DAXContext):
+        got = self._bond_args(args_str, ctx, 2, 1)
+        if got is None:
+            return None
+        (settl, mat), (freq,), rest = got
+        basis = int(rest[0]) if rest and rest[0] is not None else 0
+        pcd, ncd = self._coup_pcd_ncd(settl, mat, int(freq))
+        if basis in (0, 4):
+            # 30/360: coupon days minus accrued
+            return float(self._fn_coupdays_raw(settl, mat, int(freq), basis)
+                         - self._coupdays_between(pcd, settl, basis))
+        return float((ncd - settl).days)
+
+    def _fn_coupdays_raw(self, settl, mat, freq, basis):
+        pcd, ncd = self._coup_pcd_ncd(settl, mat, freq)
+        if basis == 1:
+            return (ncd - pcd).days
+        if basis == 3:
+            return 365.0 / freq
+        return 360.0 / freq
+
+    def _fn_coupncd(self, args_str: str, ctx: DAXContext):
+        got = self._bond_args(args_str, ctx, 2, 1)
+        if got is None:
+            return None
+        (settl, mat), (freq,), _rest = got
+        _, ncd = self._coup_pcd_ncd(settl, mat, int(freq))
+        return ncd
+
+    def _fn_couppcd(self, args_str: str, ctx: DAXContext):
+        got = self._bond_args(args_str, ctx, 2, 1)
+        if got is None:
+            return None
+        (settl, mat), (freq,), _rest = got
+        pcd, _ = self._coup_pcd_ncd(settl, mat, int(freq))
+        return pcd
+
+    def _fn_coupnum(self, args_str: str, ctx: DAXContext):
+        got = self._bond_args(args_str, ctx, 2, 1)
+        if got is None:
+            return None
+        (settl, mat), (freq,), _rest = got
+        freq = int(freq)
+        n = 0
+        _, ncd = self._coup_pcd_ncd(settl, mat, freq)
+        cur = ncd
+        while cur <= mat:
+            n += 1
+            if cur == mat:
+                break
+            cur = self._edate_months(cur, int(12 / freq))
+        return float(n)
+
+    def _fn_accrint(self, args_str: str, ctx: DAXContext):
+        vals = self._fin_args(args_str, ctx)
+        if len(vals) < 6:
+            return None
+        issue = _as_datetime(vals[0])
+        settl = _as_datetime(vals[2])
+        rate = self._fin_num(vals[3])
+        par = self._fin_num(vals[4])
+        basis = int(self._fin_num(vals[6], 0.0) or 0) if len(vals) > 6 else 0
+        if None in (issue, settl, rate, par):
+            return None
+        return par * rate * self._daycount_frac(issue, settl, basis)
+
+    def _fn_accrintm(self, args_str: str, ctx: DAXContext):
+        vals = self._fin_args(args_str, ctx)
+        if len(vals) < 4:
+            return None
+        issue = _as_datetime(vals[0])
+        settl = _as_datetime(vals[1])
+        rate = self._fin_num(vals[2])
+        par = self._fin_num(vals[3])
+        basis = int(self._fin_num(vals[4], 0.0) or 0) if len(vals) > 4 else 0
+        if None in (issue, settl, rate, par):
+            return None
+        return par * rate * self._daycount_frac(issue, settl, basis)
+
+    def _fn_disc(self, args_str: str, ctx: DAXContext):
+        got = self._bond_args(args_str, ctx, 2, 2)
+        if got is None:
+            return None
+        (settl, mat), (pr, redemption), rest = got
+        basis = int(rest[0]) if rest and rest[0] is not None else 0
+        frac = self._daycount_frac(settl, mat, basis)
+        if frac == 0:
+            return None
+        return (redemption - pr) / redemption / frac
+
+    def _fn_intrate(self, args_str: str, ctx: DAXContext):
+        got = self._bond_args(args_str, ctx, 2, 2)
+        if got is None:
+            return None
+        (settl, mat), (investment, redemption), rest = got
+        basis = int(rest[0]) if rest and rest[0] is not None else 0
+        frac = self._daycount_frac(settl, mat, basis)
+        if frac == 0 or investment == 0:
+            return None
+        return (redemption - investment) / investment / frac
+
+    def _fn_received(self, args_str: str, ctx: DAXContext):
+        got = self._bond_args(args_str, ctx, 2, 2)
+        if got is None:
+            return None
+        (settl, mat), (investment, disc), rest = got
+        basis = int(rest[0]) if rest and rest[0] is not None else 0
+        frac = self._daycount_frac(settl, mat, basis)
+        den = 1 - disc * frac
+        if den == 0:
+            return None
+        return investment / den
+
+    def _fn_pricedisc(self, args_str: str, ctx: DAXContext):
+        got = self._bond_args(args_str, ctx, 2, 2)
+        if got is None:
+            return None
+        (settl, mat), (disc, redemption), rest = got
+        basis = int(rest[0]) if rest and rest[0] is not None else 0
+        frac = self._daycount_frac(settl, mat, basis)
+        return redemption - disc * redemption * frac
+
+    def _fn_yielddisc(self, args_str: str, ctx: DAXContext):
+        got = self._bond_args(args_str, ctx, 2, 2)
+        if got is None:
+            return None
+        (settl, mat), (pr, redemption), rest = got
+        basis = int(rest[0]) if rest and rest[0] is not None else 0
+        frac = self._daycount_frac(settl, mat, basis)
+        if frac == 0 or pr == 0:
+            return None
+        return (redemption - pr) / pr / frac
+
+    def _fn_pricemat(self, args_str: str, ctx: DAXContext):
+        vals = self._fin_args(args_str, ctx)
+        if len(vals) < 5:
+            return None
+        settl = _as_datetime(vals[0])
+        mat = _as_datetime(vals[1])
+        issue = _as_datetime(vals[2])
+        rate = self._fin_num(vals[3])
+        yld = self._fin_num(vals[4])
+        basis = int(self._fin_num(vals[5], 0.0) or 0) if len(vals) > 5 else 0
+        if None in (settl, mat, issue, rate, yld):
+            return None
+        fim = self._daycount_frac(issue, mat, basis)
+        fis = self._daycount_frac(issue, settl, basis)
+        fsm = self._daycount_frac(settl, mat, basis)
+        return ((1 + fim * rate) / (1 + fsm * yld) - fis * rate) * 100
+
+    def _fn_yieldmat(self, args_str: str, ctx: DAXContext):
+        vals = self._fin_args(args_str, ctx)
+        if len(vals) < 5:
+            return None
+        settl = _as_datetime(vals[0])
+        mat = _as_datetime(vals[1])
+        issue = _as_datetime(vals[2])
+        rate = self._fin_num(vals[3])
+        pr = self._fin_num(vals[4])
+        basis = int(self._fin_num(vals[5], 0.0) or 0) if len(vals) > 5 else 0
+        if None in (settl, mat, issue, rate, pr):
+            return None
+        fim = self._daycount_frac(issue, mat, basis)
+        fis = self._daycount_frac(issue, settl, basis)
+        fsm = self._daycount_frac(settl, mat, basis)
+        if fsm == 0:
+            return None
+        num = (1 + fim * rate) - (pr / 100.0 + fis * rate)
+        den = (pr / 100.0 + fis * rate)
+        return num / den / fsm
+
+    def _fn_tbilleq(self, args_str: str, ctx: DAXContext):
+        got = self._bond_args(args_str, ctx, 2, 1)
+        if got is None:
+            return None
+        (settl, mat), (disc,), _rest = got
+        dsm = (mat - settl).days
+        den = 360 - disc * dsm
+        if den == 0:
+            return None
+        return 365 * disc / den
+
+    def _fn_tbillprice(self, args_str: str, ctx: DAXContext):
+        got = self._bond_args(args_str, ctx, 2, 1)
+        if got is None:
+            return None
+        (settl, mat), (disc,), _rest = got
+        dsm = (mat - settl).days
+        return 100 * (1 - disc * dsm / 360.0)
+
+    def _fn_tbillyield(self, args_str: str, ctx: DAXContext):
+        got = self._bond_args(args_str, ctx, 2, 1)
+        if got is None:
+            return None
+        (settl, mat), (pr,), _rest = got
+        dsm = (mat - settl).days
+        if pr == 0 or dsm == 0:
+            return None
+        return (100 - pr) / pr * 360.0 / dsm
+
+    def _price_val(self, settl, mat, rate, yld, redemption, freq, basis):
+        pcd, ncd = self._coup_pcd_ncd(settl, mat, freq)
+        e = self._fn_coupdays_raw(settl, mat, freq, basis)
+        if basis in (0, 4):
+            a = self._coupdays_between(pcd, settl, basis)
+            dsc = e - a
+        else:
+            a = (settl - pcd).days
+            dsc = (ncd - settl).days
+        n = 0
+        cur = ncd
+        while cur <= mat:
+            n += 1
+            if cur == mat:
+                break
+            cur = self._edate_months(cur, int(12 / freq))
+        coupon = 100.0 * rate / freq
+        y = yld / freq
+        if n == 1:
+            t = dsc / e
+            return ((redemption + coupon) / (1 + t * y)) - a / e * coupon
+        total = redemption / (1 + y) ** (n - 1 + dsc / e)
+        for k in range(1, n + 1):
+            total += coupon / (1 + y) ** (k - 1 + dsc / e)
+        total -= a / e * coupon
+        return total
+
+    def _fn_price(self, args_str: str, ctx: DAXContext):
+        vals = self._fin_args(args_str, ctx)
+        if len(vals) < 6:
+            return None
+        settl = _as_datetime(vals[0])
+        mat = _as_datetime(vals[1])
+        rate = self._fin_num(vals[2])
+        yld = self._fin_num(vals[3])
+        redemption = self._fin_num(vals[4])
+        freq = int(self._fin_num(vals[5], 2.0) or 2)
+        basis = int(self._fin_num(vals[6], 0.0) or 0) if len(vals) > 6 else 0
+        if None in (settl, mat, rate, yld, redemption):
+            return None
+        return self._price_val(settl, mat, rate, yld, redemption, freq, basis)
+
+    def _fn_yield(self, args_str: str, ctx: DAXContext):
+        vals = self._fin_args(args_str, ctx)
+        if len(vals) < 6:
+            return None
+        settl = _as_datetime(vals[0])
+        mat = _as_datetime(vals[1])
+        rate = self._fin_num(vals[2])
+        pr = self._fin_num(vals[3])
+        redemption = self._fin_num(vals[4])
+        freq = int(self._fin_num(vals[5], 2.0) or 2)
+        basis = int(self._fin_num(vals[6], 0.0) or 0) if len(vals) > 6 else 0
+        if None in (settl, mat, rate, pr, redemption):
+            return None
+        y = rate if rate > 0 else 0.05
+        for _ in range(200):
+            f0 = self._price_val(settl, mat, rate, y, redemption, freq, basis) - pr
+            h = 1e-7
+            f1 = self._price_val(settl, mat, rate, y + h, redemption, freq, basis) - pr
+            d = (f1 - f0) / h
+            if d == 0:
+                break
+            yn = y - f0 / d
+            if abs(yn - y) < 1e-13:
+                return yn
+            y = yn
+        return y
+
+
+    def _quasi_periods(self, start, end, freq, forward):
+        """Quasi-coupon boundaries stepping 12/freq months from start."""
+        step = int(12 / freq) * (1 if forward else -1)
+        out = [start]
+        cur = start
+        guard = 0
+        while (cur < end if forward else cur > end) and guard < 500:
+            cur = self._edate_months(cur, step)
+            out.append(cur)
+            guard += 1
+        return out
+
+    def _quasi_len(self, b0, b1, freq, basis):
+        if basis in (0, 1, 4):
+            return self._coupdays_between(b0, b1, basis)
+        return 360.0 / freq if basis == 2 else 365.0 / freq
+
+    def _fn_oddlprice(self, args_str: str, ctx: DAXContext):
+        vals = self._fin_args(args_str, ctx)
+        if len(vals) < 7:
+            return None
+        settl = _as_datetime(vals[0])
+        mat = _as_datetime(vals[1])
+        last = _as_datetime(vals[2])
+        rate = self._fin_num(vals[3])
+        yld = self._fin_num(vals[4])
+        red = self._fin_num(vals[5])
+        freq = int(self._fin_num(vals[6], 2.0) or 2)
+        basis = int(self._fin_num(vals[7], 0.0) or 0) if len(vals) > 7 else 0
+        if None in (settl, mat, last, rate, yld, red):
+            return None
+        bounds = self._quasi_periods(last, mat, freq, forward=True)
+        DCi, Ai = 0.0, 0.0
+        for b0, b1 in zip(bounds, bounds[1:]):
+            e = self._quasi_len(b0, b1, freq, basis)
+            s0, s1 = max(b0, last), min(b1, mat)
+            dci = self._coupdays_between(s0, s1, basis) if s1 > s0 else 0
+            a0, a1 = max(b0, last), min(b1, settl)
+            aa = self._coupdays_between(a0, a1, basis) if a1 > a0 else 0
+            DCi += dci / e
+            Ai += aa / e
+        x = 100.0 * rate / freq
+        dsm = self._daycount_frac(settl, mat, basis) * freq
+        return (red + DCi * x) / (1 + dsm * yld / freq) - Ai * x
+
+    def _fn_oddlyield(self, args_str: str, ctx: DAXContext):
+        vals = self._fin_args(args_str, ctx)
+        if len(vals) < 7:
+            return None
+        settl = _as_datetime(vals[0])
+        mat = _as_datetime(vals[1])
+        last = _as_datetime(vals[2])
+        rate = self._fin_num(vals[3])
+        pr = self._fin_num(vals[4])
+        red = self._fin_num(vals[5])
+        freq = int(self._fin_num(vals[6], 2.0) or 2)
+        basis = int(self._fin_num(vals[7], 0.0) or 0) if len(vals) > 7 else 0
+        if None in (settl, mat, last, rate, pr, red):
+            return None
+        bounds = self._quasi_periods(last, mat, freq, forward=True)
+        DCi, Ai = 0.0, 0.0
+        for b0, b1 in zip(bounds, bounds[1:]):
+            e = self._quasi_len(b0, b1, freq, basis)
+            s0, s1 = max(b0, last), min(b1, mat)
+            dci = self._coupdays_between(s0, s1, basis) if s1 > s0 else 0
+            a0, a1 = max(b0, last), min(b1, settl)
+            aa = self._coupdays_between(a0, a1, basis) if a1 > a0 else 0
+            DCi += dci / e
+            Ai += aa / e
+        x = 100.0 * rate / freq
+        dsm = self._daycount_frac(settl, mat, basis) * freq
+        den = (pr + Ai * x) * dsm
+        if den == 0:
+            return None
+        return (red + DCi * x - (pr + Ai * x)) / den * freq
+
+    def _oddfprice_val(self, settl, mat, issue, first, rate, yld, red, freq, basis):
+        y = yld / freq
+        x = 100.0 * rate / freq
+        bounds = list(reversed(self._quasi_periods(first, issue, freq,
+                                                   forward=False)))
+        DFCsum, Asum = 0.0, 0.0
+        for b0, b1 in zip(bounds, bounds[1:]):
+            e = self._quasi_len(b0, b1, freq, basis)
+            s0, s1 = max(b0, issue), min(b1, first)
+            dfc = self._coupdays_between(s0, s1, basis) if s1 > s0 else 0
+            a0, a1 = max(b0, issue), min(b1, settl)
+            aa = self._coupdays_between(a0, a1, basis) if a1 > a0 else 0
+            DFCsum += dfc / e
+            Asum += aa / e
+        n = 0
+        cur = first
+        while cur < mat:
+            cur = self._edate_months(cur, int(12 / freq))
+            n += 1
+        eq = self._quasi_len(self._edate_months(first, -int(12 / freq)),
+                             first, freq, basis)
+        dsc = self._coupdays_between(settl, first, basis)
+        t0 = dsc / eq
+        total = red / (1 + y) ** (n + t0)
+        total += x * DFCsum / (1 + y) ** t0
+        for k in range(1, n + 1):
+            total += x / (1 + y) ** (k + t0)
+        total -= x * Asum
+        return total
+
+    def _fn_oddfprice(self, args_str: str, ctx: DAXContext):
+        vals = self._fin_args(args_str, ctx)
+        if len(vals) < 8:
+            return None
+        settl = _as_datetime(vals[0])
+        mat = _as_datetime(vals[1])
+        issue = _as_datetime(vals[2])
+        first = _as_datetime(vals[3])
+        rate = self._fin_num(vals[4])
+        yld = self._fin_num(vals[5])
+        red = self._fin_num(vals[6])
+        freq = int(self._fin_num(vals[7], 2.0) or 2)
+        basis = int(self._fin_num(vals[8], 0.0) or 0) if len(vals) > 8 else 0
+        if None in (settl, mat, issue, first, rate, yld, red):
+            return None
+        return self._oddfprice_val(settl, mat, issue, first, rate, yld, red,
+                                   freq, basis)
+
+    def _fn_oddfyield(self, args_str: str, ctx: DAXContext):
+        vals = self._fin_args(args_str, ctx)
+        if len(vals) < 8:
+            return None
+        settl = _as_datetime(vals[0])
+        mat = _as_datetime(vals[1])
+        issue = _as_datetime(vals[2])
+        first = _as_datetime(vals[3])
+        rate = self._fin_num(vals[4])
+        pr = self._fin_num(vals[5])
+        red = self._fin_num(vals[6])
+        freq = int(self._fin_num(vals[7], 2.0) or 2)
+        basis = int(self._fin_num(vals[8], 0.0) or 0) if len(vals) > 8 else 0
+        if None in (settl, mat, issue, first, rate, pr, red):
+            return None
+        y = max(rate, 0.05)
+        for _ in range(200):
+            f0 = self._oddfprice_val(settl, mat, issue, first, rate, y, red,
+                                     freq, basis) - pr
+            h = 1e-7
+            f1 = self._oddfprice_val(settl, mat, issue, first, rate, y + h,
+                                     red, freq, basis) - pr
+            d = (f1 - f0) / h
+            if d == 0:
+                break
+            yn = y - f0 / d
+            if abs(yn - y) < 1e-13:
+                return yn
+            y = yn
+        return y
+
+    def _fn_duration(self, args_str: str, ctx: DAXContext, modified=False):
+        vals = self._fin_args(args_str, ctx)
+        if len(vals) < 5:
+            return None
+        settl = _as_datetime(vals[0])
+        mat = _as_datetime(vals[1])
+        coupon = self._fin_num(vals[2])
+        yld = self._fin_num(vals[3])
+        freq = int(self._fin_num(vals[4], 2.0) or 2)
+        basis = int(self._fin_num(vals[5], 0.0) or 0) if len(vals) > 5 else 0
+        if None in (settl, mat, coupon, yld):
+            return None
+        pcd, ncd = self._coup_pcd_ncd(settl, mat, freq)
+        e = self._fn_coupdays_raw(settl, mat, freq, basis)
+        if basis in (0, 4):
+            dsc = e - self._coupdays_between(pcd, settl, basis)
+        else:
+            dsc = (ncd - settl).days
+        n = 0
+        cur = ncd
+        while cur <= mat:
+            n += 1
+            if cur == mat:
+                break
+            cur = self._edate_months(cur, int(12 / freq))
+        y = yld / freq
+        c = coupon / freq
+        t0 = dsc / e
+        pv_total = 0.0
+        wpv_total = 0.0
+        for k in range(1, n + 1):
+            t = k - 1 + t0
+            cf = c + (1.0 if k == n else 0.0)
+            pv = cf / (1 + y) ** t
+            pv_total += pv
+            wpv_total += t * pv
+        dur = (wpv_total / pv_total) / freq
+        if modified:
+            dur = dur / (1 + y)
+        return dur
+
+    def _fn_mduration(self, args_str: str, ctx: DAXContext):
+        return self._fn_duration(args_str, ctx, modified=True)
 
     def _fn_sqrt(self, args_str: str, ctx: DAXContext) -> Any:
         """SQRT(number) — square root."""
