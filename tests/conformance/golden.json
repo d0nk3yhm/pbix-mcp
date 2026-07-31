@@ -51,6 +51,12 @@
    "value": "-0.346573590279973"
   }
  ],
+ "ADDMISSINGITEMS": [
+  {
+   "expr": "COUNTROWS(ADDMISSINGITEMS(K[grp], SUMMARIZECOLUMNS(K[grp], \"s\", SUM(F[v])), K[grp]))",
+   "value": "3"
+  }
+ ],
  "ALLCROSSFILTERED": [
   {
    "expr": "CALCULATE(COUNTROWS(F), ALLCROSSFILTERED(F))",
@@ -81,6 +87,12 @@
   {
    "expr": "AMORLINC(2400, DATE(2008,8,19), DATE(2008,12,31), 300, 1, 0.15, 1)",
    "value": "360"
+  }
+ ],
+ "APPROXIMATEDISTINCTCOUNT": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 45) Funksjonen APPROXIMATEDISTINCTCOUNT st\u00f8ttes ikke for denne lagringsmodusen. Se https://go.microsoft.com/fwlink/?linkid=2216355 for \u00e5 finne ut mer.\"",
+   "expr": "APPROXIMATEDISTINCTCOUNT(F[k])"
   }
  ],
  "ASIN": [
@@ -235,6 +247,12 @@
    "expr": "CLOSINGBALANCEWEEK(SUM(F[v]), D[Date])"
   }
  ],
+ "COLLAPSE": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 29) COLLAPSE kan bare brukes i uttrykket for en visuell beregning.\"",
+   "expr": "COLLAPSE(SUM(F[v]), K[grp])"
+  }
+ ],
  "COMBIN": [
   {
    "expr": "COMBIN(8, 2)",
@@ -275,6 +293,20 @@
   {
    "expr": "CONTAINSROW(VALUES(K[grp]), \"Q\")",
    "value": "False"
+  }
+ ],
+ "CONVERT": [
+  {
+   "expr": "CONVERT(3.7, INTEGER)",
+   "value": "4"
+  },
+  {
+   "expr": "CONVERT(5, STRING)",
+   "value": "5"
+  },
+  {
+   "expr": "CONVERT(\"7\", DOUBLE)",
+   "value": "7"
   }
  ],
  "COS": [
@@ -379,6 +411,12 @@
    "value": "1234.5679"
   }
  ],
+ "CUSTOMDATA": [
+  {
+   "expr": "CUSTOMDATA()",
+   "value": null
+  }
+ ],
  "DATESWTD": [
   {
    "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 48) DATESWTDs parameter 1 m\u00e5 v\u00e6re en kalenderreferanse.\"",
@@ -479,6 +517,12 @@
    "expr": "CALCULATE(MAX(D[Date]), ENDOFWEEK(D[Date]))"
   }
  ],
+ "EVALUATEANDLOG": [
+  {
+   "expr": "EVALUATEANDLOG(SUM(F[v]))",
+   "value": "650"
+  }
+ ],
  "EVEN": [
   {
    "expr": "EVEN(1.5)",
@@ -487,6 +531,12 @@
   {
    "expr": "EVEN(-1)",
    "value": "-2"
+  }
+ ],
+ "EXPAND": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 27) EXPAND kan bare brukes i uttrykket for en visuell beregning.\"",
+   "expr": "EXPAND(SUM(F[v]), K[grp])"
   }
  ],
  "EXPON.DIST": [
@@ -499,6 +549,12 @@
    "value": "1.35335283236613"
   }
  ],
+ "EXTERNALMEASURE": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 36) Kan ikke l\u00f8se navnet EXTERNALMEASURE. Det er ikke et gyldig tabell-, variabel- eller funksjonsnavn.\"",
+   "expr": "EXTERNALMEASURE(\"x\", INTEGER, \"remote\")"
+  }
+ ],
  "FILTERS": [
   {
    "expr": "COUNTROWS(FILTERS(K[grp]))",
@@ -507,6 +563,12 @@
   {
    "expr": "CALCULATE(COUNTROWS(FILTERS(K[grp])), K[grp] = \"X\")",
    "value": "1"
+  }
+ ],
+ "FIRSTNONBLANKVALUE": [
+  {
+   "expr": "FIRSTNONBLANKVALUE(K[grp], SUM(F[v]))",
+   "value": "350"
   }
  ],
  "FIXED": [
@@ -571,6 +633,12 @@
    "value": "650"
   }
  ],
+ "IF.EAGER": [
+  {
+   "expr": "IF.EAGER(1 > 0, \"yes\", \"no\")",
+   "value": "yes"
+  }
+ ],
  "IGNORE": [
   {
    "expr": "COUNTROWS(SUMMARIZECOLUMNS(K[grp], \"m\", IGNORE(SUM(F[v]))))",
@@ -593,6 +661,38 @@
    "value": "-292.447129909366"
   }
  ],
+ "ISAFTER": [
+  {
+   "expr": "ISAFTER(3, 2, ASC)",
+   "value": "True"
+  }
+ ],
+ "ISATLEVEL": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"ISATLEVEL kan bare brukes i uttrykket for en visuell beregning.\"",
+   "expr": "ISATLEVEL(K[grp])"
+  }
+ ],
+ "ISBOOLEAN": [
+  {
+   "expr": "ISBOOLEAN(TRUE)",
+   "value": "True"
+  },
+  {
+   "expr": "ISBOOLEAN(1)",
+   "value": "False"
+  }
+ ],
+ "ISCURRENCY": [
+  {
+   "expr": "ISCURRENCY(CURRENCY(1.5))",
+   "value": "True"
+  },
+  {
+   "expr": "ISCURRENCY(1.5)",
+   "value": "False"
+  }
+ ],
  "ISDATETIME": [
   {
    "expr": "ISDATETIME(DATE(2024,1,1))",
@@ -600,6 +700,76 @@
   },
   {
    "expr": "ISDATETIME(5)",
+   "value": "False"
+  }
+ ],
+ "ISDECIMAL": [
+  {
+   "expr": "ISDECIMAL(1.5)",
+   "value": "False"
+  },
+  {
+   "expr": "ISDECIMAL(CURRENCY(1))",
+   "value": "True"
+  }
+ ],
+ "ISDOUBLE": [
+  {
+   "expr": "ISDOUBLE(1.5)",
+   "value": "True"
+  },
+  {
+   "expr": "ISDOUBLE(1)",
+   "value": "False"
+  }
+ ],
+ "ISEMPTY": [
+  {
+   "expr": "ISEMPTY(FILTER(K, K[grp] = \"Q\"))",
+   "value": "True"
+  },
+  {
+   "expr": "ISEMPTY(K)",
+   "value": "False"
+  }
+ ],
+ "ISEVEN": [
+  {
+   "expr": "ISEVEN(4)",
+   "value": "True"
+  },
+  {
+   "expr": "ISEVEN(3)",
+   "value": "False"
+  }
+ ],
+ "ISINT64": [
+  {
+   "expr": "ISINT64(1)",
+   "value": "True"
+  },
+  {
+   "expr": "ISINT64(1.5)",
+   "value": "False"
+  }
+ ],
+ "ISINTEGER": [
+  {
+   "expr": "ISINTEGER(1)",
+   "value": "True"
+  },
+  {
+   "expr": "ISINTEGER(1.5)",
+   "value": "False"
+  }
+ ],
+ "ISNUMERIC": [
+  {
+   "expr": "ISNUMERIC(1)",
+   "value": "True"
+  },
+  {
+   "expr": "ISNUMERIC(\"x\")",
    "value": "False"
   }
  ],
@@ -611,6 +781,16 @@
   {
    "expr": "ISO.CEILING(-4.3, 2)",
    "value": "-4"
+  }
+ ],
+ "ISODD": [
+  {
+   "expr": "ISODD(3)",
+   "value": "True"
+  },
+  {
+   "expr": "ISODD(4)",
+   "value": "False"
   }
  ],
  "ISONORAFTER": [
@@ -629,16 +809,88 @@
    "value": "-64814.8148148148"
   }
  ],
+ "ISSELECTEDMEASURE": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 38) Det finnes ingen m\u00e5lreferanse i den gjeldende konteksten som kan brukes av ISSELECTEDMEASURE.\"",
+   "expr": "ISSELECTEDMEASURE([Total V])"
+  }
+ ],
+ "ISSTRING": [
+  {
+   "expr": "ISSTRING(\"x\")",
+   "value": "True"
+  },
+  {
+   "expr": "ISSTRING(1)",
+   "value": "False"
+  }
+ ],
+ "ISSUBTOTAL": [
+  {
+   "expr": "SUMX(SUMMARIZE(K, ROLLUP(K[grp]), \"st\", ISSUBTOTAL(K[grp])), IF([st], 1, 0))",
+   "value": "1"
+  }
+ ],
+ "LASTNONBLANKVALUE": [
+  {
+   "expr": "LASTNONBLANKVALUE(K[grp], SUM(F[v]))",
+   "value": "300"
+  }
+ ],
  "LCM": [
   {
    "expr": "LCM(4, 6)",
    "value": "12"
   }
  ],
+ "LINEST": [
+  {
+   "expr": "SUMX(LINEST(N[x], N[i]), [Slope1])",
+   "value": "-0.01"
+  }
+ ],
+ "LINESTX": [
+  {
+   "expr": "SUMX(LINESTX(N, N[x], N[i]), [Slope1])",
+   "value": "-0.01"
+  }
+ ],
+ "LOOKUP": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 27) LOOKUP kan bare brukes i uttrykket for en visuell beregning.\"",
+   "expr": "LOOKUP(K[grp], K[k], 2)"
+  }
+ ],
+ "LOOKUPWITHTOTALS": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 62) Funksjonen LOOKUPWITHTOTALS forventer en kolonnereferanse som argumentnummer 2.\"",
+   "expr": "LOOKUPWITHTOTALS(K[grp], K[k], 2)"
+  }
+ ],
+ "MAXA": [
+  {
+   "expr": "MAXA(N[i])",
+   "value": "5"
+  },
+  {
+   "expr": "MAXA(N[b])",
+   "value": "1"
+  }
+ ],
  "MDURATION": [
   {
    "expr": "MDURATION(DATE(2008,1,1), DATE(2016,1,1), 0.08, 0.09, 2, 1)",
    "value": "5.73566981391884"
+  }
+ ],
+ "MINA": [
+  {
+   "expr": "MINA(N[i])",
+   "value": "1"
+  },
+  {
+   "expr": "MINA(N[b])",
+   "value": "0"
   }
  ],
  "MROUND": [
@@ -651,10 +903,26 @@
    "value": "-9"
   }
  ],
+ "NAMEOF": [
+  {
+   "expr": "NAMEOF(K[grp])",
+   "value": "'K'[grp]"
+  },
+  {
+   "expr": "NAMEOF([Total V])",
+   "value": "'F'[Total V]"
+  }
+ ],
  "NATURALINNERJOIN": [
   {
    "expr": "COUNTROWS(NATURALINNERJOIN(F, K))",
    "value": "4"
+  }
+ ],
+ "NATURALJOINUSAGE": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 57) For mange argumenter ble sendt til funksjonen NATURALJOINUSAGE. H\u00f8yeste antall argumenter for funksjonen er 1.\"",
+   "expr": "NATURALJOINUSAGE(F, K)"
   }
  ],
  "NATURALLEFTOUTERJOIN": [
@@ -783,6 +1051,18 @@
    "expr": "OPENINGBALANCEWEEK(SUM(F[v]), D[Date])"
   }
  ],
+ "PATH": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Kan ikke sp\u00f8rre interne st\u00f8ttestrukturer for kolonnen PC[id] fordi de ikke er behandlet.  Oppdater eller beregn tabellen PC p\u00e5 nytt.\"",
+   "expr": "CONCATENATEX(FILTER(PC, PC[id] = 4), PATH(PC[id], PC[parent]))"
+  }
+ ],
+ "PATHITEMREVERSE": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Kan ikke sp\u00f8rre interne st\u00f8ttestrukturer for kolonnen PC[id] fordi de ikke er behandlet.  Oppdater eller beregn tabellen PC p\u00e5 nytt.\"",
+   "expr": "CONCATENATEX(FILTER(PC, PC[id] = 4), PATHITEMREVERSE(PATH(PC[id], PC[parent]), 1))"
+  }
+ ],
  "PDURATION": [
   {
    "expr": "PDURATION(0.025, 2000, 2200)",
@@ -895,6 +1175,12 @@
    "value": "99.9844988755569"
   }
  ],
+ "PRODUCTX": [
+  {
+   "expr": "PRODUCTX(N, N[i])",
+   "value": "120"
+  }
+ ],
  "PV": [
   {
    "expr": "PV(0.08/12, 240, 500)",
@@ -951,16 +1237,74 @@
    "value": "1014584.6544071"
   }
  ],
+ "ROLLUP": [
+  {
+   "expr": "COUNTROWS(SUMMARIZE(K, ROLLUP(K[grp]), \"n\", COUNTROWS(K)))",
+   "value": "4"
+  }
+ ],
  "ROLLUPADDISSUBTOTAL": [
   {
    "expr": "COUNTROWS(SUMMARIZECOLUMNS(ROLLUPADDISSUBTOTAL(K[grp], \"T\")))",
    "value": "4"
   }
  ],
+ "ROLLUPGROUP": [
+  {
+   "expr": "COUNTROWS(SUMMARIZE(K, ROLLUP(ROLLUPGROUP(K[grp])), \"n\", COUNTROWS(K)))",
+   "value": "4"
+  }
+ ],
+ "ROLLUPISSUBTOTAL": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 106) For f\u00e5 argumenter ble sendt til funksjonen ROLLUPISSUBTOTAL. Laveste antall argumenter for funksjonen er 2.\"",
+   "expr": "COUNTROWS(SUMMARIZECOLUMNS(ROLLUPADDISSUBTOTAL(K[grp], \"st\"), \"chk\", ROLLUPISSUBTOTAL()))"
+  }
+ ],
  "RRI": [
   {
    "expr": "RRI(96, 10000, 11000)",
    "value": "0.00099330737629133"
+  }
+ ],
+ "SAMPLE": [
+  {
+   "expr": "COUNTROWS(SAMPLE(2, F, F[v]))",
+   "value": "2"
+  },
+  {
+   "expr": "SUMX(SAMPLE(2, F, F[v], ASC), F[v])",
+   "value": "350"
+  }
+ ],
+ "SAMPLEAXISWITHLOCALMINMAX": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 56) For f\u00e5 argumenter ble sendt til funksjonen SAMPLEAXISWITHLOCALMINMAX. Laveste antall argumenter for funksjonen er 5.\"",
+   "expr": "COUNTROWS(SAMPLEAXISWITHLOCALMINMAX(4, F, F[v]))"
+  }
+ ],
+ "SAMPLECARTESIANPOINTSBYCOVER": [
+  {
+   "expr": "COUNTROWS(SAMPLECARTESIANPOINTSBYCOVER(4, F, F[v], F[k]))",
+   "value": "4"
+  }
+ ],
+ "SELECTEDMEASURE": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 36) Det finnes ingen m\u00e5lreferanse i den gjeldende konteksten som kan brukes som SELECTEDMEASURE.\"",
+   "expr": "SELECTEDMEASURE()"
+  }
+ ],
+ "SELECTEDMEASUREFORMATSTRING": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 48) Misbruk av SELECTEDMEASUREFORMATSTRING. Det finnes ingen m\u00e5lreferanse i den gjeldende konteksten.\"",
+   "expr": "SELECTEDMEASUREFORMATSTRING()"
+  }
+ ],
+ "SELECTEDMEASURENAME": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 40) Det finnes ingen m\u00e5lreferanse i den gjeldende konteksten som kan brukes av SELECTEDMEASURENAME.\"",
+   "expr": "SELECTEDMEASURENAME()"
   }
  ],
  "SIN": [
@@ -1007,6 +1351,18 @@
   {
    "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 68) STARTOFWEEKs parameter 1 m\u00e5 v\u00e6re en kalenderreferanse.\"",
    "expr": "CALCULATE(MAX(D[Date]), STARTOFWEEK(D[Date]))"
+  }
+ ],
+ "STDEV.P": [
+  {
+   "expr": "STDEV.P(N[i])",
+   "value": "1.4142135623731"
+  }
+ ],
+ "STDEV.S": [
+  {
+   "expr": "STDEV.S(N[i])",
+   "value": "1.58113883008419"
   }
  ],
  "STDEVX.P": [
@@ -1071,6 +1427,12 @@
    "value": "0.606533075825759"
   }
  ],
+ "TABLEOF": [
+  {
+   "expr": "COUNTROWS(TABLEOF([Total V]))",
+   "value": "4"
+  }
+ ],
  "TAN": [
   {
    "expr": "TAN(0)",
@@ -1109,10 +1471,32 @@
    "value": "0.0914169629253426"
   }
  ],
+ "TIME": [
+  {
+   "expr": "TIME(14, 30, 15)",
+   "value": "12/30/1899 14:30:15"
+  },
+  {
+   "expr": "TIME(25, 0, 0)",
+   "value": "12/30/1899 01:00:00"
+  }
+ ],
  "TIMEVALUE": [
   {
    "expr": "TIMEVALUE(\"14:30:00\")",
    "value": "12/30/1899 14:30:00"
+  }
+ ],
+ "TOCSV": [
+  {
+   "expr": "SUBSTITUTE(TOCSV(K), UNICHAR(10), \"|\")",
+   "value": "'K'[k],'K'[grp]|1,X|2,X|3,Y|4,Z"
+  }
+ ],
+ "TOJSON": [
+  {
+   "expr": "SUBSTITUTE(TOJSON(K, 1), UNICHAR(10), \"|\")",
+   "value": "{|\t\"header\": [\"'K'[k]\", \"'K'[grp]\"],|\t\"rowCount\": 4,|\t\"data\": [|\t\t[1, \"X\"]|\t]|}"
   }
  ],
  "TOPNSKIP": [
@@ -1123,6 +1507,42 @@
   {
    "expr": "COUNTROWS(TOPNSKIP(2, 0, F, F[v]))",
    "value": "2"
+  }
+ ],
+ "TOTALWTD": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 49) TOTALWTDs parameter 2 m\u00e5 v\u00e6re en kalenderreferanse.\"",
+   "expr": "TOTALWTD(SUM(F[v]), D[Date])"
+  }
+ ],
+ "USERCULTURE": [
+  {
+   "expr": "LEN(USERCULTURE()) > 0",
+   "value": "True"
+  }
+ ],
+ "USEROBJECTID": [
+  {
+   "expr": "LEN(USEROBJECTID()) > 0",
+   "value": "True"
+  }
+ ],
+ "UTCTODAY": [
+  {
+   "expr": "ISDATETIME(UTCTODAY())",
+   "value": "True"
+  }
+ ],
+ "VAR.P": [
+  {
+   "expr": "VAR.P(N[i])",
+   "value": "2"
+  }
+ ],
+ "VAR.S": [
+  {
+   "expr": "VAR.S(N[i])",
+   "value": "2.5"
   }
  ],
  "VARX.P": [
@@ -1157,6 +1577,20 @@
   {
    "expr": "XNPV(F, F[v], F[d], 0.09)",
    "value": "639.029409480885"
+  }
+ ],
+ "YEARFRAC": [
+  {
+   "expr": "YEARFRAC(DATE(2012,1,1), DATE(2012,7,30))",
+   "value": "0.580555555555556"
+  },
+  {
+   "expr": "YEARFRAC(DATE(2012,1,1), DATE(2012,7,30), 1)",
+   "value": "0.576502732240437"
+  },
+  {
+   "expr": "YEARFRAC(DATE(2012,1,1), DATE(2012,7,30), 3)",
+   "value": "0.578082191780822"
   }
  ],
  "YIELD": [

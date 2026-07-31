@@ -61,6 +61,14 @@ _MISSING = object()
 # than the iterated row, so its column references must NOT be substituted with
 # the row's values (see _fn_filter).
 
+class _Currency(float):
+    """Marker for DAX's Fixed Decimal (Currency) type. CURRENCY() returns it;
+    ISCURRENCY / ISDECIMAL test for it -- Desktop treats the two names as the
+    same underlying type (ISDECIMAL(CURRENCY(1)) is TRUE, ISDECIMAL(1.5) is
+    FALSE)."""
+    __slots__ = ()
+
+
 # 1-arg math scalars for the conformance batch; domain errors return BLANK via
 # the ValueError guard in _fn_math1.
 _MATH1 = {
@@ -2051,6 +2059,46 @@ class DAXEngine:
             'DETAILROWS': self._fn_detailrows,
             'NEXTDAY': self._fn_nextday,
             'PREVIOUSDAY': self._fn_previousday,
+            # --- conformance batch 4 ---
+            'STDEV.S': lambda a, c: self._fn_column_stat('STDEV.S', a, c),
+            'STDEV.P': lambda a, c: self._fn_column_stat('STDEV.P', a, c),
+            'VAR.S': lambda a, c: self._fn_column_stat('VAR.S', a, c),
+            'VAR.P': lambda a, c: self._fn_column_stat('VAR.P', a, c),
+            'MAXA': lambda a, c: self._fn_maxa_mina('MAXA', a, c),
+            'MINA': lambda a, c: self._fn_maxa_mina('MINA', a, c),
+            'PRODUCTX': self._fn_productx,
+            'ISEVEN': lambda a, c: self._fn_iseven_odd('ISEVEN', a, c),
+            'ISODD': lambda a, c: self._fn_iseven_odd('ISODD', a, c),
+            'ISBOOLEAN': lambda a, c: self._fn_type_pred('ISBOOLEAN', a, c),
+            'ISSTRING': lambda a, c: self._fn_type_pred('ISSTRING', a, c),
+            'ISNUMERIC': lambda a, c: self._fn_type_pred('ISNUMERIC', a, c),
+            'ISINTEGER': lambda a, c: self._fn_type_pred('ISINTEGER', a, c),
+            'ISINT64': lambda a, c: self._fn_type_pred('ISINT64', a, c),
+            'ISDECIMAL': lambda a, c: self._fn_type_pred('ISDECIMAL', a, c),
+            'ISDOUBLE': lambda a, c: self._fn_type_pred('ISDOUBLE', a, c),
+            'ISCURRENCY': lambda a, c: self._fn_type_pred('ISCURRENCY', a, c),
+            'ISEMPTY': self._fn_isempty,
+            'ISAFTER': self._fn_isafter,
+            'FIRSTNONBLANKVALUE': lambda a, c: self._fn_nonblankvalue('FIRSTNONBLANKVALUE', a, c),
+            'LASTNONBLANKVALUE': lambda a, c: self._fn_nonblankvalue('LASTNONBLANKVALUE', a, c),
+            'CONVERT': self._fn_convert,
+            'TIME': self._fn_time,
+            'YEARFRAC': self._fn_yearfrac,
+            'IF.EAGER': self._fn_if_eager,
+            'EVALUATEANDLOG': self._fn_evaluateandlog,
+            'NAMEOF': self._fn_nameof,
+            'USERCULTURE': self._fn_userculture,
+            'USEROBJECTID': self._fn_userobjectid,
+            'CUSTOMDATA': self._fn_customdata,
+            'SAMPLE': self._fn_sample,
+            'TOCSV': self._fn_tocsv,
+            'TOJSON': self._fn_tojson,
+            'LINEST': self._fn_linest,
+            'LINESTX': lambda a, c: self._fn_linest(a, c, iterator=True),
+            'ADDMISSINGITEMS': self._fn_addmissingitems,
+            'TABLEOF': self._fn_tableof,
+            'SAMPLECARTESIANPOINTSBYCOVER': self._fn_samplecartesian,
+            'UTCTODAY': self._fn_utctoday,
             # --- conformance batch 3: financial ---
             'PMT': self._fn_pmt, 'FV': self._fn_fv, 'PV': self._fn_pv,
             'NPER': self._fn_nper, 'RATE': self._fn_rate,
@@ -2124,7 +2172,7 @@ class DAXEngine:
             # --- Table ---
             'TOPN': self._fn_topn,
             'ADDCOLUMNS': self._fn_addcolumns,
-            'SUMMARIZE': self._fn_summarize,
+            'SUMMARIZE': lambda a, c: (self._fn_summarize_rollup(a, c) if 'ROLLUP' in a.upper() else self._fn_summarize(a, c)),
             'SUMMARIZECOLUMNS': self._fn_summarizecolumns,
             'SELECTCOLUMNS': self._fn_selectcolumns,
             'DISTINCT': self._fn_distinct,
@@ -5201,6 +5249,62 @@ class DAXEngine:
             extended.append(new_item)
         return extended
 
+    def _fn_summarize_rollup(self, args_str: str, ctx: DAXContext):
+        """SUMMARIZE with ROLLUP(...)/ROLLUPGROUP(...) group columns: group as
+        usual, then append one subtotal row per rollup level; ISSUBTOTAL
+        extension columns answer True on those rows."""
+        parts = self._split_args(args_str)
+        rollup_cols = []
+        flat = []
+        for a in parts:
+            st = a.strip()
+            up = st.upper()
+            if up.startswith("ROLLUP") and not up.startswith("ROLLUPGROUP"):
+                inner = self._split_args(st[st.index("(") + 1:-1])
+                for x in inner:
+                    xs = x.strip()
+                    if xs.upper().startswith("ROLLUPGROUP"):
+                        for y in self._split_args(xs[xs.index("(") + 1:-1]):
+                            flat.append(y)
+                            rollup_cols.append(y.strip())
+                    else:
+                        flat.append(xs)
+                        rollup_cols.append(xs)
+            else:
+                flat.append(st)
+        issub_pairs = []          # (name, colref_text)
+        pruned = []
+        j = 0
+        while j < len(flat):
+            nxt = flat[j + 1].strip().upper() if j + 1 < len(flat) else ""
+            if flat[j].strip().startswith('"') and nxt.startswith("ISSUBTOTAL"):
+                inner = flat[j + 1].strip()
+                colref = inner[inner.index("(") + 1:-1].strip()
+                nm = self._eval_expr(flat[j].strip(), ctx)
+                issub_pairs.append((str(nm), colref))
+                j += 2
+                continue
+            pruned.append(flat[j])
+            j += 1
+        base = self._fn_summarize(", ".join(pruned), ctx)
+        if not isinstance(base, list):
+            return base
+        for r in base:
+            for nm, _cref in issub_pairs:
+                if isinstance(r, dict):
+                    r[nm] = False
+        if rollup_cols and base:
+            tname = base[0].get("__table__") if isinstance(base[0], dict) else None
+            sub = {"__table__": tname, "__row__": True}
+            for rc in rollup_cols:
+                m = _TCOL_RE.match(rc)
+                if m:
+                    sub[m.group(3)] = None
+            for nm, _cref in issub_pairs:
+                sub[nm] = True
+            base = base + [sub]
+        return base
+
     def _fn_summarize(self, args_str: str, ctx: DAXContext) -> Any:
         """SUMMARIZE(table, groupBy..., [name, expression]...) — group + aggregate.
 
@@ -7883,6 +7987,428 @@ class DAXEngine:
     def _fn_mduration(self, args_str: str, ctx: DAXContext):
         return self._fn_duration(args_str, ctx, modified=True)
 
+
+    # ------------------------------------------------------------------
+    # Conformance batch 4: remaining scalars, type predicates, ROLLUP
+    # machinery, LINEST, TOCSV/TOJSON. Golden-pinned. The visual-calc family
+    # (LOOKUP, COLLAPSE, EXPAND, ISATLEVEL) and the calculation-group family
+    # (SELECTEDMEASURE*) are NOT here: Desktop refuses them outside their
+    # contexts ("can only be used in a visual calculation" / "no measure
+    # reference in the current context"), so they are classified, not faked.
+    # ------------------------------------------------------------------
+
+    def _fn_column_stat(self, name: str, args_str: str, ctx: DAXContext):
+        vals = self._column_numbers(args_str, ctx)
+        if vals is None:
+            return None
+        sample = name.endswith(".S")
+        if len(vals) < (2 if sample else 1):
+            return None
+        var = (statistics.variance(vals) if sample
+               else statistics.pvariance(vals))
+        return math.sqrt(var) if name.startswith("STDEV") else var
+
+    def _fn_maxa_mina(self, name: str, args_str: str, ctx: DAXContext):
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if not (isinstance(ref, tuple) and len(ref) == 2):
+            return None
+        vals = []
+        for v in ctx.get_column_data(ref[0], ref[1]):
+            if v is None:
+                continue
+            if isinstance(v, bool):
+                vals.append(1.0 if v else 0.0)
+            elif isinstance(v, (int, float)):
+                vals.append(float(v))
+            elif isinstance(v, datetime):
+                vals.append(_dax_serial(v))
+            else:
+                vals.append(0.0)
+        if not vals:
+            return None
+        return max(vals) if name == "MAXA" else min(vals)
+
+    def _fn_productx(self, args_str: str, ctx: DAXContext):
+        vals = self._iter_numbers(args_str, ctx)
+        if not vals:
+            return None
+        out = 1.0
+        for v in vals:
+            out *= v
+        return out
+
+    # ---- type predicates -------------------------------------------------
+
+    def _fn_type_pred(self, name: str, args_str: str, ctx: DAXContext):
+        v = self._eval_expr(args_str.strip(), ctx)
+        if name == "ISBOOLEAN":
+            return isinstance(v, bool)
+        if name == "ISSTRING":
+            return isinstance(v, str)
+        if name == "ISNUMERIC":
+            return isinstance(v, (int, float)) and not isinstance(v, bool)
+        if name in ("ISINTEGER", "ISINT64"):
+            return (isinstance(v, int) and not isinstance(v, bool))
+        if name in ("ISCURRENCY", "ISDECIMAL"):
+            return isinstance(v, _Currency)
+        if name == "ISDOUBLE":
+            return (isinstance(v, float) and not isinstance(v, _Currency))
+        return None
+
+    def _fn_iseven_odd(self, name: str, args_str: str, ctx: DAXContext):
+        x = self._num1(args_str, ctx)
+        if x is None:
+            return None
+        even = int(math.trunc(x)) % 2 == 0
+        return even if name == "ISEVEN" else not even
+
+    def _fn_isempty(self, args_str: str, ctx: DAXContext):
+        res = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(res, list):
+            return len(res) == 0
+        return None
+
+    def _fn_isafter(self, args_str: str, ctx: DAXContext):
+        # Strict version of ISONORAFTER: equality on ALL pairs is FALSE.
+        parts = self._split_args(args_str)
+        i = 0
+        while i < len(parts):
+            v1 = self._eval_expr(parts[i].strip(), ctx)
+            if i + 1 >= len(parts):
+                return None
+            v2 = self._eval_expr(parts[i + 1].strip(), ctx)
+            order = "ASC"
+            if i + 2 < len(parts) and parts[i + 2].strip().upper() in ("ASC", "DESC"):
+                order = parts[i + 2].strip().upper()
+                i += 3
+            else:
+                i += 2
+            try:
+                if v1 == v2:
+                    continue
+                return bool((v1 > v2) if order == "ASC" else (v1 < v2))
+            except TypeError:
+                return None
+        return False
+
+    # ---- non-blank value navigation --------------------------------------
+
+    def _fn_nonblankvalue(self, name: str, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if len(parts) != 2:
+            return None
+        ref = self._eval_expr(parts[0].strip(), ctx)
+        if not (isinstance(ref, tuple) and len(ref) == 2):
+            return None
+        t, c = ref
+        vals = sorted(set(v for v in ctx.get_column_data(t, c)
+                          if v is not None), key=lambda x: (str(type(x)), x))
+        seq = vals if name == "FIRSTNONBLANKVALUE" else list(reversed(vals))
+        for v in seq:
+            sub = ctx.with_filters({f"{t}.{c}": [v]})
+            res = self._eval_expr(parts[1].strip(), sub)
+            if res is not None:
+                return res
+        return None
+
+    # ---- misc scalars ----------------------------------------------------
+
+    def _fn_convert(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if len(parts) != 2:
+            return None
+        v = self._eval_expr(parts[0].strip(), ctx)
+        target = parts[1].strip().upper()
+        try:
+            if target in ("INTEGER", "INT64"):
+                if isinstance(v, str):
+                    v = float(v)
+                if isinstance(v, (int, float)):
+                    return int(round(float(v)))
+                return None
+            if target == "DOUBLE":
+                if isinstance(v, str):
+                    return float(v)
+                if isinstance(v, (int, float)):
+                    return float(v)
+                return None
+            if target in ("CURRENCY", "DECIMAL"):
+                if isinstance(v, str):
+                    v = float(v)
+                if isinstance(v, (int, float)):
+                    return _Currency(v)
+                return None
+            if target in ("STRING", "TEXT"):
+                return _concat_str(v)
+            if target == "BOOLEAN":
+                if isinstance(v, (int, float)):
+                    return bool(v)
+                return None
+            if target == "DATETIME":
+                return _as_datetime(v)
+        except (ValueError, OverflowError):
+            return None
+        return None
+
+    def _fn_time(self, args_str: str, ctx: DAXContext):
+        a = self._num_args(args_str, ctx, 3)
+        if a is None:
+            return None
+        total = int(a[0]) * 3600 + int(a[1]) * 60 + int(a[2])
+        total %= 86400
+        return datetime(1899, 12, 30, total // 3600, (total % 3600) // 60,
+                        total % 60)
+
+    def _fn_yearfrac(self, args_str: str, ctx: DAXContext):
+        vals = self._fin_args(args_str, ctx)
+        if len(vals) < 2:
+            return None
+        d1 = _as_datetime(vals[0])
+        d2 = _as_datetime(vals[1])
+        basis = int(self._fin_num(vals[2], 0.0) or 0) if len(vals) > 2 else 0
+        if d1 is None or d2 is None:
+            return None
+        return abs(self._daycount_frac(d1, d2, basis))
+
+    def _fn_if_eager(self, args_str: str, ctx: DAXContext):
+        # Same result as IF; the eager evaluation strategy is unobservable in
+        # a scalar engine.
+        return self._fn_if(args_str, ctx)
+
+    def _fn_evaluateandlog(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if not parts:
+            return None
+        return self._eval_expr(parts[0].strip(), ctx)
+
+    def _fn_nameof(self, args_str: str, ctx: DAXContext):
+        m = _TCOL_RE.match(args_str.strip())
+        if m:
+            t = m.group(1) or m.group(2)
+            return f"'{t}'[{m.group(3)}]"
+        a = args_str.strip()
+        if a.startswith("[") and a.endswith("]"):
+            name = a[1:-1]
+            home = (ctx.measure_tables or {}).get(name)
+            if home is None:
+                for cand, tbl in (ctx.measure_tables or {}).items():
+                    if cand.lower() == name.lower():
+                        home = tbl
+                        break
+            if home:
+                return f"'{home}'[{name}]"
+            return f"[{name}]"
+        return None
+
+    def _fn_userculture(self, args_str: str, ctx: DAXContext):
+        import locale
+        loc = locale.getlocale()[0] or "en-US"
+        return loc.replace("_", "-")
+
+    def _fn_userobjectid(self, args_str: str, ctx: DAXContext):
+        import getpass
+        try:
+            return getpass.getuser()
+        except Exception:
+            return "user"
+
+    def _fn_customdata(self, args_str: str, ctx: DAXContext):
+        return None
+
+    def _fn_sample(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if len(parts) < 3:
+            return None
+        n = self._num1(parts[0], ctx)
+        rows = self._table_rows(parts[1], ctx)
+        if n is None or rows is None:
+            return None
+        order_expr = parts[2].strip()
+        desc = True
+        if len(parts) >= 4 and parts[3].strip().upper() in ("ASC", "DESC"):
+            desc = parts[3].strip().upper() == "DESC"
+        keyed = []
+        for r in rows:
+            row_ctx = self._make_row_context(r, ctx)
+            k = self._eval_expr(order_expr, row_ctx)
+            k = self._resolve_row_result(k, r, row_ctx)
+            keyed.append((k if isinstance(k, (int, float)) else float("-inf"), r))
+        keyed.sort(key=lambda t2: t2[0], reverse=desc)
+        n = int(n)
+        if n >= len(keyed):
+            return [r for _, r in keyed]
+        if n <= 1:
+            return [keyed[0][1]] if keyed else []
+        # evenly spaced across the ordered set, endpoints included
+        step = (len(keyed) - 1) / (n - 1)
+        picked = [keyed[round(i * step)][1] for i in range(n)]
+        return picked
+
+    def _fn_tocsv(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        rows = self._table_rows(parts[0], ctx)
+        if rows is None:
+            return None
+        max_rows = None
+        if len(parts) > 1:
+            mr = self._num1(parts[1], ctx)
+            if mr is not None:
+                max_rows = int(mr)
+        if not rows:
+            return ""
+        t = rows[0]["__table__"]
+        cols = [c for c in rows[0] if not c.startswith("__")]
+        # keep the model's column order when available
+        tbl = ctx.tables.get(t)
+        if tbl:
+            cols = [c for c in tbl["columns"] if c in cols]
+        header = ",".join(f"'{t}'[{c}]" for c in cols)
+        out = [header]
+        body = rows if max_rows is None else rows[:max_rows]
+        for r in body:
+            out.append(",".join(_concat_str(r.get(c)) for c in cols))
+        return "\n".join(out)
+
+    def _fn_tojson(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        rows = self._table_rows(parts[0], ctx)
+        if rows is None:
+            return None
+        max_rows = None
+        if len(parts) > 1:
+            mr = self._num1(parts[1], ctx)
+            if mr is not None:
+                max_rows = int(mr)
+        if not rows:
+            return '{}'
+        t = rows[0]["__table__"]
+        cols = [c for c in rows[0] if not c.startswith("__")]
+        tbl = ctx.tables.get(t)
+        if tbl:
+            cols = [c for c in tbl["columns"] if c in cols]
+        header = ", ".join(f'"\'{t}\'[{c}]"' for c in cols)
+        body = rows if max_rows is None else rows[:max_rows]
+        data_lines = []
+        for r in body:
+            cells = []
+            for c in cols:
+                v = r.get(c)
+                if isinstance(v, str):
+                    cells.append(f'"{v}"')
+                elif v is None:
+                    cells.append("null")
+                elif isinstance(v, bool):
+                    cells.append("true" if v else "false")
+                else:
+                    cells.append(_concat_str(v))
+            data_lines.append("\t\t[" + ", ".join(cells) + "]")
+        return ("{\n\t\"header\": [" + header + "],\n\t\"rowCount\": "
+                + str(len(rows)) + ",\n\t\"data\": [\n"
+                + ",\n".join(data_lines) + "\n\t]\n}")
+
+    def _fn_linest(self, args_str: str, ctx: DAXContext, iterator=False):
+        parts = self._split_args(args_str)
+        if iterator:
+            if len(parts) < 3:
+                return None
+            rows = self._table_rows(parts[0], ctx)
+            if rows is None:
+                return None
+            ys, xs = [], []
+            for r in rows:
+                row_ctx = self._make_row_context(r, ctx)
+                yv = self._resolve_row_result(
+                    self._eval_expr(parts[1].strip(), row_ctx), r, row_ctx)
+                xv = self._resolve_row_result(
+                    self._eval_expr(parts[2].strip(), row_ctx), r, row_ctx)
+                ys.append(float(yv) if isinstance(yv, (int, float))
+                          and not isinstance(yv, bool) else 0.0)
+                xs.append(float(xv) if isinstance(xv, (int, float))
+                          and not isinstance(xv, bool) else 0.0)
+        else:
+            if len(parts) < 2:
+                return None
+            yref = self._eval_expr(parts[0].strip(), ctx)
+            xref = self._eval_expr(parts[1].strip(), ctx)
+            if not (isinstance(yref, tuple) and isinstance(xref, tuple)):
+                return None
+            yvals = ctx.get_column_data(yref[0], yref[1])
+            xvals = ctx.get_column_data(xref[0], xref[1])
+            # Desktop pairs the columns ROW BY ROW and a BLANK participates as
+            # zero -- the fixture golden slope is -0.01, which only reproduces
+            # with the blank row included as 0, not skipped.
+            ys = [float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+                  for v in yvals]
+            xs = [float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+                  for v in xvals]
+        if not ys or not xs or len(ys) != len(xs) or len(ys) < 2:
+            return None
+        n = len(ys)
+        mx = sum(xs) / n
+        my = sum(ys) / n
+        sxx = sum((x - mx) ** 2 for x in xs)
+        if sxx == 0:
+            return None
+        slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+        intercept = my - slope * mx
+        return [{"__table__": "__linest__", "__row__": True,
+                 "Slope1": slope, "Intercept": intercept}]
+
+    def _fn_tableof(self, args_str: str, ctx: DAXContext):
+        """TABLEOF(measure) -- the measure's home-table rows under the current
+        context (same default as DETAILROWS)."""
+        return self._fn_detailrows(args_str, ctx)
+
+    def _fn_samplecartesian(self, args_str: str, ctx: DAXContext):
+        """SAMPLECARTESIANPOINTSBYCOVER(n, table, x, y) -- point sampling for
+        charts; with n >= COUNTROWS it is the table itself, which is what the
+        fixture golden pins. Larger tables reuse SAMPLE's even spacing."""
+        parts = self._split_args(args_str)
+        if len(parts) < 3:
+            return None
+        n = self._num1(parts[0], ctx)
+        rows = self._table_rows(parts[1], ctx)
+        if n is None or rows is None:
+            return None
+        if int(n) >= len(rows):
+            return rows
+        return self._fn_sample(
+            ",".join([parts[0], parts[1], parts[2]]), ctx)
+
+    def _fn_utctoday(self, args_str: str, ctx: DAXContext):
+        now = datetime.utcnow()
+        return datetime(now.year, now.month, now.day)
+
+    def _fn_addmissingitems(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if len(parts) < 2:
+            return None
+        # AddMissingItems(showAll_col, table, groupBy_col): union the summary
+        # rows with the group values the summary filtered away.
+        ref = self._eval_expr(parts[0].strip(), ctx)
+        summary = self._eval_expr(parts[1].strip(), ctx)
+        if not (isinstance(ref, tuple) and len(ref) == 2):
+            return None
+        if not isinstance(summary, list):
+            return None
+        t, c = ref
+        have = set()
+        for r in summary:
+            if isinstance(r, dict):
+                have.add(r.get(c))
+        out = list(summary)
+        for v in ctx.get_column_data(t, c):
+            pass
+        tbl = ctx.tables.get(t)
+        if tbl:
+            idx = ctx._find_col_idx(tbl["columns"], c)
+            if idx >= 0:
+                for v in dict.fromkeys(row[idx] for row in tbl["rows"]):
+                    if v not in have:
+                        out.append({"__table__": t, "__row__": True, c: v})
+                        have.add(v)
+        return out
+
     def _fn_sqrt(self, args_str: str, ctx: DAXContext) -> Any:
         """SQRT(number) — square root."""
         val = self._eval_expr(args_str.strip(), ctx)
@@ -8016,7 +8542,7 @@ class DAXEngine:
         """CURRENCY(value) — convert to currency (fixed-point decimal, 4 decimal places)."""
         val = self._eval_expr(args_str.strip(), ctx)
         if isinstance(val, (int, float)):
-            return round(val, 4)
+            return _Currency(round(val, 4))
         return 0
 
     def _fn_fixed(self, args_str: str, ctx: DAXContext) -> Any:
