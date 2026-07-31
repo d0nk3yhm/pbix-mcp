@@ -16,6 +16,7 @@ Architecture:
   - DataModel writing works via ABF round-trip (decompress → modify → recompress)
 """
 
+import atexit
 import copy
 import difflib
 import io
@@ -26,6 +27,7 @@ import shutil
 import sqlite3
 import struct
 import tempfile
+import time
 import traceback
 import uuid
 import zipfile
@@ -78,6 +80,86 @@ mcp = FastMCP(
 # State: track open files
 # ---------------------------------------------------------------------------
 _open_files: dict[str, dict] = {}
+
+# Work directories created by THIS process. pbix_close removes an entry; the
+# atexit hook below removes whatever is left, so a process that exits without
+# closing (a test run, a script, a crashed sweep) does not strand its
+# extractions. Thousands of pbix_mcp_* directories were found accumulated in
+# %TEMP% from exactly that class of caller.
+_work_dirs: set[str] = set()
+
+
+def _cleanup_own_work_dirs() -> None:
+    for d in list(_work_dirs):
+        shutil.rmtree(d, ignore_errors=True)
+        _work_dirs.discard(d)
+
+
+atexit.register(_cleanup_own_work_dirs)
+
+_scavenged = False
+
+
+def _pid_alive(pid: int) -> bool:
+    """Liveness without psutil. NEVER os.kill(pid, 0) on Windows -- any signal
+    value other than the CTRL events unconditionally TerminateProcess-es the
+    target."""
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return False
+        ctypes.windll.kernel32.CloseHandle(h)
+        return True
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _scavenge_stale_work_dirs() -> None:
+    """Once per process, on the first pbix_open: delete sibling pbix_mcp_*
+    directories whose owning process is gone.
+
+    The directory name ends in _<pid>_<uuid8> (parsed from the END, because an
+    alias may itself contain underscores). A dead pid is deleted immediately; a
+    live or unparseable name is deleted only past a 7-day backstop, so another
+    process's ACTIVE extraction is never touched even under pid reuse.
+    """
+    global _scavenged
+    if _scavenged:
+        return
+    _scavenged = True
+    root = tempfile.gettempdir()
+    now = time.time()
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return
+    for name in entries:
+        if not name.startswith("pbix_mcp_"):
+            continue
+        full = os.path.join(root, name)
+        if full in _work_dirs or not os.path.isdir(full):
+            continue
+        parts = name.split("_")
+        pid = parts[-2] if len(parts) >= 4 and parts[-2].isdigit() else None
+        stale = False
+        if pid is not None and not _pid_alive(int(pid)):
+            stale = True
+        else:
+            try:
+                stale = (now - os.path.getmtime(full)) > 7 * 86400
+            except OSError:
+                stale = False
+        if stale:
+            shutil.rmtree(full, ignore_errors=True)
+            logger.debug("Scavenged stale work dir %s", full)
 # key = alias (user-chosen or auto), value = {
 #   "path": str,              # original file path
 #   "work_dir": str,          # temp extraction directory
@@ -1217,6 +1299,8 @@ def pbix_open(file_path: str, alias: str = "") -> str:
         f"_{os.getpid()}_{uuid.uuid4().hex[:8]}",
     )
     os.makedirs(work_dir, exist_ok=True)
+    _work_dirs.add(work_dir)
+    _scavenge_stale_work_dirs()
 
     try:
         logger.info("Opening %s as '%s'", file_path, alias)
@@ -1227,6 +1311,7 @@ def pbix_open(file_path: str, alias: str = "") -> str:
     except Exception as e:
         logger.error("Failed to extract %s: %s", file_path, e)
         shutil.rmtree(work_dir, ignore_errors=True)
+        _work_dirs.discard(work_dir)
         raise InvalidPBIXError(f"Failed to extract: {e}")
 
     # Detect DirectQuery / composite models by checking for connections in DataModel
@@ -1354,6 +1439,7 @@ def pbix_close(alias: str, force: bool = False) -> str:
             )
 
         shutil.rmtree(work_dir, ignore_errors=True)
+        _work_dirs.discard(work_dir)
         logger.info("Closed '%s'", alias)
         del _open_files[alias]
         # Clear DAX cache to avoid stale data on reopen

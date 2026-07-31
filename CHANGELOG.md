@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.64] - 2026-07-31
+
+### Fixed
+
+- **`pbix_open` no longer strands its extraction directory.** Every open
+  extracts the .pbix into a `pbix_mcp_*` directory under the system temp dir,
+  and only `pbix_close` deleted it — so any caller that exits without closing
+  (scripts, test runs, killed processes) leaked the whole extraction, and the
+  directories accumulate until the disk fills. Two independent mechanisms now
+  clean up: an `atexit` hook removes every directory the process created and
+  has not closed, and a once-per-process scavenger deletes stale sibling
+  directories whose owning pid (parsed from the end of the name) is dead. Live
+  and unparseable names are kept unless a 7-day backstop passes, so another
+  process's active extraction is never touched — and pid liveness on Windows is
+  probed via `OpenProcess`, never `os.kill(pid, 0)`, which on Windows
+  terminates the target.
+
 ## [0.9.63] - 2026-07-31
 
 **Full corpus parity: every comparable cell now matches Power BI Desktop.**
