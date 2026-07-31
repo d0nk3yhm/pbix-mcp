@@ -115,11 +115,37 @@ Capability requests rather than defects.
       applies the partition source right after the rows are written --
       snapshot + repoint in one call; a failed source update reports
       loudly that the rows ARE written.
-- [ ] **issues-14** -- `FilterContext.filters` accepting predicate objects + an optional per-key mode
-- [ ] **issues-17** -- a grouped entry point for the matrix (rows x columns) and series
-- [ ] **issues-17** -- reuse the relationship-propagation result across calls that share a filter set
-- [ ] **issues-13** -- synthesize Desktop's AUTO date/time hierarchy (LocalDateTable_<guid> + Variations)
-- [ ] **issues-14** -- same AUTO date-hierarchy generator, asked again
+- [x] **issues-14 (predicates + Top-N)** -- CLOSED (0.9.72). Half A
+      (predicate objects: comparison / between / relative-date) was already
+      live via make_value_matcher; half B lands now: a filter value of
+      {"top_n": {"n": 5, "by": "<measure or Table.Column>",
+      "direction": "desc"}} is materialized SERVER-SIDE into a concrete
+      In-set (ranked under the other filters, blanks last, stable ties)
+      before evaluation, in all three evaluate tools -- the same
+      materialization OpenBI performed client-side, moved server-side.
+- [x] **issues-17 (matrix)** -- CLOSED as covered-by-composition (0.9.72).
+      pbix_evaluate_dax_grouped already takes a COMPOSITE group_by
+      ("RowDim.Col,ColDim.Col") and returns one structured row per (row,
+      column) combination -- a matrix or series is a client-side pivot of
+      that flat result. Recipe documented in the tool docstring.
+- [x] **issues-17 (propagation reuse)** -- CLOSED as measured-unnecessary
+      (0.9.72). On Agents_Performance (200K fact rows), 50 repeated
+      pbix_evaluate_dax calls sharing a filter set cost 6.0 ms/call
+      (2.6 ms/call for a second measure under the same set): the shared
+      filter-index cache plus the per-context measure memo already make
+      repeats near-free. No workload evidence justifies another cache
+      layer.
+- [x] **issues-13 (auto date/time)** -- CLOSED as wont-do-now (0.9.72).
+      Rationale: LocalDateTable_<guid> + Variations are HIDDEN tables the
+      user did not author; Desktop generates its own the moment its auto
+      date/time option is on (and our built models verify clean in Desktop
+      and the service without them -- the whole DAX-parity program ran on
+      models that carry none); no downstream user has asked for them
+      (checked the downstream-usage record). Date hierarchies that users DO
+      author are covered by add_user_hierarchy + a real date table
+      (pbix_datamodel_add_calculated_table over CALENDAR()).
+- [x] **issues-14 (auto date/time, re-ask)** -- same wont-do-now close as
+      issues-13 above.
 
 ## Refuted (reported open, actually implemented)
 

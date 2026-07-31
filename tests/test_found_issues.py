@@ -899,3 +899,65 @@ class TestPartitionMSetter:
         finally:
             server._open_files.pop(alias, None)
             server._dax_cache.pop(alias, None)
+
+
+class TestTopNFilterSpec:
+    """Ledger issues-14 half B: {"top_n": {...}} in filter_context is
+    materialized server-side into an In-set before evaluation."""
+
+    @staticmethod
+    def _make(tmp_path):
+        p = str(tmp_path / "topn.pbix")
+        b = PBIXBuilder("TopN")
+        b.add_table("K", [{"name": "grp", "data_type": "String"}],
+                    rows=[{"grp": "X"}, {"grp": "Y"}, {"grp": "Z"}])
+        b.add_table("F", [{"name": "grp", "data_type": "String"},
+                          {"name": "v", "data_type": "Double"}],
+                    rows=[{"grp": "X", "v": 100.0}, {"grp": "Y", "v": 300.0},
+                          {"grp": "Z", "v": 200.0}, {"grp": "Y", "v": 50.0}])
+        b.add_relationship("F", "grp", "K", "grp")
+        b.add_measure("F", "Total", "SUM(F[v])")
+        b.save(p)
+        return p
+
+    def test_topn_by_measure_and_column(self, tmp_path):
+        p = self._make(tmp_path)
+        alias = "topn1"
+        try:
+            server.pbix_open(p, alias)
+            def ev(fc):
+                out = json.loads(server.pbix_evaluate_dax(
+                    alias, "Total", filter_context=json.dumps(fc),
+                    apply_default_filters=False))
+                assert out["success"], out
+                return out["results"][0]["value"]
+            # group totals: X=100, Y=350, Z=200
+            assert ev({"K.grp": {"top_n": {"n": 1, "by": "Total"}}}) == 350.0
+            assert ev({"K.grp": {"top_n": {"n": 2, "by": "Total"}}}) == 550.0
+            assert ev({"K.grp": {"top_n": {"n": 1, "by": "Total",
+                                           "direction": "asc"}}}) == 100.0
+            assert ev({"K.grp": {"top_n": {"n": 1, "by": "F.v"}}}) == 350.0
+        finally:
+            server._open_files.pop(alias, None)
+            server._dax_cache.pop(alias, None)
+
+    def test_topn_per_dimension_and_errors(self, tmp_path):
+        p = self._make(tmp_path)
+        alias = "topn2"
+        try:
+            server.pbix_open(p, alias)
+            fc = json.dumps({"K.grp": {"top_n": {"n": 2, "by": "Total"}}})
+            out = json.loads(server.pbix_evaluate_dax_per_dimension(
+                alias, "Total", dimension="K.grp", filter_context=fc,
+                apply_default_filters=False))
+            assert out["success"], out
+            bad = json.loads(server.pbix_evaluate_dax(
+                alias, "Total",
+                filter_context=json.dumps(
+                    {"K.grp": {"top_n": {"n": 1, "by": "NoSuch"}}}),
+                apply_default_filters=False))
+            assert bad["success"] is False
+            assert "NoSuch" in str(bad.get("error") or bad.get("message"))
+        finally:
+            server._open_files.pop(alias, None)
+            server._dax_cache.pop(alias, None)
