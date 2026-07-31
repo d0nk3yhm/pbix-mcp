@@ -844,3 +844,58 @@ class TestUnresolvableReferenceIsTyped:
         finally:
             server._open_files.pop(alias, None)
             server._dax_cache.pop(alias, None)
+
+
+class TestPartitionMSetter:
+    """Ledger issues-12: a table-scoped raw-M partition setter, and a `source`
+    parameter on pbix_set_table_data so snapshot + repoint is one call."""
+
+    @staticmethod
+    def _make(tmp_path):
+        p = str(tmp_path / "l5m.pbix")
+        b = PBIXBuilder("L5M")
+        b.add_table("T", [{"name": "A", "data_type": "String"},
+                          {"name": "N", "data_type": "Int64"}],
+                    rows=[{"A": "x", "N": 1}])
+        b.save(p)
+        return p
+
+    def test_set_partition_m_roundtrip(self, tmp_path):
+        p = self._make(tmp_path)
+        alias = "l5m1"
+        try:
+            server.pbix_open(p, alias)
+            m = ('let\n    Source = Sql.Database("srv", "db"),\n'
+                 '    T = Source{[Schema="dbo",Item="T"]}[Data]\nin\n    T')
+            out = json.loads(server.pbix_set_partition_m(alias, "T", m))
+            assert out["success"] is True, out
+            pq = json.loads(server.pbix_get_model_power_query(alias))
+            assert "Sql.Database" in json.dumps(pq)
+            bad = json.loads(server.pbix_set_partition_m(alias, "NoSuch", m))
+            assert bad["success"] is False
+            empty = json.loads(server.pbix_set_partition_m(alias, "T", "  "))
+            assert empty["success"] is False
+        finally:
+            server._open_files.pop(alias, None)
+            server._dax_cache.pop(alias, None)
+
+    def test_set_table_data_with_source(self, tmp_path):
+        p = self._make(tmp_path)
+        alias = "l5m2"
+        try:
+            server.pbix_open(p, alias)
+            data = json.dumps({
+                "columns": [{"name": "A", "data_type": "String"},
+                            {"name": "N", "data_type": "Int64"}],
+                "rows": [{"A": "y", "N": 2}, {"A": "z", "N": 3}]})
+            src = json.dumps({"type": "postgresql", "server": "pg.local",
+                              "database": "d", "table": "t"})
+            out = json.loads(server.pbix_set_table_data(
+                alias, "T", data, source_json=src))
+            assert out["success"] is True, out
+            assert "Source updated" in out["message"], out
+            pq = json.dumps(json.loads(server.pbix_get_model_power_query(alias)))
+            assert "PostgreSQL.Database" in pq
+        finally:
+            server._open_files.pop(alias, None)
+            server._dax_cache.pop(alias, None)

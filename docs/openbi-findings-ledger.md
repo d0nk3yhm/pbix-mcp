@@ -106,8 +106,15 @@ Our output loads and renders, but differs field-for-field from a Desktop-authore
 
 Capability requests rather than defects.
 
-- [ ] **issues-12** -- a table-scoped partition-M setter, e.g. `pbix_set_partition_m`
-- [ ] **issues-12** -- a `source` parameter on `pbix_set_table_data`
+- [x] **issues-12 (partition-M setter)** -- CLOSED (0.9.71-dev).
+      `pbix_set_partition_m(alias, table, m_expression)` writes
+      Partition.QueryDefinition verbatim, metadata-only (cached rows
+      untouched; Power BI runs the new M on next Refresh).
+- [x] **issues-12 (source on set_table_data)** -- CLOSED (0.9.71-dev).
+      Optional `source_json` (same format as pbix_update_data_source)
+      applies the partition source right after the rows are written --
+      snapshot + repoint in one call; a failed source update reports
+      loudly that the rows ARE written.
 - [ ] **issues-14** -- `FilterContext.filters` accepting predicate objects + an optional per-key mode
 - [ ] **issues-17** -- a grouped entry point for the matrix (rows x columns) and series
 - [ ] **issues-17** -- reuse the relationship-propagation result across calls that share a filter set

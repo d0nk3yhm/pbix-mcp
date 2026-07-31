@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.71] - 2026-07-31
+
+**Two feature asks from the OpenBI ledger (L5, issues-12).**
+
+### Added
+
+- **`pbix_set_partition_m(alias, table, m_expression)`** — table-scoped raw
+  Power Query M setter, the complement to `pbix_set_m_code`
+  (whole-DataMashup) and `pbix_update_data_source` (structured params).
+  Writes `Partition.QueryDefinition` verbatim, metadata-only: cached
+  VertiPaq rows stay, Power BI runs the new M on the next Refresh.
+- **`source_json` parameter on `pbix_set_table_data`** — apply connection
+  parameters to the table's partition right after the rows are written
+  (same format as `pbix_update_data_source`), so writing a data snapshot
+  and pointing the partition at its live source is one call. A failed
+  source update reports loudly that the rows ARE written.
+
 ## [0.9.70] - 2026-07-31
 
 **L4 Desktop-fidelity cluster complete.**
