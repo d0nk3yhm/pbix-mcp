@@ -67,8 +67,16 @@ These produce a plausible answer with no error, which is why they survived so lo
 
 Our output loads and renders, but differs field-for-field from a Desktop-authored file.
 
-- [ ] **issues-3** -- `tabOrder` is never written on the visualContainer by add_visual / add_html_visual / builder (add_image does write it)
-- [ ] **issues-4** -- report-level config keys `version` / `activeSectionIndex` / `linguisticSchema` are not filled
+- [x] **issues-3** -- CLOSED (0.9.69). add_visual, add_html_visual and the
+      builder now stamp Desktop's 1000-step `z` + `tabOrder = z + 1000` on
+      the container AND config.layouts position (add_image's verified
+      pattern). Desktop-load + query verified on a freshly built file.
+- [x] **issues-4** -- CLOSED (0.9.69). The builder's Report/Layout now
+      carries a report-level config with `version` (5.61, the corpus-era
+      schema version), `activeSectionIndex`, `linguisticSchemaSyncVersion`,
+      `defaultDrillFilterOtherVisuals` and filter-pane settings, matching
+      Desktop-authored files (ground truth MS_AI_Sample / GeoSales).
+      Desktop-load verified.
 - [ ] **issues-8** -- verify + document table-visual properties against a Desktop-authored table
 - [ ] **issues-8** -- record Desktop's OFFLINE behaviour for a reference-only public custom visual
 

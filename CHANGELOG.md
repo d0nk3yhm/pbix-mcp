@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.69] - 2026-07-31
+
+**Desktop-fidelity fixes from the OpenBI findings ledger (L4).**
+
+### Fixed
+
+- **`tabOrder` is now stamped on every visual container** (ledger
+  issues-3). `pbix_add_visual`, `pbix_add_html_visual`, and the builder
+  write Desktop's 1000-step `z` and `tabOrder = z + 1000` on both the
+  container and `config.layouts[0].position` — previously only
+  `pbix_add_image` did, and `add_visual` wrote `z = 0` with no `tabOrder`
+  at all. Keyboard/tab navigation order in built reports now matches
+  Desktop-authored files.
+- **The builder's Report/Layout carries a report-level `config`**
+  (ledger issues-4): `version` (5.61, the corpus-era report schema),
+  `activeSectionIndex`, `linguisticSchemaSyncVersion`,
+  `defaultDrillFilterOtherVisuals`, and filter-pane settings — matching
+  Desktop-authored files field-for-field (ground truth: MS_AI_Sample,
+  GeoSales_Dashboard). Previously the layout had only `id` + `sections`.
+
+Both verified live: a freshly built report opens in Power BI Desktop and
+answers its measure through the workspace engine.
+
 ## [0.9.68] - 2026-07-31
 
 **Two "silently wrong output" fixes from the OpenBI findings ledger (L3).**
