@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.68] - 2026-07-31
+
+**Two "silently wrong output" fixes from the OpenBI findings ledger (L3).**
+
+### Fixed
+
+- **Unresolvable `[Name]` references are now typed errors, not silent
+  blanks** (ledger issues-7). A measure like `[Nope] + 1` used to answer
+  `1` with status `"ok"` — the missing reference degraded to BLANK and the
+  arithmetic kept going. The engine now raises for a bare `[Name]` that is
+  neither a measure, a row/extension-column key, nor a column anywhere in
+  the model (the same rule the qualified `Table[Name]` path has had since
+  0.9.53), records the reason, and `pbix_evaluate_dax` reports status
+  `"error"` with the message — distinguishable from a legitimate BLANK.
+  Extension-column aliases (`SUMX(ADDCOLUMNS(...), [alias])`) are
+  unaffected. Corpus-verified: MS_AI_Sample 22/22, MS_Life_Expectancy
+  41/41, Agents_Performance 102/102 against fresh Desktop ground truth.
+- **Coordinates now AVERAGE, never Sum** (ledger issues-5). A bare numeric
+  column in a map's Latitude/Longitude field well — or a
+  lat/long-named numeric column in any value or X role — becomes
+  `Aggregation(..., Function=1)` (`Avg(...)` queryRef), matching Desktop's
+  default summarization for geographic columns. Summed coordinates place
+  the point on no real map. Other value-role columns keep Sum /
+  CountNonNull exactly as before.
+
 ## [0.9.67] - 2026-07-31
 
 **`PATH` + `PATHITEMREVERSE` implemented and Desktop-verified — 435 of the

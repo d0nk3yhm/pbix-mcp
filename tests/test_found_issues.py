@@ -806,3 +806,41 @@ class TestIssues9PageIndexValidation:
         finally:
             server._open_files.pop(alias, None)
             server._dax_cache.pop(alias, None)
+
+
+class TestUnresolvableReferenceIsTyped:
+    """Ledger issues-7: a measure whose expression references a name that is
+    neither a measure, a column, nor an in-scope extension column must report
+    status "error" -- not a blank indistinguishable from a legitimate BLANK
+    (before the fix, `[Nope] + 1` answered 1 with status "ok")."""
+
+    def test_unresolved_bare_bracket_reports_error(self, tmp_path):
+        p = str(tmp_path / "iss7.pbix")
+        b = PBIXBuilder("Iss7")
+        b.add_table("Items", [{"name": "Name", "data_type": "String"},
+                              {"name": "Price", "data_type": "Double"}],
+                    rows=[{"Name": "A", "Price": 1.0},
+                          {"Name": "B", "Price": 2.0}])
+        b.add_measure("Items", "Broken", "[Nope] + 1")
+        # extension-column aliases must KEEP working (they are bare-bracket
+        # references too, resolved through the row context)
+        b.add_measure("Items", "AliasOK",
+                      'SUMX(ADDCOLUMNS(Items, "x2", Items[Price] * 2), [x2])')
+        b.save(p)
+        alias = "iss7typed"
+        try:
+            server.pbix_open(p, alias)
+            out = json.loads(server.pbix_evaluate_dax(
+                alias, "Broken,AliasOK", apply_default_filters=False))
+            assert out["success"] is True, out
+            by_name = {r["name"]: r for r in out["results"]}
+            broken = by_name["Broken"]
+            assert broken["status"] == "error", broken
+            assert "Nope" in broken.get("error_message", ""), broken
+            assert broken.get("value") in (None,), broken
+            ok = by_name["AliasOK"]
+            assert ok["status"] == "ok", ok
+            assert abs(ok["value"] - 6.0) < 1e-9, ok
+        finally:
+            server._open_files.pop(alias, None)
+            server._dax_cache.pop(alias, None)
