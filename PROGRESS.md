@@ -5,10 +5,14 @@ and how, what is left, and the traps already hit so they are not re-hit.
 
 ## Where things stand
 
-**0.9.62 is released** (PyPI + GitHub, 2026-07-31), verified by installing it
-from PyPI into a clean venv: `pbix_mcp 0.9.62` on Python 3.13, pure-Python, and
-`FORMAT(DATE(2021,7,19),"mmmm dd, yyyy")` returns `July 19, 2021` from the
-published artifact.
+**0.9.63 is released** (PyPI + GitHub, 2026-07-31) and is the FULL-PARITY
+release: **432/432** comparable measures at the grand total, **1,705/1,705**
+measure x dimension cells under a filter context, **397/397** calculated columns
+vs stored VertiPaq values -- zero diffs anywhere in the 25-file corpus.
+Verified by installing from PyPI into a clean venv and asserting the
+table-expansion rule in the published artifact (column filter -> no expansion,
+table filter -> expansion). 0.9.62 shipped earlier the same day with five of the
+six fixes and four known-wrong cells; 0.9.63 closes them.
 
 **Note on 0.9.61: it was never published.** This file previously called it "the
 last released version". There is no `v0.9.61` tag, no GitHub release, and PyPI
