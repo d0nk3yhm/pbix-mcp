@@ -202,6 +202,45 @@ class TestTableFilterArgumentReplacesPropagation:
                   'FILTER(Fact, 1=1))') == 10
 
 
+class TestPropagationFollowsTableExpansion:
+    """Desktop's propagation rule, pinned on MS_Employee_Hiring in one query:
+    a filter on a TABLE filters its EXPANDED table -- it reaches the one-side
+    dimensions the table points at -- while a filter on a COLUMN does not.
+
+        MAX('Date'[PeriodNumber])                                      201612
+        CALCULATE(same, FILTER(Employee, ISBLANK(Employee[TermDate])))  201412
+        CALCULATE(same, Employee[FP] = "FT")                            201612
+
+    Both earlier implementations satisfied exactly one of the two anchors:
+    the symmetric index broke the column case (Agents_Performance's
+    SELECTEDVALUE answered 213 for Desktop's BLANK, so [Rank Filtering *]
+    returned 1 for Desktop's 0), and the directional commit 6a4896a broke the
+    table case ([Actives] went from Desktop's 32,401 to None). This class is
+    both anchors in miniature; every test must hold at once.
+    """
+
+    def test_a_column_filter_does_not_reach_the_one_side(self):
+        assert ev("CALCULATE(COUNTROWS(Dim), Fact[v] = 10)") == 2
+
+    def test_selectedvalue_on_the_one_side_stays_blank(self):
+        assert ev("CALCULATE(SELECTEDVALUE(Dim[grp]), Fact[v] = 10)") is None
+
+    def test_a_table_filter_reaches_the_one_side(self):
+        """The [Actives] shape: FILTER(Fact, ...) filters the expanded table,
+        so Dim is restricted to the rows Fact points at."""
+        assert ev("CALCULATE(COUNTROWS(Dim), FILTER(Fact, Fact[v] = 10))") == 1
+
+    def test_an_aggregate_over_the_one_side_sees_the_expansion(self):
+        """MAX over the dimension under a fact TABLE filter -- the corpus
+        shape: MAX('Date'[PeriodNumber]) dropping 201612 -> 201412."""
+        assert ev("CALCULATE(SELECTEDVALUE(Dim[grp]), "
+                  "FILTER(Fact, Fact[v] = 10))") == "X"
+
+    def test_one_to_many_still_flows_both_shapes(self):
+        assert ev('CALCULATE(SUM(Fact[v]), Dim[grp] = "X")') == 10
+        assert ev("SUM(Fact[v])", filters={"Dim.grp": ["X"]}) == 10
+
+
 class TestOneRowTableIsAScalar:
     """A measure must evaluate to a value. `LASTDATE('Year'[Date])` returned
     the internal row-dict list, whose str() leaked 72 characters of Python
