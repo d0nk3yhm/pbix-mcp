@@ -1,14 +1,15 @@
-# Session progress — 2026-07-28 → 07-30
+# Session progress — 2026-07-28 → 07-31
 
 Working note for picking this back up. Records what was done, what is verified
 and how, what is left, and the traps already hit so they are not re-hit.
 
 ## Where things stand
 
-**0.9.63 is released** (PyPI + GitHub, 2026-07-31) and is the FULL-PARITY
-release: **432/432** comparable measures at the grand total, **1,705/1,705**
-measure x dimension cells under a filter context, **397/397** calculated columns
-vs stored VertiPaq values -- zero diffs anywhere in the 25-file corpus.
+**0.9.64 is the latest release** (2026-07-31; fixes the pbix_open extraction-
+directory leak). **0.9.63, same day, is the FULL-PARITY release**: **432/432**
+comparable measures at the grand total, **1,705/1,705** measure x dimension
+cells under a filter context, **397/397** calculated columns vs stored VertiPaq
+values -- zero diffs anywhere in the 25-file corpus.
 Verified by installing from PyPI into a clean venv and asserting the
 table-expansion rule in the published artifact (column filter -> no expansion,
 table filter -> expansion). 0.9.62 shipped earlier the same day with five of the
@@ -20,21 +21,22 @@ goes 0.9.60 -> 0.9.62. It was a version-bump commit only; its CHANGELOG section
 documents work that actually shipped inside 0.9.62. The last release before
 today was **0.9.60**.
 
-A sixth fix (directional filter propagation) was landed and reverted this cycle;
-the write-up below is the one to read before re-attempting it.
+The sixth fix (filter propagation) shipped in 0.9.63 as TABLE EXPANSION after a
+purely directional attempt was reverted; the write-up below records all three
+formulations and why only expansion satisfies both anchors.
 
 | verification | scale | result |
 |---|---|---|
 | measures at the grand total | 547 measures, 24 files | 1:1 with Desktop |
 | measures UNDER A FILTER CONTEXT | ~1,700 measure x dimension-value cells | see per-file table below |
 | calculated columns vs stored VertiPaq values | 397 columns, all 25 files | 0 mismatches, 8 deliberate refusals |
-| unit tests | 1,336 | pass (`pytest -m "not slow"`) |
+| unit tests | 1,349 | pass (`pytest -m "not slow"`) |
 | ruff / mypy | — | clean / 140 (the standing baseline) |
 
 Filter-context comparisons re-run after the five landed fixes: MS_AI_Sample
 44/44, Ecommerce_Conversion 132/132, MS_Competitive_Marketing 88/88,
 MS_Covid_Tracking 22/22, MS_Sales_Returns 116/116, GeoSales_Dashboard 152/152,
-Agents_Performance 404/408 (the four in the reverted-propagation write-up).
+Agents_Performance 408/408 (closed by the table-expansion fix, 0.9.63).
 
 Earlier issues #3-#7 all remain CLOSED. The OpenBI findings ledger
 (`docs/openbi-findings-ledger.md`) is the authority on what is still open.
@@ -309,7 +311,7 @@ Two anchors, both required, and neither is optional:
 | Ecommerce_Conversion | 132/132 |
 | MS_Competitive_Marketing | 88/88 |
 | MS_Covid_Tracking | 22/22 |
-| Agents_Performance | 404/408 (the 4 below) |
+| Agents_Performance | 408/408 (table-expansion fix, 0.9.63) |
 
 **STILL OPEN.**
 

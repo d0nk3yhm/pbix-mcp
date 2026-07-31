@@ -31,19 +31,19 @@ These produce a plausible answer with no error, which is why they survived so lo
       single-hop relationship index is symmetric, so filtering the many side
       restricts the one side, and `SELECTEDVALUE(DimEmployee[EmployeeKey])`
       answers 213 where Desktop answers BLANK. That is what makes the measure
-      return 1 instead of 0. A directional fix takes Agents_Performance to
-      408/408 but breaks MS_Employee_Hiring's `[Actives]` (32,401 -> None) and
-      was reverted; the full write-up and the resume point are in PROGRESS.md.
-      Whether `IN` can then be enabled generally is a SEPARATE question that has
-      not been re-tested since.
-- [x] **issues-3** -- set_visual_property / update_visual_json on a CLASSIC layout now recompile query+dataTransforms (0.9.61), so Desktop no longer renders the old field
+      return 1 instead of 0. RESOLVED in 0.9.63: propagation now follows TABLE
+      EXPANSION (a column filter propagates one -> many only; a table filter
+      argument's keys may also ride many -> one), and BOTH anchors hold --
+      Agents_Performance is 408/408 with [Actives] = 32,401. Whether `IN` can
+      now be enabled generally is a SEPARATE question, still untested.
+- [x] **issues-3** -- set_visual_property / update_visual_json on a CLASSIC layout now recompile query+dataTransforms (0.9.61-dev, shipped in 0.9.62), so Desktop no longer renders the old field
 - [ ] **issues-7** -- "measure not found" is indistinguishable from a genuine BLANK; needs a typed DAXError
 - [x] **issues-9** -- default-filter behaviour differs between pbix_evaluate_dax and pbix_evaluate_dax_per_dimension.
       NOT A DEFECT: the divergence is a deliberate contract (a per-dimension
       sweep is normally asked against the raw model) and is pinned by tests.
       The real gap was documentation -- `pbix_evaluate_dax_grouped` carried no
-      NOTE. Added in 0.9.61; all three tools now say so in their own docstring.
-- [x] **issues-15** -- residual COALESCE(ExplicitName, InferredName) instances (fixed 0.9.61). Four sites audited and corrected: `pbix_get_hierarchies`'
+      NOTE. Added in the 0.9.61-dev cycle (shipped in 0.9.62); all three tools now say so in their own docstring.
+- [x] **issues-15** -- residual COALESCE(ExplicitName, InferredName) instances (fixed in the 0.9.61-dev cycle, shipped in 0.9.62). Four sites audited and corrected: `pbix_get_hierarchies`'
       level query, `_report_type_resolver`'s Type IN (1,2,4) scan,
       `_detect_field_parameter_shape` (whose `ExplicitName NOT LIKE` also
       dropped the NULL rows outright), and the perspective column list.

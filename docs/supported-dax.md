@@ -1,6 +1,6 @@
 # Supported DAX Functions
 
-183 functions across 11 categories. The engine is **best-effort** — it produces correct results for common patterns but does not aim for semantic parity with Analysis Services.
+183 functions across 11 categories. Semantics are verified against Power BI Desktop's own engine on a 25-file corpus: every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns — matches Desktop exactly (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused. Full parity with the entire DAX surface is the roadmap, not yet a claim.
 
 ## Aggregation (13)
 `SUM`, `AVERAGE`, `COUNT`, `COUNTA`, `COUNTROWS`, `MIN`, `MAX`, `DISTINCTCOUNT`, `DISTINCTCOUNTNOBLANK`, `PRODUCT`, `MEDIAN`, `MEDIANX`, `COUNTBLANK`
