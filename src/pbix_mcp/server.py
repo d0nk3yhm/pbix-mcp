@@ -6758,6 +6758,62 @@ def pbix_update_data_source(
 
 
 @mcp.tool()
+def pbix_set_partition_m(alias: str, table_name: str, m_expression: str) -> str:
+    """Set a table partition's raw Power Query M expression.
+
+    The table-scoped complement to pbix_set_m_code (which replaces the whole
+    DataMashup) and pbix_update_data_source (which builds the M from
+    structured connection parameters): the expression is written to
+    ``Partition.QueryDefinition`` verbatim (ledger issues-12). Metadata-only —
+    the cached VertiPaq rows are untouched, so the file keeps opening with
+    its current data, and Power BI runs the new M on the next Refresh.
+
+    Args:
+        alias: The alias of the open file
+        table_name: The table whose partition to update
+        m_expression: The complete M expression (e.g. ``let Source = ... in
+            Source``); written as-is, no validation of the M itself
+    """
+    try:
+        info = _ensure_open(alias)
+        if not (m_expression or "").strip():
+            return ToolResponse.error(
+                "m_expression is empty — pass the complete M expression.",
+                "INVALID_INPUT").to_text()
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error(
+                "No DataModel found.", DataModelCompressionError.code).to_text()
+
+        def _do_update(conn: sqlite3.Connection):
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT p.ID FROM Partition p JOIN [Table] t ON p.TableID = t.ID "
+                "WHERE t.Name = ? AND t.ModelID = 1 "
+                "AND t.Name NOT LIKE 'H$%' AND t.Name NOT LIKE 'R$%'",
+                (table_name,)).fetchone()
+            if not row:
+                raise ValueError(f"Table '{table_name}' not found")
+            conn.execute(
+                "UPDATE Partition SET QueryDefinition = ? WHERE ID = ?",
+                (m_expression, row["ID"]))
+            conn.commit()
+
+        old_size, new_size = _modify_metadata_only(dm_path, _do_update)
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Partition M set for '{table_name}' ({len(m_expression)} chars)\n"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes "
+            "(metadata-only, cached data untouched)").to_text()
+    except ValueError as e:
+        return ToolResponse.error(str(e), "INVALID_INPUT").to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
 def pbix_get_model_columns(alias: str) -> str:
     """Get all DAX calculated columns from the model.
 
@@ -9092,8 +9148,28 @@ def _rebuild_datamodel(
     return len(dm_bytes), new_size
 
 
+def _apply_table_source(alias: str, table_name: str,
+                        source_json: str) -> str | None:
+    """Apply an optional post-write source update for pbix_set_table_data.
+
+    Returns None when no source was requested, a "\\n  Source ..." suffix on
+    success, or an "ERROR:<message>" marker the caller converts to a tool
+    error (the rows ARE written at that point — the message must say so)."""
+    if not source_json:
+        return None
+    try:
+        res = json.loads(pbix_update_data_source(alias, table_name,
+                                                 source_json))
+    except Exception as e:                          # noqa: BLE001
+        return f"ERROR:{e}"
+    if not res.get("success"):
+        return "ERROR:" + str(res.get("error") or res.get("message"))
+    return "\n  Source updated: " + str(res.get("message", "")).split("\n")[0]
+
+
 @mcp.tool()
-def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
+def pbix_set_table_data(alias: str, table_name: str, data_json: str,
+                        source_json: str = "") -> str:
     """Write/replace actual row data in a table in the DataModel (VertiPaq).
 
     This encodes the data into VertiPaq column format (IDF + IDFMETA +
@@ -9120,6 +9196,12 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
             e.g. "ImageUrl" so table/matrix cells (and the Power BI service)
             render the value as an image, or "WebUrl" for clickable links.
             It survives later rebuild-based edits.
+        source_json: Optional connection parameters applied to the table's
+            partition AFTER the rows are written — same format as
+            pbix_update_data_source (ledger issues-12: writing a data
+            snapshot and pointing the partition at its live source is one
+            operation, not two). Empty (default) leaves the partition
+            M untouched.
     """
     try:
         info = _ensure_open(alias)
@@ -9177,9 +9259,15 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str) -> str:
             action = "created"
 
         info["modified"] = True
+        src_note = _apply_table_source(alias, table_name, source_json)
+        if src_note is not None and src_note.startswith("ERROR:"):
+            return ToolResponse.error(
+                f"Rows written, but source update failed: {src_note[6:]}",
+                "SOURCE_UPDATE_FAILED").to_text()
         return ToolResponse.ok(
             f"Table '{table_name}' {action}: {len(rows)} rows, {len(columns)} columns\n"
             f"  DataModel: {old_size:,} → {new_size:,} bytes"
+            + (src_note or "")
         ).to_text()
     except json.JSONDecodeError as e:
         return ToolResponse.error(f"Invalid JSON: {e}", ABFRebuildError.code).to_text()
