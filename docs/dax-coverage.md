@@ -89,12 +89,19 @@ structures PATH-queryable. Desktop still refuses PATH on the builder's
 **import** tables (*"Cannot query internal support structures for column
 ... because they are not processed"*, for every non-join column even in
 tables that participate in relationships — while `VALUES(...)`,
-aggregations, and relationships all work). Ruled out empirically:
-metadata version alignment, `IsPrivate`, `ExpressionContext` — the H$
-POS_TO_ID/ID_TO_POS payloads match Desktop's layout logically, so the
-remaining suspect is a binary detail of the structure files or their
-`.idfmeta`. Tracked as a builder correctness issue (does not affect DAX
-parity, which the calculated-table fixture covers).
+aggregations, and relationships all work). The investigation closed with
+a definitive comparison: a Desktop-saved file whose calculated table had
+just been processed live persists hierarchy structures **byte-identical
+to the builder's output** — payloads, `.idfmeta`, versions, file names.
+There is no at-rest "processed" byte for the builder to write. Import
+tables become PATH-queryable only through a real engine refresh (the
+corpus files that answer PATH at rest all carry high refresh
+generations), which Desktop cannot run on a source-less model.
+Resolution: **documented limitation with a supported workaround** —
+author parent-child tables that need `PATH` as calculated tables, which
+Desktop recomputes and fully processes at open; that is exactly what the
+conformance fixture does. See README → Known Limitations. pbix-mcp's own
+DAX engine evaluates `PATH` on any table regardless.
 
 ## INFO.* semantics note
 
