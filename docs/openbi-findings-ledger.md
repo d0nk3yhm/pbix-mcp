@@ -77,8 +77,30 @@ Our output loads and renders, but differs field-for-field from a Desktop-authore
       `defaultDrillFilterOtherVisuals` and filter-pane settings, matching
       Desktop-authored files (ground truth MS_AI_Sample / GeoSales).
       Desktop-load verified.
-- [ ] **issues-8** -- verify + document table-visual properties against a Desktop-authored table
-- [ ] **issues-8** -- record Desktop's OFFLINE behaviour for a reference-only public custom visual
+- [x] **issues-8 (table audit)** -- CLOSED (0.9.70-dev). Field-for-field vs
+      the GeoSales Desktop-authored tableEx: container keys match (incl.
+      tabOrder, query, dataTransforms, filters); the two structural gaps --
+      config.layouts written only for image visuals, and
+      drillFilterOtherVisuals not defaulted -- are fixed in pbix_add_visual
+      for every type. The remaining differences (objects.columnFormatting /
+      columnHeaders / grid / total, vcObjects styling, columnProperties
+      display names, hasDefaultSort) are user/theme content, accepted via
+      config_json / pbix_format_visual, not defaults to invent.
+- [x] **issues-8 (offline behaviour)** -- CLOSED as documentation
+      (0.9.70-dev). Desktop resolves `publicCustomVisuals` GUIDs from
+      AppSource at report open and keeps a per-machine cache
+      (`%LOCALAPPDATA%\Microsoft\Power BI Desktop\ExtensionCache`,
+      hashed entries; `CertifiedExtensions` holds connector .pqx, not
+      visuals). Offline with a cold cache the report still OPENS -- the
+      referenced visual's container renders Desktop's unavailable-visual
+      placeholder while every other visual and the model work normally;
+      once the visual has been fetched on any online open, the cache
+      serves it offline. NOT verified by a live network-isolated run on
+      this machine (blocking Desktop's network needs firewall changes
+      out of scope for this environment); the cache-directory facts are
+      verified locally, the placeholder behaviour is Power BI's
+      documented/standard handling. pbix_reference_public_visual's
+      docstring now carries the offline note.
 
 ## Open: feature asks
 
