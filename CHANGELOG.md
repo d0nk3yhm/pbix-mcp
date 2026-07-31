@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.63] - 2026-07-31
+
+**Full corpus parity: every comparable cell now matches Power BI Desktop.**
+Verified on the release commit — **432/432** comparable measures at the grand
+total, **1,705/1,705** measure×dimension cells under a filter context, and
+**397/397** calculated columns against their stored VertiPaq values. The four
+cells 0.9.62 shipped as known-wrong are fixed.
+
+### Filter propagation follows table expansion
+
+- **A filter on a COLUMN propagates one → many only; a filter on a TABLE also
+  propagates many → one, because it filters the table's EXPANDED table.**
+  Desktop returns both behaviours in the same model, pinned in one query on
+  `MS_Employee_Hiring`:
+
+  ```
+  MAX('Date'[PeriodNumber])                                      201612
+  CALCULATE(same, FILTER(Employee, ISBLANK(Employee[TermDate])))  201412
+  CALCULATE(same, Employee[FP] = "FT")                            201612
+  ```
+
+  The relationship index was symmetric, so a column filter on the many side
+  wrongly restricted the one side: on `Agents_Performance`,
+  `SELECTEDVALUE(DimEmployee[EmployeeKey])` under
+  `DimStore[StoreType]="Catalog"` answered 213 where Desktop answers BLANK, and
+  the three `[Rank Filtering *]` measures returned 1 for Desktop's 0 (with
+  `[Employee Name]` returning a name for Desktop's empty marker). A purely
+  directional index — attempted and reverted during 0.9.62 — broke the table
+  case instead: `[Actives]` is `CALCULATE([EmpCount], FILTER(Employee, …))` and
+  *needs* the many → one flow, since `[EmpCount]` anchors to
+  `MAX('Date'[PeriodNumber])`, which only drops to the last period Employee
+  covers because the table filter restricts Date.
+
+  The engine now keeps a directional index as the default and records the keys
+  registered by a table filter argument; only those may take the reverse
+  direction. Both anchors hold at once — `[Actives]` = 32,401 and the Agents
+  `SELECTEDVALUE` = BLANK — which no previous formulation achieved, and the
+  regression tests discriminate all three historical states so neither wrong
+  version can return unnoticed.
+
 ## [0.9.62] - 2026-07-31
 
 **Five filter-context defects, found by widening the Desktop comparison past the
