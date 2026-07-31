@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.70] - 2026-07-31
+
+**L4 Desktop-fidelity cluster complete.**
+
+### Fixed
+
+- **`config.layouts` and `drillFilterOtherVisuals` are now written for
+  every visual type** by `pbix_add_visual` — previously only image
+  visuals carried them. Field-for-field audit against a Desktop-authored
+  `tableEx` (GeoSales) shows structural parity; the remaining differences
+  (`objects.columnFormatting`/`columnHeaders`/`grid`/`total`, `vcObjects`
+  styling, `columnProperties` display names) are user/theme content
+  accepted via `config_json` / `pbix_format_visual`, not defaults to
+  invent.
+
+### Documentation
+
+- **Offline behavior of reference-only public custom visuals** recorded
+  (ledger issues-8): Desktop fetches `publicCustomVisuals` GUIDs from
+  AppSource at open and caches per-machine (`ExtensionCache`); offline
+  with a cold cache the report still opens with an unavailable-visual
+  placeholder in that container. Noted in
+  `pbix_reference_public_visual`'s docstring.
+
+### Internal
+
+- The `config: dict` annotation in `pbix_add_visual` cleared a cluster of
+  mypy noise — the checked-error count drops from 140 to **127**, the new
+  ratchet baseline.
+
 ## [0.9.69] - 2026-07-31
 
 **Desktop-fidelity fixes from the OpenBI findings ledger (L4).**

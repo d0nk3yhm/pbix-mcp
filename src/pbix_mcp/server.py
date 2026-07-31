@@ -2477,7 +2477,7 @@ def pbix_add_visual(
         import uuid
         visual_name = str(uuid.uuid4()).replace("-", "")[:16]
 
-        config = {
+        config: dict = {
             "name": visual_name,
             "singleVisual": {
                 "visualType": visual_type,
@@ -2598,14 +2598,24 @@ def pbix_add_visual(
         z_new = _next_layer_z(page)
         tab_order = z_new + 1000
 
-        # Update layouts position if present (image visuals)
-        if "layouts" in config:
-            for lay in config["layouts"]:
-                pos = lay.get("position", {})
-                pos["x"] = x
-                pos["y"] = y
-                pos["z"] = z_new
-                pos["tabOrder"] = tab_order
+        # Desktop-authored visuals of EVERY type carry config.layouts and
+        # default drillFilterOtherVisuals: true (ledger issues-8 field
+        # audit against the GeoSales tableEx); both were previously only
+        # written for image visuals.
+        config.setdefault("layouts", [{"id": 0, "position": {
+            "x": float(x), "y": float(y), "z": z_new,
+            "width": float(width), "height": float(height),
+            "tabOrder": tab_order,
+        }}])
+        if config.get("singleVisual", {}).get("prototypeQuery"):
+            config["singleVisual"].setdefault("drillFilterOtherVisuals", True)
+
+        for lay in config["layouts"]:
+            pos = lay.get("position", {})
+            pos["x"] = x
+            pos["y"] = y
+            pos["z"] = z_new
+            pos["tabOrder"] = tab_order
 
         # Opt-in visual-level sort: author prototypeQuery.OrderBy BEFORE the
         # config is serialized and the binding compiled (the compiler deep-
@@ -4668,6 +4678,12 @@ def pbix_reference_public_visual(alias: str, guid: str) -> str:
     ``Report/CustomVisuals/`` and no .pbiviz is required: zero file parts,
     zero [Content_Types].xml changes, resourcePackages untouched
     (service-verified against app.powerbi.com on a certified-only tenant).
+
+    OFFLINE: Desktop fetches the visual from AppSource at report open and
+    caches it per-machine (ExtensionCache under Desktop's LocalAppData).
+    With no network and a cold cache the report still opens — the container
+    shows Desktop's unavailable-visual placeholder while everything else
+    works; after one online open the cache serves the visual offline.
 
     After registering, place the visual with
     ``pbix_add_visual(alias, page_index, visual_type="<guid>", ...)`` — for
