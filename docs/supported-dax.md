@@ -1,6 +1,6 @@
 # Supported DAX Functions
 
-183 functions across 11 categories. Semantics are verified against Power BI Desktop's own engine on a 25-file corpus: every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns — matches Desktop exactly (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused. Full parity with the entire DAX surface is the roadmap, not yet a claim.
+245 functions across 12 categories. Semantics are verified against Power BI Desktop's own engine on a 25-file corpus: every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns — matches Desktop exactly (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused. Full parity with the entire DAX surface is the roadmap, not yet a claim.
 
 ## Aggregation (13)
 `SUM`, `AVERAGE`, `COUNT`, `COUNTA`, `COUNTROWS`, `MIN`, `MAX`, `DISTINCTCOUNT`, `DISTINCTCOUNTNOBLANK`, `PRODUCT`, `MEDIAN`, `MEDIANX`, `COUNTBLANK`
@@ -40,6 +40,21 @@ grouping there is no scope beyond the filter context the tool was handed.
 
 ## Information (10)
 `LOOKUPVALUE`, `ISNUMBER`, `ISTEXT`, `ISNONTEXT`, `ISLOGICAL`, `ISERROR`, `USERNAME`, `USERPRINCIPALNAME`, `BLANK`, `GENERATESERIES`
+
+
+## Trigonometry & advanced math (29) — conformance batch 1
+`ACOS`, `ACOSH`, `ACOT`, `ACOTH`, `ASIN`, `ASINH`, `ATAN`, `ATANH`, `COS`, `COSH`, `COT`, `COTH`, `SIN`, `SINH`, `TAN`, `TANH`, `DEGREES`, `RADIANS`, `SQRTPI`, `COMBIN`, `COMBINA`, `PERMUT`, `QUOTIENT`, `BITAND`, `BITOR`, `BITXOR`, `BITLSHIFT`, `BITRSHIFT`, `ISO.CEILING`
+
+## Statistical distributions (24) — conformance batch 1
+`NORM.DIST`, `NORM.INV`, `NORM.S.DIST`, `NORM.S.INV`, `EXPON.DIST`, `POISSON.DIST`, `BETA.DIST`, `BETA.INV`, `CHISQ.DIST`, `CHISQ.DIST.RT`, `CHISQ.INV`, `CHISQ.INV.RT`, `T.DIST`, `T.DIST.RT`, `T.DIST.2T`, `T.INV`, `T.INV.2T`, `CONFIDENCE.NORM`, `CONFIDENCE.T`, `PERCENTILE.INC`, `PERCENTILE.EXC`, `PERCENTILEX.INC`, `PERCENTILEX.EXC`, `RANK.EQ`
+
+## Batch-1 additions elsewhere
+`GEOMEAN`, `GEOMEANX`, `STDEVX.S`, `STDEVX.P`, `VARX.S`, `VARX.P`, `AVERAGEA`, `DATEVALUE`, `TIMEVALUE`
+
+Every batch-1 function is pinned by Desktop-captured golden values in
+`tests/conformance/golden.json` (114 probes, 1e-9 relative). `CEILING.MATH`
+and `FLOOR.MATH` are listed by the engine's DMV but Desktop itself cannot
+resolve them in a query — empirically out of authorable scope, not missing.
 
 ## Known Limitations
 
