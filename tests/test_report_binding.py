@@ -13,7 +13,7 @@ import zipfile
 
 import pytest
 
-from pbix_mcp.report_binding import attach_order_by, compile_visual_binding
+from pbix_mcp.report_binding import apply_implicit_aggregations, attach_order_by, compile_visual_binding
 
 pytestmark = pytest.mark.unit
 
@@ -530,3 +530,69 @@ class TestAttachOrderBy:
         }
         ref, _ = attach_order_by(sv, "'O''Brien Sales'[Qty]", "desc")
         assert ref == "O'Brien Sales.Qty"
+
+
+class TestGeoAverageAggregation:
+    """Ledger issues-5: coordinates must AVERAGE, never Sum — Desktop's
+    default summarization for latitude/longitude. Summed coordinates place
+    the point on no real map."""
+
+    @staticmethod
+    def _sv():
+        return {
+            "visualType": "azureMap",
+            "prototypeQuery": {
+                "From": [{"Name": "g", "Entity": "Geo", "Type": 0}],
+                "Select": [
+                    {"Column": {"Expression": {"SourceRef": {"Source": "g"}},
+                                "Property": "Lat"}, "Name": "Geo.Lat"},
+                    {"Column": {"Expression": {"SourceRef": {"Source": "g"}},
+                                "Property": "Longitude"},
+                     "Name": "Geo.Longitude"},
+                    {"Column": {"Expression": {"SourceRef": {"Source": "g"}},
+                                "Property": "Sales"}, "Name": "Geo.Sales"},
+                ],
+            },
+            "projections": {
+                "Latitude": [{"queryRef": "Geo.Lat"}],
+                "Longitude": [{"queryRef": "Geo.Longitude"}],
+                "Size": [{"queryRef": "Geo.Sales"}],
+            },
+        }
+
+    def test_geo_roles_average_size_sums(self):
+        sv = self._sv()
+        apply_implicit_aggregations(sv, resolve_type=lambda e, p, m: "Double")
+        by_prop = {s["Aggregation"]["Expression"]["Column"]["Property"]:
+                   s["Aggregation"]["Function"]
+                   for s in sv["prototypeQuery"]["Select"]}
+        assert by_prop == {"Lat": 1, "Longitude": 1, "Sales": 0}
+        assert sv["projections"]["Latitude"][0]["queryRef"] == "Avg(Geo.Lat)"
+        assert sv["projections"]["Size"][0]["queryRef"] == "Sum(Geo.Sales)"
+
+    def test_latlong_named_column_in_y_role_averages(self):
+        sv = self._sv()
+        sv["visualType"] = "scatterChart"
+        sv["projections"] = {"Y": [{"queryRef": "Geo.Lat"}],
+                             "X": [{"queryRef": "Geo.Longitude"}],
+                             "Size": [{"queryRef": "Geo.Sales"}]}
+        apply_implicit_aggregations(sv, resolve_type=lambda e, p, m: "Double")
+        by_prop = {s["Aggregation"]["Expression"]["Column"]["Property"]:
+                   s["Aggregation"]["Function"]
+                   for s in sv["prototypeQuery"]["Select"]
+                   if "Aggregation" in s}
+        assert by_prop["Lat"] == 1        # lat-named in Y -> Avg
+        assert by_prop["Longitude"] == 1  # long-named in X -> Avg
+        assert by_prop["Sales"] == 0      # ordinary numeric in Size -> Sum
+
+    def test_ordinary_numeric_x_left_bare(self):
+        sv = self._sv()
+        sv["visualType"] = "scatterChart"
+        sv["projections"] = {"X": [{"queryRef": "Geo.Sales"}],
+                             "Y": [{"queryRef": "Geo.Lat"}]}
+        apply_implicit_aggregations(sv, resolve_type=lambda e, p, m: "Double")
+        sales_sel = next(s for s in sv["prototypeQuery"]["Select"]
+                         if s["Name"].endswith("Sales)")
+                         or s.get("Column", {}).get("Property") == "Sales")
+        # non-geo X keeps its previous (bare) behavior
+        assert "Column" in sales_sel and "Aggregation" not in sales_sel

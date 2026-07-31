@@ -1893,6 +1893,11 @@ class DAXEngine:
         # gave up", which is the one distinction that matters when the number is
         # going into a report.
         self.timed_out: set[str] = set()
+        # Measures whose evaluation RAISED (unresolvable reference, circular
+        # definition, ...). They also surface as BLANK values, and without
+        # this record the caller cannot tell "genuinely blank" from "could
+        # not be evaluated at all" (ledger issues-7).
+        self.eval_errors: dict[str, str] = {}
         # Wall-clock budget per outermost measure, enforced on the ENGINE (not
         # the context) because iterators spawn a fresh sub-context per row —
         # a context-local timer/counter would reset every row and never fire.
@@ -2445,6 +2450,11 @@ class DAXEngine:
                 if self._eval_depth > 1:
                     raise
                 self.timed_out.add(measure_name)
+            else:
+                # Record WHY before degrading, so the tool layer can report
+                # status "error" instead of a blank indistinguishable from a
+                # legitimate BLANK (ledger issues-7).
+                self.eval_errors.setdefault(measure_name, str(_exc))
             # Graceful degradation
             return None
         finally:
@@ -2606,6 +2616,16 @@ class DAXEngine:
                     col = self._resolve_bare_column(data, ctx)
                     if col is not None:
                         return col
+                    # Neither a measure, a row/extension-column key, nor a
+                    # column anywhere in the model: Desktop refuses the whole
+                    # expression rather than evaluating around it. Degrading
+                    # to BLANK let `[Nope] + 1` answer 1 with status "ok" --
+                    # indistinguishable from a genuine blank (ledger
+                    # issues-7). Same rule as the qualified Table[Name] path.
+                    from pbix_mcp.errors import DAXEvaluationError
+                    raise DAXEvaluationError(
+                        f"Measure or column '[{data}]' cannot be found or "
+                        f"may not be used in this expression")
                 return self.evaluate_measure(data, ctx)
             if kind == _P_MAYBEVAR:
                 if var_scope:
@@ -2650,6 +2670,14 @@ class DAXEngine:
                     col = self._resolve_bare_column(data, ctx)
                     if col is not None:
                         return col
+                    # Same rule as _P_BRACKET1: an unresolvable bare [Name]
+                    # raises, mirroring the qualified Table[Name] path
+                    # (ledger issues-7 -- silent BLANK made `[Nope] + 1`
+                    # answer 1 with status "ok").
+                    from pbix_mcp.errors import DAXEvaluationError
+                    raise DAXEvaluationError(
+                        f"Measure or column '[{data}]' cannot be found or "
+                        f"may not be used in this expression")
                 return self.evaluate_measure(data, ctx)
             if kind == _P_NONE:
                 return None

@@ -37,7 +37,13 @@ These produce a plausible answer with no error, which is why they survived so lo
       Agents_Performance is 408/408 with [Actives] = 32,401. Whether `IN` can
       now be enabled generally is a SEPARATE question, still untested.
 - [x] **issues-3** -- set_visual_property / update_visual_json on a CLASSIC layout now recompile query+dataTransforms (0.9.61-dev, shipped in 0.9.62), so Desktop no longer renders the old field
-- [ ] **issues-7** -- "measure not found" is indistinguishable from a genuine BLANK; needs a typed DAXError
+- [x] **issues-7** -- CLOSED (0.9.68). Two layers: unknown TOP-LEVEL names
+      already raised DAXMeasureNotFoundError with close-match hints; the
+      remaining hole was IN-EXPRESSION references -- `[Nope] + 1` answered 1
+      with status "ok". A bare [Name] that is neither a measure, a
+      row/extension-column key, nor a model column now raises (same rule as
+      the qualified Table[Name] path), and pbix_evaluate_dax reports status
+      "error" with the message. Corpus re-verified (22/22, 41/41, 102/102).
 - [x] **issues-9** -- default-filter behaviour differs between pbix_evaluate_dax and pbix_evaluate_dax_per_dimension.
       NOT A DEFECT: the divergence is a deliberate contract (a per-dimension
       sweep is normally asked against the raw model) and is pinned by tests.
@@ -47,7 +53,10 @@ These produce a plausible answer with no error, which is why they survived so lo
       level query, `_report_type_resolver`'s Type IN (1,2,4) scan,
       `_detect_field_parameter_shape` (whose `ExplicitName NOT LIKE` also
       dropped the NULL rows outright), and the perspective column list.
-- [ ] **issues-5** -- lat/long in X/Y value roles must AVERAGE, not Sum
+- [x] **issues-5** -- CLOSED (0.9.68). Latitude/Longitude field wells and
+      lat/long-named numeric columns in value/X roles now compile to
+      Aggregation Function=1 (Avg), matching Desktop's geographic default
+      summarization; all other value-role behavior unchanged.
 
 - [x] **issues-9 (follow-on)** -- CLOSED. Agents_Performance matches Desktop on
       all 102 measures, `CALCULATETABLE` is implemented, and the `IN` operator is

@@ -12374,8 +12374,10 @@ def pbix_evaluate_dax(
         else:
             fc = None
 
-        # Reset unsupported tracker before evaluation
+        # Reset unsupported + error trackers before evaluation
         dax_engine._engine.unsupported_functions.clear()
+        dax_engine._engine.eval_errors.clear()
+        dax_engine._engine.timed_out.clear()
         logger.info("Evaluating %d measures for '%s'", len(measure_names), alias)
 
         # simulate_row_context=False: report what the MODEL returns, exactly as
@@ -12407,6 +12409,15 @@ def pbix_evaluate_dax(
                         "evaluation budget exceeded "
                         f"({dax_engine._engine._max_eval_seconds:.0f}s); raise "
                         "PBIX_DAX_MAX_SECONDS to allow longer"),
+                ))
+            elif name in dax_engine._engine.eval_errors:
+                # NOT a blank: evaluation RAISED (unresolvable reference,
+                # circular definition, ...). Reporting it as blank made a
+                # broken measure indistinguishable from a legitimately empty
+                # one (ledger issues-7).
+                dax_results.append(DAXResult(
+                    name=name, value=None, status="error",
+                    error_message=dax_engine._engine.eval_errors[name],
                 ))
             elif unsupported:
                 # Value is None and unsupported functions were hit — mark as unsupported

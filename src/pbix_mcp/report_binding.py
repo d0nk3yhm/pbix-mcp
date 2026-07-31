@@ -34,10 +34,19 @@ _CARTESIAN_TYPES = {
 # Roles that act as a value/measure axis (paired with Series => pivoted).
 _VALUE_ROLES = {"Y", "Values", "Y2", "Size"}
 # Model value types Power BI implicitly Sums when a bare column lands on a value
-# axis (everything else is Count-ed). QueryAggregateFunction: Sum=0, CountNonNull=5.
+# axis (everything else is Count-ed). QueryAggregateFunction: Sum=0, Avg=1,
+# CountNonNull=5.
 _NUMERIC_TYPES = {"Int64", "Double", "Decimal"}
 _AGG_SUM = 0
+_AGG_AVERAGE = 1
 _AGG_COUNTNONNULL = 5
+# Coordinates must never be summed: Desktop's default summarization for
+# latitude/longitude is AVERAGE (summing coordinates of two cities lands the
+# point in the ocean). Applies to the map field wells that only ever hold
+# coordinates, and to lat/long-named numeric columns in any value role
+# (ledger issues-5).
+_GEO_ROLES = {"Latitude", "Longitude"}
+_LATLONG_NAME_RE = re.compile(r"^(lat(itude)?|lo?ng(itude)?)$", re.IGNORECASE)
 
 # (underlyingType, queryMetadata.Type) per model data type — taken verbatim from
 # Desktop-authored reports (sales_demo + GeoSales/IT_Support/etc. corpus). Keyed
@@ -120,20 +129,33 @@ def apply_implicit_aggregations(single_visual: dict, resolve_type=None) -> dict[
         if "Column" not in sel:
             continue                       # measures / explicit aggregations
         old_ref = sel.get("Name")
-        if ref2role.get(old_ref) not in _VALUE_ROLES:
-            continue
         col = sel["Column"]
         src = col.get("Expression", {}).get("SourceRef", {})
         entity = alias2entity.get(src.get("Source"), src.get("Entity"))
         prop = col.get("Property", "")
+        role = ref2role.get(old_ref)
+        geo_role = role in _GEO_ROLES
+        geo_named = bool(_LATLONG_NAME_RE.match(prop or ""))
+        # X is a value role only for the lat/long case handled here; treating
+        # every scatter X as an implicit aggregate is a separate (unchanged)
+        # behavior.
+        if role not in _VALUE_ROLES and not geo_role \
+                and not (role == "X" and geo_named):
+            continue
         vtype = None
         if resolve_type is not None:
             try:
                 vtype = resolve_type(entity, prop, False)
             except Exception:
                 vtype = None
-        func = _AGG_SUM if vtype in _NUMERIC_TYPES else _AGG_COUNTNONNULL
-        fn_name = "Sum" if func == _AGG_SUM else "CountNonNull"
+        if geo_role or (geo_named and vtype in _NUMERIC_TYPES):
+            # Coordinates AVERAGE (Desktop's geo default summarization);
+            # summing them produces a point that exists on no map.
+            func, fn_name = _AGG_AVERAGE, "Avg"
+        elif vtype in _NUMERIC_TYPES:
+            func, fn_name = _AGG_SUM, "Sum"
+        else:
+            func, fn_name = _AGG_COUNTNONNULL, "CountNonNull"
         new_ref = (f"{fn_name}({entity}.{prop})" if entity and prop
                    else f"{fn_name}({old_ref})")
         sel.pop("Column")
