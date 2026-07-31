@@ -84,4 +84,6 @@ BUILDER_TABLES = [
            {"name": "grp", "data_type": "String"}], K_ROWS),
 ]
 
+FIXTURE_MEASURES = {"Total V": ("F", "SUM(F[v])")}
+
 FIXTURE_PBIX = "test_corpus/conformance_fixture.pbix"
