@@ -251,11 +251,17 @@ the two anchors that looked incompatible:
 
 So the fix is NOT "never propagate many -> one". It is: **a COLUMN filter does
 not propagate many -> one; a TABLE filter argument does, because it filters the
-expanded table.** Our symmetric index gets the first wrong and the second right;
-the reverted directional commit got the first right and the second wrong. Neither
-is the whole rule. Implement expansion-awareness at the point the filter is
-registered -- a table-valued filter argument should mark the tables its expanded
-table covers -- and both anchors can hold at once.
+expanded table.**
+
+**IMPLEMENTED (commit 0e4c352), and both anchors hold at once for the first
+time.** `_rel_dir` carries the one->many (+ bidirectional) edges and is the
+default lookup; keys registered by the multi-column row-set branch of CALCULATE
+go into `_expanded_keys` and only those may take the reverse direction.
+Verified: Agents_Performance **408/408** (the last open cluster), MS_Employee_
+Hiring 124/124, MS_AI_Sample 44/44, Ecommerce_Conversion 132/132, `[Actives]` =
+32,401, `[Rank Filtering Employyees MTD]` = 0.
+`TestPropagationFollowsTableExpansion` discriminates all three historical
+states, so neither wrong formulation can return unnoticed.
 
 The probe that produced this, for re-running after a change --
 `verify_live.ps1 -File test_corpus/MS_Employee_Hiring.pbix`:
