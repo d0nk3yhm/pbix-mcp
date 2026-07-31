@@ -1174,6 +1174,14 @@ class DAXContext:
         # was applied. Only those are suppressed; a filter created later
         # inside a nested CALCULATE still propagates, as Desktop does.
         self._no_prop_keys: dict = {}
+        # Filter keys registered by a TABLE filter argument (FILTER(T,...),
+        # ALL(T) row sets). Desktop's rule, pinned on MS_Employee_Hiring:
+        # a filter on a TABLE filters its EXPANDED table, so it reaches the
+        # one-side dimensions the table points at (MAX('Date'[PeriodNumber])
+        # drops 201612 -> 201412 under FILTER(Employee, ...)); a filter on a
+        # COLUMN does not (Employee[FP]="FT" leaves it at 201612). Keys in
+        # this set may propagate MANY -> ONE; every other filter is one->many.
+        self._expanded_keys: set = set()
         # Pre-transition (outer) context, set by _make_row_context. In real DAX a
         # row context does NOT filter — only CALCULATE / a measure invocation
         # performs the row->filter transition. This engine applies the transition
@@ -1192,6 +1200,7 @@ class DAXContext:
         self._max_eval_calls = 3_000_000
         # Build relationship index: { (fromTable, toTable): { fromCol, toCol } }
         self._rel_index = {}
+        self._rel_dir: dict = {}
         for rel in self.relationships:
             if rel.get('IsActive'):
                 ft = rel.get('FromTable', '')
@@ -1201,6 +1210,14 @@ class DAXContext:
                 if ft and tt and fc and tc:
                     self._rel_index[(ft, tt)] = {'from_col': fc, 'to_col': tc}
                     self._rel_index[(tt, ft)] = {'from_col': tc, 'to_col': fc}
+                    # Directional copy: a filter flows ONE -> MANY (ToTable ->
+                    # FromTable) by default; the reverse edge exists only for a
+                    # bidirectional relationship. The symmetric index above
+                    # stays, but propagation may only take the reverse
+                    # direction for EXPANDED keys (see _expanded_keys).
+                    self._rel_dir[(ft, tt)] = {'from_col': fc, 'to_col': tc}
+                    if rel.get('CrossFilteringBehavior') == 2:
+                        self._rel_dir[(tt, ft)] = {'from_col': tc, 'to_col': fc}
         # Directed adjacency for MULTI-HOP (snowflake) filter propagation.
         # A filter propagates along the default cross-filter direction: from the
         # "one" side (ToTable) to the "many" side (FromTable). Each edge carries
@@ -1348,7 +1365,9 @@ class DAXContext:
         try:
             ck = (id(tbl), 'xtf', tuple(sorted(
                 (k, self._filter_sig(v)) for k, v in self.filter_context.items())),
-                tuple(sorted((self._no_prop_keys.get(table_name) or {}).items())))
+                tuple(sorted((self._no_prop_keys.get(table_name) or {}).items())),
+                tuple(sorted(k for k in self._expanded_keys
+                             if k in self.filter_context)))
         except TypeError:
             ck = None
         if ck is not None:
@@ -1392,8 +1411,22 @@ class DAXContext:
             if not src_tbl:
                 continue
 
-            # Find relationship between source dim table and target table
-            rel = self._rel_index.get((table_name, src_table))
+            # Find relationship between source dim table and target table.
+            # Directional first (one -> many, plus bidirectional). The reverse
+            # direction -- the MANY side restricting the ONE side -- is DAX's
+            # expanded-table behaviour and is taken only for keys a TABLE
+            # filter argument registered: FILTER(Employee, ...) restricts Date
+            # ([Actives] = 32,401 needs exactly that), while a column filter
+            # like DimStore[StoreType]="Catalog" must NOT reach DimEmployee
+            # (Desktop: COUNTROWS(DimEmployee) stays 293, SELECTEDVALUE BLANK).
+            rel = self._rel_dir.get((table_name, src_table))
+            if not rel:
+                expanded = [cf for cf in col_filters
+                            if f"{src_table}.{cf[0]}" in self._expanded_keys]
+                if expanded:
+                    rel = self._rel_index.get((table_name, src_table))
+                    if rel:
+                        col_filters = expanded
             if not rel:
                 # Try via date table special handling (for Year/Month filters on date dim)
                 if src_table == self.date_table:
@@ -1792,6 +1825,7 @@ class DAXContext:
         ctx._filter_idx_cache = self._filter_idx_cache
         ctx._no_propagate = set(self._no_propagate)
         ctx._no_prop_keys = dict(self._no_prop_keys)
+        ctx._expanded_keys = set(self._expanded_keys)
         ctx.measure_tables = self.measure_tables
         ctx.model_columns = self.model_columns
         # Share the measure memo by REFERENCE across the derivation family. Its
@@ -1811,6 +1845,7 @@ class DAXContext:
         ctx._filter_idx_cache = self._filter_idx_cache
         ctx._no_propagate = set(self._no_propagate)
         ctx._no_prop_keys = dict(self._no_prop_keys)
+        ctx._expanded_keys = set(self._expanded_keys)
         ctx.measure_tables = self.measure_tables
         ctx.model_columns = self.model_columns
         return ctx
@@ -3698,6 +3733,11 @@ class DAXEngine:
                              if any(k.startswith(f"{t}.") for t in tbls)])
                         snaps = {t: new_ctx._filter_snapshot(t) for t in tbls}
                         new_ctx = new_ctx.with_filters(groups)
+                        # These keys came from a TABLE filter argument, so they
+                        # filter the EXPANDED table and may ride the reverse
+                        # (many -> one) direction in _get_cross_table_filters.
+                        new_ctx._expanded_keys = (
+                            new_ctx._expanded_keys | set(groups))
                         new_ctx._no_propagate = new_ctx._no_propagate | tbls
                         new_ctx._no_prop_keys = {**new_ctx._no_prop_keys, **snaps}
                     elif groups:
