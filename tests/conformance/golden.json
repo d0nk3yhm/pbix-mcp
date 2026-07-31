@@ -1555,14 +1555,14 @@
  ],
  "PATH": [
   {
-   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Kan ikke sp\u00f8rre interne st\u00f8ttestrukturer for kolonnen PC[id] fordi de ikke er behandlet.  Oppdater eller beregn tabellen PC p\u00e5 nytt.\"",
-   "expr": "CONCATENATEX(FILTER(PC, PC[id] = 4), PATH(PC[id], PC[parent]))"
+   "expr": "CONCATENATEX(FILTER(PC, PC[id] = 4), PATH(PC[id], PC[parent]))",
+   "value": "1|2|4"
   }
  ],
  "PATHITEMREVERSE": [
   {
-   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Kan ikke sp\u00f8rre interne st\u00f8ttestrukturer for kolonnen PC[id] fordi de ikke er behandlet.  Oppdater eller beregn tabellen PC p\u00e5 nytt.\"",
-   "expr": "CONCATENATEX(FILTER(PC, PC[id] = 4), PATHITEMREVERSE(PATH(PC[id], PC[parent]), 1))"
+   "expr": "CONCATENATEX(FILTER(PC, PC[id] = 4), PATHITEMREVERSE(PATH(PC[id], PC[parent]), 1))",
+   "value": "4"
   }
  ],
  "PDURATION": [

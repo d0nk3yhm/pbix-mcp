@@ -15,6 +15,7 @@ from tests.conformance.fixture_def import (  # noqa: E402
     BUILDER_TABLES,
     FIXTURE_PBIX,
     FIXTURE_RELATIONSHIPS,
+    PC_CALC_DAX,
 )
 
 
@@ -32,7 +33,17 @@ def main() -> str:
     out = os.path.abspath(FIXTURE_PBIX)
     with open(out, "wb") as fh:
         fh.write(data)
-    print(f"built {out} ({len(data):,} bytes)")
+    # PC rides in as a CALCULATED table so Desktop processes its hierarchy
+    # support structures at open, making it PATH-queryable (import tables
+    # from the builder are not — the known H$ processing gap).
+    from pbix_mcp import server  # noqa: E402
+    server.pbix_open(out, "__fixture__")
+    server.pbix_datamodel_add_calculated_table("__fixture__", "PC",
+                                               PC_CALC_DAX)
+    server.pbix_save("__fixture__")
+    server.pbix_close("__fixture__")
+    size = os.path.getsize(out)
+    print(f"built {out} ({size:,} bytes, PC as calculated table)")
     return out
 
 

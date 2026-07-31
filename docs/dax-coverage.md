@@ -11,10 +11,9 @@ the conformance fixture.
 | | count |
 |---|---|
 | DAX functions in the engine (March 2026 build) | **467** |
-| implemented and verified | **433** ([supported-dax.md](supported-dax.md)) |
+| implemented and verified | **435** ([supported-dax.md](supported-dax.md)) |
 | classified out of authorable scope (Desktop's own error as evidence) | **26** |
 | open — week-grain family, needs calendar-object investigation | **8** |
-| open — PATH pair, blocked on a builder fix | **2** |
 
 Implemented-and-verified means one of two proof levels: **257** functions have
 per-function goldens captured from the live Desktop engine and replayed by
@@ -52,7 +51,7 @@ in a query/measure context.
 - **Name not resolvable (2)** — Desktop cannot resolve the name in any
   context we could author: `CEILING.MATH`, `FLOOR.MATH`
 
-## Open items (10)
+## Open items (8)
 
 - **Week-grain time intelligence (8)**: `CLOSINGBALANCEWEEK`, `DATESWTD`,
   `ENDOFWEEK`, `NEXTWEEK`, `OPENINGBALANCEWEEK`, `PREVIOUSWEEK`,
@@ -60,16 +59,22 @@ in a query/measure context.
   reference (2025 calendar-object model feature). Under investigation:
   whether the fixture can carry a calendar object, so these can be captured
   and implemented — otherwise they finalize as needs-model-feature.
-- **PATH family (2)**: `PATH`, `PATHITEMREVERSE`. Desktop refuses them on
-  builder-produced models: *"Cannot query internal support structures for
-  column ... because they are not processed"* — for **every** column that is
-  not a relationship join column (`PATH(D[M], D[Q])` fails even though D
-  participates in a relationship; `COUNTROWS(VALUES(PC[id]))` works fine).
-  This is a builder gap (per-column hierarchy support structures are only
-  processed for join columns), tracked as a correctness issue in its own
-  right; once fixed, PATH goldens capture normally. `PATHLENGTH`,
-  `PATHITEM`, `PATHCONTAINS` are already implemented and verified against
-  literal path strings.
+
+## PATH and the builder hierarchy gap
+
+`PATH`/`PATHITEMREVERSE` are implemented and conformance-verified: the
+fixture's parent-child table is a **calculated table**, which Desktop
+recomputes and fully processes at open, making its hierarchy support
+structures PATH-queryable. Desktop still refuses PATH on the builder's
+**import** tables (*"Cannot query internal support structures for column
+... because they are not processed"*, for every non-join column even in
+tables that participate in relationships — while `VALUES(...)`,
+aggregations, and relationships all work). Ruled out empirically:
+metadata version alignment, `IsPrivate`, `ExpressionContext` — the H$
+POS_TO_ID/ID_TO_POS payloads match Desktop's layout logically, so the
+remaining suspect is a binary detail of the structure files or their
+`.idfmeta`. Tracked as a builder correctness issue (does not affect DAX
+parity, which the calculated-table fixture covers).
 
 ## INFO.* semantics note
 

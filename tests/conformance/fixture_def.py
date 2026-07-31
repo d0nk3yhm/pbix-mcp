@@ -54,19 +54,33 @@ K_ROWS = [
     [4, "Z"],          # no fact rows -> tests blank-member behaviour
 ]
 
+# PC is a CALCULATED table in the built fixture. Desktop recomputes and fully
+# processes calculated tables at open, so their hierarchy support structures
+# are PATH-queryable. Builder-written IMPORT tables lack processed H$ support
+# structures (PATH says "not processed"; every other query works) — a real
+# builder gap tracked separately. Column order (id, label, parent) is what
+# ADDCOLUMNS produces. The root's parent must be a true BLANK: a BLANK()
+# inside a DATATABLE row literal arrives as 0, which PATH rejects.
+PC_ROWS = [
+    # id, label,     parent
+    [1, "root", None],
+    [2, "child-a", 1],
+    [3, "child-b", 1],
+    [4, "grand", 2],
+]
+PC_CALC_DAX = (
+    'ADDCOLUMNS(DATATABLE("id", INTEGER, "label", STRING, '
+    '{{1, "root"}, {2, "child-a"}, {3, "child-b"}, {4, "grand"}}), '
+    '"parent", IF([id] = 1, BLANK(), IF([id] = 4, 2, 1)))'
+)
+
 FIXTURE_TABLES = {
     "N": {"columns": ["x", "i", "b", "s"], "rows": N_ROWS},
     "D": {"columns": ["Date", "M", "Q"], "rows": D_ROWS},
     "F": {"columns": ["k", "v", "d"], "rows": F_ROWS},
     "K": {"columns": ["k", "grp"], "rows": K_ROWS},
-    "PC": {"columns": ["id", "parent", "label"], "rows": []},
+    "PC": {"columns": ["id", "label", "parent"], "rows": PC_ROWS},
 }
-FIXTURE_TABLES["PC"]["rows"] = [
-    [1, None, "root"],
-    [2, 1, "child-a"],
-    [3, 1, "child-b"],
-    [4, 2, "grand"],
-]
 
 FIXTURE_RELATIONSHIPS = [
     {"FromTable": "F", "FromColumn": "k", "ToTable": "K", "ToColumn": "k",
@@ -89,18 +103,8 @@ BUILDER_TABLES = [
            {"name": "d", "data_type": "DateTime"}], F_ROWS),
     ("K", [{"name": "k", "data_type": "Int64"},
            {"name": "grp", "data_type": "String"}], K_ROWS),
-    ("PC", [{"name": "id", "data_type": "Int64"},
-            {"name": "parent", "data_type": "Int64"},
-            {"name": "label", "data_type": "String"}],
-     FIXTURE_TABLES["PC"]["rows"]),
-]
-
-PC_ROWS = [
-    # id, parent, label
-    [1, None, "root"],
-    [2, 1, "child-a"],
-    [3, 1, "child-b"],
-    [4, 2, "grand"],
+    # PC is NOT in BUILDER_TABLES: build_fixture.py adds it as a calculated
+    # table (PC_CALC_DAX) after the import build — see the note above PC_ROWS.
 ]
 
 FIXTURE_MEASURES = {"Total V": ("F", "SUM(F[v])")}

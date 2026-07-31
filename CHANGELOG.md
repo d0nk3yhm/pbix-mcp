@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.67] - 2026-07-31
+
+**`PATH` + `PATHITEMREVERSE` implemented and Desktop-verified — 435 of the
+live engine's 467 DAX functions now carry conformance goldens; 8 remain open
+(week-grain calendar family).**
+
+### Added
+
+- `PATH(id, parent)` — pipe-delimited ancestor chain walked over the
+  pre-transition context, integers printed Desktop-style (`1|2|4`) — and
+  `PATHITEMREVERSE(path, n)`, completing the PATH family.
+
+### Changed
+
+- The conformance fixture's parent-child table `PC` is now a **calculated
+  table** (`ADDCOLUMNS` over `DATATABLE`, root parent a true BLANK):
+  Desktop recomputes and fully processes calculated tables at open, which
+  makes their hierarchy support structures PATH-queryable. Import tables
+  written by the builder are not — Desktop's *"internal support structures
+  not processed"* — a builder issue now precisely characterized in
+  [docs/dax-coverage.md](docs/dax-coverage.md) (metadata layout matches
+  Desktop's; versions, `IsPrivate`, and refresh-type experiments ruled
+  out; remaining suspect is a binary detail of the H$ structure files).
+
+### Fixed
+
+- A `BLANK()` inside a `DATATABLE` row literal materializes as 0 in
+  Desktop's own evaluation — the fixture avoids the shape and documents it.
+
 ## [0.9.66] - 2026-07-31
 
 **119 new DAX functions (314 → 433 of the live engine's 467): the window
