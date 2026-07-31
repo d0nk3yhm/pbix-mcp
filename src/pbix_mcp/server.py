@@ -119,6 +119,11 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
+    except (OverflowError, ValueError):
+        # A PID outside the OS's valid range (the test's synthetic dead pid
+        # exceeds Linux's signed-int pid space) cannot belong to a live
+        # process. Windows never hits this: OpenProcess just fails.
+        return False
     return True
 
 
