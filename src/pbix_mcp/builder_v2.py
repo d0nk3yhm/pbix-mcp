@@ -12,6 +12,7 @@ import secrets
 import xml.etree.ElementTree as ET
 from typing import Dict
 
+from pbix_mcp.formats.abf_from_scratch import build_cryptkey
 from pbix_mcp.formats.abf_rebuild import (
     _HEADER_PAGE_SIZE,
     _SIGNATURE_LEN,
@@ -30,21 +31,18 @@ def _windows_filetime_now() -> int:
 
 
 # ── Step 3: CryptKey constant ───────────────────────────────────────
-# The CryptKey.bin is a 144-byte cryptographic key BLOB that requires
-# Microsoft's crypto infrastructure to generate (rskeymgmt / exponent-of-one
-# private key packaging). We use a known-valid key extracted from a working
-# PBIX. The key is GUID-independent — any valid key works with any db.xml.
-CRYPTKEY_BYTES = bytes.fromhex(
-    "98bc215d2d8de64ea8e5d038aac94441"
-    "04000000300000005000000010000000"
-    "0100000007000000ffffffff00000000"
-    "010200000366000000a400009270d94a"
-    "b3f7014a7f3d8cda8a0b13dc34f880"
-    "45ef9e253200a15b7ca339a6f052795f"
-    "804bbc5f635463b6f39c4a4de6535c4a"
-    "ea8360a9904a3974163dd10200000000"
-    "0098bc215d2d8de64ea8e5d038aac94441"
-)
+# CryptKey.bin is a 144-byte fixed-format container Analysis Services expects
+# when SvrEncryptPwdFlag is on (the server default). Its structure was
+# independently derived by differential observation of lawfully generated PBIX
+# files (docs/reverse-engineering/experiments/cryptkey.md): a 16-byte GUID
+# bookend + typed header, a variable region, then the GUID again. Across 25
+# corpus files the scaffold is byte-identical while the variable region
+# differs per file, and Power BI Desktop accepts our OWN bytes there (verified:
+# random and hash-derived regions load and serve data; only a degenerate
+# all-zero region is rejected). So we generate the key entirely ourselves
+# rather than shipping bytes lifted from a Microsoft file. It is
+# db.xml-independent — the same generated key loads with any database GUID.
+CRYPTKEY_BYTES = build_cryptkey()
 
 
 # ── Step 2: Generate db.xml XMLA Load document ─────────────────────

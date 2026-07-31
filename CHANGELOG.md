@@ -5,6 +5,72 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.73] - 2026-07-31
+
+### Fixed — RELATED() ignored row context inside iterators (silent wrong values)
+
+- **`SUMX(Sales, Sales[Qty] * RELATED(Products[UnitPrice]))` — the canonical
+  line-total pattern — returned wrong values** (e.g. 839.72 instead of
+  599.72). `RELATED` resolved to the *first visible row* of the related
+  table regardless of which row the iterator was on, so every iterated row
+  got the same related value; grouped output masked it (each group leaves
+  one related row visible) while grand totals and cards were corrupted.
+  `RELATED` now navigates from the **current row's** foreign key through the
+  relationship (single- and multi-hop, active relationships only). A second,
+  related defect is fixed too: `FILTER(T, RELATED(...) = v)` had `RELATED`
+  wrongly listed in the aggregation guard, so FILTER never bound the current
+  row for it — removed. Desktop-pinned probes added to the conformance
+  harness (`RELATED` → 350 / 7 / 1) plus an 9-case unit matrix
+  (`tests/test_related_rowcontext.py`). Reported by OpenBI's bridge suite
+  (findings #20).
+
+### Fixed — builder reports now render in Power BI Desktop (was: crash)
+
+- **Builder-produced reports carried no `themeCollection`, so Power BI
+  Desktop's renderer crashed** with *"Cannot read properties of undefined
+  (reading 'customTheme')"* — the model loaded (queries answered), but the
+  report never rendered. `PBIXBuilder._build_layout` now emits a
+  report-level `config.themeCollection` referencing a built-in base theme
+  by name (the same one `pbix_set_theme` uses; no theme asset shipped).
+  **Verified by opening the built report in Desktop and screenshotting the
+  rendered bar chart with data**, not just checking the model. Regression
+  guard: `tests/test_report_render_theme.py`.
+- **A visual config that names fields but matches no binding shape now
+  warns instead of silently shipping an empty visual.** Passing, e.g.,
+  `{"category": "T.C", "values": [...]}` (wrong shape) to a chart used to
+  produce a container Desktop renders as an empty "drag fields here"
+  placeholder with no signal; the builder now emits a `UserWarning` naming
+  the expected shape.
+
+**CryptKey.bin is now independently generated — no Microsoft key material
+ships in the package.**
+
+Earlier builds embedded a fixed 144-byte `CryptKey.bin` copied out of a
+working PBIX, documented as a "Microsoft RSA key BLOB [that] requires
+`rskeymgmt` to generate." A clean-room differential study of 25 lawfully
+generated corpus files
+([docs/reverse-engineering/experiments/cryptkey.md](docs/reverse-engineering/experiments/cryptkey.md))
+established that the 144 bytes are a fixed-format container: a scaffold that
+is byte-identical across every observed file, plus a variable region that
+Power BI Desktop accepts filled with our own non-degenerate bytes (random and
+hash-derived key regions load and serve data; only a degenerate all-zero
+region is rejected). The "RSA key BLOB / rskeymgmt" description was unverified.
+
+### Changed
+
+- `abf_from_scratch.build_cryptkey()` composes the observed format scaffold
+  with a self-authored SHA-512 keystream; the from-scratch builder
+  (`builder_v2`) and the rebuild path (`abf_rebuild`) both use it. Verified:
+  a builder-produced file carrying the generated key opens in Power BI
+  Desktop and returns the expected measure value. The generated key is
+  database-independent. Regression: `tests/test_cryptkey.py`.
+- README / architecture / limitations docs restated accurately: every
+  artifact is generated (including `CryptKey.bin`); dropped the "Microsoft
+  RSA key BLOB / requires Microsoft's crypto infrastructure" framing and the
+  "entire PBIX format" absolute.
+- Added `docs/reverse-engineering/` provenance trail (methodology + the
+  CryptKey experiment).
+
 ## [0.9.72] - 2026-07-31
 
 **The OpenBI findings ledger is EMPTY — every open item across L3/L4/L5 is

@@ -271,6 +271,13 @@ PROBES: dict[str, list[str]] = {
     "SAMPLEAXISWITHLOCALMINMAX": ["COUNTROWS(SAMPLEAXISWITHLOCALMINMAX(4, F, F[v], F[k]))","COUNTROWS(SAMPLEAXISWITHLOCALMINMAX(4, F, F[v], F[k], 1))"],
     "SAMPLECARTESIANPOINTSBYCOVER": ["COUNTROWS(SAMPLECARTESIANPOINTSBYCOVER(4, F, F[v], F[k]))"],
     "UTCTODAY": ["ISDATETIME(UTCTODAY())"],
+    # RELATED inside an iterator is ROW-CONTEXT navigation (findings #20):
+    # each F row follows F[k]->K[k] to its own related K row, not the
+    # first visible one. F: k=1/v=100, k=2/v=200, k=1/v=50, k=3/v=300;
+    # K: 1->X,2->X,3->Y,4->Z. Sum(v where related grp=X)=350; Sum(k)=7.
+    "RELATED": ["SUMX(F, IF(RELATED(K[grp]) = \"X\", F[v], 0))",
+                "SUMX(F, RELATED(K[k]))",
+                "COUNTROWS(FILTER(F, RELATED(K[grp]) = \"Y\"))"],
     # ================================================== batch 5
     # ---- window family (F ordered by v = 50, 100, 200, 300)
     "ROWNUMBER": ["SUMX(F, ROWNUMBER(ORDERBY(F[v])))",
