@@ -2301,6 +2301,8 @@ class DAXEngine:
             'COMBINEVALUES': self._fn_combinevalues,
             'CONCATENATEX': self._fn_concatenatex,
             'RANKX': self._fn_rankx,
+            'PATH': self._fn_path,
+            'PATHITEMREVERSE': self._fn_pathitemreverse,
             'PATHCONTAINS': self._fn_pathcontains,
             'PATHITEM': self._fn_pathitem,
             'PATHLENGTH': self._fn_pathlength,
@@ -9396,6 +9398,66 @@ class DAXEngine:
         else:
             beat = sum(1 for v in all_vals if v < current_val)
         return beat + 1
+
+    @staticmethod
+    def _path_item_str(v) -> str:
+        """A path element as Desktop prints it: integers without decimals."""
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+        return str(v)
+
+    def _fn_path(self, args_str: str, ctx: DAXContext) -> Any:
+        """PATH(id_column, parent_column) -- pipe-delimited ancestor chain,
+        root first. Evaluated per row; the id->parent mapping comes from the
+        PRE-transition context (the row transition narrows the table to the
+        current row, which would leave nothing to walk)."""
+        parts = self._split_args(args_str)
+        if len(parts) < 2:
+            return None
+        id_ref = parts[0].strip()
+        par_ref = parts[1].strip()
+        if '[' not in id_ref or '[' not in par_ref:
+            return None
+        tname = id_ref[:id_ref.index('[')].strip().strip("'")
+        id_col = id_ref[id_ref.index('[') + 1:-1]
+        par_col = par_ref[par_ref.index('[') + 1:-1]
+        cur = self._eval_expr(id_ref, ctx)
+        cur = self._resolve_row_result(cur, getattr(ctx, '_current_row', None),
+                                       ctx)
+        if cur is None or isinstance(cur, tuple):
+            return None
+        base = getattr(ctx, '_outer_ctx', None) or ctx
+        rows = self._table_rows(f"'{tname}'" if ' ' in tname else tname, base)
+        if rows is None:
+            return None
+        parent_of = {}
+        for r in rows:
+            if id_col in r:
+                parent_of[r.get(id_col)] = r.get(par_col)
+        chain = []
+        node = cur
+        for _ in range(len(parent_of) + 1):
+            chain.append(node)
+            nxt = parent_of.get(node)
+            if nxt is None:
+                break
+            node = nxt
+        else:
+            return None                       # cycle guard
+        return "|".join(self._path_item_str(v) for v in reversed(chain))
+
+    def _fn_pathitemreverse(self, args_str: str, ctx: DAXContext) -> Any:
+        """PATHITEMREVERSE(path, position, type) -- item counted from the END
+        of the pipe-delimited path (1-based)."""
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return ''
+        path = str(self._eval_expr(args[0].strip(), ctx) or '')
+        pos = int(self._eval_expr(args[1].strip(), ctx) or 1)
+        items = path.split('|') if path else []
+        if 1 <= pos <= len(items):
+            return items[len(items) - pos]
+        return ''
 
     def _fn_pathcontains(self, args_str: str, ctx: DAXContext) -> Any:
         """PATHCONTAINS(path, item) — check if pipe-delimited path contains item."""

@@ -1,6 +1,6 @@
 # Supported DAX Functions
 
-433 of the live engine's 467 DAX functions, implemented and verified; 26 of the remaining 34 are proven not query-authorable by Desktop's own error messages, and 10 stay open with concrete investigation paths ([dax-coverage.md](dax-coverage.md)). Semantics are verified two ways: a per-function conformance harness replays Desktop-captured goldens (354 value probes, 1e-9 relative tolerance), and the 25-file corpus matches Desktop on every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused.
+435 of the live engine's 467 DAX functions, implemented and verified; 26 of the remaining 32 are proven not query-authorable by Desktop's own error messages, and 8 stay open with a concrete investigation path ([dax-coverage.md](dax-coverage.md)). Semantics are verified two ways: a per-function conformance harness replays Desktop-captured goldens (354 value probes, 1e-9 relative tolerance), and the 25-file corpus matches Desktop on every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused.
 
 ## Aggregation (13)
 `SUM`, `AVERAGE`, `COUNT`, `COUNTA`, `COUNTROWS`, `MIN`, `MAX`, `DISTINCTCOUNT`, `DISTINCTCOUNTNOBLANK`, `PRODUCT`, `MEDIAN`, `MEDIANX`, `COUNTBLANK`
@@ -137,6 +137,18 @@ in the expression of a visual calculation"*); engine-internal
 `NATURALJOINUSAGE` (*"can only be used as a value filter for
 SUMMARIZECOLUMNS"*, yet refused there too) and `LOOKUPWITHTOTALS` (rejects
 every authorable column-reference shape).
+
+## Batch-6 additions (2)
+
+`PATH` and `PATHITEMREVERSE`, completing the PATH family. The fixture's
+parent-child table became a **calculated table** so Desktop processes its
+hierarchy support structures at open (import tables from the builder are
+not PATH-queryable in Desktop — a builder issue tracked in
+[dax-coverage.md](dax-coverage.md)). `PATH` walks the id→parent mapping in
+the pre-transition context and prints integers Desktop-style (`1|2|4`);
+the root's parent must be a true BLANK — a `BLANK()` inside a `DATATABLE`
+row literal arrives as 0, which PATH rejects, hence the
+`ADDCOLUMNS`+`IF` shape in the fixture definition.
 
 ## Known Limitations
 
