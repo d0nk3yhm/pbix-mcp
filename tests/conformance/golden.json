@@ -253,6 +253,18 @@
    "expr": "COLLAPSE(SUM(F[v]), K[grp])"
   }
  ],
+ "COLLAPSEALL": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"COLLAPSEALL kan bare brukes i uttrykket for en visuell beregning.\"",
+   "expr": "COLLAPSEALL(SUM(F[v]), ROWS)"
+  }
+ ],
+ "COLUMNSTATISTICS": [
+  {
+   "expr": "COUNTROWS(COLUMNSTATISTICS())",
+   "value": "20"
+  }
+ ],
  "COMBIN": [
   {
    "expr": "COMBIN(8, 2)",
@@ -539,6 +551,12 @@
    "expr": "EXPAND(SUM(F[v]), K[grp])"
   }
  ],
+ "EXPANDALL": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"EXPANDALL kan bare brukes i uttrykket for en visuell beregning.\"",
+   "expr": "EXPANDALL(SUM(F[v]), ROWS)"
+  }
+ ],
  "EXPON.DIST": [
   {
    "expr": "EXPON.DIST(0.2, 10, TRUE)",
@@ -563,6 +581,12 @@
   {
    "expr": "CALCULATE(COUNTROWS(FILTERS(K[grp])), K[grp] = \"X\")",
    "value": "1"
+  }
+ ],
+ "FIRST": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"LAST kan bare brukes i uttrykket for en visuell beregning.\"",
+   "expr": "FIRST(SUM(F[v]))"
   }
  ],
  "FIRSTNONBLANKVALUE": [
@@ -643,6 +667,430 @@
   {
    "expr": "COUNTROWS(SUMMARIZECOLUMNS(K[grp], \"m\", IGNORE(SUM(F[v]))))",
    "value": "3"
+  }
+ ],
+ "INDEX": [
+  {
+   "expr": "SUMX(INDEX(1, F, ORDERBY(F[v])), F[v])",
+   "value": "50"
+  },
+  {
+   "expr": "SUMX(INDEX(-1, F, ORDERBY(F[v])), F[v])",
+   "value": "300"
+  }
+ ],
+ "INFO.ALTERNATEOFDEFINITIONS": [
+  {
+   "expr": "COUNTROWS(INFO.ALTERNATEOFDEFINITIONS())",
+   "value": null
+  }
+ ],
+ "INFO.ANNOTATIONS": [
+  {
+   "expr": "COUNTROWS(INFO.ANNOTATIONS()) > 0",
+   "value": "True"
+  }
+ ],
+ "INFO.ATTRIBUTEHIERARCHIES": [
+  {
+   "expr": "COUNTROWS(INFO.ATTRIBUTEHIERARCHIES())",
+   "value": "20"
+  }
+ ],
+ "INFO.ATTRIBUTEHIERARCHYSTORAGES": [
+  {
+   "expr": "COUNTROWS(INFO.ATTRIBUTEHIERARCHYSTORAGES())",
+   "value": "20"
+  }
+ ],
+ "INFO.CALCDEPENDENCY": [
+  {
+   "expr": "COUNTROWS(INFO.CALCDEPENDENCY())",
+   "value": "6"
+  }
+ ],
+ "INFO.CALCULATIONGROUPS": [
+  {
+   "expr": "COUNTROWS(INFO.CALCULATIONGROUPS())",
+   "value": null
+  }
+ ],
+ "INFO.CALCULATIONITEMS": [
+  {
+   "expr": "COUNTROWS(INFO.CALCULATIONITEMS())",
+   "value": null
+  }
+ ],
+ "INFO.CATALOGS": [
+  {
+   "expr": "COUNTROWS(INFO.CATALOGS())",
+   "value": "1"
+  }
+ ],
+ "INFO.CHANGEDPROPERTIES": [
+  {
+   "expr": "COUNTROWS(INFO.CHANGEDPROPERTIES())",
+   "value": null
+  }
+ ],
+ "INFO.COLUMNPARTITIONSTORAGES": [
+  {
+   "expr": "COUNTROWS(INFO.COLUMNPARTITIONSTORAGES())",
+   "value": "52"
+  }
+ ],
+ "INFO.COLUMNPERMISSIONS": [
+  {
+   "expr": "COUNTROWS(INFO.COLUMNPERMISSIONS())",
+   "value": null
+  }
+ ],
+ "INFO.COLUMNS": [
+  {
+   "expr": "COUNTROWS(INFO.COLUMNS())",
+   "value": "20"
+  }
+ ],
+ "INFO.COLUMNSTORAGES": [
+  {
+   "expr": "COUNTROWS(INFO.COLUMNSTORAGES())",
+   "value": "52"
+  }
+ ],
+ "INFO.CSDLMETADATA": [
+  {
+   "expr": "COUNTROWS(INFO.CSDLMETADATA())",
+   "value": "1"
+  }
+ ],
+ "INFO.CULTURES": [
+  {
+   "expr": "COUNTROWS(INFO.CULTURES())",
+   "value": "1"
+  }
+ ],
+ "INFO.DATACOVERAGEDEFINITIONS": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Denne operasjonen kan ikke utf\u00f8res fordi den refererer til et objekt eller en egenskap som er utilgjengelig i den gjeldende utgaven av serveren eller kompatibilitetsniv\u00e5et for databasen.\"",
+   "expr": "COUNTROWS(INFO.DATACOVERAGEDEFINITIONS())"
+  }
+ ],
+ "INFO.DATASOURCES": [
+  {
+   "expr": "COUNTROWS(INFO.DATASOURCES())",
+   "value": null
+  }
+ ],
+ "INFO.DELTATABLEMETADATASTORAGES": [
+  {
+   "expr": "COUNTROWS(INFO.DELTATABLEMETADATASTORAGES())",
+   "value": null
+  }
+ ],
+ "INFO.DEPENDENCIES": [
+  {
+   "expr": "COUNTROWS(INFO.DEPENDENCIES())",
+   "value": "6"
+  }
+ ],
+ "INFO.DETAILROWSDEFINITIONS": [
+  {
+   "expr": "COUNTROWS(INFO.DETAILROWSDEFINITIONS())",
+   "value": null
+  }
+ ],
+ "INFO.DICTIONARYSTORAGES": [
+  {
+   "expr": "COUNTROWS(INFO.DICTIONARYSTORAGES())",
+   "value": "52"
+  }
+ ],
+ "INFO.EXCLUDEDARTIFACTS": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Denne operasjonen kan ikke utf\u00f8res fordi den refererer til et objekt eller en egenskap som er utilgjengelig i den gjeldende utgaven av serveren eller kompatibilitetsniv\u00e5et for databasen.\"",
+   "expr": "COUNTROWS(INFO.EXCLUDEDARTIFACTS())"
+  }
+ ],
+ "INFO.EXPRESSIONS": [
+  {
+   "expr": "COUNTROWS(INFO.EXPRESSIONS())",
+   "value": null
+  }
+ ],
+ "INFO.EXTENDEDPROPERTIES": [
+  {
+   "expr": "COUNTROWS(INFO.EXTENDEDPROPERTIES())",
+   "value": null
+  }
+ ],
+ "INFO.FORMATSTRINGDEFINITIONS": [
+  {
+   "expr": "COUNTROWS(INFO.FORMATSTRINGDEFINITIONS())",
+   "value": null
+  }
+ ],
+ "INFO.FUNCTIONS": [
+  {
+   "expr": "COUNTROWS(INFO.FUNCTIONS())",
+   "value": "467"
+  }
+ ],
+ "INFO.GENERALSEGMENTMAPSEGMENTMETADATASTORAGES": [
+  {
+   "expr": "COUNTROWS(INFO.GENERALSEGMENTMAPSEGMENTMETADATASTORAGES())",
+   "value": null
+  }
+ ],
+ "INFO.GROUPBYCOLUMNS": [
+  {
+   "expr": "COUNTROWS(INFO.GROUPBYCOLUMNS())",
+   "value": null
+  }
+ ],
+ "INFO.HIERARCHIES": [
+  {
+   "expr": "COUNTROWS(INFO.HIERARCHIES())",
+   "value": null
+  }
+ ],
+ "INFO.HIERARCHYSTORAGES": [
+  {
+   "expr": "COUNTROWS(INFO.HIERARCHYSTORAGES())",
+   "value": null
+  }
+ ],
+ "INFO.KPIS": [
+  {
+   "expr": "COUNTROWS(INFO.KPIS())",
+   "value": null
+  }
+ ],
+ "INFO.LEVELS": [
+  {
+   "expr": "COUNTROWS(INFO.LEVELS())",
+   "value": null
+  }
+ ],
+ "INFO.LINGUISTICMETADATA": [
+  {
+   "expr": "COUNTROWS(INFO.LINGUISTICMETADATA())",
+   "value": null
+  }
+ ],
+ "INFO.MEASURES": [
+  {
+   "expr": "COUNTROWS(INFO.MEASURES())",
+   "value": "1"
+  }
+ ],
+ "INFO.MODEL": [
+  {
+   "expr": "COUNTROWS(INFO.MODEL())",
+   "value": "1"
+  }
+ ],
+ "INFO.OBJECTTRANSLATIONS": [
+  {
+   "expr": "COUNTROWS(INFO.OBJECTTRANSLATIONS())",
+   "value": null
+  }
+ ],
+ "INFO.PARQUETFILESTORAGES": [
+  {
+   "expr": "COUNTROWS(INFO.PARQUETFILESTORAGES())",
+   "value": null
+  }
+ ],
+ "INFO.PARTITIONS": [
+  {
+   "expr": "COUNTROWS(INFO.PARTITIONS())",
+   "value": "5"
+  }
+ ],
+ "INFO.PARTITIONSTORAGES": [
+  {
+   "expr": "COUNTROWS(INFO.PARTITIONSTORAGES())",
+   "value": "22"
+  }
+ ],
+ "INFO.PERSPECTIVECOLUMNS": [
+  {
+   "expr": "COUNTROWS(INFO.PERSPECTIVECOLUMNS())",
+   "value": null
+  }
+ ],
+ "INFO.PERSPECTIVEHIERARCHIES": [
+  {
+   "expr": "COUNTROWS(INFO.PERSPECTIVEHIERARCHIES())",
+   "value": null
+  }
+ ],
+ "INFO.PERSPECTIVEMEASURES": [
+  {
+   "expr": "COUNTROWS(INFO.PERSPECTIVEMEASURES())",
+   "value": null
+  }
+ ],
+ "INFO.PERSPECTIVES": [
+  {
+   "expr": "COUNTROWS(INFO.PERSPECTIVES())",
+   "value": null
+  }
+ ],
+ "INFO.PERSPECTIVETABLES": [
+  {
+   "expr": "COUNTROWS(INFO.PERSPECTIVETABLES())",
+   "value": null
+  }
+ ],
+ "INFO.PROPERTIES": [
+  {
+   "expr": "COUNTROWS(INFO.PROPERTIES()) > 0",
+   "value": "True"
+  }
+ ],
+ "INFO.QUERYGROUPS": [
+  {
+   "expr": "COUNTROWS(INFO.QUERYGROUPS())",
+   "value": null
+  }
+ ],
+ "INFO.REFRESHPOLICIES": [
+  {
+   "expr": "COUNTROWS(INFO.REFRESHPOLICIES())",
+   "value": null
+  }
+ ],
+ "INFO.RELATEDCOLUMNDETAILS": [
+  {
+   "expr": "COUNTROWS(INFO.RELATEDCOLUMNDETAILS())",
+   "value": null
+  }
+ ],
+ "INFO.RELATIONSHIPINDEXSTORAGES": [
+  {
+   "expr": "COUNTROWS(INFO.RELATIONSHIPINDEXSTORAGES())",
+   "value": "2"
+  }
+ ],
+ "INFO.RELATIONSHIPS": [
+  {
+   "expr": "COUNTROWS(INFO.RELATIONSHIPS())",
+   "value": "2"
+  }
+ ],
+ "INFO.RELATIONSHIPSTORAGES": [
+  {
+   "expr": "COUNTROWS(INFO.RELATIONSHIPSTORAGES())",
+   "value": "2"
+  }
+ ],
+ "INFO.ROLEMEMBERSHIPS": [
+  {
+   "expr": "COUNTROWS(INFO.ROLEMEMBERSHIPS())",
+   "value": null
+  }
+ ],
+ "INFO.ROLES": [
+  {
+   "expr": "COUNTROWS(INFO.ROLES())",
+   "value": null
+  }
+ ],
+ "INFO.SEGMENTMAPSTORAGES": [
+  {
+   "expr": "COUNTROWS(INFO.SEGMENTMAPSTORAGES())",
+   "value": "22"
+  }
+ ],
+ "INFO.SEGMENTSTORAGES": [
+  {
+   "expr": "COUNTROWS(INFO.SEGMENTSTORAGES())",
+   "value": "52"
+  }
+ ],
+ "INFO.STORAGEFILES": [
+  {
+   "expr": "COUNTROWS(INFO.STORAGEFILES()) > 0",
+   "value": "True"
+  }
+ ],
+ "INFO.STORAGEFOLDERS": [
+  {
+   "expr": "COUNTROWS(INFO.STORAGEFOLDERS()) > 0",
+   "value": "True"
+  }
+ ],
+ "INFO.STORAGETABLECOLUMNS": [
+  {
+   "expr": "COUNTROWS(INFO.STORAGETABLECOLUMNS())",
+   "value": "52"
+  }
+ ],
+ "INFO.STORAGETABLECOLUMNSEGMENTS": [
+  {
+   "expr": "COUNTROWS(INFO.STORAGETABLECOLUMNSEGMENTS()) > 0",
+   "value": "True"
+  }
+ ],
+ "INFO.STORAGETABLES": [
+  {
+   "expr": "COUNTROWS(INFO.STORAGETABLES())",
+   "value": "22"
+  }
+ ],
+ "INFO.TABLEPERMISSIONS": [
+  {
+   "expr": "COUNTROWS(INFO.TABLEPERMISSIONS())",
+   "value": null
+  }
+ ],
+ "INFO.TABLES": [
+  {
+   "expr": "COUNTROWS(INFO.TABLES())",
+   "value": "5"
+  }
+ ],
+ "INFO.TABLESTORAGES": [
+  {
+   "expr": "COUNTROWS(INFO.TABLESTORAGES())",
+   "value": "22"
+  }
+ ],
+ "INFO.USERDEFINEDFUNCTIONS": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Denne operasjonen kan ikke utf\u00f8res fordi den refererer til et objekt eller en egenskap som er utilgjengelig i den gjeldende utgaven av serveren eller kompatibilitetsniv\u00e5et for databasen.\"",
+   "expr": "COUNTROWS(INFO.USERDEFINEDFUNCTIONS())"
+  }
+ ],
+ "INFO.VARIATIONS": [
+  {
+   "expr": "COUNTROWS(INFO.VARIATIONS())",
+   "value": null
+  }
+ ],
+ "INFO.VIEW.COLUMNS": [
+  {
+   "expr": "COUNTROWS(INFO.VIEW.COLUMNS())",
+   "value": "20"
+  }
+ ],
+ "INFO.VIEW.MEASURES": [
+  {
+   "expr": "COUNTROWS(INFO.VIEW.MEASURES())",
+   "value": "1"
+  }
+ ],
+ "INFO.VIEW.RELATIONSHIPS": [
+  {
+   "expr": "COUNTROWS(INFO.VIEW.RELATIONSHIPS())",
+   "value": "2"
+  }
+ ],
+ "INFO.VIEW.TABLES": [
+  {
+   "expr": "COUNTROWS(INFO.VIEW.TABLES())",
+   "value": "5"
   }
  ],
  "INTRATE": [
@@ -831,6 +1279,12 @@
    "value": "1"
   }
  ],
+ "LAST": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"LAST kan bare brukes i uttrykket for en visuell beregning.\"",
+   "expr": "LAST(SUM(F[v]))"
+  }
+ ],
  "LASTNONBLANKVALUE": [
   {
    "expr": "LASTNONBLANKVALUE(K[grp], SUM(F[v]))",
@@ -863,8 +1317,18 @@
  ],
  "LOOKUPWITHTOTALS": [
   {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 73) Funksjonen LOOKUPWITHTOTALS forventer en kolonnereferanse som argumentnummer 2.\"",
+   "expr": "SUMX(F, IF(LOOKUPWITHTOTALS(K[grp], K[k], F[k]) = \"X\", 1, 0))"
+  },
+  {
    "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 62) Funksjonen LOOKUPWITHTOTALS forventer en kolonnereferanse som argumentnummer 2.\"",
-   "expr": "LOOKUPWITHTOTALS(K[grp], K[k], 2)"
+   "expr": "LOOKUPWITHTOTALS(K[grp], K[k], 2, 0)"
+  }
+ ],
+ "MATCHBY": [
+  {
+   "expr": "SUMX(F, ROWNUMBER(F, ORDERBY(F[v]), MATCHBY(F[v])))",
+   "value": "10"
   }
  ],
  "MAXA": [
@@ -891,6 +1355,12 @@
   {
    "expr": "MINA(N[b])",
    "value": "0"
+  }
+ ],
+ "MOVINGAVERAGE": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"MOVINGAVERAGE kan bare brukes i uttrykket for en visuell beregning.\"",
+   "expr": "MOVINGAVERAGE(SUM(F[v]), 2)"
   }
  ],
  "MROUND": [
@@ -921,8 +1391,12 @@
  ],
  "NATURALJOINUSAGE": [
   {
-   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 57) For mange argumenter ble sendt til funksjonen NATURALJOINUSAGE. H\u00f8yeste antall argumenter for funksjonen er 1.\"",
-   "expr": "NATURALJOINUSAGE(F, K)"
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 47) NATURALJOINUSAGE-funksjonen kan bare brukes som et verdifilter for SUMMARIZECOLUMNS.\"",
+   "expr": "COUNTROWS(NATURALJOINUSAGE(F))"
+  },
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 37) NATURALJOINUSAGE-funksjonen kan bare brukes som et verdifilter for SUMMARIZECOLUMNS.\"",
+   "expr": "NATURALJOINUSAGE(K)"
   }
  ],
  "NATURALLEFTOUTERJOIN": [
@@ -939,6 +1413,12 @@
   {
    "expr": "NETWORKDAYS(DATE(2024,2,1), DATE(2024,3,1), 1)",
    "value": "22"
+  }
+ ],
+ "NEXT": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"NEXT kan bare brukes i uttrykket for en visuell beregning.\"",
+   "expr": "NEXT(SUM(F[v]))"
   }
  ],
  "NEXTDAY": [
@@ -965,8 +1445,12 @@
  ],
  "NONVISUAL": [
   {
-   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 40) NONVISUAL-funksjonen kan ikke brukes p\u00e5 kolonner som ikke er grupperte.\"",
-   "expr": "COUNTROWS(SUMMARIZECOLUMNS(NONVISUAL(VALUES(K[grp]))))"
+   "expr": "SUMX(SUMMARIZECOLUMNS(K[grp], NONVISUAL(TREATAS({\"X\"}, K[grp])), \"s\", SUM(F[v])), [s])",
+   "value": "350"
+  },
+  {
+   "expr": "COUNTROWS(SUMMARIZECOLUMNS(K[grp], NONVISUAL(TREATAS({\"X\"}, K[grp])), \"s\", SUM(F[v])))",
+   "value": "1"
   }
  ],
  "NORM.DIST": [
@@ -1045,10 +1529,28 @@
    "value": "0.0451922356291692"
   }
  ],
+ "OFFSET": [
+  {
+   "expr": "SUMX(F, SUMX(OFFSET(-1, F, ORDERBY(F[v])), F[v]))",
+   "value": "350"
+  }
+ ],
  "OPENINGBALANCEWEEK": [
   {
    "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 39) Det siste argumentet m\u00e5 v\u00e6re ett av disse n\u00f8kkelordene: DAY, MONTH, QUARTER eller YEAR.\"",
    "expr": "OPENINGBALANCEWEEK(SUM(F[v]), D[Date])"
+  }
+ ],
+ "ORDERBY": [
+  {
+   "expr": "SUMX(F, ROWNUMBER(ORDERBY(F[v], DESC)) * F[v])",
+   "value": "1200"
+  }
+ ],
+ "PARTITIONBY": [
+  {
+   "expr": "SUMX(F, RANK(DENSE, F, ORDERBY(F[v]), PARTITIONBY(F[k])))",
+   "value": "5"
   }
  ],
  "PATH": [
@@ -1145,6 +1647,12 @@
    "value": "-27598.0534624214"
   }
  ],
+ "PREVIOUS": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"NEXT kan bare brukes i uttrykket for en visuell beregning.\"",
+   "expr": "PREVIOUS(SUM(F[v]))"
+  }
+ ],
  "PREVIOUSDAY": [
   {
    "expr": "COUNTROWS(PREVIOUSDAY(D[Date]))",
@@ -1211,6 +1719,26 @@
    "value": "1.5707963267949"
   }
  ],
+ "RANGE": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"RANGE kan bare brukes i uttrykket for en visuell beregning.\"",
+   "expr": "RANGE(SUM(F[v]), 1)"
+  }
+ ],
+ "RANK": [
+  {
+   "expr": "SUMX(F, RANK(ORDERBY(F[v])))",
+   "value": "10"
+  },
+  {
+   "expr": "SUMX(F, RANK(DENSE, F, ORDERBY(F[k])))",
+   "value": "7"
+  },
+  {
+   "expr": "SUMX(F, RANK(SKIP, F, ORDERBY(F[k])))",
+   "value": "9"
+  }
+ ],
  "RANK.EQ": [
   {
    "expr": "RANK.EQ(3, N[i])",
@@ -1257,14 +1785,38 @@
  ],
  "ROLLUPISSUBTOTAL": [
   {
-   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 106) For f\u00e5 argumenter ble sendt til funksjonen ROLLUPISSUBTOTAL. Laveste antall argumenter for funksjonen er 2.\"",
-   "expr": "COUNTROWS(SUMMARIZECOLUMNS(ROLLUPADDISSUBTOTAL(K[grp], \"st\"), \"chk\", ROLLUPISSUBTOTAL()))"
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 163) Funksjonen ROLLUPISSUBTOTAL forventer et kolonnenavn som argumentnummer 3.\"",
+   "expr": "COUNTROWS(ADDMISSINGITEMS(K[grp], SUMMARIZECOLUMNS(ROLLUPADDISSUBTOTAL(K[grp], \"st\"), \"s\", SUM(F[v])), ROLLUPISSUBTOTAL([st], K[grp])))"
+  },
+  {
+   "expr": "COUNTROWS(ADDMISSINGITEMS(K[grp], SUMMARIZECOLUMNS(ROLLUPADDISSUBTOTAL(K[grp], \"st\"), \"s\", SUM(F[v])), ROLLUPISSUBTOTAL(K[grp], [st])))",
+   "value": "4"
+  }
+ ],
+ "ROWNUMBER": [
+  {
+   "expr": "SUMX(F, ROWNUMBER(ORDERBY(F[v])))",
+   "value": "10"
+  },
+  {
+   "expr": "SUMX(F, ROWNUMBER(ORDERBY(F[v])) * F[v])",
+   "value": "2050"
+  },
+  {
+   "expr": "SUMX(F, ROWNUMBER(F, ORDERBY(F[v]), PARTITIONBY(F[k])))",
+   "value": "5"
   }
  ],
  "RRI": [
   {
    "expr": "RRI(96, 10000, 11000)",
    "value": "0.00099330737629133"
+  }
+ ],
+ "RUNNINGSUM": [
+  {
+   "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"RUNNINGSUM kan bare brukes i uttrykket for en visuell beregning.\"",
+   "expr": "RUNNINGSUM(SUM(F[v]))"
   }
  ],
  "SAMPLE": [
@@ -1280,7 +1832,11 @@
  "SAMPLEAXISWITHLOCALMINMAX": [
   {
    "error": "Exception calling \"ExecuteReader\" with \"0\" argument(s): \"Query (1, 56) For f\u00e5 argumenter ble sendt til funksjonen SAMPLEAXISWITHLOCALMINMAX. Laveste antall argumenter for funksjonen er 5.\"",
-   "expr": "COUNTROWS(SAMPLEAXISWITHLOCALMINMAX(4, F, F[v]))"
+   "expr": "COUNTROWS(SAMPLEAXISWITHLOCALMINMAX(4, F, F[v], F[k]))"
+  },
+  {
+   "expr": "COUNTROWS(SAMPLEAXISWITHLOCALMINMAX(4, F, F[v], F[k], 1))",
+   "value": "4"
   }
  ],
  "SAMPLECARTESIANPOINTSBYCOVER": [
@@ -1565,6 +2121,16 @@
   {
    "expr": "VDB(2400, 300, 10, 1, 3)",
    "value": "691.2"
+  }
+ ],
+ "WINDOW": [
+  {
+   "expr": "SUMX(F, SUMX(WINDOW(1, ABS, 2, ABS, F, ORDERBY(F[v])), F[v]))",
+   "value": "600"
+  },
+  {
+   "expr": "SUMX(F, SUMX(WINDOW(-1, REL, 0, REL, F, ORDERBY(F[v])), F[v]))",
+   "value": "1000"
   }
  ],
  "XIRR": [

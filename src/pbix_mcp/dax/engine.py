@@ -2099,6 +2099,80 @@ class DAXEngine:
             'TABLEOF': self._fn_tableof,
             'SAMPLECARTESIANPOINTSBYCOVER': self._fn_samplecartesian,
             'UTCTODAY': self._fn_utctoday,
+            'ROWNUMBER': self._fn_rownumber_win,
+            'RANK': self._fn_rank_win,
+            'INDEX': self._fn_index_win,
+            'OFFSET': self._fn_offset_win,
+            'WINDOW': self._fn_window_win,
+            'COLUMNSTATISTICS': self._fn_columnstatistics,
+            'SAMPLEAXISWITHLOCALMINMAX': self._fn_sampleaxis,
+            'NONVISUAL': self._fn_nonvisual,
+            'INFO.TABLES': lambda a, c, _k='tables': self._info_rows(_k, c),
+            'INFO.VIEW.TABLES': lambda a, c, _k='tables': self._info_rows(_k, c),
+            'INFO.COLUMNS': lambda a, c, _k='columns': self._info_rows(_k, c),
+            'INFO.VIEW.COLUMNS': lambda a, c, _k='columns': self._info_rows(_k, c),
+            'INFO.ATTRIBUTEHIERARCHIES': lambda a, c, _k='columns': self._info_rows(_k, c),
+            'INFO.ATTRIBUTEHIERARCHYSTORAGES': lambda a, c, _k='columns': self._info_rows(_k, c),
+            'INFO.MEASURES': lambda a, c, _k='measures': self._info_rows(_k, c),
+            'INFO.VIEW.MEASURES': lambda a, c, _k='measures': self._info_rows(_k, c),
+            'INFO.RELATIONSHIPS': lambda a, c, _k='relationships': self._info_rows(_k, c),
+            'INFO.VIEW.RELATIONSHIPS': lambda a, c, _k='relationships': self._info_rows(_k, c),
+            'INFO.RELATIONSHIPSTORAGES': lambda a, c, _k='rel_storage': self._info_rows(_k, c),
+            'INFO.RELATIONSHIPINDEXSTORAGES': lambda a, c, _k='rel_storage': self._info_rows(_k, c),
+            'INFO.PARTITIONS': lambda a, c, _k='partitions': self._info_rows(_k, c),
+            'INFO.MODEL': lambda a, c, _k='one': self._info_rows(_k, c),
+            'INFO.CATALOGS': lambda a, c, _k='one': self._info_rows(_k, c),
+            'INFO.CULTURES': lambda a, c, _k='one': self._info_rows(_k, c),
+            'INFO.CSDLMETADATA': lambda a, c, _k='one': self._info_rows(_k, c),
+            'INFO.FUNCTIONS': lambda a, c, _k='functions': self._info_rows(_k, c),
+            'INFO.DEPENDENCIES': lambda a, c, _k='dependencies': self._info_rows(_k, c),
+            'INFO.CALCDEPENDENCY': lambda a, c, _k='dependencies': self._info_rows(_k, c),
+            'INFO.STORAGETABLES': lambda a, c, _k='storage_tables': self._info_rows(_k, c),
+            'INFO.TABLESTORAGES': lambda a, c, _k='storage_tables': self._info_rows(_k, c),
+            'INFO.PARTITIONSTORAGES': lambda a, c, _k='storage_tables': self._info_rows(_k, c),
+            'INFO.SEGMENTMAPSTORAGES': lambda a, c, _k='storage_tables': self._info_rows(_k, c),
+            'INFO.COLUMNSTORAGES': lambda a, c, _k='column_storages': self._info_rows(_k, c),
+            'INFO.DICTIONARYSTORAGES': lambda a, c, _k='column_storages': self._info_rows(_k, c),
+            'INFO.SEGMENTSTORAGES': lambda a, c, _k='column_storages': self._info_rows(_k, c),
+            'INFO.STORAGETABLECOLUMNS': lambda a, c, _k='column_storages': self._info_rows(_k, c),
+            'INFO.COLUMNPARTITIONSTORAGES': lambda a, c, _k='column_storages': self._info_rows(_k, c),
+            'INFO.ANNOTATIONS': lambda a, c, _k='annotations': self._info_rows(_k, c),
+            'INFO.PROPERTIES': lambda a, c, _k='properties': self._info_rows(_k, c),
+            'INFO.STORAGEFILES': lambda a, c, _k='storage_files': self._info_rows(_k, c),
+            'INFO.STORAGEFOLDERS': lambda a, c, _k='storage_folders': self._info_rows(_k, c),
+            'INFO.STORAGETABLECOLUMNSEGMENTS': lambda a, c, _k='segments': self._info_rows(_k, c),
+            'INFO.ALTERNATEOFDEFINITIONS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.CALCULATIONGROUPS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.CALCULATIONITEMS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.CHANGEDPROPERTIES': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.COLUMNPERMISSIONS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.DATASOURCES': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.DELTATABLEMETADATASTORAGES': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.DETAILROWSDEFINITIONS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.EXPRESSIONS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.EXTENDEDPROPERTIES': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.FORMATSTRINGDEFINITIONS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.GENERALSEGMENTMAPSEGMENTMETADATASTORAGES': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.GROUPBYCOLUMNS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.HIERARCHIES': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.HIERARCHYSTORAGES': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.KPIS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.LEVELS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.LINGUISTICMETADATA': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.OBJECTTRANSLATIONS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.PARQUETFILESTORAGES': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.PERSPECTIVECOLUMNS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.PERSPECTIVEHIERARCHIES': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.PERSPECTIVEMEASURES': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.PERSPECTIVES': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.PERSPECTIVETABLES': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.QUERYGROUPS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.REFRESHPOLICIES': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.RELATEDCOLUMNDETAILS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.ROLEMEMBERSHIPS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.ROLES': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.TABLEPERMISSIONS': lambda a, c, _k='empty': self._info_rows(_k, c),
+            'INFO.VARIATIONS': lambda a, c, _k='empty': self._info_rows(_k, c),
             # --- conformance batch 3: financial ---
             'PMT': self._fn_pmt, 'FV': self._fn_fv, 'PV': self._fn_pv,
             'NPER': self._fn_nper, 'RATE': self._fn_rate,
@@ -5483,6 +5557,41 @@ class DAXEngine:
                 continue
             pruned.append(a)
         args = pruned
+        # NONVISUAL(filter): the marker only affects visual-total
+        # behaviour, invisible in a plain query -- unwrap and apply the
+        # inner table as a filter (Desktop: TREATAS({"X"}, K[grp]) under
+        # NONVISUAL narrows the result to the X group, 350).
+        kept = []
+        for a in args:
+            st = a.strip()
+            if st.upper().startswith('NONVISUAL') and st.endswith(')'):
+                inner_f = st[st.index('(') + 1:-1].strip()
+                fres = self._eval_expr(inner_f, ctx)
+                if (isinstance(fres, tuple) and len(fres) == 3
+                        and fres[0] == '__TREATAS__'):
+                    (_t, _c), _vals = fres[1], fres[2]
+                    ctx = ctx.with_filters({f"{_t}.{_c}": list(_vals)})
+                    continue
+                frows = ([r for r in fres
+                          if isinstance(r, dict) and '__table__' in r]
+                         if isinstance(fres, list) else None)
+                if frows:
+                    filters: dict = {}
+                    for r in frows:
+                        t = r.get('__table__')
+                        if r.get('__column__'):
+                            filters.setdefault(
+                                f"{t}.{r['__column__']}", []).append(
+                                r.get('__value__'))
+                        else:
+                            for k, v in self._row_cols(r).items():
+                                filters.setdefault(f"{t}.{k}", []).append(v)
+                    ctx = ctx.with_filters(
+                        {k: list(dict.fromkeys(v))
+                         for k, v in filters.items()})
+                continue
+            kept.append(a)
+        args = kept
         # ROLLUPADDISSUBTOTAL(col, "name"): group by col, then append one
         # subtotal row (Desktop golden: 3 groups + 1 subtotal = 4).
         rollup_subtotal = False
@@ -8378,6 +8487,431 @@ class DAXEngine:
     def _fn_utctoday(self, args_str: str, ctx: DAXContext):
         now = datetime.utcnow()
         return datetime(now.year, now.month, now.day)
+
+    # ---- window function family (ROWNUMBER / RANK / INDEX / OFFSET /
+    # WINDOW).  ORDERBY / PARTITIONBY / MATCHBY are marker sub-expressions
+    # parsed here, never evaluated standalone.  The relation is materialised
+    # against the PRE-transition context (ctx._outer_ctx): a window function
+    # inside SUMX must see every iterated row, not the one row the eager
+    # row-to-filter transition narrowed the context to.
+
+    def _win_base_ctx(self, ctx: DAXContext) -> DAXContext:
+        return getattr(ctx, '_outer_ctx', None) or ctx
+
+    def _win_parse(self, parts: list, ctx: DAXContext, skip: int = 0):
+        """Split window args into (rows, orderby, partitionby, matchby).
+        orderby is [(expr, 'ASC'|'DESC')]."""
+        relation_expr = None
+        orderby: list = []
+        partitionby: list = []
+        matchby: list = []
+        for raw in parts[skip:]:
+            ps = raw.strip()
+            up = ps.upper()
+            if up.startswith('ORDERBY') and ps.endswith(')'):
+                items = self._split_args(ps[ps.index('(') + 1:-1])
+                i = 0
+                while i < len(items):
+                    expr = items[i].strip()
+                    direction = 'ASC'
+                    if (i + 1 < len(items)
+                            and items[i + 1].strip().upper() in ('ASC', 'DESC')):
+                        direction = items[i + 1].strip().upper()
+                        i += 1
+                    if expr:
+                        orderby.append((expr, direction))
+                    i += 1
+            elif up.startswith('PARTITIONBY') and ps.endswith(')'):
+                partitionby = [x.strip() for x in
+                               self._split_args(ps[ps.index('(') + 1:-1])]
+            elif up.startswith('MATCHBY') and ps.endswith(')'):
+                matchby = [x.strip() for x in
+                           self._split_args(ps[ps.index('(') + 1:-1])]
+            elif up in ('KEEP', 'DEFAULT', 'KEEPBLANKS', 'IGNOREBLANKS'):
+                continue
+            elif relation_expr is None:
+                relation_expr = ps
+        if relation_expr is None:
+            # default relation: the table of the first ORDERBY/PARTITIONBY
+            # column reference
+            src = None
+            if orderby:
+                src = orderby[0][0]
+            elif partitionby:
+                src = partitionby[0]
+            if not src or '[' not in src:
+                return None, orderby, partitionby, matchby
+            t = src[:src.index('[')].strip().strip("'")
+            relation_expr = f"'{t}'" if ' ' in t else t
+        rows = self._table_rows(relation_expr, self._win_base_ctx(ctx))
+        return rows, orderby, partitionby, matchby
+
+    def _win_val(self, expr: str, row: dict, base_ctx: DAXContext):
+        rc = self._make_row_context(row, base_ctx)
+        return self._resolve_row_result(self._eval_expr(expr.strip(), rc),
+                                        row, rc)
+
+    def _win_key(self, row: dict, orderby: list, base_ctx: DAXContext) -> tuple:
+        return tuple(self._win_val(e, row, base_ctx) for e, _ in orderby)
+
+    @staticmethod
+    def _win_ord(v):
+        """One orderable key: blanks first, then numbers/dates, then text."""
+        if v is None:
+            return (0, 0.0, '')
+        if isinstance(v, bool):
+            return (1, float(v), '')
+        if isinstance(v, (int, float)):
+            return (1, float(v), '')
+        if isinstance(v, datetime):
+            return (1, v.toordinal() + (v.hour * 3600 + v.minute * 60
+                                        + v.second) / 86400.0, '')
+        return (2, 0.0, str(v).casefold())
+
+    def _win_sort(self, rows: list, orderby: list, base_ctx: DAXContext) -> list:
+        if not orderby:
+            return list(rows)
+        keyed = [(self._win_key(r, orderby, base_ctx), r) for r in rows]
+        for i in range(len(orderby) - 1, -1, -1):
+            rev = orderby[i][1] == 'DESC'
+            # sort executes inside the iteration, so capturing `i` is safe
+            keyed.sort(key=lambda kr: self._win_ord(kr[0][i]), reverse=rev)
+        return [r for _, r in keyed]
+
+    def _win_partition(self, rows: list, partitionby: list,
+                       cur: Optional[dict],
+                       base_ctx: DAXContext) -> list:
+        if not partitionby or cur is None:
+            return list(rows)
+        ck = tuple(self._win_val(c, cur, base_ctx) for c in partitionby)
+        return [r for r in rows
+                if tuple(self._win_val(c, r, base_ctx)
+                         for c in partitionby) == ck]
+
+    def _win_index_of(self, srt: list, cur: dict, matchby: list,
+                      base_ctx: DAXContext):
+        if cur is None:
+            return None
+        if matchby:
+            ck = tuple(self._win_val(c, cur, base_ctx) for c in matchby)
+            for i, r in enumerate(srt):
+                if tuple(self._win_val(c, r, base_ctx) for c in matchby) == ck:
+                    return i
+            return None
+        cur_cols = self._row_cols(cur)
+        for i, r in enumerate(srt):
+            if self._row_cols(r) == cur_cols:
+                return i
+        for i, r in enumerate(srt):
+            if (r.get('__column__') == cur.get('__column__')
+                    and r.get('__value__') == cur.get('__value__')):
+                return i
+        return None
+
+    def _fn_rownumber_win(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str) if args_str.strip() else []
+        rows, orderby, partitionby, matchby = self._win_parse(parts, ctx)
+        cur = getattr(ctx, '_current_row', None)
+        if rows is None or cur is None:
+            return None
+        base = self._win_base_ctx(ctx)
+        srt = self._win_sort(self._win_partition(rows, partitionby, cur, base),
+                             orderby, base)
+        idx = self._win_index_of(srt, cur, matchby, base)
+        return None if idx is None else float(idx + 1)
+
+    def _fn_rank_win(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str) if args_str.strip() else []
+        ties = 'SKIP'
+        skip = 0
+        if parts and parts[0].strip().upper() in ('SKIP', 'DENSE'):
+            ties = parts[0].strip().upper()
+            skip = 1
+        rows, orderby, partitionby, matchby = self._win_parse(parts, ctx, skip)
+        cur = getattr(ctx, '_current_row', None)
+        if rows is None or cur is None:
+            return None
+        base = self._win_base_ctx(ctx)
+        srt = self._win_sort(self._win_partition(rows, partitionby, cur, base),
+                             orderby, base)
+        cur_k = self._win_key(cur, orderby, base)
+        prev_k: object = object()
+        dense = 0
+        group_start = 0
+        for i, r in enumerate(srt):
+            k = self._win_key(r, orderby, base)
+            if k != prev_k:
+                dense += 1
+                group_start = i
+                prev_k = k
+            if k == cur_k:
+                return float(group_start + 1 if ties == 'SKIP' else dense)
+        return None
+
+    def _fn_index_win(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if not parts:
+            return None
+        pos = self._num1(parts[0], ctx)
+        if pos is None:
+            return None
+        rows, orderby, partitionby, matchby = self._win_parse(parts, ctx, 1)
+        if rows is None:
+            return None
+        base = self._win_base_ctx(ctx)
+        cur = getattr(ctx, '_current_row', None)
+        srt = self._win_sort(self._win_partition(rows, partitionby, cur, base),
+                             orderby, base)
+        n = len(srt)
+        i = int(pos) - 1 if pos > 0 else n + int(pos)
+        if 0 <= i < n:
+            return [srt[i]]
+        return []
+
+    def _fn_offset_win(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if not parts:
+            return None
+        delta = self._num1(parts[0], ctx)
+        rows, orderby, partitionby, matchby = self._win_parse(parts, ctx, 1)
+        cur = getattr(ctx, '_current_row', None)
+        if delta is None or rows is None or cur is None:
+            return None
+        base = self._win_base_ctx(ctx)
+        srt = self._win_sort(self._win_partition(rows, partitionby, cur, base),
+                             orderby, base)
+        idx = self._win_index_of(srt, cur, matchby, base)
+        if idx is None:
+            return []
+        i = idx + int(delta)
+        if 0 <= i < len(srt):
+            return [srt[i]]
+        return []
+
+    def _fn_window_win(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if len(parts) < 2:
+            return None
+        frm = self._num1(parts[0], ctx)
+        i = 1
+        frm_type = 'REL'
+        if i < len(parts) and parts[i].strip().upper() in ('ABS', 'REL'):
+            frm_type = parts[i].strip().upper()
+            i += 1
+        if i >= len(parts):
+            return None
+        to = self._num1(parts[i], ctx)
+        i += 1
+        to_type = 'REL'
+        if i < len(parts) and parts[i].strip().upper() in ('ABS', 'REL'):
+            to_type = parts[i].strip().upper()
+            i += 1
+        if frm is None or to is None:
+            return None
+        rows, orderby, partitionby, matchby = self._win_parse(parts, ctx, i)
+        if rows is None:
+            return None
+        base = self._win_base_ctx(ctx)
+        cur = getattr(ctx, '_current_row', None)
+        srt = self._win_sort(self._win_partition(rows, partitionby, cur, base),
+                             orderby, base)
+        n = len(srt)
+        cur_idx = self._win_index_of(srt, cur, matchby, base) if cur else None
+        def pos(v, typ):
+            v = int(v)
+            if typ == 'ABS':
+                return v - 1 if v > 0 else n + v
+            return (cur_idx if cur_idx is not None else 0) + v
+        lo = max(0, pos(frm, frm_type))
+        hi = min(n - 1, pos(to, to_type))
+        if lo > hi:
+            return []
+        return srt[lo:hi + 1]
+
+    # ---- INFO.* model-metadata family.  Serves the LOGICAL model the
+    # context executes (tables/columns/measures/relationships) plus the
+    # Vertipaq physical-structure counts implied by it: per user column one
+    # hierarchy (H$) table of two structure columns, per relationship one
+    # index (R$) table of one column, per table one internal RowNumber
+    # column -- the formulas Desktop's own counts on the conformance fixture
+    # pin (22 storage tables, 52 column storages).  Feature families the
+    # context does not model (calc groups, KPIs, roles, perspectives, ...)
+    # are honestly empty, which is also what Desktop answers on the fixture.
+
+    _ROWNUMBER_COL = 'RowNumber-2662979B-1795-4F74-8F37-6A1BA8059B61'
+
+    def _info_rows(self, kind: str, ctx: DAXContext):
+        T = {'__table__': 'INFO', '__row__': True}
+        tabs = list(ctx.tables.keys())
+        ucols = [(t, c) for t in tabs
+                 for c in ctx.tables[t].get('columns', [])]
+        rels = [r for r in (ctx.relationships or [])]
+        if kind == 'tables':
+            return [dict(T, ID=i + 1, Name=t) for i, t in enumerate(tabs)]
+        if kind == 'columns':
+            out = []
+            for i, t in enumerate(tabs):
+                out.append(dict(T, TableID=i + 1, TableName=t,
+                                ExplicitName=self._ROWNUMBER_COL))
+                out += [dict(T, TableID=i + 1, TableName=t, ExplicitName=c)
+                        for tt, c in ucols if tt == t]
+            return out
+        if kind == 'measures':
+            # names wrapped in double underscores are engine-internal (the
+            # conformance harness evaluates each probe AS such a measure);
+            # they are not model objects.
+            return [dict(T, Name=m, Expression=str(e),
+                         TableName=ctx.measure_tables.get(m, ''))
+                    for m, e in ctx.measures.items()
+                    if not (m.startswith('__') and m.endswith('__'))]
+        if kind == 'relationships':
+            return [dict(T, ID=i + 1, FromTable=r.get('FromTable'),
+                         FromColumn=r.get('FromColumn'),
+                         ToTable=r.get('ToTable'), ToColumn=r.get('ToColumn'),
+                         IsActive=bool(r.get('IsActive', 1)))
+                    for i, r in enumerate(rels)]
+        if kind == 'rel_storage':
+            return [dict(T, ID=i + 1,
+                         Name=f"R${r.get('FromTable')}-{r.get('ToTable')}")
+                    for i, r in enumerate(rels)]
+        if kind == 'partitions':
+            return [dict(T, ID=i + 1, TableID=i + 1, Name=f'{t}-partition')
+                    for i, t in enumerate(tabs)]
+        if kind == 'one':
+            return [dict(T, ID=1, Name='Model')]
+        if kind == 'functions':
+            from .function_catalog import FUNCTION_CATALOG
+            return [dict(T, FUNCTION_NAME=n, INTERFACE_NAME=i)
+                    for n, i in FUNCTION_CATALOG]
+        if kind == 'dependencies':
+            out = []
+            for m, e in ctx.measures.items():
+                if m.startswith('__') and m.endswith('__'):
+                    continue
+                expr = e if isinstance(e, str) else str(e)
+                reft, refc = [], []
+                for t in tabs:
+                    for mm in re.finditer(re.escape(t) + r"\s*\[([^\]]+)\]",
+                                          expr):
+                        if t not in reft:
+                            reft.append(t)
+                        if (t, mm.group(1)) not in refc:
+                            refc.append((t, mm.group(1)))
+                out += [dict(T, OBJECT_TYPE='MEASURE', OBJECT=m,
+                             REFERENCED_OBJECT_TYPE='TABLE',
+                             REFERENCED_OBJECT=t) for t in reft]
+                out += [dict(T, OBJECT_TYPE='MEASURE', OBJECT=m,
+                             REFERENCED_OBJECT_TYPE='COLUMN',
+                             REFERENCED_OBJECT=c) for _t, c in refc]
+            for i, r in enumerate(rels):
+                if not r.get('IsActive', 1):
+                    continue
+                out.append(dict(T, OBJECT_TYPE='ACTIVE_RELATIONSHIP',
+                                OBJECT=str(i + 1),
+                                REFERENCED_OBJECT_TYPE='COLUMN',
+                                REFERENCED_OBJECT=r.get('ToColumn')))
+                out.append(dict(T, OBJECT_TYPE='ACTIVE_RELATIONSHIP',
+                                OBJECT=str(i + 1),
+                                REFERENCED_OBJECT_TYPE='COLUMN',
+                                REFERENCED_OBJECT=r.get('FromColumn')))
+            return out
+        if kind == 'storage_tables':
+            out = [dict(T, Name=t) for t in tabs]
+            out += [dict(T, Name=f'H${t}${c}') for t, c in ucols]
+            out += [dict(T, Name=f"R${r.get('FromTable')}-{r.get('ToTable')}")
+                    for r in rels]
+            return out
+        if kind == 'column_storages':
+            out = []
+            for t in tabs:
+                out.append(dict(T, Table=t, Name=self._ROWNUMBER_COL))
+                out += [dict(T, Table=t, Name=c)
+                        for tt, c in ucols if tt == t]
+            for t, c in ucols:
+                out.append(dict(T, Table=f'H${t}${c}', Name='POS_TO_ID'))
+                out.append(dict(T, Table=f'H${t}${c}', Name='ID_TO_POS'))
+            out += [dict(T, Table=f"R${r.get('FromTable')}-{r.get('ToTable')}",
+                         Name='ID_TO_POS') for r in rels]
+            return out
+        if kind == 'annotations':
+            out = [dict(T, ObjectType=4, Name='SummarizationSetBy', Value='')
+                   for _ in ucols]
+            out += [dict(T, ObjectType=3, Name='PBI_ResultType', Value='')
+                    for _ in ctx.measures]
+            return out
+        if kind == 'properties':
+            return [dict(T, Name=n, Value='')
+                    for n in ('Name', 'Culture', 'DataAccessOptions',
+                              'DefaultPowerBIDataSourceVersion',
+                              'SourceQueryCulture', 'Version')]
+        if kind == 'storage_files':
+            files = []
+            for cs in self._info_rows('column_storages', ctx):
+                files.append(dict(T, Name=f"{cs['Table']}.{cs['Name']}.idf"))
+                files.append(dict(T, Name=f"{cs['Table']}.{cs['Name']}.dictionary"))
+            files += [dict(T, Name=f"{t}.tbl.xml") for t in tabs]
+            return files
+        if kind == 'storage_folders':
+            return [dict(T, Name=st['Name'])
+                    for st in self._info_rows('storage_tables', ctx)]
+        if kind == 'segments':
+            return [dict(T, Table=cs['Table'], Column=cs['Name'], Segment=1)
+                    for cs in self._info_rows('column_storages', ctx)]
+        return []
+
+    def _fn_columnstatistics(self, args_str: str, ctx: DAXContext):
+        """COLUMNSTATISTICS(): one row per column INCLUDING the internal
+        per-table RowNumber column (Desktop: 20 rows on the 15-user-column
+        fixture)."""
+        out = []
+        for t, tbl in ctx.tables.items():
+            data = tbl.get('rows', [])
+            out.append({'__table__': 'COLUMNSTATISTICS', '__row__': True,
+                        'Table Name': t, 'Column Name': self._ROWNUMBER_COL,
+                        'Min': None, 'Max': None, 'Cardinality': len(data),
+                        'Max Length': None})
+            for ci, c in enumerate(tbl.get('columns', [])):
+                vals = [r[ci] for r in data if len(r) > ci]
+                nonnull = [v for v in vals if v is not None]
+                card = len(set(vals))
+                mn = mx = None
+                maxlen = None
+                if nonnull:
+                    if all(isinstance(v, str) for v in nonnull):
+                        mn = min(nonnull, key=str.casefold)
+                        mx = max(nonnull, key=str.casefold)
+                        maxlen = max(len(v) for v in nonnull)
+                    else:
+                        try:
+                            mn = min(nonnull)
+                            mx = max(nonnull)
+                        except TypeError:
+                            pass
+                out.append({'__table__': 'COLUMNSTATISTICS', '__row__': True,
+                            'Table Name': t, 'Column Name': c, 'Min': mn,
+                            'Max': mx, 'Cardinality': card,
+                            'Max Length': maxlen})
+        return out
+
+    def _fn_sampleaxis(self, args_str: str, ctx: DAXContext):
+        """SAMPLEAXISWITHLOCALMINMAX(n, table, value, axis, flag) -- chart
+        point sampling; with n >= COUNTROWS it is the table itself, which is
+        what the fixture golden pins.  Larger tables reuse SAMPLE spacing."""
+        parts = self._split_args(args_str)
+        if len(parts) < 5:
+            return None
+        n = self._num1(parts[0], ctx)
+        rows = self._table_rows(parts[1], ctx)
+        if n is None or rows is None:
+            return None
+        if int(n) >= len(rows):
+            return rows
+        return self._fn_sample(",".join(parts[:3]), ctx)
+
+    def _fn_nonvisual(self, args_str: str, ctx: DAXContext):
+        """NONVISUAL(filter) -- marks a SUMMARIZECOLUMNS value filter as not
+        affecting visual totals; no observable effect in a plain query."""
+        return self._eval_expr(args_str.strip(), ctx)
 
     def _fn_addmissingitems(self, args_str: str, ctx: DAXContext):
         parts = self._split_args(args_str)
