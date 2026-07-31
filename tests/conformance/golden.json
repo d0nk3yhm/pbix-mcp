@@ -1765,6 +1765,20 @@
    "value": "1014584.6544071"
   }
  ],
+ "RELATED": [
+  {
+   "expr": "SUMX(F, IF(RELATED(K[grp]) = \"X\", F[v], 0))",
+   "value": "350"
+  },
+  {
+   "expr": "SUMX(F, RELATED(K[k]))",
+   "value": "7"
+  },
+  {
+   "expr": "COUNTROWS(FILTER(F, RELATED(K[grp]) = \"Y\"))",
+   "value": "1"
+  }
+ ],
  "ROLLUP": [
   {
    "expr": "COUNTROWS(SUMMARIZE(K, ROLLUP(K[grp]), \"n\", COUNTROWS(K)))",

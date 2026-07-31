@@ -160,6 +160,16 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **findings-20** -- CLOSED (0.9.73). `RELATED()` inside an iterator ignored
+  row context: it resolved to the first *visible* row of the related table for
+  every iterated row, so `SUMX(Sales, Sales[Qty] * RELATED(Products[UnitPrice]))`
+  gave 839.72 instead of 599.72 (grouped output masked it; grand totals and
+  cards were wrong). `_fn_related` now navigates from the current row's FK
+  through active relationships (single/multi-hop); `RELATED`/`RELATEDTABLE`
+  removed from the FILTER aggregation guard so `FILTER(T, RELATED(...) = v)`
+  binds the current row. Desktop-pinned probes (RELATED -> 350/7/1) +
+  `tests/test_related_rowcontext.py` (9 cases). Reported by OpenBI's bridge
+  suite after the 0.9.55 -> 0.9.72 upgrade.
 - **issues-19** -- `pbix_bind_field_parameter` (0.9.57), plus the dangling-OrderBy
   and wells-less-visual fixes (0.9.58). All 8 pieces of the binding diffed
   IDENTICAL against the Desktop-authored artifact in that doc.

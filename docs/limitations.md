@@ -72,7 +72,7 @@ Every layer of the PBIX is generated from scratch — no templates or skeletons:
 - **PBIX ZIP shell**: Version, Content_Types, DiagramLayout, Settings, Metadata — all generated constants
 - **ABF binary container**: signature, BackupLogHeader, VirtualDirectory, BackupLog — `build_abf_clean()`
 - **XMLA Load document (db.xml)**: 28 xmlns namespaces, CompatibilityLevel=1550 — `generate_db_xml()`
-- **CryptKey.bin**: 144-byte RSA key BLOB constant (Microsoft crypto format; GUID-independent)
+- **CryptKey.bin**: 144-byte fixed-format container, independently generated (observed scaffold + self-authored key region; database-independent) — see docs/reverse-engineering/experiments/cryptkey.md
 - **Metadata SQLite**: clean DATASOURCEVERSION=2, 68 system tables — only user-specified tables, columns, and measures
 - **VertiPaq column data**: all IDF segments, dictionaries, H$ hierarchy tables, R$ relationship tables. Verified with 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase). Cross-table lookups verified byte-exact against PBI Desktop ground truth.
 - **Report layout JSON**: pages, visuals, filters generated from scratch. Supported visuals: table, pieChart, clusteredBarChart, clusteredColumnChart, card, slicer

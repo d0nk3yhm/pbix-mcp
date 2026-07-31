@@ -798,15 +798,26 @@ class PBIXBuilder:
             })
 
         # Report-level config, matching Desktop-authored files field-for-field
-        # (ledger issues-4; ground truth MS_AI_Sample / GeoSales: version,
-        # activeSectionIndex, linguisticSchemaSyncVersion were never filled).
-        # "version" is the report-schema version Desktop stamps -- 5.61 is the
-        # GeoSales-era value this corpus verifies against.
+        # (ledger issues-4; ground truth MS_AI_Sample / GeoSales). "version" is
+        # the report-schema version Desktop stamps (5.61, GeoSales-era).
+        #
+        # themeCollection is LOAD-BEARING: Desktop's ribbon reads
+        # themeCurrent.customTheme, and with no themeCollection the whole
+        # report render crashes ("Cannot read properties of undefined (reading
+        # 'customTheme')") -- the model still loads, so a model-only check
+        # misses it. It references a BUILT-IN base theme BY NAME (a
+        # compatibility reference; Power BI resolves the name, no theme asset
+        # ships), reusing the same built-in pbix_set_theme applies.
         report_config = {
             "version": "5.61",
+            "themeCollection": {
+                "baseTheme": {"name": "CY24SU10", "version": "5.63",
+                              "type": 2}
+            },
             "activeSectionIndex": 0,
             "linguisticSchemaSyncVersion": 2,
             "defaultDrillFilterOtherVisuals": True,
+            "objects": {},
             "settings": {"useNewFilterPaneExperience": True,
                          "allowChangeFilterTypes": True},
         }
@@ -905,6 +916,20 @@ class PBIXBuilder:
             projections["Y"] = [{"queryRef": meas_ref, "active": True}]
 
         else:
+            # A config that names fields but matches no binding shape produces
+            # a visual Desktop renders as an empty "drag fields here"
+            # placeholder -- a silent-wrong-output. Warn loudly with the
+            # expected shape instead of shipping an unbound visual.
+            _intent = {"category", "measure", "values", "columns", "column",
+                       "series", "y", "x"}
+            if isinstance(cfg, dict) and _intent & {k.lower() for k in cfg}:
+                warnings.warn(
+                    f"visual '{visual_type}' config {cfg!r} matched no binding "
+                    "shape -- the visual will be EMPTY in Power BI. A chart "
+                    "expects {'category': {'table': T, 'column': C}, "
+                    "'measure': M}; a card {'measure': M}; a table "
+                    "{'columns': [{'column':..} | {'measure':..}]}.",
+                    stacklevel=2)
             # No data binding needed (textbox, shapes, etc.)
             return None
 

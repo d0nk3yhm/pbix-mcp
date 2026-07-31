@@ -5,6 +5,7 @@ NO template dependency. Generates signature, header, system files,
 metadata, VertiPaq data, BackupLog, and VirtualDirectory.
 """
 
+import hashlib
 import secrets
 import uuid
 import xml.etree.ElementTree as ET
@@ -30,14 +31,47 @@ _PARTITIONS = bytes.fromhex(
     "fffe3c0050006100720074006900740069006f006e0073002f003e00"
 )  # UTF-16: <Partitions/>  28 bytes
 
-_CRYPTKEY = bytes.fromhex(
-    "98bc215d2d8de64ea8e5d038aac94441040000003000000050000000"
-    "100000000100000007000000ffffffff00000000010200000366000000"
-    "a400009270d94ab3f7014a7f3d8cda8a0b13dc34f88045ef9e253200"
-    "a15b7ca339a6f052795f804bbc5f635463b6f39c4a4de6535c4aea83"
-    "60a9904a3974163dd102000000000098bc215d2d8de64ea8e5d038aa"
-    "c94441"
-)  # 144 bytes — exact CryptKey.bin from working ABF
+# CryptKey.bin is a 144-byte fixed-format container that Analysis Services
+# expects when SvrEncryptPwdFlag is on (the server default). Its structure was
+# independently derived by differential observation of lawfully generated PBIX
+# files (docs/reverse-engineering/experiments/cryptkey.md): a 16-byte GUID
+# bookend + typed header, then a variable region, then the GUID again. Across
+# 25 corpus files the scaffold (below, with the variable region zeroed) is
+# byte-identical, while each file carries a different variable region -- and
+# Power BI Desktop accepts our OWN bytes there (verified: random and
+# hash-derived regions load and serve data; only a degenerate all-zero region
+# is rejected). So we generate the key entirely ourselves rather than shipping
+# bytes lifted from a Microsoft file.
+_CRYPTKEY_SCAFFOLD = bytes.fromhex(
+    "98bc215d2d8de64ea8e5d038aac9444104000000300000005000000010000000"
+    "0100000007000000ffffffff00000000010200000366000000a4000000000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "0000000000000000000000000000000000000000000000000000020000000000"
+    "98bc215d2d8de64ea8e5d038aac94441"
+)
+# Byte offsets Microsoft varies per file (60..121 except the constant 84).
+_CRYPTKEY_VAR_OFFSETS = tuple(i for i in range(60, 122) if i != 84)
+
+
+def build_cryptkey(seed: bytes = b"pbix-mcp cryptkey v1") -> bytes:
+    """Build a valid 144-byte CryptKey.bin from the observed format scaffold
+    plus a self-authored, non-degenerate variable region derived from *seed*
+    via SHA-512. No Microsoft key material is used. The default seed yields a
+    fixed, reproducible key; pass a per-file seed (e.g. the database GUID) to
+    vary it as Microsoft does."""
+    n = len(_CRYPTKEY_VAR_OFFSETS)
+    stream = b""
+    counter = 0
+    while len(stream) < n:
+        stream += hashlib.sha512(seed + counter.to_bytes(4, "big")).digest()
+        counter += 1
+    out = bytearray(_CRYPTKEY_SCAFFOLD)
+    for j, off in enumerate(_CRYPTKEY_VAR_OFFSETS):
+        out[off] = stream[j]
+    return bytes(out)
+
+
+_CRYPTKEY = build_cryptkey()  # 144 bytes, independently generated
 
 
 def _xml_to_utf16(root: ET.Element) -> bytes:

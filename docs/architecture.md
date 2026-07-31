@@ -50,7 +50,7 @@ src/pbix_mcp/
 
 ### Creating a PBIX
 
-**Everything is generated from scratch** — no templates or skeletons. The entire PBIX binary format has been reversed and reimplemented: PBIX ZIP shell, ABF binary container (signature, header, VirtualDirectory, BackupLog), XMLA database document (db.xml), metadata SQLite (68 system tables), VertiPaq column storage, and report layout JSON. The only non-generated artifact is a 144-byte CryptKey constant (Microsoft RSA key BLOB, GUID-independent).
+**Everything is generated from scratch** — no templates or skeletons. The PBIX binary structures pbix-mcp's capabilities require are independently reimplemented: PBIX ZIP shell, ABF binary container (signature, header, VirtualDirectory, BackupLog), XMLA database document (db.xml), metadata SQLite (68 system tables), VertiPaq column storage, and report layout JSON. Every artifact is generated, including the 144-byte `CryptKey.bin` (a fixed-format container: observed scaffold + self-authored key region — see docs/reverse-engineering/experiments/cryptkey.md).
 
 1. `PBIXBuilder` generates clean SQLite metadata (DATASOURCEVERSION=2) — only user-specified tables, columns, and measures
 2. Key PBI annotations are written: PBI_IsFromSource (ObjectType=7), PBI_ResultType, SummarizationSetBy, PBI_QueryOrder, __PBI_TimeIntelligenceEnabled

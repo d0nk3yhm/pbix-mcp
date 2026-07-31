@@ -731,15 +731,12 @@ def build_abf_from_scratch(
     )
     _PARTITIONS_CONTENT = b'<Partitions />'
 
-    # CryptKey.bin — 144-byte crypto key extracted from a valid PBIX.
-    # Required by AS when SvrEncryptPwdFlag=true (server default).
-    _CRYPTKEY_CONTENT = bytes.fromhex(
-        "98bc215d2d8de64ea8e5d038aac94441"
-        "040000003000000050000000100000000100000007000000ffffffff00000000"
-        "010200000366000000a40000805bf7b37f703bf7ef3b7fb6299d1adab316e67c"
-        "80ab58310051a5c7d76097fba0aba4c09cc73a2b165781ea68aa644bcc2bba09"
-        "012e44fdfde63ed5221b02000000000098bc215d2d8de64ea8e5d038aac94441"
-    )
+    # CryptKey.bin — required by AS when SvrEncryptPwdFlag=true (server
+    # default). Independently generated (see abf_from_scratch.build_cryptkey):
+    # observed format scaffold + our own hash-derived variable region, no
+    # Microsoft key material.
+    from .abf_from_scratch import build_cryptkey
+    _CRYPTKEY_CONTENT = build_cryptkey()
 
     # Collect flat-name -> content, preserving required ordering.
     ordered_files: list[tuple[str, bytes]] = []

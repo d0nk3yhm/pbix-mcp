@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python — no templates, no skeletons, no Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026. The DAX engine is verified against Power BI Desktop's own evaluator at two levels: **435 of the engine's 467 DAX functions** carry per-function conformance goldens captured from Desktop's workspace engine (the other 32 are proven not query-evaluable by Desktop itself), and the full corpus matches 1:1 — **432/432** grand totals, **1,705/1,705** measure×dimension filter-context cells, **397/397** calculated columns (v0.9.63; latest sweep 534/534 comparable measures across 20 files).
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The PBIX binary format is independently reimplemented in pure Python — every structure pbix-mcp's supported capabilities require, with no templates, skeletons, or Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026. The DAX engine is verified against Power BI Desktop's own evaluator at two levels: **435 of the engine's 467 DAX functions** carry per-function conformance goldens captured from Desktop's workspace engine (the other 32 are proven not query-evaluable by Desktop itself), and the full corpus matches 1:1 — **432/432** grand totals, **1,705/1,705** measure×dimension filter-context cells, **397/397** calculated columns (v0.9.63; latest sweep 534/534 comparable measures across 20 files).
 
 Exposes 128 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing (rename / reorder / hide / duplicate pages, move & copy visuals — identically on classic `Report/Layout` and service-authored **PBIR**), visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, sort-by-column, TMDL export, incremental refresh, DAX evaluation (435 of the live engine's 467 DAX functions, conformance-verified against Desktop; corpus 1:1), RLS security, and binary format internals.
 
@@ -90,7 +90,7 @@ Every layer of the PBIX binary format has been independently reversed and reimpl
 | Report/Layout JSON | **Reversed** | Pages, visuals, data bindings, filters — `_build_layout()` |
 | ABF binary container | **Reversed** | 72-byte signature, BackupLogHeader, VirtualDirectory, BackupLog — `build_abf_clean()` |
 | XMLA Load document (db.xml) | **Reversed** | 28 xmlns namespaces, CompatibilityLevel=1550, TabularMetadata — `generate_db_xml()` |
-| CryptKey.bin | **Constant** | 144-byte RSA key BLOB (Microsoft crypto format; GUID-independent constant) |
+| CryptKey.bin | **Generated** | 144-byte fixed-format container: observed format scaffold + self-authored key region — independently generated, no Microsoft key material ([derivation](docs/reverse-engineering/experiments/cryptkey.md)) |
 | Metadata SQLite | **Reversed** | 68 system tables matching PBI March 2026 schema — `create_empty_metadata_db()` |
 | VertiPaq column storage | **Reversed** | IDF (bit-packed), IDFMETA (segment stats), dictionary (Long/Real/String, uncompressed or Huffman-compressed), HIDX (hash index) |
 | H$ attribute hierarchies | **Reversed** | NoSplit<32> POS_TO_ID + ID_TO_POS for all cardinalities |
@@ -98,7 +98,7 @@ Every layer of the PBIX binary format has been independently reversed and reimpl
 | Compressed string store | **Reversed** | Canonical-Huffman string pages ([MS-XLDM §2.7.4](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-xldm/)) — read and write; codec via [xmhuffman](https://github.com/Hugoberry/xmhuffman-cython) (MIT) |
 | XPress9 compression | **Reversed** | Custom compress/decompress with reversed chunk framing, headers, and multi-thread format; core algorithm via [xpress9-python](https://github.com/Hugoberry/xpress9-python) (MIT) |
 
-The only non-generated artifact is the 144-byte CryptKey constant. This is a Microsoft RSA key BLOB that requires `rskeymgmt` infrastructure to generate. The key is GUID-independent — any valid key works with any database ID. Random bytes produce `PFE_INVALID_CRYPT_KEY`.
+Every artifact is generated, including `CryptKey.bin` — a 144-byte fixed-format container Analysis Services expects when server-side password encryption is on. Its structure was derived by differential observation of lawfully generated PBIX files ([derivation](docs/reverse-engineering/experiments/cryptkey.md)): a fixed format scaffold (byte-identical across every observed file) plus a variable region that accepts our own non-degenerate bytes — Desktop loads files carrying a random or hash-derived key region and rejects only a degenerate all-zero one. `build_cryptkey()` composes the scaffold with a self-authored SHA-512 keystream, so no Microsoft key material ships in the package. It is database-independent — the same generated key loads with any database ID.
 
 ## Stability
 
@@ -167,7 +167,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
 - **Opening existing DirectQuery files** — layout, measures, and metadata editing work; DAX evaluation and table reads return clear errors since data lives in the remote source (this is inherent to DirectQuery — the data isn't in the file)
 - **Creating DirectQuery files** — fully working with SQL Server (LocalDB), PostgreSQL 16, and MySQL 9.6 (via MariaDB adapter); requires a running database server and initial data snapshot
-- **CryptKey.bin** — the 144-byte RSA key BLOB cannot be generated without Microsoft's crypto infrastructure (`rskeymgmt`). A known-valid GUID-independent constant is used.
+- **CryptKey.bin** — independently generated: a fixed format scaffold (observed identical across lawfully generated files) plus a self-authored key region. Database-independent; verified to load in Power BI Desktop ([derivation](docs/reverse-engineering/experiments/cryptkey.md)).
 - **Embedded VertiPaq data** — verified working with 11 tables, 72 columns, 13 relationships, 121K+ rows (Adventure Works DW 2020) and 6 tables, 36 columns, 5 relationships, 25 rows, 3 pages, 14 visuals (Northwind showcase)
 - **RLE encoding** — disabled in the VertiPaq encoder (pure bitpack used). Slightly less space-efficient but correct
 - **`PATH()` on built import tables in Desktop** — Power BI Desktop refuses `PATH`/`PATHITEMREVERSE` over import-table columns of a builder-produced file ("internal support structures … not processed"). This is an engine behavior, not a file defect: Desktop's own saved files carry byte-identical hierarchy structures, and only tables that went through a real engine refresh (or calculated tables, which Desktop recomputes at open) are PATH-queryable. **Workaround: author parent-child tables that need `PATH` as calculated tables** (`pbix_datamodel_add_calculated_table`, e.g. over `DATATABLE`; note a `BLANK()` inside a `DATATABLE` row literal becomes 0 — synthesize blank parents with `ADDCOLUMNS` + `IF`). pbix-mcp's own DAX engine evaluates `PATH` on any table either way.
@@ -576,7 +576,7 @@ PBIX file (ZIP)
     ├── ADDITIONAL_LOG     ← UTF-16: product name
     ├── PARTITIONS         ← UTF-16: partition marker
     ├── db.xml             ← XMLA Load document (28 namespaces)
-    ├── CryptKey.bin       ← 144-byte RSA key BLOB (constant)
+    ├── CryptKey.bin       ← 144-byte fixed-format container (generated)
     ├── metadata.sqlitedb  ← SQLite: 68 system tables (Table, Column, Measure, Relationship, ...)
     ├── *.tbl\*.prt\*.idf  ← VertiPaq: bit-packed column data
     ├── *.idfmeta          ← Segment statistics (CP/CS/SS/SDOs)

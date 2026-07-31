@@ -84,10 +84,17 @@ _MATH1 = {
     'SQRTPI': lambda x: math.sqrt(x * math.pi),
 }
 
+# Calls that AGGREGATE over the context inside a FILTER predicate -- these keep
+# the filter-context path and must NOT be row-substituted. RELATED /
+# RELATEDTABLE are deliberately EXCLUDED: they are row-context NAVIGATIONS (the
+# opposite of an aggregation), so a FILTER predicate using them needs the
+# current row bound, not the filter-context fallback (findings #20 -- otherwise
+# FILTER(Sales, RELATED(Products[X]) = v) resolves RELATED to the first visible
+# related row for every row).
 _AGG_CALL_RE = re.compile(
     r"\b(SUM|SUMX|AVERAGE|AVERAGEX|MIN|MINX|MAX|MAXX|COUNT|COUNTX|COUNTA|"
     r"COUNTROWS|COUNTBLANK|DISTINCTCOUNT|MEDIAN|MEDIANX|PRODUCT|PRODUCTX|"
-    r"STDEV\.[SP]|VAR\.[SP]|RANKX|CALCULATE|RELATED|RELATEDTABLE)\s*\(",
+    r"STDEV\.[SP]|VAR\.[SP]|RANKX|CALCULATE)\s*\(",
     re.IGNORECASE,
 )
 
@@ -9680,21 +9687,102 @@ class DAXEngine:
     # Relationship functions
     # =========================================================================
 
+    def _related_row_index(self, ctx: DAXContext, to_table: str,
+                           to_col: str) -> dict:
+        """{ key value -> related row as a column dict } for to_table[to_col],
+        built once per model and memoized in the shared per-model cache
+        (_filter_idx_cache) so an iterator does not rebuild it per row. First
+        matching row wins, matching relationship key semantics (the one side
+        is unique)."""
+        cache = ctx._filter_idx_cache
+        ck = ('__related_idx__', to_table, to_col)
+        cached: Optional[dict] = cache.get(ck)
+        if cached is not None:
+            return cached
+        idx: dict = {}
+        ttbl = ctx.tables.get(to_table)
+        if ttbl:
+            cols = ttbl['columns']
+            ti = ctx._find_col_idx(cols, to_col)
+            if ti >= 0:
+                for r in ttbl['rows']:
+                    if len(r) > ti and r[ti] not in idx:
+                        mrow = {'__table__': to_table, '__row__': True}
+                        for i, c in enumerate(cols):
+                            if i < len(r):
+                                mrow[c] = r[i]
+                        idx[r[ti]] = mrow
+        cache[ck] = idx
+        return idx
+
+    def _related_lookup(self, cur: dict, target_table: str,
+                        ctx: DAXContext, _depth: int = 0):
+        """Navigate from the current (many-side) row to its single related row
+        in target_table, following active From->To relationship edges (the FK
+        on the many side matches the key on the one side). Multi-hop capable.
+        Returns the target row as a column dict, or None."""
+        if _depth > 16 or not isinstance(cur, dict):
+            return None
+        src_table = cur.get('__table__')
+        if src_table == target_table:
+            return cur
+        for rel in ctx.relationships:
+            if rel.get('FromTable') != src_table:
+                continue
+            if not rel.get('IsActive', 1):
+                continue          # RELATED follows only active relationships
+            from_col = rel.get('FromColumn')
+            to_table = rel.get('ToTable')
+            to_col = rel.get('ToColumn')
+            if from_col not in cur:
+                continue          # this row dict does not carry the FK
+            fk = cur[from_col]
+            # O(1) lookup via a per-model FK index (built once, shared across
+            # every row context through _filter_idx_cache) -- a linear scan
+            # here made SUMX(fact, RELATED(...)) O(fact x dim) on 200k-row
+            # models.
+            idx = self._related_row_index(ctx, to_table, to_col)
+            mrow = idx.get(fk)
+            if mrow is None:
+                continue          # no related row (orphan FK) -> BLANK
+            if to_table == target_table:
+                return mrow
+            deeper = self._related_lookup(mrow, target_table, ctx, _depth + 1)
+            if deeper is not None:
+                return deeper
+        return None
+
     def _fn_related(self, args_str: str, ctx: DAXContext) -> Any:
-        """RELATED(column) — follow relationship to get a value from a related table.
-        Approximation: looks up value via relationship index and current filter context."""
+        """RELATED(column) -- from the CURRENT ROW on the many side, follow the
+        relationship to the one side and return the column's value. This is a
+        row-context navigation (the FK of the iterated row selects the related
+        row), NOT a filter-context lookup -- so it must use ctx._current_row,
+        never 'the first visible row of the related table' (which returns the
+        same value for every iterated row)."""
         ref = self._eval_expr(args_str.strip(), ctx)
         if not isinstance(ref, tuple) or len(ref) != 2:
             return None
         target_table, target_col = ref
-        # Try to find a related value via relationships
         tbl = ctx.tables.get(target_table)
         if not tbl:
             return None
         target_col_idx = ctx._find_col_idx(tbl['columns'], target_col)
         if target_col_idx < 0:
             return None
-        # Get filtered rows from the target table
+        cur = getattr(ctx, '_current_row', None)
+        if isinstance(cur, dict) and cur.get('__table__'):
+            related = self._related_lookup(cur, target_table, ctx)
+            if related is not None:
+                return related.get(target_col)
+            # A row context exists but no related row was reachable: the FK is
+            # orphaned or the current row already IS the target table with the
+            # column present. Fall through only for the same-table case.
+            if cur.get('__table__') == target_table and target_col in cur:
+                return cur[target_col]
+            return None
+        # No row context (degenerate RELATED call): the previous
+        # filter-context behavior, so a single-visible-row context still
+        # resolves rather than crashing.
         rows = ctx.get_filtered_rows(target_table)
         if rows:
             return rows[0][target_col_idx]
