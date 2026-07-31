@@ -133,11 +133,13 @@ class TestCalcTableEvaluator:
         assert res["columns"] == cols
 
     def test_unsupported_function_refused(self):
-        # NATURALINNERJOIN, not MEDIANX: MEDIANX is implemented now (Desktop
-        # parity work), and this test is about the REFUSAL path, so it needs a
-        # function the engine genuinely does not have.
+        # This test is about the REFUSAL path, so it needs a function the
+        # engine genuinely does not have. Earlier picks (NATURALINNERJOIN,
+        # COLUMNSTATISTICS) kept graduating to supported; MOVINGAVERAGE is
+        # visual-calculation-only — Desktop itself refuses it in a query —
+        # so it can never graduate.
         res, err = evaluate_calc_table_expression(
-            "COLUMNSTATISTICS()", SALES)
+            "MOVINGAVERAGE(SUM(Sales[Amount]), 2)", SALES)
         assert res is None and "unsupported" in err
 
     def test_calendar_date_table(self):

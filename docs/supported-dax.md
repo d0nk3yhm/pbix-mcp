@@ -1,6 +1,6 @@
 # Supported DAX Functions
 
-354 functions across 14 categories. Semantics are verified against Power BI Desktop's own engine on a 25-file corpus: every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns — matches Desktop exactly (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused. Full parity with the entire DAX surface is the roadmap, not yet a claim.
+433 of the live engine's 467 DAX functions, implemented and verified; 26 of the remaining 34 are proven not query-authorable by Desktop's own error messages, and 10 stay open with concrete investigation paths ([dax-coverage.md](dax-coverage.md)). Semantics are verified two ways: a per-function conformance harness replays Desktop-captured goldens (354 value probes, 1e-9 relative tolerance), and the 25-file corpus matches Desktop on every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused.
 
 ## Aggregation (13)
 `SUM`, `AVERAGE`, `COUNT`, `COUNTA`, `COUNTROWS`, `MIN`, `MAX`, `DISTINCTCOUNT`, `DISTINCTCOUNTNOBLANK`, `PRODUCT`, `MEDIAN`, `MEDIANX`, `COUNTBLANK`
@@ -93,7 +93,50 @@ the same family `COLLAPSEALL`/`EXPANDALL`); calculation-group-context-only
 `SELECTEDMEASURE`, `ISSELECTEDMEASURE`, `SELECTEDMEASURENAME`,
 `SELECTEDMEASUREFORMATSTRING`; unresolvable `EXTERNALMEASURE`;
 import-storage-unsupported `APPROXIMATEDISTINCTCOUNT`; calendar-reference
-`TOTALWTD`; auto-date-table-dependent `COLUMNSTATISTICS`.
+`TOTALWTD`; auto-date-table-dependent `COLUMNSTATISTICS` (reversed in
+batch 5 — see below).
+
+## Batch-5 additions (79)
+
+**Window family (8)**: `ROWNUMBER`, `RANK`, `INDEX`, `OFFSET`, `WINDOW` with
+the `ORDERBY`, `PARTITIONBY`, `MATCHBY` marker sub-expressions. The relation
+is materialised against the pre-transition context, so a window function
+inside `SUMX`/`ADDCOLUMNS` sees every iterated row rather than the single row
+the eager row-to-filter transition narrows the context to; the current row is
+located by value in the sorted partition (all columns, or the `MATCHBY`
+columns). `WINDOW` supports `ABS` (1-based, negative-from-end) and `REL`
+(clamped at partition edges) endpoints; `RANK` supports `SKIP` and `DENSE`
+ties. All fourteen Desktop goldens — including partitioned row numbers and
+relative windows — match by hand-checkable values.
+
+**INFO.\* model-metadata family (66)**: every `INFO.*` function Desktop's
+engine will evaluate in a query. They serve the logical model the engine
+executes plus the Vertipaq physical-structure counts it implies; Desktop's
+own counts on the fixture pin the formulas (`INFO.FUNCTIONS()` = 467,
+22 storage tables, 52 column storages). See the semantics note in
+[dax-coverage.md](dax-coverage.md). The three functions Desktop refuses as
+edition/compat-level-unavailable (`INFO.DATACOVERAGEDEFINITIONS`,
+`INFO.EXCLUDEDARTIFACTS`, `INFO.USERDEFINEDFUNCTIONS`) are classified out
+with that error as evidence.
+
+**Misc (5)**: `NONVISUAL` (valid only over grouped columns —
+Desktop-verified shape; a no-op marker in plain queries, applied as the
+filter it wraps), `ROLLUPISSUBTOTAL` (the working argument order is
+`ROLLUPISSUBTOTAL(groupCol, [isSubtotalCol])` inside `ADDMISSINGITEMS`),
+`SAMPLEAXISWITHLOCALMINMAX` (5-argument form), `COLUMNSTATISTICS`
+(batch-4 classification **reversed**: its 20 fixture rows are the 15 user
+columns plus one internal RowNumber row per table — `INFO.TABLES()` = 5
+proved no auto date/time tables existed in the capture), and the internal
+per-table RowNumber column surfaced consistently across
+`COLUMNSTATISTICS`/`INFO.COLUMNS`.
+
+Classified out this batch, each from Desktop's own error message:
+visual-calculation-only `MOVINGAVERAGE`, `RUNNINGSUM`, `FIRST`, `LAST`,
+`NEXT`, `PREVIOUS`, `RANGE`, `COLLAPSEALL`, `EXPANDALL` (*"can only be used
+in the expression of a visual calculation"*); engine-internal
+`NATURALJOINUSAGE` (*"can only be used as a value filter for
+SUMMARIZECOLUMNS"*, yet refused there too) and `LOOKUPWITHTOTALS` (rejects
+every authorable column-reference shape).
 
 ## Known Limitations
 

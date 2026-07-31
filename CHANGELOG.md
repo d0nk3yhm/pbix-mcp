@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.66] - 2026-07-31
+
+**119 new DAX functions (314 → 433 of the live engine's 467): the window
+family, the complete INFO.\* metadata family, and conformance batches 4–5.
+Every function in the engine is now either implemented with Desktop-captured
+goldens or proven not query-authorable by Desktop's own error message — 10
+remain open (week-grain calendar family, PATH pair), each with a concrete
+investigation path. See [docs/dax-coverage.md](docs/dax-coverage.md).**
+
+### Added
+
+- **Window functions** — `ROWNUMBER`, `RANK` (`SKIP`/`DENSE`), `INDEX`,
+  `OFFSET`, `WINDOW` (`ABS`/`REL` endpoints) with `ORDERBY`, `PARTITIONBY`,
+  `MATCHBY` markers. The relation is materialised against the
+  pre-transition context so window functions inside iterators see every
+  iterated row; all 14 Desktop goldens (including partitioned row numbers
+  and relative windows) match.
+- **`INFO.*` family (66 functions)** — the full model-metadata surface
+  Desktop will evaluate in a query, serving the logical model plus the
+  Vertipaq physical-structure counts it implies (pinned by Desktop's own
+  counts: `INFO.FUNCTIONS()` = 467, 22 storage tables, 52 column storages).
+  A generated `dax/function_catalog.py` carries the 467-function inventory.
+- **Batch 4 (40 functions)** — dotted-name column statistics
+  (`STDEV.S`/`VAR.P`/…), type predicates (`ISNUMERIC`/`ISCURRENCY`/…),
+  `CONVERT`, `YEARFRAC`, `LINEST`/`LINESTX` (BLANK participates as zero,
+  Desktop-verified), `TOCSV`/`TOJSON`, `SAMPLE`, `ADDMISSINGITEMS`,
+  `ROLLUP`/`ROLLUPGROUP`/`ISSUBTOTAL`, and more.
+- **Misc** — `NONVISUAL` (applied as the filter it wraps; Desktop-verified
+  grouped-column requirement), `ROLLUPISSUBTOTAL` (working argument order
+  captured), `SAMPLEAXISWITHLOCALMINMAX`, `COLUMNSTATISTICS` (its 20
+  fixture rows are user columns + one internal RowNumber row per table —
+  the batch-4 needs-model-feature classification is reversed).
+
+### Changed
+
+- `docs/dax-coverage.md` rewritten from the definitive artifacts: 433
+  implemented and verified, 26 classified out with Desktop's error text
+  recorded in `golden.json`, 10 open.
+
+### Fixed
+
+- Conformance probes for `USERCULTURE`-style environment-dependent INFO
+  counts pinned by shape (`COUNTROWS(...) > 0`), not by msmdsrv-session
+  internals.
+
 ## [0.9.65] - 2026-07-31
 
 **131 new DAX functions (183 → 314), each pinned to Power BI Desktop's own
