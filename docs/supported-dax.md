@@ -1,6 +1,6 @@
 # Supported DAX Functions
 
-263 functions across 12 categories. Semantics are verified against Power BI Desktop's own engine on a 25-file corpus: every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns — matches Desktop exactly (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused. Full parity with the entire DAX surface is the roadmap, not yet a claim.
+314 functions across 13 categories. Semantics are verified against Power BI Desktop's own engine on a 25-file corpus: every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns — matches Desktop exactly (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused. Full parity with the entire DAX surface is the roadmap, not yet a claim.
 
 ## Aggregation (13)
 `SUM`, `AVERAGE`, `COUNT`, `COUNTA`, `COUNTROWS`, `MIN`, `MAX`, `DISTINCTCOUNT`, `DISTINCTCOUNTNOBLANK`, `PRODUCT`, `MEDIAN`, `MEDIANX`, `COUNTBLANK`
@@ -67,6 +67,14 @@ reference* as their first argument ("parameter 1 must be a calendar
 reference"), an object this engine's model layer does not yet carry.
 `ROWNUMBER`/`ORDERBY` (the window family) is deliberately deferred to its own
 batch rather than shipped shallow.
+
+
+## Financial (51) — conformance batch 3
+`PMT`, `FV`, `PV`, `NPER`, `RATE`, `IPMT`, `PPMT`, `CUMIPMT`, `CUMPRINC`, `ISPMT`, `SLN`, `SYD`, `DDB`, `DB`, `VDB`, `AMORDEGRC`, `AMORLINC`, `EFFECT`, `NOMINAL`, `RRI`, `PDURATION`, `DOLLARDE`, `DOLLARFR`, `XNPV`, `XIRR`, `ACCRINT`, `ACCRINTM`, `COUPDAYBS`, `COUPDAYS`, `COUPDAYSNC`, `COUPNCD`, `COUPNUM`, `COUPPCD`, `DISC`, `DURATION`, `MDURATION`, `INTRATE`, `PRICE`, `PRICEDISC`, `PRICEMAT`, `RECEIVED`, `TBILLEQ`, `TBILLPRICE`, `TBILLYIELD`, `YIELD`, `YIELDDISC`, `YIELDMAT`, `ODDFPRICE`, `ODDFYIELD`, `ODDLPRICE`, `ODDLYIELD`
+
+Day-count bases 0–4 (30/360 US, actual/actual, actual/360, actual/365,
+30E/360) with a coupon-schedule kernel; `RATE`/`YIELD`/`XIRR`/`ODDFYIELD` via
+Newton iteration. All 51 pinned by Desktop goldens at 1e-9.
 
 ## Known Limitations
 

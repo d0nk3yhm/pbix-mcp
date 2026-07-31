@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.65] - 2026-07-31
+
+**131 new DAX functions (183 → 314), each pinned to Power BI Desktop's own
+answers by a new per-function conformance harness.**
+
+`tests/conformance/` holds a deterministic fixture model built with pbix-mcp's
+own builder, per-function probe expressions, and Desktop-captured golden values
+(207 probes, 1e-9 relative for floats). The conformance suite has no
+"unsupported" escape hatch — an unimplemented function fails its probes — which
+makes it a ratchet toward full-surface parity. The authoritative surface is the
+engine's own `$SYSTEM.MDSCHEMA_FUNCTIONS` (467 DAX functions in the March 2026
+build); progress is tracked in `docs/dax-coverage.md`.
+
+### Added, all Desktop-pinned
+- **Trig & math** (29): the full trig family, `COMBIN(A)`, `PERMUT`,
+  `QUOTIENT`, `BIT*`, `ISO.CEILING`, `SQRTPI`, `DEGREES`, `RADIANS`
+- **Statistical distributions** (24): `NORM.*`, `BETA.*`, `CHISQ.*`, `T.*`,
+  `EXPON.DIST`, `POISSON.DIST`, `CONFIDENCE.*`, `PERCENTILE(X).INC/EXC`,
+  `RANK.EQ` — inverse normal via Acklam + Halley polish, incomplete beta/gamma
+  via Lentz continued fractions, all at 1e-9 against Desktop
+- **Table machinery & dates** (18): `GROUPBY`+`CURRENTGROUP`,
+  `NATURALINNERJOIN`, `NATURALLEFTOUTERJOIN`, `TOPNSKIP`, `FILTERS`,
+  `CONTAINSROW`, `ALLNOBLANKROW`, `ALLCROSSFILTERED`, `SUBSTITUTEWITHINDEX`,
+  `DETAILROWS`, `ISONORAFTER`, `NEXTDAY`, `PREVIOUSDAY`, `NETWORKDAYS`,
+  `ISDATETIME`, `IGNORE`/`ROLLUPADDISSUBTOTAL` in `SUMMARIZECOLUMNS`
+- **Financial** (51): the complete family — annuities, depreciation
+  (Excel month conventions), `XIRR`/`XNPV`, and the bond family on day-count
+  bases 0–4 with a coupon-schedule kernel; `RATE`/`YIELD`/`ODDFYIELD` via
+  Newton
+- Dotted function names (`STDEV.S`, `T.DIST.2T`) now parse at all — the name
+  regex stopped at `\w`, so every dotted function silently fell through
+
+### Classified from Desktop's own behaviour, not assumed
+- `CEILING.MATH`/`FLOOR.MATH`: listed by the DMV, refused by the engine in a
+  query — out of authorable scope
+- The week-grain time-intelligence family requires a model *calendar
+  reference* — needs-model-feature
+- `ROWNUMBER`/`ORDERBY` (window family): deferred to a dedicated batch rather
+  than shipped shallow
+
 ## [0.9.64] - 2026-07-31
 
 ### Fixed
