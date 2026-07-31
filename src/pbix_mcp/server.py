@@ -2591,12 +2591,21 @@ def pbix_add_visual(
             x = max(0.0, x)
             y = max(0.0, y)
 
+        # Desktop stamps every container with a 1000-step z and
+        # tabOrder = z + 1000 (ground truth: add_image / Desktop-authored
+        # corpus). Ledger issues-3: add_visual used to write z=0 and no
+        # tabOrder at all.
+        z_new = _next_layer_z(page)
+        tab_order = z_new + 1000
+
         # Update layouts position if present (image visuals)
         if "layouts" in config:
             for lay in config["layouts"]:
                 pos = lay.get("position", {})
                 pos["x"] = x
                 pos["y"] = y
+                pos["z"] = z_new
+                pos["tabOrder"] = tab_order
 
         # Opt-in visual-level sort: author prototypeQuery.OrderBy BEFORE the
         # config is serialized and the binding compiled (the compiler deep-
@@ -2618,9 +2627,10 @@ def pbix_add_visual(
         container = {
             "x": x,
             "y": y,
-            "z": 0,
+            "z": z_new,
             "width": float(width),
             "height": float(height),
+            "tabOrder": tab_order,
             "config": json.dumps(config, ensure_ascii=False),
         }
         if visual_type == "image":
@@ -5042,11 +5052,16 @@ def pbix_add_html_visual(
         # Carry the position in config.layouts too — modern Power BI Desktop reads
         # the visual position from here for custom visuals; a container without it
         # can fault the whole report load. (Matches Desktop-authored custom visuals.)
+        # Desktop's 1000-step z / tabOrder stamping (ledger issues-3; same
+        # convention as pbix_add_image and Desktop-authored corpus files).
+        z_new = _next_layer_z(page)
+        tab_order = z_new + 1000
         config = {
             "name": _uuid.uuid4().hex[:16],
             "layouts": [{"id": 0, "position": {
-                "x": xf, "y": yf, "z": 0.0,
+                "x": xf, "y": yf, "z": z_new,
                 "width": float(width), "height": float(height),
+                "tabOrder": tab_order,
             }}],
             "singleVisual": single_visual,
         }
@@ -5065,8 +5080,9 @@ def pbix_add_html_visual(
         q, dt = compile_visual_binding(single_visual, _res)
 
         container = {
-            "x": xf, "y": yf, "z": 0.0,
+            "x": xf, "y": yf, "z": z_new,
             "width": float(width), "height": float(height),
+            "tabOrder": tab_order,
             "config": json.dumps(config, ensure_ascii=False),
             "filters": "[]",
         }

@@ -755,12 +755,17 @@ class PBIXBuilder:
                     single_visual["projections"] = bindings["projections"]
                     single_visual["prototypeQuery"] = bindings["prototypeQuery"]
 
+                # Desktop stamps every container with a 1000-step z and
+                # tabOrder = z + 1000 (ledger issues-3; ground truth:
+                # Desktop-authored corpus + pbix_add_image).
+                z_val = vis.get("z", j * 1000)
                 container = {
                     "x": vis.get("x", 20 + j * 320),
                     "y": vis.get("y", 20),
-                    "z": vis.get("z", 0),
+                    "z": z_val,
                     "width": vis.get("width", 300),
                     "height": vis.get("height", 200),
+                    "tabOrder": vis.get("tabOrder", z_val + 1000),
                 }
                 # Compile the data binding (query + dataTransforms) that Power BI
                 # Desktop's report loader requires on data visuals — without it a
@@ -792,7 +797,24 @@ class PBIXBuilder:
                 "visualContainers": containers,
             })
 
-        layout = {"id": 0, "sections": sections}
+        # Report-level config, matching Desktop-authored files field-for-field
+        # (ledger issues-4; ground truth MS_AI_Sample / GeoSales: version,
+        # activeSectionIndex, linguisticSchemaSyncVersion were never filled).
+        # "version" is the report-schema version Desktop stamps -- 5.61 is the
+        # GeoSales-era value this corpus verifies against.
+        report_config = {
+            "version": "5.61",
+            "activeSectionIndex": 0,
+            "linguisticSchemaSyncVersion": 2,
+            "defaultDrillFilterOtherVisuals": True,
+            "settings": {"useNewFilterPaneExperience": True,
+                         "allowChangeFilterTypes": True},
+        }
+        layout = {
+            "id": 0,
+            "config": json.dumps(report_config, ensure_ascii=False),
+            "sections": sections,
+        }
         return json.dumps(layout, ensure_ascii=False).encode("utf-16-le")
 
     @staticmethod
