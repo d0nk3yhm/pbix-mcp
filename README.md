@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python — no templates, no skeletons, no Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026. The DAX engine is corpus-verified against Power BI Desktop's own evaluator: **432/432** measures at the grand total, **1,705/1,705** measure×dimension cells under a filter context, and **397/397** calculated columns match Desktop exactly across a 25-file test corpus (v0.9.63).
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The entire PBIX binary format has been independently reversed and reimplemented in pure Python — no templates, no skeletons, no Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026. The DAX engine is verified against Power BI Desktop's own evaluator at two levels: **435 of the engine's 467 DAX functions** carry per-function conformance goldens captured from Desktop's workspace engine (the other 32 are proven not query-evaluable by Desktop itself), and the full corpus matches 1:1 — **432/432** grand totals, **1,705/1,705** measure×dimension filter-context cells, **397/397** calculated columns (v0.9.63; latest sweep 534/534 comparable measures across 20 files).
 
 Exposes 128 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing (rename / reorder / hide / duplicate pages, move & copy visuals — identically on classic `Report/Layout` and service-authored **PBIR**), visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, sort-by-column, TMDL export, incremental refresh, DAX evaluation (435 of the live engine's 467 DAX functions, conformance-verified against Desktop; corpus 1:1), RLS security, and binary format internals.
 
@@ -125,7 +125,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 | Color extraction & recolor | **Stable** | `pbix_extract_colors` scans themes + all visuals. `pbix_recolor` replaces hex + ThemeDataColor refs, auto-extends palette, injects per-series/category chart colors, generates themed table rows, strips borders and pie/donut backgrounds, hides card titles (shows categoryLabels), fixes text contrast (WCAG 2.0) including theme foreground, chart axis/legend/labels, table rows, and card calloutValue |
 | Visual property editing | **Stable** | Dot-path and full JSON |
 | DAX measure CRUD | **Stable** | Add, modify, remove via binary splice (PBI Desktop files) or full builder rebuild. Sequential adds supported with automatic MAXID tracking |
-| DAX evaluation (435 of the live engine's 467 DAX functions, conformance-verified against Desktop; corpus 1:1) | **Stable API** | Best-effort semantic parity — stable API, practical evaluation for common DAX patterns; see accuracy notes below |
+| DAX evaluation (435 of the live engine's 467 DAX functions, conformance-verified against Desktop; corpus 1:1) | **Stable API** | Verified parity on everything tested: per-function goldens from Desktop's own engine (1e-9) + full-corpus 1:1; documented deltas in the DAX Engine section |
 | Metadata SQL read/write | **Stable** | Full SQLite access to tables, columns, relationships |
 | Default slicer filter extraction | **Stable** | Legacy Layout JSON and PBIR format |
 | PBIR read + write | **Stable** | Service-authored reports (`Report/definition/`) are read AND edited by the same tools as classic. The 126 tools present at the 0.9.39 parity audit are verified on both formats by applying the tool, saving, reopening and checking the saved bytes — see [docs/capability-parity.md](docs/capability-parity.md) |
@@ -161,7 +161,7 @@ The only non-generated artifact is the 144-byte CryptKey constant. This is a Mic
 
 ## Known Limitations
 
-- **DAX engine is best-effort** — designed for practical evaluation, not semantic parity with Analysis Services. Unsupported functions return `None` with status `"unsupported"`, circular references raise `DAXEvaluationError`. See [docs/supported-dax.md](docs/supported-dax.md) for full details.
+- **DAX engine parity is bounded by what is tested** — 435/467 functions carry Desktop-captured conformance goldens and the 20-file corpus matches 1:1, but goldens pin probe shapes, not every argument combination; unlisted expression shapes are refused rather than guessed (`None`, status `"unsupported"`), circular references raise `DAXEvaluationError`. See [docs/dax-coverage.md](docs/dax-coverage.md) and [docs/supported-dax.md](docs/supported-dax.md).
 - **PBIR format** — PBI Desktop (March 2026) has rendering bugs with PBIR decomposed format. PBIP export uses legacy report format (version 1.0) which works reliably.
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
@@ -452,7 +452,30 @@ Every component of the VertiPaq columnar storage engine is independently impleme
 
 ## DAX Engine
 
-174 functions across 10 categories. This is a **best-effort evaluator** — it produces correct results for common patterns but does not aim for semantic parity with Analysis Services.
+**Verified parity with Power BI Desktop on everything tested** — no longer a
+best-effort evaluator. Two independent proof layers, both reproducible from
+committed artifacts:
+
+1. **Per-function conformance** ([docs/dax-coverage.md](docs/dax-coverage.md)):
+   435 of the live engine's 467 DAX functions are implemented; 259 carry
+   goldens captured from Power BI Desktop's **own workspace engine** and
+   replayed by `tests/test_dax_conformance.py` at 1e-9 relative tolerance
+   (356 value probes, no "unsupported" escape hatch). The other 32 are
+   proven not query-evaluable by Desktop itself, with its refusal recorded
+   in `tests/conformance/golden.json`.
+2. **Full-corpus 1:1**: every comparable real-world measure across the
+   20-file test corpus matches Desktop — 534/534 in the latest sweep
+   (432 grand totals, 1,705 measure×dimension filter-context cells, and
+   397 calculated columns in the fuller v0.9.63 verification).
+
+What "parity" does **not** claim: the goldens pin each function's semantics
+on its probe expressions over the conformance fixture, and the corpus pins
+real-world composition — not every conceivable argument combination.
+Documented deltas: floating-point results agree inside a 1e-9 relative band
+(summation order; bit-identity is not achievable), one corpus measure needs
+per-row visual context (RANKX), and unlisted expression *shapes* may still
+be refused rather than guessed. An unimplemented function returns `None`
+with status `"unsupported"` — never a guess.
 
 | Category | Functions |
 |----------|-----------|
@@ -578,7 +601,7 @@ src/pbix_mcp/
   errors.py              # Typed exceptions with stable error codes
   logging_config.py      # Diagnostic logging (normal/debug/trace)
   dax/
-    engine.py            # DAX evaluator (174 functions, best-effort)
+    engine.py            # DAX evaluator (435 functions, Desktop-conformance-verified)
     calc_tables.py       # Calculated table support
   formats/
     abf_rebuild.py       # ABF archive reader and rebuilder
