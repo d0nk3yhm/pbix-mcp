@@ -1,6 +1,6 @@
 # Supported DAX Functions
 
-435 of the live engine's 467 DAX functions, implemented and verified; 26 of the remaining 32 are proven not query-authorable by Desktop's own error messages, and 8 stay open with a concrete investigation path ([dax-coverage.md](dax-coverage.md)). Semantics are verified two ways: a per-function conformance harness replays Desktop-captured goldens (354 value probes, 1e-9 relative tolerance), and the 25-file corpus matches Desktop on every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused.
+435 of the live engine's 467 DAX functions, implemented and verified; the remaining 32 are proven not query-authorable by the engine's own refusals — the whole surface is accounted for ([dax-coverage.md](dax-coverage.md)). Semantics are verified two ways: a per-function conformance harness replays Desktop-captured goldens (354 value probes, 1e-9 relative tolerance), and the 25-file corpus matches Desktop on every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused.
 
 ## Aggregation (13)
 `SUM`, `AVERAGE`, `COUNT`, `COUNTA`, `COUNTROWS`, `MIN`, `MAX`, `DISTINCTCOUNT`, `DISTINCTCOUNTNOBLANK`, `PRODUCT`, `MEDIAN`, `MEDIANX`, `COUNTBLANK`
