@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.72] - 2026-07-31
+
+**The OpenBI findings ledger is EMPTY — every open item across L3/L4/L5 is
+now fixed, implemented, or closed with written rationale.**
+
+### Added
+
+- **Per-key Top-N filter spec** (ledger issues-14, half B — half A's
+  predicate objects were already live). A `filter_context` value of
+  `{"top_n": {"n": 5, "by": "<measure or Table.Column>", "direction":
+  "desc"}}` is materialized server-side into a concrete In-set — the key's
+  distinct values ranked by the aggregate under the other filters, blanks
+  last, stable ties, `"asc"` for bottom-N — in all three evaluate tools.
+  This is the materialization OpenBI performed client-side, moved
+  server-side.
+
+### Closed with rationale (no code)
+
+- **Matrix / series entry point** (issues-17): covered by composition —
+  `pbix_evaluate_dax_grouped` takes a composite `group_by`
+  ("RowDim.Col,ColDim.Col") and returns one structured row per cell; the
+  recipe is now in the tool docstring.
+- **Propagation-result reuse** (issues-17): measured unnecessary — 50
+  repeated calls sharing a filter set cost 6.0 ms/call (2.6 ms for a
+  second measure) on a 200K-row model; existing caches already make
+  repeats near-free.
+- **Auto date/time synthesis** (issues-13/14): wont-do-now — hidden
+  tables the user did not author, Desktop generates its own when the
+  option is on, built models verify clean without them, and no downstream
+  demand exists. User-authored date hierarchies remain covered by
+  `add_user_hierarchy` + a calculated `CALENDAR()` table.
+
 ## [0.9.71] - 2026-07-31
 
 **Two feature asks from the OpenBI ledger (L5, issues-12).**

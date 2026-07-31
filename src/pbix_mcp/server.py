@@ -12405,6 +12405,86 @@ def _parse_measure_names(measures: str, measure_defs: dict) -> list[str]:
     return names
 
 
+def _resolve_topn_filters(ctx: dict, filters: dict) -> dict:
+    """Materialize ``{"top_n": ...}`` filter specs into concrete In-sets.
+
+    Ledger issues-14 (half B; predicates were half A): a filter value of
+    ``{"top_n": {"n": 5, "by": "<measure or Table.Column>",
+    "direction": "desc"}}`` ranks the key's distinct values by the aggregate
+    -- evaluated under the OTHER filters -- keeps the top n, and replaces the
+    spec with the plain value list, so the engine then applies ordinary
+    set-membership. ``"asc"`` ranks smallest-first (bottom-N); blanks sort
+    last either way; ties keep model order (stable sort). This is exactly
+    the materialization OpenBI performed client-side, moved server-side."""
+    if not any(isinstance(v, dict) and "top_n" in v for v in filters.values()):
+        return filters
+    from pbix_mcp.dax import engine as dax_engine
+    out = dict(filters)
+    for key, spec in filters.items():
+        if not (isinstance(spec, dict) and "top_n" in spec):
+            continue
+        tn = spec.get("top_n") or {}
+        n = int(tn.get("n", 0))
+        by = str(tn.get("by", "")).strip()
+        direction = str(tn.get("direction", "desc")).lower()
+        if n <= 0 or not by:
+            raise ValueError(
+                f"top_n spec for '{key}' needs n >= 1 and a 'by' measure "
+                "or Table.Column")
+        t, _, c = key.partition(".")
+        tbl = (ctx.get("tables") or {}).get(t)
+        if not tbl:
+            raise ValueError(f"top_n filter key '{key}': table '{t}' not found")
+        cols = tbl["columns"]
+        if c not in cols:
+            raise ValueError(
+                f"top_n filter key '{key}': column '{c}' not in '{t}'")
+        ci = cols.index(c)
+        distinct = list(dict.fromkeys(r[ci] for r in tbl["rows"]))
+        measures = dict(ctx["measure_defs"])
+        by_name = by
+        if by not in measures:
+            low = by.lower()
+            match = next((m for m in measures if m.lower() == low), None)
+            if match is not None:
+                by_name = match
+            elif "." in by:
+                bt, _, bc = by.partition(".")
+                by_name = "__topn_by__"
+                measures[by_name] = f"SUM('{bt}'[{bc}])"
+            else:
+                raise ValueError(
+                    f"top_n 'by' = '{by}' is neither a measure nor a "
+                    "Table.Column reference")
+        # ranking context: every OTHER plain filter applies; other top_n
+        # keys are excluded rather than half-resolved
+        base_fc = {k: v for k, v in out.items()
+                   if k != key and not (isinstance(v, dict) and "top_n" in v)}
+        ranked = []
+        for v in distinct:
+            fc = dict(base_fc)
+            fc[key] = [v]
+            res = dax_engine.evaluate_measures_smart(
+                [by_name], ctx["tables"], measures, fc,
+                ctx.get("date_table"), ctx.get("date_column"),
+                ctx.get("relationships"), simulate_row_context=False,
+                measure_tables=ctx.get("measure_tables"),
+                model_columns=ctx.get("model_columns"))
+            val = res.get(by_name)
+            if not isinstance(val, (int, float)) or isinstance(val, bool):
+                val = None
+            ranked.append((v, val))
+        if direction == "asc":
+            ranked.sort(key=lambda pr: (pr[1] is None,
+                                        pr[1] if pr[1] is not None else 0.0))
+        else:
+            ranked.sort(key=lambda pr: (pr[1] is not None,
+                                        pr[1] if pr[1] is not None else 0.0),
+                        reverse=True)
+        out[key] = [v for v, _ in ranked[:n]]
+    return out
+
+
 def _resolve_default_filters(ctx: dict, page_index: int) -> dict | None:
     """Default slicer filters for an evaluation.
 
@@ -12483,6 +12563,8 @@ def pbix_evaluate_dax(
         measure_names = _parse_measure_names(measures, ctx['measure_defs'])
 
         parsed_fc = FilterContext.from_json_str(filter_context)
+        if parsed_fc.filters:
+            parsed_fc.filters = _resolve_topn_filters(ctx, parsed_fc.filters)
         fc: dict | None
         if parsed_fc.filters:
             fc = parsed_fc.filters
@@ -12607,6 +12689,8 @@ def pbix_evaluate_dax_per_dimension(
         ctx = _get_dax_context(alias)
         measure_names = _parse_measure_names(measures, ctx['measure_defs'])
         parsed_fc = FilterContext.from_json_str(filter_context)
+        if parsed_fc.filters:
+            parsed_fc.filters = _resolve_topn_filters(ctx, parsed_fc.filters)
         base_fc = parsed_fc.filters
         if not base_fc and apply_default_filters:
             base_fc = _resolve_default_filters(ctx, page_index) or {}
@@ -12724,7 +12808,11 @@ def pbix_evaluate_dax_grouped(
         measures: Comma-separated measure names, e.g. "Sales,Sales LY"
         group_by: Grouping column "Table.Column". Comma-separate for a
             composite key, e.g. "dim-Geo.Country,dim-Geo.State" (a composite
-            key evaluates per group combination — the single-column form is
+            key evaluates per group combination — this is also the MATRIX
+            recipe: "RowDim.Col,ColDim.Col" returns one structured row per
+            (row, column) cell, which a client pivots into the grid; a
+            series chart is the same with the series column as the second
+            key — the single-column form is
             the one with the single-pass fast path).
         filter_context: Optional JSON base filter, e.g. '{"dim-Date.Year": [2015]}'
         max_groups: Cap on groups returned (default 3500 — Power BI's own
@@ -12753,6 +12841,8 @@ def pbix_evaluate_dax_grouped(
         rels: list = ctx.get('relationships') or []
         measure_names = _parse_measure_names(measures, ctx['measure_defs'])
         parsed_fc = FilterContext.from_json_str(filter_context)
+        if parsed_fc.filters:
+            parsed_fc.filters = _resolve_topn_filters(ctx, parsed_fc.filters)
         base_fc = parsed_fc.filters
         if not base_fc and apply_default_filters:
             base_fc = _resolve_default_filters(ctx, page_index) or {}
