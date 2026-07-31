@@ -92,6 +92,47 @@ PROBES: dict[str, list[str]] = {
     "MROUND": ["MROUND(10, 3)", "MROUND(-10, -3)"],
     "CURRENCY": ["CURRENCY(1234.56789)"],
     "FIXED": ["FIXED(1234.567, 1)", "FIXED(1234.567, -2, TRUE)"],
+
+    # ================================================== batch 2
+    # ---- week-grain time intelligence (fixture D spans Jan-Jun 2024)
+    "STARTOFWEEK": ["COUNTROWS(STARTOFWEEK(D[Date]))",
+                     "CALCULATE(MAX(D[Date]), STARTOFWEEK(D[Date]))"],
+    "ENDOFWEEK": ["CALCULATE(MAX(D[Date]), ENDOFWEEK(D[Date]))"],
+    "NEXTDAY": ["CALCULATE(MAX(D[Date]), NEXTDAY(D[Date]))",
+                 "COUNTROWS(NEXTDAY(D[Date]))"],
+    "PREVIOUSDAY": ["COUNTROWS(PREVIOUSDAY(D[Date]))"],
+    "NEXTWEEK": ["COUNTROWS(NEXTWEEK(D[Date]))"],
+    "PREVIOUSWEEK": ["COUNTROWS(PREVIOUSWEEK(D[Date]))"],
+    "DATESWTD": ["COUNTROWS(DATESWTD(D[Date]))",
+                  "CALCULATE(SUM(F[v]), DATESWTD(D[Date]))"],
+    "CLOSINGBALANCEWEEK": ["CLOSINGBALANCEWEEK(SUM(F[v]), D[Date])"],
+    "OPENINGBALANCEWEEK": ["OPENINGBALANCEWEEK(SUM(F[v]), D[Date])"],
+    "NETWORKDAYS": ["NETWORKDAYS(DATE(2024,1,1), DATE(2024,1,31))",
+                     "NETWORKDAYS(DATE(2024,2,1), DATE(2024,3,1), 1)"],
+    "ISDATETIME": ["ISDATETIME(DATE(2024,1,1))", "ISDATETIME(5)"],
+    # ---- table machinery
+    "CONTAINSROW": ["CONTAINSROW(VALUES(K[grp]), \"X\")",
+                     "CONTAINSROW(VALUES(K[grp]), \"Q\")"],
+    "ALLNOBLANKROW": ["COUNTROWS(ALLNOBLANKROW(K))",
+                       "COUNTROWS(ALLNOBLANKROW(K[grp]))"],
+    "FILTERS": ["COUNTROWS(FILTERS(K[grp]))",
+                 "CALCULATE(COUNTROWS(FILTERS(K[grp])), K[grp] = \"X\")"],
+    "TOPNSKIP": ["SUMX(TOPNSKIP(2, 1, F, F[v]), F[v])",
+                  "COUNTROWS(TOPNSKIP(2, 0, F, F[v]))"],
+    "NATURALINNERJOIN": ["COUNTROWS(NATURALINNERJOIN(F, K))"],
+    "NATURALLEFTOUTERJOIN": ["COUNTROWS(NATURALLEFTOUTERJOIN(F, K))"],
+    "GROUPBY": ["COUNTROWS(GROUPBY(F, F[k]))",
+                 "SUMX(GROUPBY(F, F[k], \"S\", SUMX(CURRENTGROUP(), F[v])), [S])"],
+    "ISONORAFTER": ["ISONORAFTER(3, 2, ASC)", "ISONORAFTER(1, 2, ASC)"],
+    "ALLCROSSFILTERED": ["CALCULATE(COUNTROWS(F), ALLCROSSFILTERED(F))",
+                          "CALCULATE(CALCULATE(COUNTROWS(F), ALLCROSSFILTERED(F)), K[grp] = \"X\")"],
+    # ---- classification probes: expected to ERROR standalone
+    "IGNORE": ["COUNTROWS(SUMMARIZECOLUMNS(K[grp], \"m\", IGNORE(SUM(F[v]))))"],
+    "ROLLUPADDISSUBTOTAL": ["COUNTROWS(SUMMARIZECOLUMNS(ROLLUPADDISSUBTOTAL(K[grp], \"T\")))"],
+    "NONVISUAL": ["COUNTROWS(SUMMARIZECOLUMNS(NONVISUAL(VALUES(K[grp]))))"],
+    "DETAILROWS": ["COUNTROWS(DETAILROWS([Total V]))"],
+    "SUBSTITUTEWITHINDEX": ["COUNTROWS(SUBSTITUTEWITHINDEX(F, \"i\", K, K[k], ASC))"],
+    # ROWNUMBER/ORDERBY: window-function batch, deliberately deferred
 }
 
 # Deterministic-by-shape only: capture records the TYPE, not the value.

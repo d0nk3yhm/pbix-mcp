@@ -24,6 +24,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ""))
 from pbix_mcp.dax import engine as de  # noqa: E402
 from tests.conformance.fixture_def import (  # noqa: E402
+    FIXTURE_MEASURES,
     FIXTURE_RELATIONSHIPS,
     FIXTURE_TABLES,
 )
@@ -46,8 +47,11 @@ def _ev(expr):
     ctx = de.DAXContext(
         {k: {"columns": v["columns"], "rows": [list(r) for r in v["rows"]]}
          for k, v in FIXTURE_TABLES.items()},
-        {"__probe__": expr}, None, None, None,
+        dict({"__probe__": expr},
+             **{n: e for n, (_t, e) in FIXTURE_MEASURES.items()}),
+        None, None, None,
         [dict(r) for r in FIXTURE_RELATIONSHIPS])
+    ctx.measure_tables = {n: t for n, (t, _e) in FIXTURE_MEASURES.items()}
     return de.DAXEngine().evaluate_measure("__probe__", ctx)
 
 

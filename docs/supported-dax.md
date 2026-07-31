@@ -1,6 +1,6 @@
 # Supported DAX Functions
 
-245 functions across 12 categories. Semantics are verified against Power BI Desktop's own engine on a 25-file corpus: every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns — matches Desktop exactly (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused. Full parity with the entire DAX surface is the roadmap, not yet a claim.
+263 functions across 12 categories. Semantics are verified against Power BI Desktop's own engine on a 25-file corpus: every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns — matches Desktop exactly (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused. Full parity with the entire DAX surface is the roadmap, not yet a claim.
 
 ## Aggregation (13)
 `SUM`, `AVERAGE`, `COUNT`, `COUNTA`, `COUNTROWS`, `MIN`, `MAX`, `DISTINCTCOUNT`, `DISTINCTCOUNTNOBLANK`, `PRODUCT`, `MEDIAN`, `MEDIANX`, `COUNTBLANK`
@@ -55,6 +55,18 @@ Every batch-1 function is pinned by Desktop-captured golden values in
 `tests/conformance/golden.json` (114 probes, 1e-9 relative). `CEILING.MATH`
 and `FLOOR.MATH` are listed by the engine's DMV but Desktop itself cannot
 resolve them in a query — empirically out of authorable scope, not missing.
+
+
+## Batch-2 additions (18)
+`NETWORKDAYS`, `ISDATETIME`, `CONTAINSROW`, `ALLNOBLANKROW`, `FILTERS`, `TOPNSKIP`, `NATURALINNERJOIN`, `NATURALLEFTOUTERJOIN`, `GROUPBY`, `CURRENTGROUP`, `ISONORAFTER`, `ALLCROSSFILTERED`, `SUBSTITUTEWITHINDEX`, `DETAILROWS`, `NEXTDAY`, `PREVIOUSDAY`, `IGNORE`, `ROLLUPADDISSUBTOTAL`
+
+The week-grain time-intelligence family (`STARTOFWEEK`, `ENDOFWEEK`, `NEXTWEEK`,
+`PREVIOUSWEEK`, `DATESWTD`, `OPENINGBALANCEWEEK`, `CLOSINGBALANCEWEEK`) is
+classified **needs-model-feature**: Desktop requires a model *calendar
+reference* as their first argument ("parameter 1 must be a calendar
+reference"), an object this engine's model layer does not yet carry.
+`ROWNUMBER`/`ORDERBY` (the window family) is deliberately deferred to its own
+batch rather than shipped shallow.
 
 ## Known Limitations
 

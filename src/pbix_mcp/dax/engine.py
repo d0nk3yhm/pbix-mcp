@@ -1193,6 +1193,9 @@ class DAXContext:
         # was applied. Only those are suppressed; a filter created later
         # inside a nested CALCULATE still propagates, as Desktop does.
         self._no_prop_keys: dict = {}
+        # Rows of the group being evaluated by GROUPBY's extension columns;
+        # CURRENTGROUP() reads it.
+        self._current_group: Optional[list] = None
         # Filter keys registered by a TABLE filter argument (FILTER(T,...),
         # ALL(T) row sets). Desktop's rule, pinned on MS_Employee_Hiring:
         # a filter on a TABLE filters its EXPANDED table, so it reaches the
@@ -2031,6 +2034,23 @@ class DAXEngine:
             'DATEVALUE': self._fn_datevalue,
             'TIMEVALUE': self._fn_timevalue,
             'ISO.CEILING': self._fn_iso_ceiling,
+            # --- conformance batch 2 ---
+            'NETWORKDAYS': self._fn_networkdays,
+            'ISDATETIME': self._fn_isdatetime,
+            'CONTAINSROW': self._fn_containsrow,
+            'ALLNOBLANKROW': self._fn_allnoblankrow,
+            'FILTERS': self._fn_filters,
+            'TOPNSKIP': self._fn_topnskip,
+            'NATURALINNERJOIN': lambda a, c: self._fn_naturaljoin('NATURALINNERJOIN', a, c),
+            'NATURALLEFTOUTERJOIN': lambda a, c: self._fn_naturaljoin('NATURALLEFTOUTERJOIN', a, c),
+            'GROUPBY': self._fn_groupby,
+            'CURRENTGROUP': self._fn_currentgroup,
+            'ISONORAFTER': self._fn_isonorafter,
+            'ALLCROSSFILTERED': self._fn_allcrossfiltered,
+            'SUBSTITUTEWITHINDEX': self._fn_substitutewithindex,
+            'DETAILROWS': self._fn_detailrows,
+            'NEXTDAY': self._fn_nextday,
+            'PREVIOUSDAY': self._fn_previousday,
             # --- Logic ---
             'IF': self._fn_if,
             'SWITCH': self._fn_switch,
@@ -5316,6 +5336,35 @@ class DAXEngine:
         args = self._split_args(args_str)
         if not args:
             return []
+        # IGNORE(expr) marks a measure excluded from the result AND from
+        # blank-group filtering; with the pair dropped, auto-exist over the
+        # group columns is exactly what remains (Desktop golden: 3 groups).
+        pruned = []
+        skip_next_of_ignore = False
+        for j, a in enumerate(args):
+            if skip_next_of_ignore:
+                skip_next_of_ignore = False
+                continue
+            nxt = args[j + 1].strip().upper() if j + 1 < len(args) else ""
+            if (a.strip().startswith('"') and nxt.startswith('IGNORE')):
+                skip_next_of_ignore = True
+                continue
+            pruned.append(a)
+        args = pruned
+        # ROLLUPADDISSUBTOTAL(col, "name"): group by col, then append one
+        # subtotal row (Desktop golden: 3 groups + 1 subtotal = 4).
+        rollup_subtotal = False
+        expanded = []
+        for a in args:
+            st = a.strip()
+            if st.upper().startswith('ROLLUPADDISSUBTOTAL'):
+                _ra_args = self._split_args(st[st.index('(') + 1:-1])
+                if _ra_args:
+                    expanded.append(_ra_args[0])
+                rollup_subtotal = True
+            else:
+                expanded.append(a)
+        args = expanded
         # Find group-by columns (column refs) vs name/expression pairs (string, expression)
         group_refs = []
         for arg in args:
@@ -5335,7 +5384,13 @@ class DAXEngine:
         tail = args[len(group_refs):]
         if tail:
             inner += ", " + ", ".join(a.strip() for a in tail)
-        return self._fn_summarize(inner, ctx)
+        result = self._fn_summarize(inner, ctx)
+        if rollup_subtotal and isinstance(result, list):
+            sub = {'__table__': group_refs[0][0], '__row__': True}
+            for _t, _c in group_refs:
+                sub[_c] = None
+            result = result + [sub]
+        return result
 
     def _fn_selectcolumns(self, args_str: str, ctx: DAXContext) -> Any:
         """SELECTCOLUMNS(table, name, expression, ...) — select/rename columns."""
@@ -6476,6 +6531,316 @@ class DAXEngine:
             except ValueError:
                 continue
         return None
+
+
+    # ------------------------------------------------------------------
+    # Conformance batch 2: table machinery, date navigation, NETWORKDAYS.
+    # Golden-pinned in tests/conformance/golden.json. The week-grain
+    # time-intel family (STARTOFWEEK, DATESWTD, ...) is NOT here: Desktop
+    # requires a model CALENDAR reference for those ("parameter 1 must be a
+    # calendar reference"), a model feature the fixture does not carry --
+    # classified needs-model-feature, not silently faked.
+    # ------------------------------------------------------------------
+
+    def _table_rows(self, expr: str, ctx: DAXContext):
+        """Evaluate an expression expected to yield a table: a list of row
+        dicts carrying __table__. Returns None when it does not."""
+        res = self._eval_expr(expr.strip(), ctx)
+        if isinstance(res, list):
+            return [r for r in res if isinstance(r, dict) and '__table__' in r]
+        return None
+
+    @staticmethod
+    def _row_cols(row):
+        return {k: v for k, v in row.items() if not k.startswith('__')}
+
+    def _fn_networkdays(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if len(parts) < 2:
+            return None
+        d1 = _as_datetime(self._eval_expr(parts[0].strip(), ctx))
+        d2 = _as_datetime(self._eval_expr(parts[1].strip(), ctx))
+        if d1 is None or d2 is None:
+            return None
+        # weekend parameter: 1 = Sat/Sun (default). Other codes exist; only
+        # implement what the golden pins and refuse the rest.
+        weekend = {5, 6}                       # Python weekday(): Sat=5, Sun=6
+        if len(parts) >= 3:
+            w = self._eval_expr(parts[2].strip(), ctx)
+            if isinstance(w, (int, float)) and int(w) != 1:
+                return None
+        sign = 1
+        if d2 < d1:
+            d1, d2 = d2, d1
+            sign = -1
+        days = 0
+        cur = datetime(d1.year, d1.month, d1.day)
+        end = datetime(d2.year, d2.month, d2.day)
+        one = timedelta(days=1)
+        while cur <= end:
+            if cur.weekday() not in weekend:
+                days += 1
+            cur += one
+        return float(sign * days)
+
+    def _fn_isdatetime(self, args_str: str, ctx: DAXContext):
+        v = self._eval_expr(args_str.strip(), ctx)
+        return isinstance(v, datetime)
+
+    def _fn_containsrow(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if len(parts) < 2:
+            return None
+        rows = self._eval_expr(parts[0].strip(), ctx)
+        if not isinstance(rows, list):
+            return None
+        needle = tuple(self._eval_expr(x.strip(), ctx) for x in parts[1:])
+        for r in rows:
+            if isinstance(r, dict) and '__value__' in r:
+                hay = (r['__value__'],)
+            elif isinstance(r, dict):
+                hay = tuple(self._row_cols(r).values())
+            else:
+                hay = (r,)
+            if len(hay) == len(needle) and all(a == b for a, b in zip(hay, needle)):
+                return True
+        return False
+
+    def _fn_allnoblankrow(self, args_str: str, ctx: DAXContext):
+        # This engine never materialises the blank (unknown) member row, so
+        # ALLNOBLANKROW is ALL over stored rows -- which is exactly what
+        # Desktop's goldens on the fixture show (K: 4 rows; K[grp]: 3 values).
+        return self._fn_all(args_str, ctx)
+
+    def _fn_filters(self, args_str: str, ctx: DAXContext):
+        """FILTERS(column) -- the directly-filtered values of the column, or
+        every value when the column carries no direct filter."""
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if not (isinstance(ref, tuple) and len(ref) == 2):
+            return None
+        t, c = ref
+        key = f"{t}.{c}"
+        direct = ctx.filter_context.get(key) if ctx.filter_context else None
+        if direct is not None and isinstance(direct, list):
+            vals = list(dict.fromkeys(direct))
+        else:
+            tbl = ctx.tables.get(t)
+            if not tbl:
+                return None
+            idx = ctx._find_col_idx(tbl['columns'], c)
+            if idx < 0:
+                return None
+            vals = list(dict.fromkeys(row[idx] for row in tbl['rows']))
+        return [{'__table__': t, '__column__': c, '__value__': v} for v in vals]
+
+    def _fn_topnskip(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if len(parts) < 4:
+            return None
+        n = self._num1(parts[0], ctx)
+        skip = self._num1(parts[1], ctx)
+        rows = self._table_rows(parts[2], ctx)
+        if n is None or skip is None or rows is None:
+            return None
+        order_expr = parts[3].strip()
+        keyed = []
+        for r in rows:
+            row_ctx = self._make_row_context(r, ctx)
+            k = self._eval_expr(order_expr, row_ctx)
+            k = self._resolve_row_result(k, r, row_ctx)
+            keyed.append((k if isinstance(k, (int, float)) else float('-inf'), r))
+        keyed.sort(key=lambda t2: t2[0], reverse=True)
+        lo, hi = int(skip), int(skip) + int(n)
+        return [r for _, r in keyed[lo:hi]]
+
+    def _fn_naturaljoin(self, name: str, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if len(parts) != 2:
+            return None
+        left = self._table_rows(parts[0], ctx)
+        right = self._table_rows(parts[1], ctx)
+        if left is None or right is None:
+            return None
+        if not left:
+            return []
+        lcols = set(self._row_cols(left[0]).keys()) if left else set()
+        rcols = set(self._row_cols(right[0]).keys()) if right else set()
+        common = lcols & rcols
+        out = []
+        for lr in left:
+            lvals = self._row_cols(lr)
+            matches = [rr for rr in right
+                       if all(self._row_cols(rr).get(c) == lvals.get(c)
+                              for c in common)]
+            if matches:
+                for rr in matches:
+                    merged = dict(lr)
+                    for k, v in self._row_cols(rr).items():
+                        merged.setdefault(k, v)
+                    out.append(merged)
+            elif name == 'NATURALLEFTOUTERJOIN':
+                out.append(dict(lr))
+        return out
+
+    def _fn_groupby(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if len(parts) < 2:
+            return None
+        rows = self._table_rows(parts[0], ctx)
+        if rows is None:
+            return None
+        group_cols = []
+        i = 1
+        while i < len(parts):
+            ref = self._eval_expr(parts[i].strip(), ctx)
+            if isinstance(ref, tuple) and len(ref) == 2:
+                group_cols.append(ref[1])
+                i += 1
+            else:
+                break
+        ext = parts[i:]
+        groups: dict = {}
+        for r in rows:
+            key = tuple(r.get(c) for c in group_cols)
+            groups.setdefault(key, []).append(r)
+        out = []
+        for key, grp_rows in groups.items():
+            new_row = {'__table__': rows[0]['__table__'], '__row__': True}
+            for c, v in zip(group_cols, key):
+                new_row[c] = v
+            j = 0
+            while j + 1 < len(ext):
+                cname = self._eval_expr(ext[j].strip(), ctx)
+                prev_grp = getattr(ctx, '_current_group', None)
+                ctx._current_group = grp_rows
+                try:
+                    val = self._eval_expr(ext[j + 1].strip(), ctx)
+                finally:
+                    ctx._current_group = prev_grp
+                new_row[str(cname)] = val
+                j += 2
+            out.append(new_row)
+        return out
+
+    def _fn_currentgroup(self, args_str: str, ctx: DAXContext):
+        return getattr(ctx, '_current_group', None) or []
+
+    def _fn_isonorafter(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        i = 0
+        while i < len(parts):
+            v1 = self._eval_expr(parts[i].strip(), ctx)
+            if i + 1 >= len(parts):
+                return None
+            v2 = self._eval_expr(parts[i + 1].strip(), ctx)
+            order = 'ASC'
+            if i + 2 < len(parts) and parts[i + 2].strip().upper() in ('ASC', 'DESC'):
+                order = parts[i + 2].strip().upper()
+                i += 3
+            else:
+                i += 2
+            try:
+                if v1 == v2:
+                    continue
+                ok = (v1 >= v2) if order == 'ASC' else (v1 <= v2)
+                return bool(ok)
+            except TypeError:
+                return None
+        return True
+
+    def _fn_allcrossfiltered(self, args_str: str, ctx: DAXContext):
+        # Clears every filter that reaches the table, directly or through
+        # relationships -- the CALCULATE branch treats it like ALL(Table).
+        return self._fn_all(args_str, ctx)
+
+    def _fn_substitutewithindex(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if len(parts) < 5:
+            return None
+        left = self._table_rows(parts[0], ctx)
+        name = self._eval_expr(parts[1].strip(), ctx)
+        right = self._table_rows(parts[2], ctx)
+        if left is None or right is None:
+            return None
+        order_ref = self._eval_expr(parts[3].strip(), ctx)
+        if not (isinstance(order_ref, tuple) and len(order_ref) == 2):
+            return None
+        ocol = order_ref[1]
+        rsorted = sorted(right, key=lambda r: (r.get(ocol) is None, r.get(ocol)))
+        common = None
+        out = []
+        for lr in left:
+            lvals = self._row_cols(lr)
+            if common is None and rsorted:
+                common = set(lvals) & set(self._row_cols(rsorted[0]))
+            idx = None
+            for j, rr in enumerate(rsorted):
+                rv = self._row_cols(rr)
+                if all(rv.get(c) == lvals.get(c) for c in (common or set())):
+                    idx = j
+                    break
+            new_row = {k: v for k, v in lr.items()
+                       if k.startswith('__') or k not in (common or set())}
+            new_row[str(name)] = idx
+            out.append(new_row)
+        return out
+
+    def _fn_detailrows(self, args_str: str, ctx: DAXContext):
+        """DETAILROWS(measure) -- no detail-rows expression support in the
+        model layer yet, so this returns the measure's home-table rows under
+        the current context, which is Desktop's default behaviour."""
+        m = args_str.strip()
+        if m.startswith('[') and m.endswith(']'):
+            m = m[1:-1]
+        home = (ctx.measure_tables or {}).get(m)
+        if not home:
+            for cand, tbl in (ctx.measure_tables or {}).items():
+                if cand.lower() == m.lower():
+                    home = tbl
+                    break
+        if not home:
+            return None
+        tbl = ctx.tables.get(home)
+        if not tbl:
+            return None
+        rows = ctx.get_filtered_rows(home)
+        cols = tbl['columns']
+        return [dict({'__table__': home, '__row__': True},
+                     **dict(zip(cols, r))) for r in rows]
+
+    def _fn_nextday(self, args_str: str, ctx: DAXContext):
+        return self._day_shift(args_str, ctx, +1)
+
+    def _fn_previousday(self, args_str: str, ctx: DAXContext):
+        return self._day_shift(args_str, ctx, -1)
+
+    def _day_shift(self, args_str: str, ctx: DAXContext, direction: int):
+        """NEXTDAY / PREVIOUSDAY: the single day after the last (before the
+        first) date in the current selection -- empty when the calendar does
+        not contain it, and an empty set means BLANK downstream."""
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if not (isinstance(ref, tuple) and len(ref) == 2):
+            return None
+        t, c = ref
+        visible = [d for d in (_as_datetime(v)
+                               for v in ctx.get_column_data(t, c))
+                   if d is not None]
+        if not visible:
+            return []
+        anchor = max(visible) if direction > 0 else min(visible)
+        target = anchor + timedelta(days=direction)
+        tbl = ctx.tables.get(t)
+        if not tbl:
+            return []
+        idx = ctx._find_col_idx(tbl['columns'], c)
+        if idx < 0:
+            return []
+        for row in tbl['rows']:
+            d = _as_datetime(row[idx])
+            if d is not None and d.date() == target.date():
+                return [{'__table__': t, '__column__': c,
+                         '__value__': row[idx]}]
+        return []
 
     def _fn_sqrt(self, args_str: str, ctx: DAXContext) -> Any:
         """SQRT(number) — square root."""

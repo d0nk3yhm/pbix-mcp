@@ -97,6 +97,8 @@ class TestCalcTableEvaluator:
     ])
     def test_supported_shapes(self, expr, cols, nrows):
         assert calc_table_unsupported_reason(expr) is None
+        # NATURALINNERJOIN graduated to a supported function in the
+        # conformance batches; COLUMNSTATISTICS is still genuinely unsupported.
         res, err = evaluate_calc_table_expression(expr, SALES)
         assert err is None, err
         assert res["columns"] == cols
@@ -135,7 +137,7 @@ class TestCalcTableEvaluator:
         # parity work), and this test is about the REFUSAL path, so it needs a
         # function the engine genuinely does not have.
         res, err = evaluate_calc_table_expression(
-            "NATURALINNERJOIN(Sales, Sales)", SALES)
+            "COLUMNSTATISTICS()", SALES)
         assert res is None and "unsupported" in err
 
     def test_calendar_date_table(self):
