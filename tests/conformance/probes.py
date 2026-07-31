@@ -193,6 +193,84 @@ PROBES: dict[str, list[str]] = {
     "ODDFYIELD": ["ODDFYIELD(DATE(2008,11,11), DATE(2021,3,1), DATE(2008,10,15), DATE(2009,3,1), 0.0575, 84.5, 100, 2, 0)"],
     "ODDLPRICE": ["ODDLPRICE(DATE(2008,2,7), DATE(2008,6,15), DATE(2007,10,15), 0.0375, 0.0405, 100, 2, 0)"],
     "ODDLYIELD": ["ODDLYIELD(DATE(2008,4,20), DATE(2008,6,15), DATE(2007,12,24), 0.0375, 99.875, 100, 2, 0)"],
+
+    # ================================================== batch 4
+    # ---- column-stat dotted names (parse fix made these reachable)
+    "STDEV.S": ["STDEV.S(N[i])"],
+    "STDEV.P": ["STDEV.P(N[i])"],
+    "VAR.S": ["VAR.S(N[i])"],
+    "VAR.P": ["VAR.P(N[i])"],
+    "MAXA": ["MAXA(N[i])", "MAXA(N[b])"],
+    "MINA": ["MINA(N[i])", "MINA(N[b])"],
+    "PRODUCTX": ["PRODUCTX(N, N[i])"],
+    # ---- type predicates
+    "ISEVEN": ["ISEVEN(4)", "ISEVEN(3)"],
+    "ISODD": ["ISODD(3)", "ISODD(4)"],
+    "ISBOOLEAN": ["ISBOOLEAN(TRUE)", "ISBOOLEAN(1)"],
+    "ISSTRING": ["ISSTRING(\"x\")", "ISSTRING(1)"],
+    "ISNUMERIC": ["ISNUMERIC(1)", "ISNUMERIC(\"x\")"],
+    "ISINTEGER": ["ISINTEGER(1)", "ISINTEGER(1.5)"],
+    "ISINT64": ["ISINT64(1)", "ISINT64(1.5)"],
+    "ISDECIMAL": ["ISDECIMAL(1.5)", "ISDECIMAL(CURRENCY(1))"],
+    "ISDOUBLE": ["ISDOUBLE(1.5)", "ISDOUBLE(1)"],
+    "ISCURRENCY": ["ISCURRENCY(CURRENCY(1.5))", "ISCURRENCY(1.5)"],
+    "ISEMPTY": ["ISEMPTY(FILTER(K, K[grp] = \"Q\"))", "ISEMPTY(K)"],
+    # ---- non-blank navigation
+    "FIRSTNONBLANKVALUE": ["FIRSTNONBLANKVALUE(K[grp], SUM(F[v]))"],
+    "LASTNONBLANKVALUE": ["LASTNONBLANKVALUE(K[grp], SUM(F[v]))"],
+    # ---- misc scalars
+    "CONVERT": ["CONVERT(3.7, INTEGER)", "CONVERT(5, STRING)",
+                 "CONVERT(\"7\", DOUBLE)"],
+    "TIME": ["TIME(14, 30, 15)", "TIME(25, 0, 0)"],
+    "YEARFRAC": ["YEARFRAC(DATE(2012,1,1), DATE(2012,7,30))",
+                  "YEARFRAC(DATE(2012,1,1), DATE(2012,7,30), 1)",
+                  "YEARFRAC(DATE(2012,1,1), DATE(2012,7,30), 3)"],
+    "IF.EAGER": ["IF.EAGER(1 > 0, \"yes\", \"no\")"],
+    "EVALUATEANDLOG": ["EVALUATEANDLOG(SUM(F[v]))"],
+    "APPROXIMATEDISTINCTCOUNT": ["APPROXIMATEDISTINCTCOUNT(F[k])"],
+    "NAMEOF": ["NAMEOF(K[grp])", "NAMEOF([Total V])"],
+    "USERCULTURE": ["LEN(USERCULTURE()) > 0"],
+    "SAMPLE": ["COUNTROWS(SAMPLE(2, F, F[v]))",
+                "SUMX(SAMPLE(2, F, F[v], ASC), F[v])"],
+    "TOCSV": ["SUBSTITUTE(TOCSV(K), UNICHAR(10), \"|\")"],
+    "TOJSON": ["SUBSTITUTE(TOJSON(K, 1), UNICHAR(10), \"|\")"],
+    # ---- PATH family on the PC table
+    "PATH": ["CONCATENATEX(FILTER(PC, PC[id] = 4), PATH(PC[id], PC[parent]))"],
+    "PATHITEMREVERSE": ["CONCATENATEX(FILTER(PC, PC[id] = 4), PATHITEMREVERSE(PATH(PC[id], PC[parent]), 1))"],
+    # ---- classification probes (Desktop decides authorability)
+    "ISAFTER": ["ISAFTER(3, 2, ASC)"],
+    "LOOKUP": ["LOOKUP(K[grp], K[k], 2)"],
+    "TOTALWTD": ["TOTALWTD(SUM(F[v]), D[Date])"],
+    "CUSTOMDATA": ["CUSTOMDATA()"],
+    "USEROBJECTID": ["LEN(USEROBJECTID()) > 0"],
+    "ROLLUPISSUBTOTAL": ["COUNTROWS(SUMMARIZECOLUMNS(ROLLUPADDISSUBTOTAL(K[grp], \"st\"), \"chk\", ROLLUPISSUBTOTAL()))"],
+    "ROLLUPGROUP": ["COUNTROWS(SUMMARIZE(K, ROLLUP(ROLLUPGROUP(K[grp])), \"n\", COUNTROWS(K)))"],
+    "ROLLUP": ["COUNTROWS(SUMMARIZE(K, ROLLUP(K[grp]), \"n\", COUNTROWS(K)))"],
+    "ADDMISSINGITEMS": ["COUNTROWS(ADDMISSINGITEMS(K[grp], SUMMARIZECOLUMNS(K[grp], \"s\", SUM(F[v])), K[grp]))"],
+    # COUNTROWS over a ROLLUP summarize is NON-COMPOSITIONAL in Desktop:
+    # EVALUATE prints 4 rows, COUNTROWS of the same expression says 2.
+    # Probed via SUMX, which Desktop answers consistently with EVALUATE.
+    "ISSUBTOTAL": ["SUMX(SUMMARIZE(K, ROLLUP(K[grp]), \"st\", ISSUBTOTAL(K[grp])), IF([st], 1, 0))"],
+    "LINEST": ["SUMX(LINEST(N[x], N[i]), [Slope1])"],
+    "LINESTX": ["SUMX(LINESTX(N, N[x], N[i]), [Slope1])"],
+    "SELECTEDMEASURE": ["SELECTEDMEASURE()"],
+    "ISSELECTEDMEASURE": ["ISSELECTEDMEASURE([Total V])"],
+    "SELECTEDMEASURENAME": ["SELECTEDMEASURENAME()"],
+    "SELECTEDMEASUREFORMATSTRING": ["SELECTEDMEASUREFORMATSTRING()"],
+    "COLLAPSE": ["COLLAPSE(SUM(F[v]), K[grp])"],
+    "EXPAND": ["EXPAND(SUM(F[v]), K[grp])"],
+    "ISATLEVEL": ["ISATLEVEL(K[grp])"],
+    # COLUMNSTATISTICS answers in Desktop (20 rows) but the count includes
+    # auto date/time LocalDateTable columns this model layer does not
+    # carry -- needs-model-feature, tracked in dax-coverage.md.
+
+    "EXTERNALMEASURE": ["EXTERNALMEASURE(\"x\", INTEGER, \"remote\")"],
+    "TABLEOF": ["COUNTROWS(TABLEOF([Total V]))"],
+    "NATURALJOINUSAGE": ["NATURALJOINUSAGE(F, K)"],
+    "LOOKUPWITHTOTALS": ["LOOKUPWITHTOTALS(K[grp], K[k], 2)"],
+    "SAMPLEAXISWITHLOCALMINMAX": ["COUNTROWS(SAMPLEAXISWITHLOCALMINMAX(4, F, F[v]))"],
+    "SAMPLECARTESIANPOINTSBYCOVER": ["COUNTROWS(SAMPLECARTESIANPOINTSBYCOVER(4, F, F[v], F[k]))"],
+    "UTCTODAY": ["ISDATETIME(UTCTODAY())"],
 }
 
 # Deterministic-by-shape only: capture records the TYPE, not the value.

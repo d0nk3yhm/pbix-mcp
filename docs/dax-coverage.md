@@ -9,8 +9,9 @@ build the corpus is verified against, immune to documentation lag.
 | | count |
 |---|---|
 | DAX functions in the engine (March 2026 build) | **467** |
-| implemented and verified | **314** ([supported-dax.md](supported-dax.md)) |
-| not yet implemented | **145** |
+| implemented and verified | **354** ([supported-dax.md](supported-dax.md)) |
+| not yet implemented or unclassified | **92** (69 INFO.*, 13 window family, PATH pair, 6 misc) |
+| classified out of authorable scope (Desktop evidence) | **21** |
 | needs-model-feature (calendar objects) | **7** (week-grain time intelligence) |
 | empirically not authorable (Desktop refuses in a query) | **2** (`CEILING.MATH`, `FLOOR.MATH`) |
 

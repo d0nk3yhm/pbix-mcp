@@ -59,7 +59,14 @@ FIXTURE_TABLES = {
     "D": {"columns": ["Date", "M", "Q"], "rows": D_ROWS},
     "F": {"columns": ["k", "v", "d"], "rows": F_ROWS},
     "K": {"columns": ["k", "grp"], "rows": K_ROWS},
+    "PC": {"columns": ["id", "parent", "label"], "rows": []},
 }
+FIXTURE_TABLES["PC"]["rows"] = [
+    [1, None, "root"],
+    [2, 1, "child-a"],
+    [3, 1, "child-b"],
+    [4, 2, "grand"],
+]
 
 FIXTURE_RELATIONSHIPS = [
     {"FromTable": "F", "FromColumn": "k", "ToTable": "K", "ToColumn": "k",
@@ -82,6 +89,18 @@ BUILDER_TABLES = [
            {"name": "d", "data_type": "DateTime"}], F_ROWS),
     ("K", [{"name": "k", "data_type": "Int64"},
            {"name": "grp", "data_type": "String"}], K_ROWS),
+    ("PC", [{"name": "id", "data_type": "Int64"},
+            {"name": "parent", "data_type": "Int64"},
+            {"name": "label", "data_type": "String"}],
+     FIXTURE_TABLES["PC"]["rows"]),
+]
+
+PC_ROWS = [
+    # id, parent, label
+    [1, None, "root"],
+    [2, 1, "child-a"],
+    [3, 1, "child-b"],
+    [4, 2, "grand"],
 ]
 
 FIXTURE_MEASURES = {"Total V": ("F", "SUM(F[v])")}

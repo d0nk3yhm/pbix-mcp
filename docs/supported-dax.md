@@ -1,6 +1,6 @@
 # Supported DAX Functions
 
-314 functions across 13 categories. Semantics are verified against Power BI Desktop's own engine on a 25-file corpus: every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns — matches Desktop exactly (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused. Full parity with the entire DAX surface is the roadmap, not yet a claim.
+354 functions across 14 categories. Semantics are verified against Power BI Desktop's own engine on a 25-file corpus: every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns — matches Desktop exactly (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused. Full parity with the entire DAX surface is the roadmap, not yet a claim.
 
 ## Aggregation (13)
 `SUM`, `AVERAGE`, `COUNT`, `COUNTA`, `COUNTROWS`, `MIN`, `MAX`, `DISTINCTCOUNT`, `DISTINCTCOUNTNOBLANK`, `PRODUCT`, `MEDIAN`, `MEDIANX`, `COUNTBLANK`
@@ -75,6 +75,25 @@ batch rather than shipped shallow.
 Day-count bases 0–4 (30/360 US, actual/actual, actual/360, actual/365,
 30E/360) with a coupon-schedule kernel; `RATE`/`YIELD`/`XIRR`/`ODDFYIELD` via
 Newton iteration. All 51 pinned by Desktop goldens at 1e-9.
+
+
+## Batch-4 additions (40)
+`STDEV.S`, `STDEV.P`, `VAR.S`, `VAR.P`, `MAXA`, `MINA`, `PRODUCTX`, `ISEVEN`, `ISODD`, `ISBOOLEAN`, `ISSTRING`, `ISNUMERIC`, `ISINTEGER`, `ISINT64`, `ISDECIMAL`, `ISDOUBLE`, `ISCURRENCY`, `ISEMPTY`, `ISAFTER`, `FIRSTNONBLANKVALUE`, `LASTNONBLANKVALUE`, `CONVERT`, `TIME`, `YEARFRAC`, `IF.EAGER`, `EVALUATEANDLOG`, `NAMEOF`, `USERCULTURE`, `USEROBJECTID`, `CUSTOMDATA`, `SAMPLE`, `TOCSV`, `TOJSON`, `LINEST`, `LINESTX`, `ADDMISSINGITEMS`, `TABLEOF`, `SAMPLECARTESIANPOINTSBYCOVER`, `UTCTODAY`, plus `ROLLUP`/`ROLLUPGROUP`/`ISSUBTOTAL` inside `SUMMARIZE`
+
+Notes pinned by Desktop: `LINEST` pairs columns row-by-row with BLANK
+participating as **zero**; `CURRENCY()` carries a Fixed Decimal type marker so
+`ISDECIMAL`/`ISCURRENCY` answer as Desktop does; and `COUNTROWS` over a
+`ROLLUP` summarize is **non-compositional in Desktop itself** (EVALUATE prints
+4 rows, COUNTROWS of the same expression says 2) — the conformance probe uses
+the `SUMX` form Desktop answers consistently.
+
+Classified out of authorable scope this batch, each from Desktop's own error:
+visual-calculation-only `LOOKUP`, `COLLAPSE`, `EXPAND`, `ISATLEVEL` (and by
+the same family `COLLAPSEALL`/`EXPANDALL`); calculation-group-context-only
+`SELECTEDMEASURE`, `ISSELECTEDMEASURE`, `SELECTEDMEASURENAME`,
+`SELECTEDMEASUREFORMATSTRING`; unresolvable `EXTERNALMEASURE`;
+import-storage-unsupported `APPROXIMATEDISTINCTCOUNT`; calendar-reference
+`TOTALWTD`; auto-date-table-dependent `COLUMNSTATISTICS`.
 
 ## Known Limitations
 
