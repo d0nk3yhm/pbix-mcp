@@ -105,7 +105,7 @@ src/pbix_mcp/
   errors.py              # Typed exceptions with stable error codes (12 classes)
   logging_config.py      # Diagnostic logging (normal/debug/trace)
   dax/
-    engine.py            # DAX evaluator (435 functions; verified parity with Power BI Desktop on everything tested)
+    engine.py            # DAX evaluator (verified parity: all 435 query-evaluable DAX functions; 32 more are non-evaluable in Desktop itself)
     calc_tables.py       # Calculated table + column support
   formats/
     abf_rebuild.py       # ABF archive format (read, modify, build from scratch)

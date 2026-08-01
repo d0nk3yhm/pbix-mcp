@@ -452,17 +452,20 @@ Every component of the VertiPaq columnar storage engine is independently impleme
 
 ## DAX Engine
 
-**Verified parity with Power BI Desktop on everything tested** — no longer a
-best-effort evaluator. Two independent proof layers, both reproducible from
-committed artifacts:
+**Verified parity with Power BI Desktop on 100% of the DAX surface Desktop can
+evaluate in a query** — no longer a best-effort evaluator. Two independent proof
+layers, both reproducible from committed artifacts:
 
 1. **Per-function conformance** ([docs/dax-coverage.md](docs/dax-coverage.md)):
-   435 of the live engine's 467 DAX functions are implemented; 259 carry
-   goldens captured from Power BI Desktop's **own workspace engine** and
-   replayed by `tests/test_dax_conformance.py` at 1e-9 relative tolerance
-   (356 value probes, no "unsupported" escape hatch). The other 32 are
-   proven not query-evaluable by Desktop itself, with its refusal recorded
-   in `tests/conformance/golden.json`.
+   **every one of the 435 query-evaluable functions** in the live engine's
+   467-function catalog is implemented — 259 carry goldens captured from
+   Power BI Desktop's **own workspace engine** and replayed by
+   `tests/test_dax_conformance.py` at 1e-9 relative tolerance (356 value
+   probes, no "unsupported" escape hatch). The other 32 of the 467 are **not
+   a coverage gap**: Desktop itself refuses to evaluate them in a query
+   (visual-calculation-only, calculation-group-only, edition-gated, etc.),
+   with its own error text recorded in `tests/conformance/golden.json`, so
+   there is nothing to match. See [docs/dax-coverage.md](docs/dax-coverage.md).
 2. **Full-corpus 1:1**: every comparable real-world measure across the
    20-file test corpus matches Desktop — 534/534 in the latest sweep
    (432 grand totals, 1,705 measure×dimension filter-context cells, and

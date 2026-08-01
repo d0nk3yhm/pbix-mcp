@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.75] - 2026-08-01
+
+### Docs — say "100% of the evaluable surface", not a bare "435 of 467"
+
+Follow-up to 0.9.74. The short docs stated DAX coverage as a bare "435 of 467
+functions", which reads as ~93% / "unfinished" when it is not. Parity is **100%
+of the DAX surface Power BI Desktop can evaluate in a query**: all 435
+query-evaluable functions match at 1e-9. The other 32 of the engine's 467-function
+catalog are **not a coverage gap** — Desktop itself refuses to evaluate them in a
+query (13 visual-calculation-only, 8 week-grain time-intelligence requiring a
+custom-calendar object the engine build refuses, 4 calculation-group-only, 3
+engine-internal, 3 edition/compat-blocked `INFO.*`, 1 DirectQuery-only), with
+Desktop's own error text recorded in `tests/conformance/golden.json`. Matching
+parity means refusing them the same way; implementing them would invent behavior
+Desktop does not have. Reworded `README.md`, `docs/architecture.md`,
+`docs/limitations.md`, `SUPPORT.md`, and `CONTRIBUTING.md` to lead with the
+100%-of-evaluable framing. See [docs/dax-coverage.md](docs/dax-coverage.md). No
+code changes.
+
 ## [0.9.74] - 2026-08-01
 
 ### Docs — clean-room / IP / security paperwork

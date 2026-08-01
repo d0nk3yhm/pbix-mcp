@@ -18,7 +18,7 @@ src/pbix_mcp/
   errors.py              # Typed exception hierarchy
   logging_config.py      # Structured logging (normal/debug/trace)
   dax/
-    engine.py            # DAX evaluator (435 functions; verified parity with Power BI Desktop on everything tested)
+    engine.py            # DAX evaluator (verified parity: all 435 query-evaluable DAX functions; the other 32 are non-evaluable in Desktop itself)
     calc_tables.py       # Calculated table + column evaluation
   formats/
     abf_rebuild.py       # ABF archive read/write/build
@@ -173,10 +173,14 @@ All responses are JSON via `ToolResponse.to_text()`:
 
 ## DAX Engine
 
-The engine has verified parity with Power BI Desktop on everything tested — not a
-strict Analysis Services runtime. It implements 435 of the live engine's 467 DAX
-functions, pinned by per-function goldens (1e-9 tolerance) and full-corpus 1:1
-checks (see [dax-coverage.md](dax-coverage.md)). Key design decisions:
+The engine has verified parity with Power BI Desktop on **100% of the DAX surface
+Desktop can evaluate in a query** — not a strict Analysis Services runtime. It
+implements every one of the 435 query-evaluable functions in the engine's
+467-function catalog, pinned by per-function goldens (1e-9 tolerance) and
+full-corpus 1:1 checks (see [dax-coverage.md](dax-coverage.md)). The other 32 of
+the 467 are refused by Desktop itself in a query (visual-calc-only,
+calculation-group-only, edition-gated, …), so there is nothing to match. Key
+design decisions:
 
 - Returns `None` for unsupported functions (tracked in `unsupported_functions`)
 - Raises `DAXEvaluationError` for circular references (caught by graceful degradation → `None`)
