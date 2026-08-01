@@ -30,7 +30,7 @@ engine is not a strict Analysis Services runtime, so the bounds below still appl
 | .pbix (Import mode) | Full read/write/create. Entire PBIX generated from scratch — no templates. Open, Refresh verified for all database types |
 | .pbit (Template) | Full read/write |
 | DirectQuery (create) | Open, live data, Refresh all verified — PostgreSQL (native), MySQL (MariaDB ODBC 3.1), SQL Server |
-| DirectQuery (open existing) | Read-only for layout/measures/metadata; DAX eval unavailable (data lives in remote source) |
+| DirectQuery (open existing) | Layout, measures, and metadata editing work; DAX eval and table reads unavailable (data lives in the remote source) |
 | Composite models | Not tested |
 | Live connections | Not supported |
 | PBIR layout | Full read AND write — PBIR (`Report/definition`) files are edited in place (create/delete pages and visuals, filters, geometry) through the same tools as classic `Report/Layout` |

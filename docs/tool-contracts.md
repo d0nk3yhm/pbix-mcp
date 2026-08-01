@@ -66,7 +66,7 @@ DAX evaluation returns extended results:
 | `pbix_save` | `strip_sensitivity_label` | `False` | Removes MSIP sensitivity labels when True |
 | `pbix_close` | `force` | `False` | Refuses to close with unsaved changes |
 
-## Tool Categories (127 tools)
+## Tool Categories (128 tools)
 
 ### Create & File Management (6)
 `pbix_create` · `pbix_open` · `pbix_save` · `pbix_close` · `pbix_list_open` · `pbix_report_format`
@@ -111,8 +111,8 @@ Create/list/remove drill-down hierarchies (e.g. Country > State > City).
 ### Cultures & Translations (4)
 Add cultures, translate table/column/measure names, list/remove cultures.
 
-### Partition Management (3)
-List/remove M partitions. `pbix_add_partition` blocked for PBIX (needs PartitionStorage), works for PBIP/TMDL export.
+### Partition Management (4)
+List/remove M partitions and set a table's M query definition (`pbix_set_partition_m`, metadata-only — Power BI runs the new M on next Refresh). `pbix_add_partition` blocked for PBIX (needs PartitionStorage), works for PBIP/TMDL export.
 
 ### Incremental Refresh (2)
 Get/set incremental refresh policies. `pbix_set_incremental_refresh` works for files with a data source (source_csv/source_db); embedded-only files return a clear error (same as PBI Desktop).

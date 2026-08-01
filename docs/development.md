@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast tests (888 pass, 10 skip, 94 slow/integration deselected)
+# Fast tests (~1,700 pass; slow/integration deselected — run `pytest --co -q` for exact counts)
 pytest -m "not slow"
 
 # With coverage
@@ -39,7 +39,7 @@ PBIX_TEST_SAMPLES=test_corpus pytest -v
 | `test_rich_content.py` | Deneb references, ImageUrl DataCategory, field parameters, SVG measures | 22 |
 | `test_zip_safety.py` | ZIP + path-traversal hardening (bomb, Zip-Slip, `_safe_join`, `set_theme`) | 10 |
 | `test_perf_per_dimension.py` | Bucketed per-dimension eval (correctness, adversarial, fuzz, perf) | 14 |
-| `test_pbir_reader.py` | PBIR read/write, bookmarks, format normalization | 38 |
+| `test_pbir_reader.py` | PBIR read/write, bookmarks, format normalization | 47 |
 | `test_report_editing.py` | rename/reorder/hide/duplicate/move, on both formats | 38 |
 | `test_sort_by_column.py` | Sort-by-column authoring (7 skip without the corpus) | 10 |
 | `test_pbir_schema_conformance.py` | PBIR output vs Microsoft's published schemas | 3 (integration) |
