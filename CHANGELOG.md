@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.78] - 2026-08-01
+
+### Fixed — `ModelReader` leaked its temp SQLite handle on a query error (Windows `WinError 32`)
+
+Found while reproducing #21. `ModelReader._query_metadata` — the shared read path
+behind `pbix_get_model_measures`, `pbix_get_model_relationships`,
+`pbix_get_model_power_query`, `pbix_list_data_sources`, and the schema/table
+readers — closed its SQLite connection **only on the success path**. Any query
+error left the handle open, so the `finally: os.unlink()` of the temp `.db` then
+raised *"[WinError 32] the file is being used by another process"*, masking the
+real error. It only bit Windows (POSIX allows unlinking an open file), which is
+why CI never saw it. The connection is now closed on every path before the unlink,
+and a failed unlink (e.g. an AV scanner briefly holding the file) is swallowed
+rather than raised. Regression: `tests/test_model_reader_tempfile.py`.
+
 ## [0.9.77] - 2026-08-01
 
 ### Fixed — `pbix_set_table_data` silently dropped a column's declared type (OpenBI #21)
