@@ -17,7 +17,7 @@
 - File open/close/save/repack (auto-backup, force flags)
 - Report layout read/write (pages, visuals, filters, positions)
 - Visual add/remove (cards, charts, shapes, images, textboxes, slicers)
-- DAX measure read/write/evaluate (156 functions, best-effort)
+- DAX measure read/write/evaluate (435 functions; verified parity with Power BI Desktop on everything tested)
 - Calculated table evaluation (DATATABLE, GENERATESERIES, CALENDAR, field parameters)
 - Metadata SQL read/write
 - Table data read (native VertiPaq decoder)
@@ -36,8 +36,7 @@
 - HTML / CSS / SVG visuals — bundled "PBIX HTML" visual via `pbix_add_html_visual` / `pbix_get_html_visual` / `pbix_set_html_visual` / `pbix_html_template`, with optional `category_field` cross-filtering (see [docs/html-visuals.md](docs/html-visuals.md))
 
 ### Known Limitations
-- DAX engine is best-effort, not a strict runtime — unsupported functions return `None` with status `"unsupported"`, circular references raise `DAXEvaluationError`
-- PBIR format is read-only for filter extraction (no layout write)
+- DAX engine has verified parity on everything tested, not a strict Analysis Services runtime — the residual functions/expression shapes Desktop itself cannot evaluate return `None` with status `"unsupported"` (never guessed); circular references raise `DAXEvaluationError`
 - Performance — tables >100K rows trigger a warning; the engine operates on in-memory Python data
 - **Creating DirectQuery files** — fully working with SQL Server, PostgreSQL 16, and MySQL 9.6 (via MariaDB adapter)
 - **Opening existing DirectQuery files** — layout, measures, and metadata editing work; DAX evaluation and table reads return clear errors since data lives in the remote source

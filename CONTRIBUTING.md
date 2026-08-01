@@ -1,5 +1,72 @@
 # Contributing
 
+Thanks for helping improve pbix-mcp. Before sending a change, please read the
+provenance and sign-off requirements below — they keep the project's clean-room
+posture intact and are a condition of every contribution being merged.
+
+## Contributions and provenance (clean-room)
+
+pbix-mcp is an **independent, clean-room reimplementation** of the Power BI file
+format, developed for interoperability. Keeping it clean-room is what lets the
+project exist, so every contribution holds to the same discipline the
+maintainers do.
+
+**By contributing, you certify that your contribution is either:**
+
+- your own original work, or
+- derived only from **lawful, permitted sources** — published public
+  documentation, public specifications (e.g. the Microsoft Open Specifications
+  such as MS-XLDM), lawful black-box / differential observation of files you have
+  the right to inspect, or third-party code under a license compatible with this
+  project's (MIT) whose notices you have preserved.
+
+**Do NOT contribute the following — such contributions will be rejected or
+reverted:**
+
+- Microsoft (or any other third party's) **proprietary source code**, in whole
+  or in part.
+- Code, constants, or data **decompiled, disassembled, or extracted from a
+  proprietary binary** (a Power BI Desktop DLL, `msmdsrv`, a shipped Microsoft
+  assembly, extracted Power BI JavaScript/CSS, etc.).
+- **Leaked, confidential, or NDA-covered** material from any source.
+- Microsoft **binaries, keys, credentials, or tokens**, or **copyrighted assets**
+  (icons, fonts, themes, sample datasets under a restrictive license).
+- Real **secrets** of any kind (passwords, connection strings, API tokens) in
+  code, tests, or fixtures.
+
+Format knowledge in this project is obtained the same way: public docs, public
+specs, and differential observation of lawfully-obtained files — never from
+Microsoft source or decompiled binaries. When you learn a fact by observing a
+file, record how in `docs/reverse-engineering/` so the provenance trail stays
+auditable. See
+[docs/reverse-engineering/methodology.md](docs/reverse-engineering/methodology.md).
+
+If you are ever unsure whether a source is permitted, open an issue and ask
+**before** writing the code.
+
+## Developer Certificate of Origin (sign-off)
+
+Contributions are accepted under the **Developer Certificate of Origin (DCO) 1.1**
+(<https://developercertificate.org/>). The DCO is a lightweight attestation — not
+a copyright assignment — that you have the right to submit the work under the
+project's license.
+
+Sign off every commit:
+
+```bash
+git commit -s
+```
+
+which appends a line to the commit message:
+
+```
+Signed-off-by: Your Name <your.email@example.com>
+```
+
+Signing off certifies that you agree to the DCO 1.1 text **and** to the
+clean-room provenance certification above. Commits without a `Signed-off-by` line
+may be asked to amend before merge.
+
 ## Setup
 
 ```bash
@@ -11,7 +78,7 @@ pip install -e ".[dev]"
 ## Running Tests
 
 ```bash
-# Fast unit tests only (725 pass, 10 skip, 22 slow/integration deselected)
+# Fast unit tests only (1731 pass, 66 skip, 104 slow/integration deselected)
 pytest -m "not slow"
 
 # Download public test corpus, then run integration tests
@@ -32,13 +99,13 @@ pytest --cov=src/pbix_mcp --cov-report=term-missing -m "not slow"
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (125 tools)
+  server.py              # MCP server (128 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX file builder (create from scratch with row data)
   errors.py              # Typed exceptions with stable error codes (12 classes)
   logging_config.py      # Diagnostic logging (normal/debug/trace)
   dax/
-    engine.py            # DAX evaluator (156 functions, best-effort)
+    engine.py            # DAX evaluator (435 functions; verified parity with Power BI Desktop on everything tested)
     calc_tables.py       # Calculated table + column support
   formats/
     abf_rebuild.py       # ABF archive format (read, modify, build from scratch)

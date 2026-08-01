@@ -2,7 +2,7 @@
 
 ## DAX Engine
 
-The DAX engine is a **best-effort evaluator** (174 functions, 99.5% accuracy on 204 real-world measures), not a strict Analysis Services runtime.
+The DAX engine has **verified parity with Power BI Desktop on everything tested** — 435 of the live engine's 467 DAX functions are implemented, pinned by per-function goldens captured from Desktop's own engine (1e-9 tolerance) plus full-corpus 1:1 checks (see [DAX Engine](../README.md#dax-engine) and [dax-coverage.md](dax-coverage.md)). It is not a strict Analysis Services runtime, so the bounds below still apply — including the residual functions/shapes Desktop itself cannot evaluate (returned as `None` with status `"unsupported"`, never guessed).
 
 | Behavior | What happens | Impact |
 |----------|-------------|--------|
