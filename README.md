@@ -82,7 +82,7 @@ pbix-mcp-server --log-level debug
 
 ## Format Reversal Status
 
-Every layer of the PBIX binary format has been independently reversed and reimplemented. No templates, skeletons, or Microsoft binaries are used.
+Every layer of the PBIX binary format that pbix-mcp's supported capabilities require has been independently reverse-engineered and reimplemented. No templates, skeletons, or Microsoft binaries are used.
 
 | Layer | Status | Implementation |
 |-------|--------|----------------|
@@ -661,7 +661,7 @@ For **modifying existing PBIX files** (adding a measure, changing a visual), the
 
 | Operation | Approach | Why |
 |-----------|----------|-----|
-| Create new PBIX | Full build | Every byte generated from code |
+| Create new PBIX | Full build | Whole file generated from code — no templates or skeletons |
 | Add/modify measure | Incremental | Only SQLite metadata modified |
 | Edit visual/layout | Incremental | Only Report/Layout JSON modified |
 | Add table to existing file | Full DataModel rebuild | VertiPaq offsets change |
@@ -676,11 +676,13 @@ This project is **100% Python** with zero Microsoft DLLs or SDKs. Every layer of
 This project is an **independent reimplementation** of the Power BI `.pbix` file format, created for the purpose of **interoperability** — enabling AI agents, automation tools, and non-Windows platforms to create, read, and write Power BI files.
 
 - **No Microsoft source code** was used. All binary format knowledge was derived through independent analysis of file structures and publicly observable behavior.
-- **Interoperability rights**: In both the [EU (Directive 2009/24/EC, Article 6)](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=celex%3A32009L0024) and [US (DMCA 1201(f))](https://www.law.cornell.edu/uscode/text/17/1201), reverse engineering for interoperability purposes is a protected right that supersedes contractual restrictions.
+- **Interoperability context**: In the [EU (Directive 2009/24/EC, Article 6)](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=celex%3A32009L0024) and the [US (DMCA §1201(f))](https://www.law.cornell.edu/uscode/text/17/1201), reverse engineering undertaken to achieve interoperability is recognized as a permitted purpose, subject to the conditions those provisions set out. This summary is provided for context only and is **not legal advice**; how these provisions apply depends on jurisdiction and circumstances, and you should consult qualified counsel for your own situation.
 - **Functional specification**: The binary format documentation in [`docs/vertipaq-spec.md`](docs/vertipaq-spec.md) describes functional information (data layouts, compression formats, metadata schemas) necessary for cross-platform compatibility.
 
-This project is not affiliated with, endorsed by, or associated with Microsoft Corporation. "Power BI" and "PBIX" are trademarks of Microsoft.
+This project is not affiliated with, endorsed by, or associated with Microsoft Corporation. "Power BI" and "PBIX" are trademarks of Microsoft Corporation, used here only nominatively to describe interoperability with those file formats.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
+
+Third-party components are attributed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Contributions are accepted under the Developer Certificate of Origin and the clean-room provenance terms in [CONTRIBUTING.md](CONTRIBUTING.md).

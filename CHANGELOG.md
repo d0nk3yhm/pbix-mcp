@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.74] - 2026-08-01
+
+### Docs — clean-room / IP / security paperwork
+
+A documentation-only release that closes the governance gaps a five-dimension
+clean-room/IP/security audit surfaced. No code changes.
+
+- **`CONTRIBUTING.md`** — added a **contributor provenance certification** (each
+  contribution is original or drawn only from lawful public docs/specs, lawful
+  black-box observation, or license-compatible OSS), an explicit **prohibition**
+  on Microsoft proprietary / decompiled / leaked material, binaries, keys,
+  credentials, and copyrighted assets, and a **Developer Certificate of Origin
+  1.1** (`git commit -s` / `Signed-off-by`) requirement.
+- **`THIRD_PARTY_NOTICES.md`** (new) — consolidated attribution manifest for the
+  runtime dependencies (xpress9 MIT, xmhuffman MIT, mcp/FastMCP MIT, pydantic
+  MIT, apsw "any-OSI"), the development-only test corpus (MIT, Sajjad Ahmadi),
+  and the bundled `.pbiviz` visual + icon provenance. Records what is **not**
+  bundled (no Microsoft source/binary/key/credential, no Microsoft fonts or
+  theme assets, no Deneb/Vega runtime).
+- **`SECURITY.md`** — extended the threat model with the previously-undocumented
+  controls: binary-parser hardening (ABF/VertiPaq/XPRESS9 bound-check untrusted
+  length/offset/count fields, fail closed), no silent network egress from
+  report-embedded URLs, credential redaction (never logged/persisted, incl.
+  `pbix_get_password`), report-text-is-data (prompt-injection resistance), no
+  untrusted values in a shell, and secure per-file working/temp directories.
+- **`docs/legal-and-cleanroom.md`** (new) — consolidated, conservatively-worded
+  legal posture: interoperability provisions framed as a **foundation, not a
+  guarantee**, subject to their conditions, with an explicit *not legal advice*
+  note and a recommendation to consult counsel.
+- **`README.md`** — replaced the categorical "reverse engineering … supersedes
+  contractual restrictions" claim with a descriptive, attributive summary plus a
+  not-legal-advice note; scoped two absolute completeness phrasings ("every
+  byte" / "every layer") to the project's supported capabilities; linked
+  `THIRD_PARTY_NOTICES.md` and the DCO from the License section; clarified the
+  trademark line as nominative use.
+- **Consistency** — reconciled the stale "best-effort evaluator (174/156
+  functions)" self-description in `docs/architecture.md`, `docs/limitations.md`,
+  and `SUPPORT.md` to match the README's verified-parity framing (435 of 467
+  functions); corrected `SUPPORT.md`'s stale "PBIR read-only" note; refreshed
+  the tool count (128) and DAX function count in `CONTRIBUTING.md`.
+
 ## [0.9.73] - 2026-07-31
 
 ### Fixed — RELATED() ignored row context inside iterators (silent wrong values)

@@ -18,7 +18,7 @@ src/pbix_mcp/
   errors.py              # Typed exception hierarchy
   logging_config.py      # Structured logging (normal/debug/trace)
   dax/
-    engine.py            # Best-effort DAX evaluator (174 functions)
+    engine.py            # DAX evaluator (435 functions; verified parity with Power BI Desktop on everything tested)
     calc_tables.py       # Calculated table + column evaluation
   formats/
     abf_rebuild.py       # ABF archive read/write/build
@@ -173,8 +173,10 @@ All responses are JSON via `ToolResponse.to_text()`:
 
 ## DAX Engine
 
-The engine is a best-effort evaluator, not a strict Analysis Services runtime.
-It handles 174 functions across 10 categories. Key design decisions:
+The engine has verified parity with Power BI Desktop on everything tested — not a
+strict Analysis Services runtime. It implements 435 of the live engine's 467 DAX
+functions, pinned by per-function goldens (1e-9 tolerance) and full-corpus 1:1
+checks (see [dax-coverage.md](dax-coverage.md)). Key design decisions:
 
 - Returns `None` for unsupported functions (tracked in `unsupported_functions`)
 - Raises `DAXEvaluationError` for circular references (caught by graceful degradation → `None`)
