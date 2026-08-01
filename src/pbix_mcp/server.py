@@ -9197,6 +9197,12 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str,
               ]
             }
             Supported data_types: String, Int64, Float64, DateTime, Decimal, Boolean.
+            The type name is case-insensitive, and the type key may be
+            "data_type", "dataType", or "type" — but it must be present on any
+            column you want typed: a numeric column with no recognized type
+            becomes String (so aggregating measures over it return BLANK). An
+            unrecognized type name is rejected with a clear error rather than
+            silently defaulting to String.
             Optional per-column "data_category" sets Column.DataCategory —
             e.g. "ImageUrl" so table/matrix cells (and the Power BI service)
             render the value as an image, or "WebUrl" for clickable links.
@@ -9226,6 +9232,17 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str,
         rows = data.get("rows", [])
         if not columns or not rows:
             return ToolResponse.error("'columns' and 'rows' are required and must not be empty.", ABFRebuildError.code).to_text()
+        # Normalize column type keys/values up front (accept dataType/type and
+        # case-insensitive names) so a mistyped key can't silently ship a
+        # numeric column as String — the failure mode that made bound measures
+        # return BLANK and Desktop show "Error fetching data" (OpenBI #21). This
+        # also turns a columns-as-strings payload into a clear message instead
+        # of a raw "string indices must be integers" TypeError.
+        from pbix_mcp.builder import normalize_column_defs
+        try:
+            columns = normalize_column_defs(columns, table_name)
+        except (ValueError, TypeError) as e:
+            return ToolResponse.error(str(e), ABFRebuildError.code).to_text()
 
         dm_path = os.path.join(info["work_dir"], "DataModel")
         if not os.path.exists(dm_path):

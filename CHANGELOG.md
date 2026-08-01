@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.77] - 2026-08-01
+
+### Fixed — `pbix_set_table_data` silently dropped a column's declared type (OpenBI #21)
+
+- **A column type passed under `dataType` (or a lowercase name like `int64`) was
+  ignored, so every column defaulted to `String`.** A numeric column then shipped
+  as text: `SUM()` over it returned BLANK, and Power BI Desktop rendered every
+  bound visual as *"Error fetching data for this visual"* — while the tool
+  reported success and `pbix_query_table` returned the (text) rows. The engine
+  reproduces it: after the call, `[Val] = SUM(S[V])` went from 550 to **blank**;
+  with the fix it returns the correct **3000**.
+- The column type is now read from `data_type`, `dataType`, or `type`, and the
+  value is normalized case-insensitively (`"int64"` → `Int64`). A column with a
+  type we do not recognize is **rejected with a clear error** instead of silently
+  becoming `String`; a column with no type at all still defaults to `String`.
+  Centralized in `PBIXBuilder.add_table` (`normalize_column_defs`), so every
+  table-building path — `pbix_set_table_data`, `pbix_create`, the rebuild path —
+  gets it.
+- **Clearer errors for a malformed `columns` payload.** Passing `columns` as a
+  list of strings used to surface a raw `"string indices must be integers"`
+  TypeError; it now says *"Column 0 … must be an object like {\"name\": …,
+  \"data_type\": …}, not bare strings."* The accepted shape (and the accepted
+  keys) are now documented in the tool docstring.
+- Regression: `tests/test_set_table_data_typing.py` (10 cases — the reporter's
+  exact camelCase/lowercase payload keeps the bound measure queryable, plus the
+  malformed-shape and unrecognized-type errors).
+
 ## [0.9.76] - 2026-08-01
 
 ### Docs — cross-document consistency sweep + number ratchet

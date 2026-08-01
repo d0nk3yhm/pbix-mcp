@@ -160,6 +160,20 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **findings-21** -- CLOSED (0.9.77). `pbix_set_table_data` left the report
+  unqueryable in Desktop ("Error fetching data for this visual"). Root cause: a
+  column type passed under `dataType` (camelCase) or a lowercase name (`int64`)
+  was ignored -- only `data_type` was read -- so every column silently defaulted
+  to `String`. A numeric column then shipped as text, `SUM()` over it returned
+  BLANK, and every measure-bound visual errored while the tool reported success
+  and `pbix_query_table` read the (text) rows. Engine-reproduced: `[Val] =
+  SUM(S[V])` went 550 -> blank on the call, and returns the correct 3000 with the
+  fix. `PBIXBuilder.add_table` now normalizes the type key (`data_type`/`dataType`
+  /`type`) and value (case-insensitive) and refuses an unrecognized type rather
+  than defaulting to String; the malformed-`columns` payloads that used to leak a
+  raw `"string indices must be integers"` TypeError now give a clear shape error.
+  `tests/test_set_table_data_typing.py` (10). The secondary "contradictory error
+  messages" note in the report is resolved by the same clear-error path.
 - **findings-20** -- CLOSED (0.9.73). `RELATED()` inside an iterator ignored
   row context: it resolved to the first *visible* row of the related table for
   every iterated row, so `SUMX(Sales, Sales[Qty] * RELATED(Products[UnitPrice]))`

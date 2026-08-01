@@ -45,6 +45,83 @@ _TYPE_NAME_TO_AMO = {
     "Boolean": 11,
 }
 
+# A column's type may arrive under any of these keys. Only "data_type" is
+# documented, but "dataType"/"type" are the obvious guesses, and reading only
+# "data_type" silently dropped a caller's "dataType": "Int64" — the column
+# defaulted to String, so a numeric column shipped as text, SUM() over it
+# returned BLANK, and Power BI Desktop rendered every bound visual as "Error
+# fetching data for this visual" while the tool reported success (OpenBI #21).
+_COLUMN_TYPE_KEYS = ("data_type", "dataType", "datatype", "dataTypeName", "type")
+
+# Case-insensitive value aliases -> a canonical name in _TYPE_NAME_TO_AMO.
+_COLUMN_TYPE_ALIASES = {
+    "string": "String", "text": "String", "str": "String",
+    "int64": "Int64", "int": "Int64", "integer": "Int64", "long": "Int64",
+    "wholenumber": "Int64", "whole number": "Int64",
+    "double": "Double", "float64": "Float64", "float": "Double",
+    "number": "Double", "real": "Double",
+    "datetime": "DateTime", "date": "DateTime", "time": "DateTime",
+    "decimal": "Decimal", "currency": "Decimal",
+    "fixeddecimal": "Decimal", "fixed decimal": "Decimal",
+    "boolean": "Boolean", "bool": "Boolean",
+}
+
+_VALID_TYPE_NAMES = "String, Int64, Double, DateTime, Decimal, Boolean"
+
+
+def normalize_column_defs(columns: object, table_name: str = "") -> list[dict]:
+    """Return column defs with a canonical string ``data_type``.
+
+    Accepts the type under ``data_type``/``dataType``/``type`` and normalizes the
+    value case-insensitively (``"int64"`` -> ``"Int64"``). A column with a type
+    key we do not read used to be silently created as ``String``, which shipped
+    numeric data as text (aggregating measures then returned BLANK). This raises
+    a clear error on a malformed column or an unrecognized type instead of
+    corrupting the file; a column with NO type key at all still defaults to
+    ``String`` (the caller supplied no type). All other keys pass through.
+    """
+    where = f" in table '{table_name}'" if table_name else ""
+    if not isinstance(columns, list):
+        raise TypeError(
+            f"'columns'{where} must be a list of column objects like "
+            f'[{{"name": "Amount", "data_type": "Int64"}}], got '
+            f"{type(columns).__name__}.")
+    out: list[dict] = []
+    for i, col in enumerate(columns):
+        if not isinstance(col, dict):
+            raise TypeError(
+                f"Column {i}{where} must be an object like "
+                f'{{"name": "Amount", "data_type": "Int64"}}, got '
+                f"{type(col).__name__} ({col!r}). Column definitions are "
+                f"objects with a 'name' and a 'data_type', not bare strings.")
+        name = col.get("name")
+        if not name:
+            raise ValueError(
+                f"Column {i}{where} is missing its \"name\": {col!r}.")
+        raw = None
+        for k in _COLUMN_TYPE_KEYS:
+            v = col.get(k)
+            if v not in (None, ""):
+                raw = v
+                break
+        canonical: str | None
+        if raw is None:
+            canonical = "String"  # no type supplied — safe default
+        else:
+            canonical = _COLUMN_TYPE_ALIASES.get(str(raw).strip().lower())
+            if canonical is None and str(raw) in _TYPE_NAME_TO_AMO:
+                canonical = str(raw)
+            if canonical is None:
+                raise ValueError(
+                    f"Column '{name}'{where} has an unrecognized data type "
+                    f"{raw!r}. Use one of: {_VALID_TYPE_NAMES} "
+                    f"(case-insensitive; 'dataType'/'type' are also accepted "
+                    f"as the key).")
+        new = dict(col)
+        new["data_type"] = canonical
+        out.append(new)
+    return out
+
 # AMO/TOM measure DataType codes we emit. A measure's DataType tells
 # Analysis Services how to store/format the scalar result. The historical
 # code hardcoded Int64 (6) for every measure, which truncated decimal and
@@ -556,6 +633,11 @@ class PBIXBuilder:
         """
         if mode not in ("import", "directquery"):
             raise ValueError(f"mode must be 'import' or 'directquery', got {mode!r}")
+        # Normalize the column type key/value up front: accept dataType/type and
+        # case-insensitive names, and refuse an unrecognized type rather than
+        # silently defaulting it to String (which shipped numeric columns as
+        # text and made bound measures return BLANK — OpenBI #21).
+        columns = normalize_column_defs(columns, name)
         # Validate row shape early so callers get a clear error here instead
         # of a cryptic "'list' object has no attribute 'keys'" deep in save().
         if rows:
