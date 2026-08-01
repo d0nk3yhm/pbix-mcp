@@ -17,7 +17,7 @@
 - File open/close/save/repack (auto-backup, force flags)
 - Report layout read/write (pages, visuals, filters, positions)
 - Visual add/remove (cards, charts, shapes, images, textboxes, slicers)
-- DAX measure read/write/evaluate (435 functions; verified parity with Power BI Desktop on everything tested)
+- DAX measure read/write/evaluate (verified parity: all 435 query-evaluable DAX functions; the other 32 of the engine's 467 are non-evaluable in Desktop itself)
 - Calculated table evaluation (DATATABLE, GENERATESERIES, CALENDAR, field parameters)
 - Metadata SQL read/write
 - Table data read (native VertiPaq decoder)

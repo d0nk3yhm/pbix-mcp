@@ -2,7 +2,16 @@
 
 ## DAX Engine
 
-The DAX engine has **verified parity with Power BI Desktop on everything tested** — 435 of the live engine's 467 DAX functions are implemented, pinned by per-function goldens captured from Desktop's own engine (1e-9 tolerance) plus full-corpus 1:1 checks (see [DAX Engine](../README.md#dax-engine) and [dax-coverage.md](dax-coverage.md)). It is not a strict Analysis Services runtime, so the bounds below still apply — including the residual functions/shapes Desktop itself cannot evaluate (returned as `None` with status `"unsupported"`, never guessed).
+The DAX engine has **verified parity with Power BI Desktop on 100% of the DAX
+surface Desktop can evaluate in a query** — every one of the 435 query-evaluable
+functions in the engine's 467-function catalog is implemented, pinned by
+per-function goldens captured from Desktop's own engine (1e-9 tolerance) plus
+full-corpus 1:1 checks (see [DAX Engine](../README.md#dax-engine) and
+[dax-coverage.md](dax-coverage.md)). The other 32 of the 467 are **not a coverage
+gap**: Desktop itself refuses them in a query (visual-calculation-only,
+calculation-group-only, edition-gated, etc.), so parity means refusing them the
+same way — they return `None` with status `"unsupported"`, never a guess. The
+engine is not a strict Analysis Services runtime, so the bounds below still apply.
 
 | Behavior | What happens | Impact |
 |----------|-------------|--------|
