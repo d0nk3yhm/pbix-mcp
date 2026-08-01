@@ -19,15 +19,15 @@ the conformance fixture.
 either matches Power BI Desktop through the per-function conformance
 harness, or Desktop/the engine itself refuses it in every authorable shape,
 with the refusal recorded. The exact tallies are derivable from the
-committed artifacts: 259 functions carry value goldens in
-`tests/conformance/golden.json`, 176 core functions predate the harness and
+committed artifacts: 260 functions carry value goldens in
+`tests/conformance/golden.json`, 175 core functions predate the harness and
 are pinned by full-corpus parity, and 32 carry only Desktop-error records.
 
-Implemented-and-verified means one of two proof levels: **259** functions have
+Implemented-and-verified means one of two proof levels: **260** functions have
 per-function goldens captured from the live Desktop engine and replayed by
 `tests/test_dax_conformance.py` (the ratchet: no "unsupported" escape hatch,
-1e-9 relative tolerance), and **176** core functions predate the harness and
-are pinned by full-corpus parity (every comparable cell of the 25-file corpus,
+1e-9 relative tolerance), and **175** core functions predate the harness and
+are pinned by full-corpus parity (every comparable cell of the 24-report corpus,
 v0.9.63). An unimplemented function returns `None` with status
 `"unsupported"`; it is never guessed.
 

@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.76] - 2026-08-01
+
+### Docs — cross-document consistency sweep + number ratchet
+
+An independent adversarial re-read of the whole doc set (three skeptical readers)
+found cross-document number drift that the 0.9.74/0.9.75 passes missed. All are
+reconciled to ground truth measured from the code/artifacts, and the drift-prone
+counts are now pinned by a test so they cannot silently go stale again.
+
+- **Tool count → 128 everywhere.** `docs/architecture.md`, `docs/tool-contracts.md`,
+  and a stale `README.md` Package Layout comment said 127; the authoritative count
+  (`@mcp.tool` decorators in `server.py`) is 128. `tool-contracts.md` also gains
+  the missing `pbix_set_partition_m` under Partition Management (3 → 4).
+- **Test corpus → 24 reports everywhere.** `README.md` (two spots) said "4
+  dashboards" / "20-file"; `docs/dax-coverage.md`, `docs/supported-dax.md`, and
+  `PROGRESS.md` said "25-file". The default download is 24 reports (4 community
+  MIT dashboards + 20 Microsoft public samples, both MIT). `THIRD_PARTY_NOTICES.md`
+  now credits both sources. (The CryptKey experiment's separate 25-file
+  byte-observation set is unchanged — it is a different corpus.)
+- **DirectQuery (open existing)** — `docs/limitations.md` claimed layout/measures/
+  metadata are read-only, contradicting `README.md` and `SUPPORT.md`; editing
+  works (it is metadata/JSON, storage-mode-agnostic), only DAX eval and table
+  reads are unavailable. Reconciled to "editing works".
+- **Test tallies de-brittled.** `docs/development.md` (888) and `README.md` (1202)
+  gave stale fast-suite figures; both now point at `pytest --co -q` for the exact
+  number. `test_pbir_reader.py` count corrected 38 → 47.
+- **Overclaim scoping.** The "No Microsoft Dependencies" line now scopes "every
+  layer … that pbix-mcp's supported capabilities require" (matching the rest of
+  the README); `docs/vertipaq-spec.md`'s footer no longer states a categorical
+  "in accordance with applicable reverse engineering laws" conclusion — it is
+  hedged and cross-references `docs/legal-and-cleanroom.md` with a not-legal-advice
+  note.
+- **Ratchet extended** (`tests/test_doc_numbers.py`): now also pins the tool count
+  (vs `server.py`) and the corpus size (vs `scripts/download_test_corpus.py`), on
+  top of the DAX value-probe / golden-backed / corpus-pinned counts. The DAX-framing
+  reader found nothing — the 0.9.75 "100% of the evaluable surface" wording holds.
+
 ## [0.9.75] - 2026-08-01
 
 ### Docs — say "100% of the evaluable surface", not a bare "435 of 467"

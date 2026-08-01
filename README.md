@@ -6,9 +6,9 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The PBIX binary format is independently reimplemented in pure Python — every structure pbix-mcp's supported capabilities require, with no templates, skeletons, or Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026. The DAX engine is verified against Power BI Desktop's own evaluator at two levels: **435 of the engine's 467 DAX functions** carry per-function conformance goldens captured from Desktop's workspace engine (the other 32 are proven not query-evaluable by Desktop itself), and the full corpus matches 1:1 — **432/432** grand totals, **1,705/1,705** measure×dimension filter-context cells, **397/397** calculated columns (v0.9.63; latest sweep 534/534 comparable measures across 20 files).
+An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The PBIX binary format is independently reimplemented in pure Python — every structure pbix-mcp's supported capabilities require, with no templates, skeletons, or Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026. The DAX engine has **verified parity with Power BI Desktop on 100% of the DAX surface Desktop can evaluate in a query** — all 435 query-evaluable of the engine's 467 functions (the other 32 are proven not query-evaluable by Desktop itself, so there is nothing to match). Two proof layers: per-function goldens captured from Desktop's own workspace engine (359 value probes, 1e-9 tolerance) and a full-corpus 1:1 match — **432/432** grand totals, **1,705/1,705** measure×dimension filter-context cells, **397/397** calculated columns (v0.9.63; latest sweep 534/534 comparable measures across the corpus).
 
-Exposes 128 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing (rename / reorder / hide / duplicate pages, move & copy visuals — identically on classic `Report/Layout` and service-authored **PBIR**), visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, sort-by-column, TMDL export, incremental refresh, DAX evaluation (435 of the live engine's 467 DAX functions, conformance-verified against Desktop; corpus 1:1), RLS security, and binary format internals.
+Exposes 128 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing (rename / reorder / hide / duplicate pages, move & copy visuals — identically on classic `Report/Layout` and service-authored **PBIR**), visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, sort-by-column, TMDL export, incremental refresh, DAX evaluation (100% of Desktop's query-evaluable DAX surface — 435 functions, conformance-verified against Desktop; corpus 1:1), RLS security, and binary format internals.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
@@ -125,7 +125,7 @@ Every artifact is generated, including `CryptKey.bin` — a 144-byte fixed-forma
 | Color extraction & recolor | **Stable** | `pbix_extract_colors` scans themes + all visuals. `pbix_recolor` replaces hex + ThemeDataColor refs, auto-extends palette, injects per-series/category chart colors, generates themed table rows, strips borders and pie/donut backgrounds, hides card titles (shows categoryLabels), fixes text contrast (WCAG 2.0) including theme foreground, chart axis/legend/labels, table rows, and card calloutValue |
 | Visual property editing | **Stable** | Dot-path and full JSON |
 | DAX measure CRUD | **Stable** | Add, modify, remove via binary splice (PBI Desktop files) or full builder rebuild. Sequential adds supported with automatic MAXID tracking |
-| DAX evaluation (435 of the live engine's 467 DAX functions, conformance-verified against Desktop; corpus 1:1) | **Stable API** | Verified parity on everything tested: per-function goldens from Desktop's own engine (1e-9) + full-corpus 1:1; documented deltas in the DAX Engine section |
+| DAX evaluation (100% of Desktop's query-evaluable DAX surface — 435 functions; corpus 1:1) | **Stable API** | Verified parity on the full evaluable surface: per-function goldens from Desktop's own engine (1e-9) + full-corpus 1:1; the other 32 of the 467 are Desktop's own refusals; documented deltas in the DAX Engine section |
 | Metadata SQL read/write | **Stable** | Full SQLite access to tables, columns, relationships |
 | Default slicer filter extraction | **Stable** | Legacy Layout JSON and PBIR format |
 | PBIR read + write | **Stable** | Service-authored reports (`Report/definition/`) are read AND edited by the same tools as classic. The 126 tools present at the 0.9.39 parity audit are verified on both formats by applying the tool, saving, reopening and checking the saved bytes — see [docs/capability-parity.md](docs/capability-parity.md) |
@@ -161,7 +161,7 @@ Every artifact is generated, including `CryptKey.bin` — a 144-byte fixed-forma
 
 ## Known Limitations
 
-- **DAX engine parity is bounded by what is tested** — 435/467 functions carry Desktop-captured conformance goldens and the 20-file corpus matches 1:1, but goldens pin probe shapes, not every argument combination; unlisted expression shapes are refused rather than guessed (`None`, status `"unsupported"`), circular references raise `DAXEvaluationError`. See [docs/dax-coverage.md](docs/dax-coverage.md) and [docs/supported-dax.md](docs/supported-dax.md).
+- **DAX engine parity is 100% of the evaluable surface, bounded by what is tested** — every function Desktop can evaluate in a query is verified (435 of the 467-function catalog; the other 32 are Desktop's own refusals) via Desktop-captured conformance goldens plus a 24-report corpus 1:1 match, but that verification pins probe shapes and real-world corpus composition, not every argument combination; unlisted expression shapes are refused rather than guessed (`None`, status `"unsupported"`), circular references raise `DAXEvaluationError`. See [docs/dax-coverage.md](docs/dax-coverage.md) and [docs/supported-dax.md](docs/supported-dax.md).
 - **PBIR format** — PBI Desktop (March 2026) has rendering bugs with PBIR decomposed format. PBIP export uses legacy report format (version 1.0) which works reliably.
 - **1 out of 204 tested measures** returns BLANK (requires per-employee RANKX visual row context)
 - **Performance** — tables >100K rows trigger a warning; the DAX engine operates on in-memory Python data
@@ -458,16 +458,16 @@ layers, both reproducible from committed artifacts:
 
 1. **Per-function conformance** ([docs/dax-coverage.md](docs/dax-coverage.md)):
    **every one of the 435 query-evaluable functions** in the live engine's
-   467-function catalog is implemented — 259 carry goldens captured from
+   467-function catalog is implemented — 260 carry goldens captured from
    Power BI Desktop's **own workspace engine** and replayed by
-   `tests/test_dax_conformance.py` at 1e-9 relative tolerance (356 value
+   `tests/test_dax_conformance.py` at 1e-9 relative tolerance (359 value
    probes, no "unsupported" escape hatch). The other 32 of the 467 are **not
    a coverage gap**: Desktop itself refuses to evaluate them in a query
    (visual-calculation-only, calculation-group-only, edition-gated, etc.),
    with its own error text recorded in `tests/conformance/golden.json`, so
    there is nothing to match. See [docs/dax-coverage.md](docs/dax-coverage.md).
 2. **Full-corpus 1:1**: every comparable real-world measure across the
-   20-file test corpus matches Desktop — 534/534 in the latest sweep
+   24-report test corpus matches Desktop — 534/534 in the latest sweep
    (432 grand totals, 1,705 measure×dimension filter-context cells, and
    397 calculated columns in the fuller v0.9.63 verification).
 
@@ -531,7 +531,7 @@ The 1 BLANK measure requires per-employee RANKX visual row context that doesn't 
 # Fast tests (no PBIX files needed, runs from fresh clone)
 pytest -m "not slow"
 
-# Download public test corpus (4 dashboards, MIT licensed)
+# Download public test corpus (24 reports from two MIT-licensed sources)
 python scripts/download_test_corpus.py --output-dir test_corpus
 
 # Run integration tests against the corpus
@@ -562,7 +562,7 @@ A representative subset of the test suites — the largest suites include:
 | `test_tool_surfaces.py` | 10 | `unit` | No |
 | `test_pbir_reader.py` | 47 | `unit` | No |
 
-**From a fresh clone: 1202 tests collected.** Tests gated on the public test corpus are skipped when it is absent (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
+**From a fresh clone: ~1,900 tests collected** (run `pytest --co -q` for the exact number). Tests gated on the public test corpus are skipped when it is absent (no private files are needed). Download it with `python scripts/download_test_corpus.py`, then set `PBIX_TEST_SAMPLES=test_corpus` to run them.
 
 ## Architecture
 
@@ -594,7 +594,7 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (127 tools)
+  server.py              # MCP server (128 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX builder (metadata, VertiPaq, layout, relationships)
   html_templates.py      # HTML/SVG template builders (kpi_card, bar_chart, gauge, table, …)
@@ -672,7 +672,7 @@ For **modifying existing PBIX files** (adding a measure, changing a visual), the
 
 ### No Microsoft Dependencies
 
-This project is **100% Python** with zero Microsoft DLLs or SDKs. Every layer of the PBIX format — from the ZIP shell to the VertiPaq column encoding — is independently reversed and implemented. The XPress9 compression uses [xpress9-python](https://github.com/Hugoberry/xpress9-python) (MIT) and the canonical-Huffman string store uses [xmhuffman](https://github.com/Hugoberry/xmhuffman-cython) (MIT) as low-level primitives; the Power BI DataModel container format (chunk framing, headers, multi-thread support, full read/write/modify round-trip) is original work in `datamodel_roundtrip.py`.
+This project is **100% Python** with zero Microsoft DLLs or SDKs. Every layer of the PBIX format that pbix-mcp's supported capabilities require — from the ZIP shell to the VertiPaq column encoding — is independently reversed and implemented. The XPress9 compression uses [xpress9-python](https://github.com/Hugoberry/xpress9-python) (MIT) and the canonical-Huffman string store uses [xmhuffman](https://github.com/Hugoberry/xmhuffman-cython) (MIT) as low-level primitives; the Power BI DataModel container format (chunk framing, headers, multi-thread support, full read/write/modify round-trip) is original work in `datamodel_roundtrip.py`.
 
 ## Purpose & Interoperability
 

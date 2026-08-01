@@ -9,7 +9,7 @@ and how, what is left, and the traps already hit so they are not re-hit.
 directory leak). **0.9.63, same day, is the FULL-PARITY release**: **432/432**
 comparable measures at the grand total, **1,705/1,705** measure x dimension
 cells under a filter context, **397/397** calculated columns vs stored VertiPaq
-values -- zero diffs anywhere in the 25-file corpus.
+values -- zero diffs anywhere in the 24-report corpus.
 Verified by installing from PyPI into a clean venv and asserting the
 table-expansion rule in the published artifact (column filter -> no expansion,
 table filter -> expansion). 0.9.62 shipped earlier the same day with five of the
@@ -29,7 +29,7 @@ formulations and why only expansion satisfies both anchors.
 |---|---|---|
 | measures at the grand total | 547 measures, 24 files | 1:1 with Desktop |
 | measures UNDER A FILTER CONTEXT | ~1,700 measure x dimension-value cells | see per-file table below |
-| calculated columns vs stored VertiPaq values | 397 columns, all 25 files | 0 mismatches, 8 deliberate refusals |
+| calculated columns vs stored VertiPaq values | 397 columns, all 24 reports | 0 mismatches, 8 deliberate refusals |
 | unit tests | 1,349 | pass (`pytest -m "not slow"`) |
 | ruff / mypy | — | clean / 140 (the standing baseline) |
 
@@ -300,7 +300,7 @@ Two anchors, both required, and neither is optional:
   of `July` and every `mm/dd/yyyy` came out `00/19/2021`. Commit 72c0afc. Only
   ONE corpus measure uses a real date picture (`MS_Covid_Tracking[Updated]`),
   which is why the blast radius was small -- a scan of every FORMAT call in all
-  25 files confirmed it, and `Date Range Previous Period` renders its dates by
+  the corpus confirmed it, and `Date Range Previous Period` renders its dates by
   `&` concatenation, not FORMAT, so it is a different path.
 
 **Re-verified after the fixes, with the sweep's own rules:**

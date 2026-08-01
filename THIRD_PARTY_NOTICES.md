@@ -46,7 +46,11 @@ Canonical-Huffman string-page codec (MS-XLDM §2.7.4).
 The integration test suite downloads a public corpus of sample `.pbix` files at
 test time (`scripts/download_test_corpus.py`). These files are **not** included
 in the `pbix-mcp` distribution.
-- Corpus: public sample PBIX collection, MIT License (Sajjad Ahmadi).
+- Corpus: 24 public sample reports fetched at test time from two MIT-licensed
+  sources — the [Power-BI-Design-Files](https://github.com/Dashboard-Design/Power-BI-Design-Files)
+  community dashboards (Copyright © 2024 Sajjad Ahmadi) and Microsoft's public
+  [powerbi-desktop-samples](https://github.com/microsoft/powerbi-desktop-samples)
+  (MIT). Neither source is redistributed in this package.
 
 ## Bundled asset provenance
 

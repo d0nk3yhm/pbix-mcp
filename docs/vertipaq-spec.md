@@ -405,4 +405,4 @@ The DataModel entry uses Microsoft XPress9 block compression:
 
 ---
 
-*This specification was independently derived through analysis of file structures for interoperability purposes, in accordance with applicable reverse engineering laws (EU Directive 2009/24/EC Article 6, US DMCA §1201(f)). No Microsoft source code was used.*
+*This specification was independently derived through analysis of file structures for interoperability purposes. Reverse engineering undertaken to achieve interoperability is recognized as a permitted purpose under, among others, the EU Software Directive (2009/24/EC, Art. 6) and the US DMCA (§1201(f)), subject to the conditions those provisions set out; this note is provided for context and is not legal advice (see [legal-and-cleanroom.md](legal-and-cleanroom.md)). No Microsoft source code was used.*
