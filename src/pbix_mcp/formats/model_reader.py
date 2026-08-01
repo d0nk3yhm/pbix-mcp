@@ -81,17 +81,32 @@ class ModelReader:
         """Run a SQL query against metadata.sqlitedb and return rows as dicts."""
         self._ensure_datamodel()
         tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        conn = None
         try:
             tmp_db.write(self._metadata_db_bytes)
             tmp_db.close()
             conn = sqlite3.connect(tmp_db.name)
             conn.row_factory = sqlite3.Row
             rows = conn.execute(sql, params).fetchall()
-            result = [dict(row) for row in rows]
-            conn.close()
-            return result
+            return [dict(row) for row in rows]
         finally:
-            os.unlink(tmp_db.name)
+            # Close the SQLite handle BEFORE unlinking, on EVERY path. The old
+            # code closed conn only on success, so any query error left the
+            # handle open and the unlink then raised "[WinError 32] the file is
+            # being used by another process" — masking the real error on the one
+            # platform (Windows) most Power BI users are on. POSIX allows the
+            # unlink, so CI (ubuntu) never saw it. A failed unlink (e.g. an AV
+            # scanner briefly holding the file) is also swallowed rather than
+            # raised: the temp file is disposable and the OS reclaims it.
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            try:
+                os.unlink(tmp_db.name)
+            except OSError:
+                pass
 
     @property
     def schema(self) -> list[dict]:
