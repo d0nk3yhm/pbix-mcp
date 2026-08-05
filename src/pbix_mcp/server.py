@@ -9643,9 +9643,14 @@ def _modify_metadata_sqlite(
 def pbix_datamodel_query_metadata(alias: str, sql_query: str) -> str:
     """Run a read-only SQL query on the DataModel's metadata SQLite.
 
+    The metadata store is a **SQLite database** (the ABF's metadata.sqlitedb
+    with tables like [Table], [Column], Measure, Relationship, Partition), NOT
+    an Analysis Services $SYSTEM rowset — use SQLite syntax, and quote the
+    reserved names: ``SELECT Name FROM [Table]``.
+
     Args:
         alias: The alias of the open file
-        sql_query: SQL query to run (e.g., "SELECT Name, Expression FROM Measure")
+        sql_query: SQLite query to run (e.g., "SELECT Name, Expression FROM Measure")
     """
     try:
         info = _ensure_open(alias)
@@ -9670,15 +9675,27 @@ def pbix_datamodel_query_metadata(alias: str, sql_query: str) -> str:
         with open(tmp, "wb") as f:
             f.write(meta_bytes)
 
+        conn = None
         try:
             conn = sqlite3.connect(tmp)
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(sql_query)
             rows = cursor.fetchall()
             columns = [d[0] for d in cursor.description] if cursor.description else []
-            conn.close()
         finally:
-            os.remove(tmp)
+            # Close BEFORE removing, on every path: with the close on the
+            # success path only, a bad query left the handle open and the
+            # os.remove raised "[WinError 32] file in use" on Windows —
+            # masking the caller's real SQL error (issue #24 r22#3).
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
         if not rows:
             return ToolResponse.ok("Query returned no results.").to_text()
@@ -11101,10 +11118,26 @@ def pbix_datamodel_add_calculated_column(
 
     SCOPE: only row-context expressions over the table's OWN columns are
     supported — e.g. ``Margin = fct[Sales] - fct[Cost]``,
-    ``IF(t[Qty] > 0, "Yes", "No")``, ``ROUND(t[X] * 0.1, 2)``. Aggregations
-    (SUM/COUNT/…), CALCULATE, RELATED and other table/filter functions are
-    computed by the service across rows, which this engine cannot reproduce
-    per-row, so they are REFUSED with a clear reason rather than stored wrong.
+    ``IF(t[Qty] > 0, "Yes", "No")``, ``ROUND(t[X] * 0.1, 2)``.
+
+    SUPPORTED (issue #25 r23#6 — the exact surface, so you don't discover it
+    by probing): scalar row-context functions over THIS table's own columns —
+    math/rounding, text incl. ``&`` concatenation, date/time (incl. DATEVALUE /
+    DATEDIFF over columns), IF/SWITCH and the logical family — plus VAR/RETURN,
+    and — only when NO filter-context function appears anywhere in the
+    expression — a plain same-table aggregate ``SUM/AVERAGE/MIN/MAX(own[Col])``
+    (deterministic per-row in a calc column).
+
+    REFUSED with a clear reason (never stored wrong): ANY cross-table
+    reference (incl. RELATED and LOOKUPVALUE), CALCULATE / CALCULATETABLE,
+    X-iterators (SUMX/…/CONCATENATEX), RANKX/TOPN, COUNTROWS/COUNT/
+    DISTINCTCOUNT, ALL/ALLSELECTED/FILTER/VALUES/KEEPFILTERS/TREATAS and the
+    other filter/table functions, EARLIER, PATH/PATHITEM — Power BI computes
+    these server-side across rows, which cannot be reproduced per-row here.
+    Author those in Desktop, or express them as a MEASURE instead. (Existing
+    Desktop-authored calc columns using RELATED/LOOKUPVALUE/CALCULATE are
+    still PRESERVED across rebuild-path edits — this scope applies to
+    authoring NEW columns.)
 
     Args:
         alias: The alias of the open file
@@ -12769,7 +12802,8 @@ def pbix_evaluate_dax_per_dimension(
                 fb = dax_engine.evaluate_measures_batch(
                     fallback_measures, ctx['tables'], ctx['measure_defs'],
                     fc, ctx['date_table'], ctx['date_column'],
-                    ctx.get('relationships')
+                    ctx.get('relationships'), group_keys={dimension},
+                    selected_filters=base_fc
                 )
             else:
                 fb = {}
@@ -12928,7 +12962,8 @@ def pbix_evaluate_dax_grouped(
                     fc[ref] = [val]
                     vals = dax_engine.evaluate_measures_batch(
                         slow, ctx['tables'], ctx['measure_defs'], fc,
-                        ctx['date_table'], ctx['date_column'], rels)
+                        ctx['date_table'], ctx['date_column'], rels,
+                        group_keys={ref}, selected_filters=base_fc)
                 results.append({
                     "key": {dim_col: val},
                     "values": {m: (fast[m].get(val) if m in fast else
@@ -12941,7 +12976,8 @@ def pbix_evaluate_dax_grouped(
                     fc[ref] = [v]
                 vals = dax_engine.evaluate_measures_batch(
                     measure_names, ctx['tables'], ctx['measure_defs'], fc,
-                    ctx['date_table'], ctx['date_column'], rels)
+                    ctx['date_table'], ctx['date_column'], rels,
+                    group_keys={k[0] for k in keys}, selected_filters=base_fc)
                 results.append({
                     "key": {k[2]: v for k, v in zip(keys, combo)},
                     "values": {m: vals.get(m) for m in measure_names},

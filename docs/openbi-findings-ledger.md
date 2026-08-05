@@ -160,6 +160,32 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **findings-24 (GH #26)** -- CLOSED (0.9.79). ALLSELECTED semantics under
+  grouped evaluation: the engine now distinguishes group-by filters from the
+  caller's slicer (`DAXContext.group_keys` + `selected_filters` threaded
+  through the grouped/per-dimension tools). Bare `ALLSELECTED()` and
+  `ALLSELECTED(T)` were silent no-ops (percent-of-total = flat 1.0);
+  `ALLSELECTED(T[C])` behaved as `ALL` (180 where Desktop answers the 60
+  slicer total, incl. the sliced-column == grouped-column overwrite case);
+  two column-scoped args no longer degrade to ALL (outer Reg=N survives).
+  Regression: tests/test_issue25_26_dax.py.
+- **findings-23 (GH #25)** -- CLOSED (0.9.79). r23#1 window functions
+  (ROWNUMBER/RANK/OFFSET/INDEX/WINDOW) now work in measures under grouped
+  evaluation via a synthesized visual axis (selected ORDERBY/PARTITIONBY
+  values + the group's own filter as current position); r23#2 ALLSELECTED as
+  FILTER/RANKX source (running totals 30/65/105/180, RANKX 4/3/2/1); r23#3
+  ALL(table)-as-FILTER-source run-verified correct + pinned; r23#5 DATEVALUE
+  over columns does not reproduce + pinned; r23#4 O(n^2) accumulation form
+  documented in limitations.md; r23#6 add_calculated_column docstring states
+  the measured supported/refused surface.
+- **findings-22 (GH #24)** -- CLOSED (0.9.79). r22#1 datetimes now leave the
+  engine in ONE shape (ISO-8601 + a data_type field on every result; date
+  arithmetic keeps its type); r22#2 add_measure infers DateTime (9) for
+  datetime measures; r22#3 query_metadata surfaces the real SQL error instead
+  of a masking WinError 32. Regression: tests/test_issue24_type_info.py.
+- **findings-21 (GH #23)** -- also closed on GitHub with 0.9.77 evidence; GH
+  #15 (r13), #18 (r16), #19 (r17) closed as verified-fixed/attributed on
+  0.9.72-0.9.78 work.
 - **findings-21** -- CLOSED (0.9.77). `pbix_set_table_data` left the report
   unqueryable in Desktop ("Error fetching data for this visual"). Root cause: a
   column type passed under `dataType` (camelCase) or a lowercase name (`int64`)

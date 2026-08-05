@@ -1201,6 +1201,19 @@ class DAXContext:
         # "unknown", and an unresolvable-reference check must then refuse
         # nothing rather than everything.
         self.model_columns: dict = {}
+        # Filter-context KEYS ("Table.Column") that came from GROUPED
+        # evaluation (the visual's row/column grouping), as opposed to the
+        # caller's explicit slicer selection. ALLSELECTED removes exactly
+        # these and keeps the rest — without the distinction, every
+        # ALLSELECTED form under pbix_evaluate_dax_grouped was a no-op or
+        # degraded to ALL (issues #25 r23#2 / #26 r24#1-3).
+        self.group_keys: set = set()
+        # The caller's TRUE slicer state (the base filter_context BEFORE the
+        # group key was merged in). Needed because grouping a column that is
+        # ALSO sliced OVERWRITES the slicer's values in filter_context —
+        # `Cat IN (A,B)` grouped by Cat becomes `Cat=[A]`, and the slicer
+        # selection is unrecoverable from the merged dict (r24#2's 180-vs-60).
+        self.selected_filters: dict | None = None
         # Tables an enclosing ALL(Table)/REMOVEFILTERS(Table) made immune to
         # cross-table filter propagation (see _get_cross_table_filters).
         self._no_propagate: set = set()
@@ -1863,6 +1876,9 @@ class DAXContext:
         ctx._no_propagate = set(self._no_propagate)
         ctx._no_prop_keys = dict(self._no_prop_keys)
         ctx._expanded_keys = set(self._expanded_keys)
+        ctx.group_keys = set(self.group_keys)
+        ctx.selected_filters = (None if self.selected_filters is None
+                                else dict(self.selected_filters))
         ctx.measure_tables = self.measure_tables
         ctx.model_columns = self.model_columns
         # Share the measure memo by REFERENCE across the derivation family. Its
@@ -1883,6 +1899,9 @@ class DAXContext:
         ctx._no_propagate = set(self._no_propagate)
         ctx._no_prop_keys = dict(self._no_prop_keys)
         ctx._expanded_keys = set(self._expanded_keys)
+        ctx.group_keys = set(self.group_keys)
+        ctx.selected_filters = (None if self.selected_filters is None
+                                else dict(self.selected_filters))
         ctx.measure_tables = self.measure_tables
         ctx.model_columns = self.model_columns
         return ctx
@@ -1935,6 +1954,11 @@ class DAXEngine:
         # Filter context of the OUTERMOST measure -- the query/slicer selection
         # that ALLSELECTED restores (see _selected_ctx).
         self._query_filters: dict | None = None
+        # The subset of that snapshot injected by GROUPED evaluation (the
+        # visual-row grouping). ALLSELECTED drops these, keeps the rest.
+        self._group_keys: set = set()
+        # The caller's true slicer state, when grouped evaluation passes it.
+        self._selected_base: dict | None = None
         # Home tables of the measures currently on the evaluation stack; the
         # innermost one disambiguates a bare [Column] inside that measure.
         self._home_tables: list = []
@@ -2432,8 +2456,14 @@ class DAXEngine:
         self._eval_depth += 1
         if self._eval_depth == 1:
             # Snapshot what ALLSELECTED must restore, before any CALCULATE in
-            # this measure has had a chance to modify the context.
+            # this measure has had a chance to modify the context. The GROUP
+            # keys (from grouped evaluation — the visual's row grouping) are
+            # snapshotted separately: ALLSELECTED removes those and keeps the
+            # slicer selection, which is the whole difference between it and
+            # ALL under a grouped query (issues #25 r23#2 / #26 r24).
             self._query_filters = dict(ctx.filter_context)
+            self._group_keys = set(getattr(ctx, 'group_keys', ()) or ())
+            self._selected_base = getattr(ctx, 'selected_filters', None)
         if self._eval_depth == 1:
             self._deadline = time.monotonic() + self._max_eval_seconds
         # A measure invocation IS the row->filter context transition (implicit
@@ -3073,9 +3103,21 @@ class DAXEngine:
         # under a Scenario slice where both operands are blank and Desktop
         # shows nothing -- a measured zero where there is no measurement.
         any_value = acc is not None
+        # Date arithmetic keeps its type in DAX: DATE()+TIME() and d+7 are
+        # datetimes, while d1-d2 is a number of days. The serial coercion
+        # below erased that -- DATE(2026,8,2)+TIME(14,5,9) came back as the
+        # bare serial 46236.586..., indistinguishable from a numeric measure
+        # (issue #24 r22#1). Track datetime-ness across the fold and convert
+        # the final serial back. `*`/`/` results are plain numbers.
+        result_is_dt = isinstance(acc, (datetime, date)) and op in ('+', '-')
         for p in parts[1:]:
             rhs = self._eval_expr(p.strip(), ctx, var_scope)
             any_value = any_value or rhs is not None
+            if op == '+':
+                result_is_dt = result_is_dt or isinstance(rhs, (datetime, date))
+            elif op == '-':
+                # datetime - datetime = days (number); datetime - number = datetime
+                result_is_dt = result_is_dt and not isinstance(rhs, (datetime, date))
             # BLANK acts as 0 for + and -, but not for * and /. Every rule
             # below was read off the live Desktop engine (msmdsrv), not the
             # docs:
@@ -3124,7 +3166,15 @@ class DAXEngine:
                         return float('nan')
                     return float('inf') if left > 0 else float('-inf')
                 acc = left / right
-        return acc if any_value else None
+        if not any_value:
+            return None
+        if result_is_dt and isinstance(acc, (int, float)):
+            # Convert the folded serial back to the datetime DAX would return.
+            try:
+                return datetime(1899, 12, 30) + timedelta(days=float(acc))
+            except (OverflowError, ValueError):
+                return acc
+        return acc
 
     def _in_set_values(self, right: str, ctx: DAXContext,
                        var_scope: dict | None = None) -> list | None:
@@ -3304,22 +3354,44 @@ class DAXEngine:
         self._variation_cache[key] = result
         return result
 
+    def _selected_filters(self) -> dict:
+        """The SLICER-only filter set ALLSELECTED restores.
+
+        Preferred source: the caller's base filter_context, passed through
+        untouched by grouped evaluation (``DAXContext.selected_filters``) —
+        this survives a column that is BOTH sliced and grouped, where the
+        group value overwrote the slicer's in the merged dict. Fallback: the
+        outermost query snapshot minus the group keys. Under a plain
+        evaluate call all three collapse to the query snapshot."""
+        base = getattr(self, '_selected_base', None)
+        if base is not None:
+            return dict(base)
+        outer = self._query_filters or {}
+        gk = getattr(self, '_group_keys', None) or set()
+        if not gk:
+            return dict(outer)
+        return {k: v for k, v in outer.items() if k not in gk}
+
     def _selected_ctx(self, ctx: DAXContext) -> DAXContext:
         """The filter context ALLSELECTED restores.
 
         ALLSELECTED keeps the filters that came from OUTSIDE the measure --
         the query/slicer selection -- and drops the ones CALCULATE applied
-        inside it. This engine snapshots the outermost measure's filter context
-        for exactly that purpose. Approximating ALLSELECTED as VALUES (which is
-        what it did) meant it never removed a filter on its own column, so
+        inside it AND the group filter a grouped evaluation applied (the
+        visual's row grouping; see ``DAXContext.group_keys``). Approximating
+        ALLSELECTED as VALUES (which is what it did) meant it never removed a
+        filter on its own column, so
         `CALCULATE(COUNTROWS(ALLSELECTED(T[Queue])), T[Queue]="IT Support")`
         answered 1 where Desktop answers 10.
         """
-        outer = self._query_filters
-        if outer is None or outer == ctx.filter_context:
+        outer = self._selected_filters()
+        if outer == ctx.filter_context:
             return ctx
-        return DAXContext(ctx.tables, ctx.measures, ctx.date_table,
-                          ctx.date_column, dict(outer), ctx.relationships)
+        sel = DAXContext(ctx.tables, ctx.measures, ctx.date_table,
+                         ctx.date_column, dict(outer), ctx.relationships)
+        sel.measure_tables = ctx.measure_tables
+        sel.model_columns = ctx.model_columns
+        return sel
 
     def _multi_column_all(self, ref: str, ctx: DAXContext, selected: bool):
         """ALL/ALLSELECTED over SEVERAL columns -> their distinct combinations.
@@ -3839,6 +3911,20 @@ class DAXEngine:
 
             # REMOVEFILTERS / ALL
             if filter_arg.upper().startswith('REMOVEFILTERS') or filter_arg.upper().startswith('ALL'):
+                selected = filter_arg.upper().startswith('ALLSELECTED')
+                # Bare ALLSELECTED() — no argument at all. The reference regex
+                # below cannot match empty parens, so this form fell straight
+                # through as a SILENT NO-OP and percent-of-total measures
+                # rendered flat 1.0 (issue #26 r24#1). Desktop semantics:
+                # restore the whole outer query context — drop the filters
+                # grouping/CALCULATE added, put back the slicer selection.
+                if selected and re.match(r"(?is)^ALLSELECTED\s*\(\s*\)\s*$",
+                                         filter_arg.strip()):
+                    outer_sel = self._selected_filters()
+                    new_ctx = new_ctx.without_filters(
+                        [k for k in new_ctx.filter_context
+                         if k not in outer_sel]).with_filters(outer_sel)
+                    continue
                 # Extract the column/table reference. Exclude [ ] from the table
                 # capture so an UNQUOTED Sales[Region] splits into table=Sales +
                 # col=Region (else the whole "Sales[Region]" was captured as a
@@ -3847,22 +3933,42 @@ class DAXEngine:
                 if inner_match:
                     table = inner_match.group(1).strip()
                     col = inner_match.group(2)
-                    selected = filter_arg.upper().startswith('ALLSELECTED')
-                    if col:
+                    if col and selected:
+                        # ALLSELECTED(T[C]) restores the SLICER selection on
+                        # that column: the grouping filter goes, the outer
+                        # selection stays. Removing the filter outright made
+                        # it behave exactly like ALL(T[C]) — under a slicer
+                        # Cat IN (A,B) it answered the 180 grand total where
+                        # Desktop answers 60 (issue #26 r24#2; two of these
+                        # together stay per-column, fixing r24#3).
+                        key = f"{table}.{col}"
+                        outer_sel = self._selected_filters()
+                        new_ctx = new_ctx.without_filters([key])
+                        if key in outer_sel:
+                            new_ctx = new_ctx.with_filters(
+                                {key: outer_sel[key]})
+                    elif col:
                         new_ctx = new_ctx.without_filters([f"{table}.{col}"])
                     elif selected:
                         # ALLSELECTED(Table) RESTORES the query/slicer context;
-                        # it does not clear it. Drop only what a CALCULATE inside
-                        # this measure added, and leave propagation from related
-                        # tables alone -- MS_Perf_Analyzer's
+                        # it does not clear it. Drop what a CALCULATE inside
+                        # this measure OR the grouped evaluation added, restore
+                        # the slicer's own values, and leave propagation from
+                        # related tables alone -- MS_Perf_Analyzer's
                         # `CALCULATE(MIN(EventEdges[timestampMs]),
                         #  ALLSELECTED(EventEdges))` must still see the
                         # component filter that reaches EventEdges through
                         # EventTypes, so the measure reads 0, not 440.
-                        outer = self._query_filters or {}
+                        outer_sel = self._selected_filters()
                         new_ctx = new_ctx.without_filters(
                             [k for k in new_ctx.filter_context
-                             if k.startswith(f"{table}.") and k not in outer])
+                             if k.startswith(f"{table}.")
+                             and k not in outer_sel])
+                        restore = {k: v for k, v in outer_sel.items()
+                                   if k.startswith(f"{table}.")
+                                   and new_ctx.filter_context.get(k) != v}
+                        if restore:
+                            new_ctx = new_ctx.with_filters(restore)
                     else:
                         # ALL(Table) / REMOVEFILTERS(Table) clear the table
                         # outright -- both the DIRECT `Table.col` keys and the
@@ -8555,6 +8661,12 @@ class DAXEngine:
                             and items[i + 1].strip().upper() in ('ASC', 'DESC')):
                         direction = items[i + 1].strip().upper()
                         i += 1
+                    else:
+                        # Tolerate the space form `ORDERBY(T[C] DESC)` too —
+                        # silently keeping ASC would sort the wrong way.
+                        tail = expr.rsplit(None, 1)
+                        if len(tail) == 2 and tail[1].upper() in ('ASC', 'DESC'):
+                            expr, direction = tail[0].strip(), tail[1].upper()
                     if expr:
                         orderby.append((expr, direction))
                     i += 1
@@ -8636,19 +8748,104 @@ class DAXEngine:
                     return i
             return None
         cur_cols = self._row_cols(cur)
-        for i, r in enumerate(srt):
-            if self._row_cols(r) == cur_cols:
-                return i
+        # Single-column rows (__column__/__value__) have NO named columns, so
+        # cur_cols is {} and `{} == {}` matched the FIRST row for every
+        # group — ROWNUMBER answered 1 everywhere and OFFSET stepped from
+        # index 0 regardless of the current group (issue #25 r23#1). Compare
+        # named columns only when there ARE any; else fall through to the
+        # __column__/__value__ comparison.
+        if cur_cols:
+            for i, r in enumerate(srt):
+                if self._row_cols(r) == cur_cols:
+                    return i
         for i, r in enumerate(srt):
             if (r.get('__column__') == cur.get('__column__')
                     and r.get('__value__') == cur.get('__value__')):
                 return i
         return None
 
+    def _win_visual_axis(self, orderby: list, partitionby: list,
+                         ctx: DAXContext):
+        """Visual-context window axis (issue #25 r23#1).
+
+        A window function in a MEASURE under grouped evaluation has no row
+        context — ``ROWNUMBER(ORDERBY(S[Cat]))`` returned blank and
+        ``OFFSET(-1,,ORDERBY(S[Cat]))`` silently left the filter context
+        unchanged. Desktop's semantics there: the axis is the SELECTED values
+        of the ORDERBY/PARTITIONBY columns (the visible groups) and the
+        current position is the group's own filter value.
+
+        Returns ``(axis_rows, current_row)`` — single-column row dicts when
+        the axis is one column (so a CALCULATE filter replaces just that
+        column), full-row dicts otherwise — or ``(None, None)`` when the
+        shape is not the plain column-reference case or the current group
+        cannot be identified (never guessed).
+        """
+        cols: list = []
+        for e, _d in (orderby or []):
+            m = _WHOLE_TCOL_RE.match(e.strip())
+            if not m:
+                return None, None
+            cols.append(((m.group(1) or m.group(2) or '').strip(),
+                         m.group(3).strip()))
+        for e in (partitionby or []):
+            m = _WHOLE_TCOL_RE.match(e.strip())
+            if not m:
+                return None, None
+            cols.append(((m.group(1) or m.group(2) or '').strip(),
+                         m.group(3).strip()))
+        if not cols or len({t for t, _ in cols}) != 1:
+            return None, None
+        # The current group: every axis column must carry a single-valued
+        # filter in the live context (the group key the grouped evaluation
+        # injected).
+        cur_vals = {}
+        for t, c in cols:
+            v = ctx.filter_context.get(f"{t}.{c}")
+            if not isinstance(v, list) or len(v) != 1:
+                return None, None
+            cur_vals[(t, c)] = v[0]
+        table = cols[0][0]
+        sel = self._selected_ctx(ctx)
+        if len(cols) == 1:
+            t, c = cols[0]
+            vals = list(dict.fromkeys(sel.get_column_data(t, c)))
+            axis = [{'__table__': t, '__column__': c, '__value__': v}
+                    for v in vals]
+            cur = {'__table__': t, '__column__': c,
+                   '__value__': cur_vals[(t, c)]}
+            return axis, cur
+        idxs = []
+        tbl = sel.tables.get(table)
+        if not tbl:
+            return None, None
+        for _t, c in cols:
+            ci = sel._find_col_idx(tbl['columns'], c)
+            if ci < 0:
+                return None, None
+            idxs.append((c, ci))
+        seen = set()
+        axis = []
+        for r in sel.get_filtered_rows(table):
+            combo = tuple(r[ci] for _c, ci in idxs)
+            if combo in seen:
+                continue
+            seen.add(combo)
+            d = {'__table__': table, '__row__': True}
+            for (c, _ci), v in zip(idxs, combo):
+                d[c] = v
+            axis.append(d)
+        cur = {'__table__': table, '__row__': True}
+        for t, c in cols:
+            cur[c] = cur_vals[(t, c)]
+        return axis, cur
+
     def _fn_rownumber_win(self, args_str: str, ctx: DAXContext):
         parts = self._split_args(args_str) if args_str.strip() else []
         rows, orderby, partitionby, matchby = self._win_parse(parts, ctx)
         cur = getattr(ctx, '_current_row', None)
+        if cur is None:
+            rows, cur = self._win_visual_axis(orderby, partitionby, ctx)
         if rows is None or cur is None:
             return None
         base = self._win_base_ctx(ctx)
@@ -8666,6 +8863,8 @@ class DAXEngine:
             skip = 1
         rows, orderby, partitionby, matchby = self._win_parse(parts, ctx, skip)
         cur = getattr(ctx, '_current_row', None)
+        if cur is None:
+            rows, cur = self._win_visual_axis(orderby, partitionby, ctx)
         if rows is None or cur is None:
             return None
         base = self._win_base_ctx(ctx)
@@ -8693,10 +8892,14 @@ class DAXEngine:
         if pos is None:
             return None
         rows, orderby, partitionby, matchby = self._win_parse(parts, ctx, 1)
+        cur = getattr(ctx, '_current_row', None)
+        if cur is None:
+            vrows, vcur = self._win_visual_axis(orderby, partitionby, ctx)
+            if vrows is not None:
+                rows, cur = vrows, vcur
         if rows is None:
             return None
         base = self._win_base_ctx(ctx)
-        cur = getattr(ctx, '_current_row', None)
         srt = self._win_sort(self._win_partition(rows, partitionby, cur, base),
                              orderby, base)
         n = len(srt)
@@ -8712,6 +8915,10 @@ class DAXEngine:
         delta = self._num1(parts[0], ctx)
         rows, orderby, partitionby, matchby = self._win_parse(parts, ctx, 1)
         cur = getattr(ctx, '_current_row', None)
+        if cur is None:
+            vrows, vcur = self._win_visual_axis(orderby, partitionby, ctx)
+            if vrows is not None:
+                rows, cur = vrows, vcur
         if delta is None or rows is None or cur is None:
             return None
         base = self._win_base_ctx(ctx)
@@ -8746,10 +8953,14 @@ class DAXEngine:
         if frm is None or to is None:
             return None
         rows, orderby, partitionby, matchby = self._win_parse(parts, ctx, i)
+        cur = getattr(ctx, '_current_row', None)
+        if cur is None:
+            vrows, vcur = self._win_visual_axis(orderby, partitionby, ctx)
+            if vrows is not None:
+                rows, cur = vrows, vcur
         if rows is None:
             return None
         base = self._win_base_ctx(ctx)
-        cur = getattr(ctx, '_current_row', None)
         srt = self._win_sort(self._win_partition(rows, partitionby, cur, base),
                              orderby, base)
         n = len(srt)
@@ -10510,9 +10721,22 @@ def evaluate_measure(measure_name: str, tables: dict, measures: dict,
 def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
                             filter_context: dict | None = None,
                             date_table: str | None = None, date_column: str | None = None,
-                            relationships: list | None = None) -> dict:
-    """Evaluate multiple measures, returning { name: value }."""
+                            relationships: list | None = None,
+                            group_keys: set | None = None,
+                            selected_filters: dict | None = None) -> dict:
+    """Evaluate multiple measures, returning { name: value }.
+
+    ``group_keys`` names the filter_context keys that came from GROUPED
+    evaluation (the visual's row grouping) rather than the caller's slicer
+    selection, and ``selected_filters`` is that slicer selection itself (the
+    base filter_context BEFORE the group key was merged in) — together they
+    are what ALLSELECTED restores (see DAXContext.group_keys).
+    """
     ctx = DAXContext(tables, measures, date_table, date_column, filter_context, relationships)
+    if group_keys:
+        ctx.group_keys = set(group_keys)
+    if selected_filters is not None:
+        ctx.selected_filters = dict(selected_filters)
     results = {}
     for name in measure_names:
         results[name] = _engine.evaluate_measure(name, ctx)

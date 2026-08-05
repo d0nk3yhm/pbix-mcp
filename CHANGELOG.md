@@ -5,6 +5,88 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.79] - 2026-08-05
+
+### Fixed — type information on the way out of the engine (issue #24 r22)
+
+- **r22#1 — datetimes left `pbix_evaluate_dax` in two shapes**: midnight ones
+  as ISO strings, with-time ones as bare OLE serials
+  (`DATE(2026,8,2)+TIME(14,5,9)` → `46236.5869…`), indistinguishable from
+  numbers. Date arithmetic now keeps its type in the engine (`DATE()+TIME()`
+  and `d+7` are datetimes; `d1-d2` stays a number of days), every datetime
+  serializes as an ISO-8601 string, and each result carries an explicit
+  **`data_type`** field (`Double`/`String`/`DateTime`/`Boolean`) across all
+  evaluate tools.
+- **r22#2 — datetime measures stored as Double (8)**:
+  `pbix_datamodel_add_measure` now infers **DateTime (9)** for
+  datetime-valued expressions (`DATE()+TIME()`, `TODAY()`, `LASTDATE(…)`,
+  `EOMONTH(…)`, VAR-bound and IF/SWITCH-branched forms; `d1-d2` and
+  `DATEDIFF`/`YEAR` correctly stay numeric, `FORMAT` stays String).
+- **r22#3 — `pbix_datamodel_query_metadata` masked the real SQL error with
+  `WinError 32`** (temp `.db` removed while the SQLite handle was open —
+  Windows-only, same class as 0.9.78's ModelReader fix). A bad query now
+  surfaces the actual SQLite error; the docstring also states the metadata
+  store is SQLite (not an AS `$SYSTEM` rowset) with quoting guidance.
+
+### Fixed — ALLSELECTED semantics under grouped evaluation (issues #26 r24, #25 r23#2)
+
+The engine now distinguishes the filters GROUPED evaluation injects (the
+visual's row grouping) from the caller's slicer selection —
+`DAXContext.group_keys` + the caller's base filter context threaded through
+`pbix_evaluate_dax_grouped` / `pbix_evaluate_dax_per_dimension`. ALLSELECTED
+removes exactly the former and restores the latter:
+
+- **`ALLSELECTED()` and `ALLSELECTED(<table>)` as direct CALCULATE args were
+  silent no-ops** (the bare form didn't even match the arg parser) — every
+  percent-of-total idiom rendered flat 1.0. Both now restore the outer query
+  context: 180 for every group on r24#1's model, with real percent-of-total.
+- **`ALLSELECTED(<column>)` behaved exactly like `ALL(<column>)`** — under a
+  `Cat IN (A,B)` slicer it answered the 180 grand total where Desktop answers
+  the 60 slicer total (r24#2). It now restores the slicer's own selection on
+  that column — including when the sliced column IS the grouped column, where
+  the group value had overwritten the slicer's in the merged filter context.
+- **Two column-scoped ALLSELECTED args no longer degrade to ALL** (r24#3): an
+  outer `Reg=N` filter survives `ALLSELECTED(S[Cat]), ALLSELECTED(S[Reg])`.
+- **ALLSELECTED as a FILTER/RANKX source** (r23#2): the running-total idiom
+  `CALCULATE(SUM, FILTER(ALLSELECTED(S[Cat]), S[Cat] <= MAX(S[Cat])))` returns
+  30/65/105/180 and `RANKX(ALLSELECTED(S[Cat]), …)` ranks 4/3/2/1 instead of
+  answering 1 for every group.
+
+### Fixed — 2023 window functions under grouped evaluation (issue #25 r23#1)
+
+ROWNUMBER / RANK / OFFSET / INDEX / WINDOW required an iterator row context, so
+in a measure under `pbix_evaluate_dax_grouped` the first two returned blank and
+the last three silently left the filter context unchanged (plausible wrong
+numbers, no error). They now synthesize the **visual axis**: the selected
+values of the ORDERBY/PARTITIONBY columns, with the current position taken from
+the group's own filter. On the A/B/C/D model: `ROWNUMBER(ORDERBY(S[Cat]))` =
+1/2/3/4, `RANK(ORDERBY(S[Cat] DESC))` = 4/3/2/1, `OFFSET(-1,…)` = blank/30/35/40,
+`INDEX(1,…)` = 30 everywhere, `WINDOW(1,ABS,0,REL,…)` = 30/65/105/180. Also
+fixed: `_win_index_of` matched the first row for every single-column current row
+(`{} == {}`), and `ORDERBY(T[C] DESC)` (space form) silently sorted ASC.
+
+### Fixed / verified — remaining #25 items
+
+- **r23#3** (`ALL(<table>)` as FILTER source): run-verified correct on the
+  reported shapes — `CALCULATE(SUM, FILTER(ALL(S), S[V]>30))` = 150 under an
+  outer slicer (table-filter replacement incl. the sliced column), SUMX form
+  identical; pinned by regression.
+- **r23#5** (DATEVALUE constant-folded only): does not reproduce — direct
+  column, VAR-bound, and concatenated forms all materialize correct dates in
+  calculated columns; pinned by regression.
+- **r23#6**: `pbix_datamodel_add_calculated_column` docstring now states the
+  exact supported/refused function surface (measured, not guessed).
+- **r23#4**: the O(n²) `SUMX(FILTER(ALL(D), D<=_at), CALCULATE(…))`
+  accumulation form is documented in limitations.md with the O(n)
+  single-pass rewrite.
+
+### Regression
+
+`tests/test_issue25_26_dax.py` (8 scenario tests pinning every value above) +
+`tests/test_issue24_type_info.py` (18, from 0.9.79's #24 work landing in the
+same release train). Full fast suite: 1,775 passed; conformance goldens and the
+24-report corpus parity unchanged.
+
 ## [0.9.78] - 2026-08-01
 
 ### Fixed — `ModelReader` leaked its temp SQLite handle on a query error (Windows `WinError 32`)
