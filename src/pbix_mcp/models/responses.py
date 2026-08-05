@@ -7,10 +7,11 @@ inspect success/failure programmatically without string parsing.
 
 from __future__ import annotations
 
+import datetime as _dt
 import math
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def json_safe_number(value: Any) -> Any:
@@ -115,17 +116,42 @@ class ToolResponse(BaseModel):
 
 
 class DAXResult(BaseModel):
-    """Result of a DAX measure evaluation."""
+    """Result of a DAX measure evaluation.
+
+    ``data_type`` states the DAX result type explicitly (issue #24 r22#1: a
+    datetime serialized as an ISO string was indistinguishable from a text
+    measure, and before the engine fix a with-time datetime came back as its
+    bare OLE serial, indistinguishable from a number). Datetimes always
+    serialize as ISO-8601 strings with ``data_type: "DateTime"``.
+    """
 
     name: str
     value: Any = None
     status: str = "ok"  # "ok" | "blank" | "unsupported" | "error"
     error_message: str | None = None
+    data_type: str | None = None  # "Double"|"String"|"DateTime"|"Boolean"
 
     @field_validator("value")
     @classmethod
     def _finite_value(cls, v: Any) -> Any:
         return json_safe_number(v)
+
+    @model_validator(mode="after")
+    def _derive_data_type(self) -> "DAXResult":
+        if self.data_type is None and self.value is not None:
+            v = self.value
+            if isinstance(v, bool):
+                self.data_type = "Boolean"
+            elif isinstance(v, (_dt.datetime, _dt.date)):
+                self.data_type = "DateTime"
+            elif isinstance(v, (int, float)):
+                self.data_type = "Double"
+            elif isinstance(v, str):
+                # json_safe_number stringifies IEEE specials; keep them typed
+                # as the numbers they are.
+                self.data_type = ("Double" if v in ("NaN", "Infinity",
+                                                    "-Infinity") else "String")
+        return self
 
     @property
     def is_blank(self) -> bool:

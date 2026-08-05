@@ -405,17 +405,161 @@ def _dax_expr_is_text(
     return False
 
 
+# DAX functions whose scalar result is a datetime. The time-intelligence
+# entries (FIRSTDATE/LASTDATE/STARTOF*/ENDOF*) are 1-column tables that DAX
+# coerces to a scalar datetime in a measure position.
+_DATETIME_DAX_FUNCS = frozenset({
+    "DATE", "TIME", "TODAY", "NOW", "UTCNOW", "UTCTODAY",
+    "DATEVALUE", "TIMEVALUE", "EDATE", "EOMONTH",
+    "FIRSTDATE", "LASTDATE",
+    "STARTOFMONTH", "STARTOFQUARTER", "STARTOFYEAR",
+    "ENDOFMONTH", "ENDOFQUARTER", "ENDOFYEAR",
+})
+
+
+def _split_top_level_addsub(s: str) -> tuple[list[str], list[str]]:
+    """Split on top-level ``+``/``-`` (outside parens/strings/brackets).
+
+    Returns (operands, operators); a lone operand comes back as ([s], []).
+    A leading sign and scientific-notation exponents are not split.
+    """
+    operands: list[str] = []
+    ops: list[str] = []
+    depth = 0
+    in_str = False
+    start = 0
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        if in_str:
+            if ch == '"':
+                if i + 1 < n and s[i + 1] == '"':
+                    i += 2
+                    continue
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch in "+-" and depth == 0:
+            prev = s[start:i].strip()
+            prev_ch = s[:i].rstrip()[-1:] if s[:i].rstrip() else ""
+            # a sign, not an operator, when nothing precedes it or an
+            # operator/open-paren does (e.g. leading "-x", "2e-9", "(+3")
+            if prev and prev_ch not in "+-*/^(,<>=&|" and \
+                    not (prev_ch in "eE" and i >= 2 and s[i - 2].isdigit()):
+                operands.append(prev)
+                ops.append(ch)
+                start = i + 1
+        i += 1
+    operands.append(s[start:].strip())
+    return operands, ops
+
+
+def _dax_expr_is_datetime(s: str, bindings: dict[str, str] | None = None,
+                          _depth: int = 0) -> bool:
+    """Best-effort: does this DAX expression evaluate to a datetime?
+
+    Mirrors ``_dax_expr_is_text``: resolves VAR references, follows
+    IF/IFERROR/SWITCH branches, and understands date arithmetic — a top-level
+    ``+`` chain containing a datetime stays datetime (``DATE(..) + TIME(..)``,
+    ``d + 7``), while ``datetime - datetime`` is a number of days. Conservative:
+    anything unrecognized is NOT datetime (callers who know pass data_type).
+    """
+    if _depth > 10:
+        return False
+    s = s.strip()
+    while s.startswith("(") and s.endswith(")"):
+        inner = s[1:-1]
+        d = 0
+        ok = True
+        for ch in inner:
+            if ch == "(":
+                d += 1
+            elif ch == ")":
+                d -= 1
+                if d < 0:
+                    ok = False
+                    break
+        if not ok:
+            break
+        s = inner.strip()
+    if not s or s.startswith('"'):
+        return False
+    if bindings and s.lower() in bindings:
+        return _dax_expr_is_datetime(bindings[s.lower()], bindings, _depth + 1)
+    operands, ops = _split_top_level_addsub(s)
+    if ops:
+        running = _dax_expr_is_datetime(operands[0], bindings, _depth + 1)
+        for op, operand in zip(ops, operands[1:]):
+            rhs_dt = _dax_expr_is_datetime(operand, bindings, _depth + 1)
+            if op == "+":
+                running = running or rhs_dt
+            else:  # '-': dt - dt = number of days; dt - number stays dt
+                running = running and not rhs_dt
+        return running
+    m = 0
+    n = len(s)
+    while m < n and (s[m].isalnum() or s[m] in "_."):
+        m += 1
+    func = s[:m].upper()
+    rest = s[m:].lstrip()
+    if func and rest.startswith("("):
+        if func in _DATETIME_DAX_FUNCS:
+            return True
+        if func in ("IF", "IFERROR", "SWITCH"):
+            j = s.index("(", m)
+            d = 0
+            instr = False
+            k = j
+            while k < n:
+                c = s[k]
+                if instr:
+                    if c == '"':
+                        if k + 1 < n and s[k + 1] == '"':
+                            k += 2
+                            continue
+                        instr = False
+                elif c == '"':
+                    instr = True
+                elif c == "(":
+                    d += 1
+                elif c == ")":
+                    d -= 1
+                    if d == 0:
+                        break
+                k += 1
+            args = _split_top_level_args(s[j + 1:k])
+            if func in ("IF", "IFERROR"):
+                branches = args[1:] if func == "IF" else args
+            else:  # SWITCH(expr, v1, r1, ..., [else])
+                branches = [args[i] for i in range(2, len(args), 2)]
+                if len(args) >= 2 and (len(args) - 1) % 2 == 1:
+                    branches.append(args[-1])
+            return any(_dax_expr_is_datetime(b, bindings, _depth + 1)
+                       for b in branches)
+    return False
+
+
 def infer_measure_data_type(expression: str) -> int:
     """Infer an AMO measure DataType from a DAX expression.
 
-    Returns ``MEASURE_DT_STRING`` (2) when the result is text, otherwise
-    ``MEASURE_DT_DOUBLE`` (8). Double is a deliberately safe numeric default:
-    it stores integers and decimals without truncation, unlike the historical
-    hardcoded Int64. Callers who know the exact type should pass it explicitly.
+    Returns ``MEASURE_DT_STRING`` (2) when the result is text,
+    ``MEASURE_DT_DATETIME`` (9) when it is a datetime (``DATE()+TIME()``,
+    ``TODAY()``, ``LASTDATE(...)`` and friends — issue #24 r22#2: these were
+    stored as Double, making model metadata disagree with the engine),
+    otherwise ``MEASURE_DT_DOUBLE`` (8). Double is a deliberately safe numeric
+    default: it stores integers and decimals without truncation, unlike the
+    historical hardcoded Int64. Callers who know the exact type should pass it
+    explicitly.
     """
     bindings, result = _parse_measure_body(expression)
     if _dax_expr_is_text(result, bindings):
         return MEASURE_DT_STRING
+    if _dax_expr_is_datetime(result, bindings):
+        return MEASURE_DT_DATETIME
     return MEASURE_DT_DOUBLE
 
 

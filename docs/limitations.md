@@ -22,6 +22,7 @@ engine is not a strict Analysis Services runtime, so the bounds below still appl
 | Runaway measures | A measure is bounded to a fixed number of sub-expression evaluations; a non-terminating/expansion runaway degrades to BLANK rather than hanging | A single pathologically-slow (e.g. O(n²)) measure can still be slow but no longer hangs indefinitely on runaway expansion |
 | Large tables | In-memory Python, no VertiPaq compression | Performance degrades at millions of rows |
 | RANKX visual row context | Returns BLANK | 1 out of 204 tested measures affected |
+| Running-total accumulation form | `SUMX(FILTER(ALL(D), D[K] <= _at), CALCULATE(...))` re-scans + context-transitions per iterated value — **O(n²)** in distinct values; measured not finishing in 7 min over ~1,850 values, while the single-pass form returns in ~1 s (issue #25 r23#4) | Write running totals as `CALCULATE(agg, FILTER(ALL(D[K]), D[K] <= MAX(D[K])))` — one filtered pass, no per-row CALCULATE |
 
 ## File Formats
 
