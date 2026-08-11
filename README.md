@@ -1,5 +1,7 @@
 # pbix-mcp
 
+[![MCP Toplist](https://mcptoplist.com/badge/glama%2Fd0nk3yhm%2Fpbix-mcp.svg)](https://mcptoplist.com/server/glama%2Fd0nk3yhm%2Fpbix-mcp)
+
 [![CI](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/d0nk3yhm/pbix-mcp/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/pbix-mcp)](https://pypi.org/project/pbix-mcp/)
 [![Downloads](https://img.shields.io/pypi/dm/pbix-mcp)](https://pypi.org/project/pbix-mcp/)
