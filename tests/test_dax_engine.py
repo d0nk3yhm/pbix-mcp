@@ -670,3 +670,50 @@ class TestLiteralFirstArithmetic:
         assert self._ev('-3.0 < 0') is True
         # and inside iterators (fixed by the ordering — was BLANK even at HEAD)
         assert self._ev('SUMX(S, IF(-S[D] < 0, 1, 0))') == 2
+
+
+# ---------------------------------------------------------------------------
+# Issue #35: KEEPFILTERS intersects the outer filter instead of overriding
+# ---------------------------------------------------------------------------
+
+class TestKeepFilters:
+    """KEEPFILTERS(pred) in CALCULATE keeps the outer filter on the predicate's
+    column(s): the allowed set is the INTERSECTION, and an empty intersection
+    filters to empty (SUM -> BLANK). The passthrough made every KEEPFILTERS
+    measure compute the plain override — silent wrong values under any
+    overlapping outer filter (OpenBI docs r25 / issue #35)."""
+
+    TABLES = {'T': {'columns': ['Cat', 'V'],
+                    'rows': [['A', 10], ['B', 20], ['C', 30]]}}
+    MEASURES = {
+        'Plain': 'CALCULATE(SUM(T[V]), T[Cat]="B")',
+        'Keep':  'CALCULATE(SUM(T[V]), KEEPFILTERS(T[Cat]="B"))',
+        'KeepIn': 'CALCULATE(SUM(T[V]), KEEPFILTERS(T[Cat] IN {"B", "C"}))',
+    }
+
+    def _ev(self, name, fc=None):
+        engine = DAXEngine()
+        ctx = DAXContext(self.TABLES, self.MEASURES, filter_context=fc)
+        return engine.evaluate_measure(name, ctx)
+
+    def test_no_outer_filter_matches_plain(self):
+        assert self._ev('Plain') == 20
+        assert self._ev('Keep') == 20
+
+    def test_disjoint_outer_filter_goes_blank(self):
+        # {A} ∩ {B} = ∅ -> BLANK; the plain override still answers 20
+        assert self._ev('Plain', {'T.Cat': ['A']}) == 20
+        assert self._ev('Keep', {'T.Cat': ['A']}) is None
+
+    def test_matching_outer_filter_unchanged(self):
+        assert self._ev('Plain', {'T.Cat': ['B']}) == 20
+        assert self._ev('Keep', {'T.Cat': ['B']}) == 20
+
+    def test_partial_overlap_intersects(self):
+        # outer {A,C} ∩ IN {B,C} = {C} -> 30 (real DAX); override answers 50
+        assert self._ev('KeepIn', {'T.Cat': ['A', 'C']}) == 30
+        assert self._ev('KeepIn') == 50
+
+    def test_outer_filter_on_other_column_untouched(self):
+        # a filter on a DIFFERENT column must not be intersected away
+        assert self._ev('Keep', {'T.V': [20, 30]}) == 20

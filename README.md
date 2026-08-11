@@ -8,7 +8,7 @@
 
 An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The PBIX binary format is independently reimplemented in pure Python — every structure pbix-mcp's supported capabilities require, with no templates, skeletons, or Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026. The DAX engine has **verified parity with Power BI Desktop on 100% of the DAX surface Desktop can evaluate in a query** — all 435 query-evaluable of the engine's 467 functions (the other 32 are proven not query-evaluable by Desktop itself, so there is nothing to match). Two proof layers: per-function goldens captured from Desktop's own workspace engine (359 value probes, 1e-9 tolerance) and a full-corpus 1:1 match — **432/432** grand totals, **1,705/1,705** measure×dimension filter-context cells, **397/397** calculated columns (v0.9.63; latest sweep 534/534 comparable measures across the corpus).
 
-Exposes 128 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing (rename / reorder / hide / duplicate pages, move & copy visuals — identically on classic `Report/Layout` and service-authored **PBIR**), visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, sort-by-column, TMDL export, incremental refresh, DAX evaluation (100% of Desktop's query-evaluable DAX surface — 435 functions, conformance-verified against Desktop; corpus 1:1), RLS security, and binary format internals.
+Exposes 130 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing (rename / reorder / hide / duplicate pages, move & copy visuals — identically on classic `Report/Layout` and service-authored **PBIR**), visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, sort-by-column, TMDL export, incremental refresh, DAX evaluation (100% of Desktop's query-evaluable DAX surface — 435 functions, conformance-verified against Desktop; corpus 1:1), RLS security, and binary format internals.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
@@ -594,7 +594,7 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (128 tools)
+  server.py              # MCP server (130 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX builder (metadata, VertiPaq, layout, relationships)
   html_templates.py      # HTML/SVG template builders (kpi_card, bar_chart, gauge, table, …)
