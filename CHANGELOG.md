@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.80] - 2026-08-11
+
+### Added — TMDL import + PBIP open/save (issue #34, the OpenBI #14 blocker)
+
+Model round-trip is now two-way. 130 tools (was 128).
+
+- **`pbix_import_tmdl`** — the exporter's inverse. Parses a TMDL definition
+  folder, a `<X>.SemanticModel` folder, or a single `.tmdl` document into a
+  working schema-only PBIX: tables, columns (calculated included), measures,
+  relationships (name/active/cross-filter/cardinality), user hierarchies,
+  partitions with their real M/DAX sources, shared M expressions
+  (parameters), RLS roles + table permissions, **ExtendedProperties** (field
+  parameters' `ParameterMetadata`) and **LineageTags**. Round-trip contract,
+  pinned by `tests/test_tmdl_import.py`: export → import → export reproduces
+  the same TMDL files **byte-for-byte**. TMDL carries no row data, so tables
+  are empty until Desktop refreshes them from their partition sources.
+  Implemented on a new real TMDL parser
+  (`formats/tmdl_reader.py`: indentation tree, quoted-name `''` escapes,
+  inline + block expressions, extended properties, unknown-vocabulary
+  tolerance for Desktop-authored TMDL).
+- **`pbix_open_pbip`** — opens a PBIP project folder (the `.pbip` file or its
+  directory) as a live session: the TMDL model half is built into a working
+  model, and the report half is attached whether it is this project's
+  `report.json` or a Desktop-authored PBIR `definition/` tree. Every existing
+  tool then operates on it.
+- **PBIP save** — `pbix_save` on a PBIP-opened session (no `output_path`)
+  writes edits back into the project folder: TMDL re-exported into
+  `<name>.SemanticModel/definition/`, the report half mirrored back
+  (`report.json` or the PBIR tree), scaffolding (`.pbip`, `definition.pbism`,
+  `definition.pbir`) created only when missing. `pbix_save` with a `.pbix`
+  `output_path` converts the project to a PBIX.
+- **TMDL exporter upgraded to carry what the importer preserves**:
+  multi-line measure / calculated-column expressions now emit the TMDL block
+  form (they used to leak raw newlines mid-document), hierarchies + levels,
+  lineageTag on tables/columns/measures/hierarchies/levels,
+  `extendedProperty` blocks, `sortByColumn`, non-default `summarizeBy`,
+  `dataCategory`, `displayFolder`, relationship cardinality
+  (`fromCardinality`/`toCardinality` when not many→one), and TMDL-correct
+  quote escaping (doubled `''`, not backslashes).
+
+### Fixed — KEEPFILTERS was a silent no-op (issue #35, docs r25)
+
+- `CALCULATE(..., KEEPFILTERS(pred))` treated the predicate exactly like a
+  plain override — under any outer filter overlapping the predicate's
+  column, every KEEPFILTERS measure computed the override's number with no
+  error (the silent-wrong-values class). The predicate now **intersects**
+  the outer filter on the same column: `Cat="A"` outside +
+  `KEEPFILTERS(Cat="B")` inside filters to the empty set and the SUM goes
+  BLANK, exactly as Desktop answers; matching and absent outer filters are
+  unchanged, and partial overlaps keep only the intersection
+  (`tests/test_dax_engine.py::TestKeepFilters`). OpenBI can lift its
+  HTML-export freeze on KEEPFILTERS measures.
+
 ## [0.9.79] - 2026-08-05
 
 ### Fixed — type information on the way out of the engine (issue #24 r22)

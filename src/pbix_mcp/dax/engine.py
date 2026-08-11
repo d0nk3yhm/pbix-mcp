@@ -4150,7 +4150,16 @@ class DAXEngine:
             # register a filter on a column named "NOT(T".
             spec = self._calculate_filter_spec(filter_arg, new_ctx)
             if spec:
-                key, value = spec
+                key, value, keep = spec
+                if keep and key not in applied_here:
+                    # KEEPFILTERS: the predicate INTERSECTS the outer filter on
+                    # the same column instead of overriding it. An empty
+                    # intersection filters to zero rows, so SUM correctly goes
+                    # BLANK (issue #35 — the passthrough made the override
+                    # indistinguishable from not writing KEEPFILTERS at all).
+                    outer = ctx.filter_context.get(key)
+                    if outer is not None:
+                        value = {"all": [outer, value]}
                 if key in applied_here:
                     value = {"all": [applied_here[key], value]}
                 applied_here[key] = value
@@ -4216,7 +4225,7 @@ class DAXEngine:
 
     def _calculate_filter_spec(self, filter_arg: str, ctx: DAXContext,
                                var_scope: dict | None = None) -> tuple:
-        """A CALCULATE boolean filter argument as ``(key, spec)``, or ``()``.
+        """A CALCULATE boolean filter argument as ``(key, spec, keep)``, or ``()``.
 
         Only ``Table[Col] = value`` used to be honoured; every other predicate
         fell off the end of the filter loop adding NO filter and NO warning, so
@@ -4227,9 +4236,12 @@ class DAXEngine:
         ``NOT`` is folded into the operator rather than wrapped, and
         ``KEEPFILTERS`` is peeled: both used to be swallowed by the equality
         regex, which matched the WRAPPER text and registered a filter on a column
-        named e.g. ``KEEPFILTERS(T``.
+        named e.g. ``KEEPFILTERS(T``. ``keep`` is True when a KEEPFILTERS
+        wrapper was peeled — the caller must then INTERSECT with the outer
+        filter on the same column instead of replacing it (issue #35).
         """
-        wrapper, inner = self._peel_call(filter_arg, ('KEEPFILTERS',))
+        kf, inner = self._peel_call(filter_arg, ('KEEPFILTERS',))
+        keep = bool(kf)
         negate = False
         while True:
             wrapper, peeled = self._peel_call(inner, ('NOT',))
@@ -4253,8 +4265,8 @@ class DAXEngine:
             # every existing caller and test expects, and make_value_matcher
             # treats a list as string membership.
             if op == '=':
-                return (key, [val])
-            return (key, {"op": op, "value": val})
+                return (key, [val], keep)
+            return (key, {"op": op, "value": val}, keep)
 
         in_parts = self._split_in_scan(inner)
         if in_parts:
@@ -4265,7 +4277,7 @@ class DAXEngine:
                 if vals is None:
                     return ()
                 key = f"{lm.group(1).strip()}.{lm.group(2).strip()}"
-                return (key, {"not_in" if negate else "in": vals})
+                return (key, {"not_in" if negate else "in": vals}, keep)
         return ()
 
     @staticmethod

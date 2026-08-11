@@ -1394,6 +1394,15 @@ def pbix_save(alias: str, output_path: str = "", overwrite: bool = False, backup
     try:
         info = _ensure_open(alias)
         work_dir = info["work_dir"]
+
+        # A PBIP-opened session saves back into its project folder unless an
+        # explicit .pbix/.pbit output_path asks for a converted copy.
+        if info.get("pbip_dir") and not output_path:
+            summary = _save_pbip(info)
+            info["modified"] = False
+            _dax_cache.pop(alias, None)
+            return ToolResponse.ok(summary).to_text()
+
         target = output_path or info["path"]
         target = os.path.abspath(target)
         logger.info("Saving '%s' to %s (overwrite=%s, backup=%s)", alias, target, overwrite, backup)
@@ -17148,10 +17157,50 @@ def _pbir_integrity_checks(work_dir: str, layout: dict, sections: list) -> list:
 
 
 def _tmdl_escape(value: str) -> str:
-    """Escape a string value for TMDL format."""
+    """Escape a quoted TMDL name: single quotes are doubled (TMDL's own
+    escape), which parse_tmdl_document's reader reverses."""
     if not value:
         return ""
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+    return value.replace("'", "''")
+
+
+def _tmdl_quote(name: str) -> str:
+    """Quote a TMDL object name only when it needs it (non-identifier chars)."""
+    import re as _re
+    if _re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name or ""):
+        return name
+    return f"'{_tmdl_escape(name)}'"
+
+
+def _tmdl_emit_expr(lines: list, indent: str, header: str, expr: str) -> None:
+    """Emit ``header = expr`` inline for a single-line expression, or the
+    TMDL block form (``header =`` + lines indented two levels deeper) for a
+    multi-line one — matching Desktop's own TMDL writer, and what
+    tmdl_reader.parse_tmdl_document reads back verbatim."""
+    expr = (expr or "").strip()
+    if "\n" in expr:
+        lines.append(f"{indent}{header} =")
+        for el in expr.split("\n"):
+            lines.append(f"{indent}\t\t{el}" if el.strip() else "")
+    else:
+        lines.append(f"{indent}{header} = {expr}")
+
+
+def _tmdl_extended_properties(c, object_type: int, object_id: int,
+                              lines: list, indent: str) -> None:
+    """Emit extendedProperty blocks for one object (field parameters live
+    here: ParameterMetadata on the Fields column, ObjectType=4/Type=json)."""
+    try:
+        rows = c.execute(
+            "SELECT Name, Type, Value FROM ExtendedProperty "
+            "WHERE ObjectType = ? AND ObjectID = ? ORDER BY ID",
+            (object_type, object_id)).fetchall()
+    except sqlite3.OperationalError:
+        return  # older metadata without the table
+    for ep_name, _ep_type, ep_value in rows:
+        _tmdl_emit_expr(lines, indent,
+                        f"extendedProperty {_tmdl_quote(ep_name)}",
+                        ep_value or "")
 
 
 def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
@@ -17160,7 +17209,8 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
     Returns dict with counts of exported objects.
     """
     c = conn.cursor()
-    stats = {"tables": 0, "columns": 0, "measures": 0, "relationships": 0, "roles": 0}
+    stats = {"tables": 0, "columns": 0, "measures": 0, "relationships": 0,
+             "roles": 0, "hierarchies": 0}
 
     # ---- database.tmdl ----
     c.execute("SELECT Name, Culture FROM Model LIMIT 1")
@@ -17218,14 +17268,8 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
         lines = []
         for e_name, e_expr, e_desc, e_tag in exprs:
             if e_expr:
-                expr_lines = e_expr.strip().split("\n")
-                if len(expr_lines) == 1:
-                    lines.append(f"expression {_tmdl_escape(e_name)} =")
-                    lines.append(f"\t\t{expr_lines[0]}")
-                else:
-                    lines.append(f"expression {_tmdl_escape(e_name)} =")
-                    for el in expr_lines:
-                        lines.append(f"\t\t{el}")
+                _tmdl_emit_expr(lines, "",
+                                f"expression {_tmdl_quote(e_name)}", e_expr)
                 # Note: TMDL expression objects do not support 'description'
                 if e_tag:
                     lines.append(f"\tlineageTag: {e_tag}")
@@ -17238,10 +17282,11 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
     tables_dir = os.path.join(output_dir, "tables")
     os.makedirs(tables_dir, exist_ok=True)
 
-    c.execute("SELECT ID, Name, Description, IsHidden FROM [Table] ORDER BY ID")
+    c.execute("SELECT ID, Name, Description, IsHidden, LineageTag "
+              "FROM [Table] ORDER BY ID")
     tables = c.fetchall()
 
-    for table_id, table_name, table_desc, is_hidden in tables:
+    for table_id, table_name, table_desc, is_hidden, t_tag in tables:
         # Skip internal system tables (H$=hierarchy, R$=relationship, U$=user hierarchy)
         if table_name.startswith(("H$", "R$", "U$")):
             continue
@@ -17250,35 +17295,42 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
         # even though the TOM model supports it — skip to avoid load errors
         if is_hidden:
             lines.append("\tisHidden")
+        if t_tag:
+            lines.append(f"\tlineageTag: {t_tag}")
+        _tmdl_extended_properties(c, 3, table_id, lines, "\t")
         lines.append("")
 
-        # Columns
+        # Columns. SummarizeBy is emitted only when it differs from the
+        # type-default (numeric -> default(1), other -> none(2)) — exactly the
+        # default the import side's builder re-derives, which keeps
+        # export -> import -> export byte-stable while preserving overrides.
         c.execute(
-            "SELECT ExplicitName, InferredName, ExplicitDataType, InferredDataType, "
-            "IsHidden, IsKey, SourceColumn, Expression, FormatString, Description, Type "
+            "SELECT ID, ExplicitName, InferredName, ExplicitDataType, InferredDataType, "
+            "IsHidden, IsKey, SourceColumn, Expression, FormatString, Description, Type, "
+            "LineageTag, SummarizeBy, DataCategory, DisplayFolder, SortByColumnID "
             "FROM [Column] WHERE TableID = ? ORDER BY ID",
             (table_id,)
         )
         _dtype_map = {
             2: "string", 6: "int64", 8: "double", 9: "dateTime", 10: "decimal", 11: "boolean"
         }
-        for col in c.fetchall():
-            col_name = col[0] or col[1] or "?"
-            dtype_id = col[2] if col[2] else (col[3] if col[3] else 2)
+        from pbix_mcp.formats.tmdl_reader import SUMMARIZE_BY_NAMES
+        col_rows = c.fetchall()
+        id2name = {r[0]: (r[1] or r[2] or "?") for r in col_rows}
+        for col in col_rows:
+            (col_id, expl_name, inf_name, expl_dt, inf_dt, is_col_hidden,
+             is_key, source_col, expression, fmt_str, col_desc, col_type,
+             c_tag, summarize_by, data_cat, disp_folder, sortby_id) = col
+            col_name = expl_name or inf_name or "?"
+            dtype_id = expl_dt if expl_dt else (inf_dt if inf_dt else 2)
             dtype = _dtype_map.get(dtype_id, "string")
-            is_col_hidden = col[4]
-            is_key = col[5]
-            source_col = col[6]
-            expression = col[7]
-            fmt_str = col[8]
-            col_desc = col[9]
-            col_type = col[10]  # 1=data, 2=calculated, 3=rowNumber
 
             if col_type == 3:
                 continue  # Skip RowNumber system columns
 
             if expression and col_type == 2:
-                lines.append(f"\tcolumn '{_tmdl_escape(col_name)}' = {expression}")
+                _tmdl_emit_expr(lines, "\t",
+                                f"column '{_tmdl_escape(col_name)}'", expression)
             else:
                 lines.append(f"\tcolumn '{_tmdl_escape(col_name)}'")
 
@@ -17291,19 +17343,64 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
                 lines.append("\t\tisKey")
             if fmt_str:
                 lines.append(f"\t\tformatString: {fmt_str}")
+            type_default_sb = 1 if dtype_id in (6, 8, 10) else 2
+            if summarize_by and summarize_by != type_default_sb \
+                    and summarize_by in SUMMARIZE_BY_NAMES:
+                lines.append(f"\t\tsummarizeBy: {SUMMARIZE_BY_NAMES[summarize_by]}")
+            if sortby_id and sortby_id in id2name:
+                lines.append(
+                    f"\t\tsortByColumn: '{_tmdl_escape(id2name[sortby_id])}'")
+            if data_cat:
+                lines.append(f"\t\tdataCategory: {data_cat}")
+            if disp_folder:
+                lines.append(f"\t\tdisplayFolder: {disp_folder}")
+            if c_tag:
+                lines.append(f"\t\tlineageTag: {c_tag}")
+            _tmdl_extended_properties(c, 4, col_id, lines, "\t\t")
             # Note: PBI Desktop's TMDL parser rejects 'description' on columns
             lines.append("")
             stats["columns"] += 1
 
+        # Hierarchies (user drill-down hierarchies with their levels)
+        try:
+            h_rows = c.execute(
+                "SELECT ID, Name, IsHidden, DisplayFolder, LineageTag "
+                "FROM Hierarchy WHERE TableID = ? ORDER BY ID",
+                (table_id,)).fetchall()
+        except sqlite3.OperationalError:
+            h_rows = []
+        for h_id, h_name, h_hidden, h_folder, h_tag in h_rows:
+            lines.append(f"\thierarchy '{_tmdl_escape(h_name)}'")
+            if h_hidden:
+                lines.append("\t\tisHidden")
+            if h_folder:
+                lines.append(f"\t\tdisplayFolder: {h_folder}")
+            if h_tag:
+                lines.append(f"\t\tlineageTag: {h_tag}")
+            lines.append("")
+            for lv_name, lv_col_id, lv_tag in c.execute(
+                    "SELECT Name, ColumnID, LineageTag FROM Level "
+                    "WHERE HierarchyID = ? ORDER BY Ordinal", (h_id,)):
+                lines.append(f"\t\tlevel {_tmdl_quote(lv_name)}")
+                if lv_tag:
+                    lines.append(f"\t\t\tlineageTag: {lv_tag}")
+                lines.append(
+                    f"\t\t\tcolumn: '{_tmdl_escape(id2name.get(lv_col_id, ''))}'")
+                lines.append("")
+            stats["hierarchies"] += 1
+
         # Measures
         c.execute(
-            "SELECT Name, Expression, FormatString, Description, IsHidden, DisplayFolder "
+            "SELECT ID, Name, Expression, FormatString, Description, IsHidden, "
+            "DisplayFolder, DataCategory, LineageTag "
             "FROM Measure WHERE TableID = ? ORDER BY ID",
             (table_id,)
         )
         for meas in c.fetchall():
-            m_name, m_expr, m_fmt, m_desc, m_hidden, m_folder = meas
-            lines.append(f"\tmeasure '{_tmdl_escape(m_name)}' = {m_expr}")
+            (m_id, m_name, m_expr, m_fmt, m_desc, m_hidden, m_folder,
+             m_cat, m_tag) = meas
+            _tmdl_emit_expr(lines, "\t",
+                            f"measure '{_tmdl_escape(m_name)}'", m_expr or "")
             if m_fmt:
                 lines.append(f"\t\tformatString: {m_fmt}")
             # Note: PBI Desktop's TMDL parser rejects 'description' on measures
@@ -17311,6 +17408,11 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
                 lines.append("\t\tisHidden")
             if m_folder:
                 lines.append(f"\t\tdisplayFolder: {m_folder}")
+            if m_cat:
+                lines.append(f"\t\tdataCategory: {m_cat}")
+            if m_tag:
+                lines.append(f"\t\tlineageTag: {m_tag}")
+            _tmdl_extended_properties(c, 8, m_id, lines, "\t\t")
             lines.append("")
             stats["measures"] += 1
 
@@ -17332,8 +17434,8 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
                     lines.append(f"\tpartition '{_tmdl_escape(p_name)}' = m")
                     lines.append(f"\t\tmode: {mode_str}")
                 lines.append("\t\tsource =")
-                for qline in p_query.split("\n"):
-                    lines.append(f"\t\t\t{qline}")
+                for qline in p_query.strip().split("\n"):
+                    lines.append(f"\t\t\t\t{qline}" if qline.strip() else "")
                 lines.append("")
 
         # Write table TMDL
@@ -17346,7 +17448,8 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
     c.execute(
         "SELECT r.Name, r.IsActive, r.CrossFilteringBehavior, "
         "ft.Name, COALESCE(fc.ExplicitName, fc.InferredName), "
-        "tt.Name, COALESCE(tc.ExplicitName, tc.InferredName) "
+        "tt.Name, COALESCE(tc.ExplicitName, tc.InferredName), "
+        "r.FromCardinality, r.ToCardinality "
         "FROM [Relationship] r "
         "JOIN [Table] ft ON r.FromTableID = ft.ID "
         "JOIN [Column] fc ON r.FromColumnID = fc.ID "
@@ -17356,9 +17459,11 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
     )
     rels = c.fetchall()
     if rels:
+        _card_names = {0: "none", 1: "one", 2: "many"}
         lines = []
         for rel in rels:
-            r_name, is_active, cross_filter, from_tbl, from_col, to_tbl, to_col = rel
+            (r_name, is_active, cross_filter, from_tbl, from_col, to_tbl,
+             to_col, from_card, to_card) = rel
             lines.append(f"relationship {r_name or ''}")
             lines.append(f"\tfromColumn: '{_tmdl_escape(from_tbl)}'.'{_tmdl_escape(from_col)}'")
             lines.append(f"\ttoColumn: '{_tmdl_escape(to_tbl)}'.'{_tmdl_escape(to_col)}'")
@@ -17369,6 +17474,12 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
             cfb_map = {2: "bothDirections", 3: "automatic"}
             if cross_filter in cfb_map:
                 lines.append(f"\tcrossFilteringBehavior: {cfb_map[cross_filter]}")
+            # Cardinality: many->one is TMDL's default; emit only deviations
+            # (many-to-many, one-to-one) so plain star schemas stay terse.
+            if from_card is not None and from_card != 2:
+                lines.append(f"\tfromCardinality: {_card_names.get(from_card, 'many')}")
+            if to_card is not None and to_card != 1:
+                lines.append(f"\ttoCardinality: {_card_names.get(to_card, 'one')}")
             lines.append("")
             stats["relationships"] += 1
 
@@ -17728,6 +17839,7 @@ def pbix_export_tmdl(alias: str, output_path: str = "") -> str:
             f"  Columns: {stats['columns']}\n"
             f"  Measures: {stats['measures']}\n"
             f"  Relationships: {stats['relationships']}\n"
+            f"  Hierarchies: {stats.get('hierarchies', 0)}\n"
             f"  Roles: {stats['roles']}\n"
             f"Files are Git-friendly text — diff, merge, and version control your model."
         )
@@ -17736,6 +17848,637 @@ def pbix_export_tmdl(alias: str, output_path: str = "") -> str:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
+
+
+# ---- Section 10c: TMDL Import + PBIP open/save (issue #34) ----
+
+
+def _apply_tmdl_metadata(conn: sqlite3.Connection, model: dict) -> None:
+    """Post-pass after the builder skeleton: write every TMDL property the
+    builder cannot express straight into the metadata SQLite — partitions'
+    real M/DAX sources, calculated-column expressions, lineage tags,
+    format/summarize/sort/category overrides, shared M expressions,
+    relationship names, roles, and extended properties (field parameters).
+    Property-only updates + rows without storage, so it is safe under
+    ``_modify_metadata_only``."""
+    c = conn.cursor()
+    c.execute(
+        'CREATE TABLE IF NOT EXISTS [ExtendedProperty]( [ID] INTEGER, '
+        '[ObjectID] INTEGER, [ObjectType] INTEGER, [Name] TEXT, '
+        '[Type] INTEGER, [Value] TEXT, [ModifiedTime] INTEGER, '
+        'PRIMARY KEY("ID" ASC) )')
+
+    # Metadata object IDs are GLOBAL across tables — allocate from the same
+    # DBPROPERTIES MAXID counter every other splice path uses.
+    maxid_row = c.execute(
+        "SELECT Value FROM DBPROPERTIES WHERE Name = 'MAXID'").fetchone()
+    _ids = {"max": int(maxid_row[0]) if maxid_row else 0}
+
+    def _next_id() -> int:
+        _ids["max"] += 1
+        return _ids["max"]
+
+    def _add_ext_props(obj_type: int, obj_id: int, eps: list) -> None:
+        for ep in eps or []:
+            c.execute(
+                "INSERT INTO [ExtendedProperty] (ID, ObjectID, ObjectType, "
+                "Name, Type, Value) VALUES (?, ?, ?, ?, ?, ?)",
+                (_next_id(), obj_id, obj_type,
+                 ep["name"], ep["type"], ep["value"]))
+
+    # --- Model properties ---
+    sets, vals = [], []
+    if model.get("culture"):
+        sets.append("Culture = ?"); vals.append(model["culture"])
+    if model.get("default_powerbi_data_source_version") is not None:
+        sets.append("DefaultPowerBIDataSourceVersion = ?")
+        vals.append(model["default_powerbi_data_source_version"])
+    if model.get("discourage_implicit_measures"):
+        sets.append("DiscourageImplicitMeasures = 1")
+    if model.get("source_query_culture"):
+        sets.append("SourceQueryCulture = ?")
+        vals.append(model["source_query_culture"])
+    dao = model.get("data_access_options")
+    if dao is not None:
+        sets.append("DataAccessOptions = ?")
+        vals.append(json.dumps({k: True for k, v in dao.items() if v}))
+    if sets:
+        c.execute(f"UPDATE Model SET {', '.join(sets)} WHERE ID = 1", vals)
+
+    # --- Shared M expressions (parameters) ---
+    for e in model.get("expressions") or []:
+        c.execute(
+            "INSERT INTO Expression (ID, ModelID, Name, Kind, Expression, "
+            "LineageTag) VALUES (?, 1, ?, 0, ?, ?)",
+            (_next_id(), e["name"], e["expression"],
+             e.get("lineage_tag")))
+
+    # --- Per-table objects ---
+    for t in model["tables"]:
+        trow = c.execute(
+            "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
+            (t["name"],)).fetchone()
+        if not trow:
+            continue
+        tid = trow[0]
+        if t.get("lineage_tag"):
+            c.execute("UPDATE [Table] SET LineageTag = ? WHERE ID = ?",
+                      (t["lineage_tag"], tid))
+        _add_ext_props(3, tid, t.get("extended_properties"))
+
+        col_ids = {name: cid for cid, name in c.execute(
+            "SELECT ID, COALESCE(ExplicitName, InferredName) "
+            "FROM [Column] WHERE TableID = ?", (tid,))}
+        for col in t["columns"]:
+            cid = col_ids.get(col["name"])
+            if cid is None:
+                continue
+            csets, cvals = [], []
+            if col.get("format_string"):
+                csets.append("FormatString = ?")
+                cvals.append(col["format_string"])
+            if col.get("is_key"):
+                csets.append("IsKey = 1")
+            if col.get("is_hidden"):
+                csets.append("IsHidden = 1")
+            if col.get("summarize_by") is not None:
+                csets.append("SummarizeBy = ?")
+                cvals.append(col["summarize_by"])
+            if col.get("data_category"):
+                csets.append("DataCategory = ?")
+                cvals.append(col["data_category"])
+            if col.get("display_folder"):
+                csets.append("DisplayFolder = ?")
+                cvals.append(col["display_folder"])
+            if col.get("lineage_tag"):
+                csets.append("LineageTag = ?")
+                cvals.append(col["lineage_tag"])
+            if col.get("expression") is not None:
+                # Calculated column: DAX expression, no source column.
+                csets.append("Type = 2")
+                csets.append("Expression = ?")
+                cvals.append(col["expression"])
+                csets.append("SourceColumn = NULL")
+            elif col.get("source_column") and col["source_column"] != col["name"]:
+                csets.append("SourceColumn = ?")
+                cvals.append(col["source_column"])
+            if col.get("sort_by_column") and col["sort_by_column"] in col_ids:
+                csets.append("SortByColumnID = ?")
+                cvals.append(col_ids[col["sort_by_column"]])
+            if csets:
+                c.execute(
+                    f"UPDATE [Column] SET {', '.join(csets)} WHERE ID = ?",
+                    cvals + [cid])
+            _add_ext_props(4, cid, col.get("extended_properties"))
+
+        for m in t["measures"]:
+            mrow = c.execute(
+                "SELECT ID FROM Measure WHERE TableID = ? AND Name = ?",
+                (tid, m["name"])).fetchone()
+            if not mrow:
+                continue
+            msets, mvals = [], []
+            if m.get("is_hidden"):
+                msets.append("IsHidden = 1")
+            if m.get("display_folder"):
+                msets.append("DisplayFolder = ?")
+                mvals.append(m["display_folder"])
+            if m.get("lineage_tag"):
+                msets.append("LineageTag = ?")
+                mvals.append(m["lineage_tag"])
+            if msets:
+                c.execute(
+                    f"UPDATE Measure SET {', '.join(msets)} WHERE ID = ?",
+                    mvals + [mrow[0]])
+            _add_ext_props(8, mrow[0], m.get("extended_properties"))
+
+        # Partitions: replace the builder's enter-data source with the TMDL
+        # one (in ID order); extra TMDL partitions become metadata-only rows.
+        prows = [r[0] for r in c.execute(
+            "SELECT ID FROM [Partition] WHERE TableID = ? ORDER BY ID",
+            (tid,))]
+        for i, part in enumerate(t["partitions"]):
+            ptype = 2 if part["kind"] == "calculated" else 4
+            pmode = 1 if part["mode"] == "directquery" else 0
+            if i < len(prows):
+                c.execute(
+                    "UPDATE [Partition] SET Name = ?, QueryDefinition = ?, "
+                    "Mode = ?, Type = ? WHERE ID = ?",
+                    (part["name"], part["source"], pmode, ptype, prows[i]))
+            else:
+                c.execute(
+                    "INSERT INTO [Partition] (ID, TableID, Name, "
+                    "QueryDefinition, State, Type, Mode) "
+                    "VALUES (?, ?, ?, ?, 1, ?, ?)",
+                    (_next_id(), tid, part["name"],
+                     part["source"], ptype, pmode))
+
+        for h in t["hierarchies"]:
+            hrow = c.execute(
+                "SELECT ID FROM Hierarchy WHERE TableID = ? AND Name = ?",
+                (tid, h["name"])).fetchone()
+            if not hrow:
+                continue
+            if h.get("lineage_tag"):
+                c.execute("UPDATE Hierarchy SET LineageTag = ? WHERE ID = ?",
+                          (h["lineage_tag"], hrow[0]))
+            if h.get("display_folder"):
+                c.execute("UPDATE Hierarchy SET DisplayFolder = ? WHERE ID = ?",
+                          (h["display_folder"], hrow[0]))
+            if h.get("is_hidden"):
+                c.execute("UPDATE Hierarchy SET IsHidden = 1 WHERE ID = ?",
+                          (hrow[0],))
+            for lv in h["levels"]:
+                if lv.get("lineage_tag"):
+                    c.execute(
+                        "UPDATE Level SET LineageTag = ? "
+                        "WHERE HierarchyID = ? AND Name = ?",
+                        (lv["lineage_tag"], hrow[0], lv["name"]))
+
+    # --- Relationship names (builder autogenerates; TMDL keeps originals) ---
+    for r in model.get("relationships") or []:
+        row = c.execute(
+            "SELECT r.ID FROM [Relationship] r "
+            "JOIN [Table] ft ON r.FromTableID = ft.ID "
+            "JOIN [Column] fc ON r.FromColumnID = fc.ID "
+            "JOIN [Table] tt ON r.ToTableID = tt.ID "
+            "JOIN [Column] tc ON r.ToColumnID = tc.ID "
+            "WHERE ft.Name = ? AND COALESCE(fc.ExplicitName, fc.InferredName) = ? "
+            "AND tt.Name = ? AND COALESCE(tc.ExplicitName, tc.InferredName) = ?",
+            (r["from_table"], r["from_column"], r["to_table"], r["to_column"]),
+        ).fetchone()
+        if row and r.get("name"):
+            c.execute("UPDATE [Relationship] SET Name = ? WHERE ID = ?",
+                      (r["name"], row[0]))
+
+    # --- Roles + table permissions (same shape as the RLS splice path) ---
+    for role in model.get("roles") or []:
+        role_id = _next_id()
+        c.execute(
+            "INSERT INTO Role (ID, ModelID, Name, Description) "
+            "VALUES (?, 1, ?, ?)",
+            (role_id, role["name"], None))
+        for tp in role.get("table_permissions") or []:
+            trow = c.execute(
+                "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
+                (tp["table"],)).fetchone()
+            if trow:
+                c.execute(
+                    "INSERT INTO TablePermission (ID, RoleID, TableID, "
+                    "FilterExpression) VALUES (?, ?, ?, ?)",
+                    (_next_id(), role_id, trow[0],
+                     tp.get("filter_expression") or None))
+
+    if maxid_row:
+        c.execute("UPDATE DBPROPERTIES SET Value = ? WHERE Name = 'MAXID'",
+                  (str(_ids["max"]),))
+    conn.commit()
+
+
+def _build_pbix_from_tmdl_model(model: dict, output_path: str) -> dict:
+    """Build a .pbix at ``output_path`` from a parsed TMDL model dict:
+    builder skeleton (tables / columns / measures / relationships /
+    hierarchies) + full-fidelity metadata post-pass. Returns stats."""
+    import warnings as _warnings
+
+    from pbix_mcp.builder import PBIXBuilder
+
+    b = PBIXBuilder(model.get("name") or "Model")
+    stats = {"tables": 0, "columns": 0, "measures": 0,
+             "relationships": 0, "roles": len(model.get("roles") or []),
+             "hierarchies": 0, "expressions": len(model.get("expressions") or [])}
+    for t in model["tables"]:
+        cols = [{"name": col["name"], "data_type": col["data_type"]}
+                for col in t["columns"]]
+        if not cols:
+            raise ValueError(f"TMDL table '{t['name']}' declares no columns")
+        calc = [col["name"] for col in t["columns"]
+                if col.get("expression") is not None]
+        b.add_table(t["name"], cols, rows=[], hidden=t.get("is_hidden", False),
+                    calc_columns=calc)
+        stats["tables"] += 1
+        stats["columns"] += len(cols)
+        for m in t["measures"]:
+            b.add_measure(t["name"], m["name"], m["expression"],
+                          format_string=m.get("format_string") or None,
+                          data_category=m.get("data_category") or None)
+            stats["measures"] += 1
+        for h in t["hierarchies"]:
+            levels = [{"name": lv["name"], "column": lv["column"]}
+                      for lv in h["levels"] if lv.get("column")]
+            if levels:
+                b.add_user_hierarchy(t["name"], h["name"], levels)
+                stats["hierarchies"] += 1
+    for r in model.get("relationships") or []:
+        b.add_relationship(
+            r["from_table"], r["from_column"], r["to_table"], r["to_column"],
+            is_active=r.get("is_active", True),
+            cross_filter_behavior=r.get("cross_filtering_behavior", 1),
+            from_cardinality=r.get("from_cardinality", 2),
+            to_cardinality=r.get("to_cardinality", 1),
+            auto_orient=False)
+        stats["relationships"] += 1
+
+    with _warnings.catch_warnings():
+        # Schema-only import: every table is legitimately empty.
+        _warnings.simplefilter("ignore", UserWarning)
+        b.save(output_path)
+
+    # Full-fidelity post-pass on the saved file's DataModel.
+    tmp_dir = tempfile.mkdtemp(prefix="pbix_tmdl_import_")
+    try:
+        _extract_pbix(output_path, tmp_dir)
+        dm_path = os.path.join(tmp_dir, "DataModel")
+        _modify_metadata_only(dm_path, lambda conn: _apply_tmdl_metadata(conn, model))
+        _repack_pbix(tmp_dir, output_path)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return stats
+
+
+@mcp.tool()
+def pbix_import_tmdl(tmdl_path: str, output_path: str = "", alias: str = "") -> str:
+    """Import a TMDL model (folder or single .tmdl file) into a new PBIX.
+
+    The inverse of pbix_export_tmdl: parses tables, columns (calculated
+    included), measures, relationships, hierarchies, partitions (M/DAX
+    sources), shared M expressions, roles, extended properties (field
+    parameters) and lineage tags, and builds a working schema-only PBIX
+    (TMDL carries no row data — refresh in Power BI Desktop repopulates
+    from the partitions' M queries). Round-trip: export → import → export
+    reproduces the same TMDL files.
+
+    Args:
+        tmdl_path: TMDL definition folder (with tables/*.tmdl), a folder
+            containing a definition/ subfolder (SemanticModel layout), or a
+            single .tmdl document file.
+        output_path: Where to write the .pbix. Defaults to
+            <tmdl_path>_imported.pbix next to the input.
+        alias: When set, the imported file is left open under this alias
+            (like pbix_open) for further editing.
+    """
+    try:
+        from pbix_mcp.formats.tmdl_reader import (
+            parse_tmdl_folder,
+            parse_tmdl_string,
+        )
+
+        tmdl_path = os.path.abspath(tmdl_path)
+        if not os.path.exists(tmdl_path):
+            return ToolResponse.error(
+                f"TMDL path not found: {tmdl_path}", "INVALID_INPUT").to_text()
+
+        if os.path.isfile(tmdl_path):
+            with open(tmdl_path, "r", encoding="utf-8-sig") as f:
+                model = parse_tmdl_string(f.read())
+            default_out = os.path.splitext(tmdl_path)[0] + "_imported.pbix"
+        else:
+            folder = tmdl_path
+            # SemanticModel layout: the TMDL lives in definition/
+            if not os.path.isdir(os.path.join(folder, "tables")) and \
+                    os.path.isdir(os.path.join(folder, "definition")):
+                folder = os.path.join(folder, "definition")
+            model = parse_tmdl_folder(folder)
+            default_out = tmdl_path.rstrip("\\/") + "_imported.pbix"
+
+        output_path = os.path.abspath(output_path or default_out)
+        if alias and alias in _open_files:
+            raise FileAlreadyOpenError(
+                f"Alias '{alias}' is already in use. Close it first or choose "
+                f"a different alias.")
+
+        stats = _build_pbix_from_tmdl_model(model, output_path)
+
+        opened_note = ""
+        if alias:
+            # Reuse the normal open flow so the session behaves identically.
+            result = json.loads(pbix_open(output_path, alias))
+            if not result.get("success"):
+                return ToolResponse.error(
+                    f"Imported PBIX written to {output_path} but opening it "
+                    f"failed: {result.get('message')}",
+                    "IMPORT_OPEN_FAILED").to_text()
+            opened_note = f"\nOpened as alias '{alias}'."
+
+        return ToolResponse.ok(
+            f"TMDL imported to: {output_path}\n"
+            f"  Tables: {stats['tables']} ({stats['columns']} columns)\n"
+            f"  Measures: {stats['measures']}\n"
+            f"  Relationships: {stats['relationships']}\n"
+            f"  Hierarchies: {stats['hierarchies']}\n"
+            f"  Shared expressions: {stats['expressions']}\n"
+            f"  Roles: {stats['roles']}\n"
+            f"Schema-only import: tables are empty until refreshed from "
+            f"their partition sources in Power BI Desktop.{opened_note}"
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
+
+
+def _resolve_pbip_project(path: str) -> tuple[str, str, str, str]:
+    """Resolve a PBIP reference (the .pbip file or its folder) to
+    (project_root, base_name, report_dir, model_definition_dir)."""
+    path = os.path.abspath(path)
+    if os.path.isfile(path) and path.lower().endswith(".pbip"):
+        root = os.path.dirname(path)
+        pbip_file = path
+    elif os.path.isdir(path):
+        root = path
+        candidates = [f for f in os.listdir(path) if f.lower().endswith(".pbip")]
+        if not candidates:
+            raise InvalidPBIXError(
+                f"No .pbip file found in {path} — pass the project folder or "
+                f"the .pbip file itself.")
+        pbip_file = os.path.join(path, sorted(candidates)[0])
+    else:
+        raise InvalidPBIXError(f"Not a .pbip file or project folder: {path}")
+
+    with open(pbip_file, "r", encoding="utf-8-sig") as f:
+        pbip = json.load(f)
+    report_rel = ""
+    for art in pbip.get("artifacts") or []:
+        if isinstance(art, dict) and "report" in art:
+            report_rel = (art["report"] or {}).get("path", "")
+            break
+    report_dir = os.path.join(root, report_rel) if report_rel else ""
+    if not report_dir or not os.path.isdir(report_dir):
+        # fall back to the conventional folder name
+        hits = [d for d in os.listdir(root) if d.endswith(".Report")]
+        if not hits:
+            raise InvalidPBIXError(f"No .Report folder found in {root}")
+        report_dir = os.path.join(root, sorted(hits)[0])
+    base_name = os.path.basename(report_dir)
+    if base_name.endswith(".Report"):
+        base_name = base_name[: -len(".Report")]
+
+    # definition.pbir -> datasetReference.byPath -> SemanticModel folder
+    model_dir = ""
+    pbir_path = os.path.join(report_dir, "definition.pbir")
+    if os.path.exists(pbir_path):
+        with open(pbir_path, "r", encoding="utf-8-sig") as f:
+            pbir = json.load(f)
+        by_path = ((pbir.get("datasetReference") or {}).get("byPath") or {}).get("path", "")
+        if by_path:
+            model_dir = os.path.normpath(os.path.join(report_dir, by_path))
+    if not model_dir or not os.path.isdir(model_dir):
+        hits = [d for d in os.listdir(root) if d.endswith(".SemanticModel")]
+        if not hits:
+            raise InvalidPBIXError(
+                f"No SemanticModel folder found for PBIP project {root}")
+        model_dir = os.path.join(root, sorted(hits)[0])
+
+    tmdl_def = os.path.join(model_dir, "definition")
+    if not os.path.isdir(tmdl_def):
+        if os.path.exists(os.path.join(model_dir, "model.bim")):
+            raise UnsupportedFormatError(
+                "This PBIP stores its model as TMSL (model.bim), not TMDL — "
+                "only TMDL model folders are supported.")
+        raise InvalidPBIXError(
+            f"No TMDL definition/ folder in {model_dir}")
+    return root, base_name, report_dir, tmdl_def
+
+
+@mcp.tool()
+def pbix_open_pbip(path: str, alias: str = "") -> str:
+    """Open a PBIP project folder (TMDL model half + report half) as a live
+    document — the same session every other tool operates on. pbix_save
+    (with no output_path) writes edits back into the project folder;
+    pbix_save with a .pbix output_path converts the project to a PBIX.
+
+    Args:
+        path: The .pbip file or the project folder containing it.
+        alias: Short name for the session (defaults to the project name).
+    """
+    try:
+        from pbix_mcp.formats.tmdl_reader import parse_tmdl_folder
+
+        root, base_name, report_dir, tmdl_def = _resolve_pbip_project(path)
+        if not alias:
+            alias = base_name
+        if alias in _open_files:
+            raise FileAlreadyOpenError(
+                f"Alias '{alias}' is already in use. Close it first or choose "
+                f"a different alias.")
+
+        model = parse_tmdl_folder(tmdl_def)
+
+        # Build the model half into a scratch .pbix and extract it — this
+        # becomes the live work_dir every existing tool already understands.
+        gen_pbix = os.path.join(
+            tempfile.gettempdir(),
+            f"pbix_mcp_pbip_{alias}_{os.getpid()}_{uuid.uuid4().hex[:8]}.pbix")
+        stats = _build_pbix_from_tmdl_model(model, gen_pbix)
+
+        work_dir = os.path.join(
+            tempfile.gettempdir(),
+            f"pbix_mcp_{alias}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            f"_{os.getpid()}_{uuid.uuid4().hex[:8]}",
+        )
+        os.makedirs(work_dir, exist_ok=True)
+        _work_dirs.add(work_dir)
+        try:
+            _extract_pbix(gen_pbix, work_dir)
+        except Exception:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            _work_dirs.discard(work_dir)
+            raise
+
+        # Attach the report half. Our own PBIP export writes the full legacy
+        # layout as report.json; Desktop-authored projects carry a PBIR
+        # definition/ tree, which the PBIR reader already understands.
+        report_note = "none"
+        report_json = os.path.join(report_dir, "report.json")
+        pbir_tree = os.path.join(report_dir, "definition")
+        if os.path.exists(report_json):
+            with open(report_json, "r", encoding="utf-8-sig") as f:
+                layout = json.load(f)
+            layout_path = os.path.join(work_dir, "Report", "Layout")
+            os.makedirs(os.path.dirname(layout_path), exist_ok=True)
+            with open(layout_path, "wb") as f:
+                f.write(json.dumps(layout, ensure_ascii=False).encode("utf-16-le"))
+            report_note = "classic (report.json)"
+        elif os.path.isdir(os.path.join(pbir_tree, "pages")):
+            shutil.copytree(pbir_tree,
+                            os.path.join(work_dir, "Report", "definition"),
+                            dirs_exist_ok=True)
+            # PBIR must not coexist with the generated classic Layout.
+            gen_layout = os.path.join(work_dir, "Report", "Layout")
+            if os.path.exists(gen_layout):
+                os.unlink(gen_layout)
+            report_note = "PBIR (definition/ tree)"
+        static_src = os.path.join(report_dir, "StaticResources")
+        if os.path.isdir(static_src):
+            shutil.copytree(static_src,
+                            os.path.join(work_dir, "Report", "StaticResources"),
+                            dirs_exist_ok=True)
+
+        _open_files[alias] = {
+            "path": gen_pbix,
+            "work_dir": work_dir,
+            "is_pbit": False,
+            "modified": False,
+            "is_directquery": False,
+            "pbip_dir": root,
+            "pbip_base": base_name,
+        }
+        return ToolResponse.ok(
+            f"Opened PBIP project '{root}' as '{alias}'\n"
+            f"  Model: {stats['tables']} tables, {stats['measures']} measures, "
+            f"{stats['relationships']} relationships (from TMDL)\n"
+            f"  Report: {report_note}\n"
+            f"Schema-only model: tables are empty until refreshed from their "
+            f"partition sources.\n"
+            f"pbix_save writes back into the project folder; "
+            f"pbix_save with output_path='x.pbix' converts to PBIX."
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
+
+
+def _save_pbip(info: dict) -> str:
+    """Persist a PBIP-opened session back into its project folder: re-export
+    the model half as TMDL into <base>.SemanticModel/definition/ and the
+    report half as report.json (or patch the PBIR tree in place). Returns a
+    human-readable summary."""
+    from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+    from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+
+    root = info["pbip_dir"]
+    base = info["pbip_base"]
+    work_dir = info["work_dir"]
+    report_dir = os.path.join(root, f"{base}.Report")
+    model_dir = os.path.join(root, f"{base}.SemanticModel")
+    tmdl_def = os.path.join(model_dir, "definition")
+    os.makedirs(report_dir, exist_ok=True)
+
+    # --- model half: wipe + re-export TMDL ---
+    dm_path = os.path.join(work_dir, "DataModel")
+    tmdl_stats = {"tables": 0, "measures": 0}
+    if os.path.exists(dm_path):
+        if os.path.isdir(tmdl_def):
+            shutil.rmtree(tmdl_def)
+        os.makedirs(tmdl_def, exist_ok=True)
+        with open(dm_path, "rb") as f:
+            abf = decompress_datamodel(f.read())
+        db_bytes = read_metadata_sqlite(abf)
+        fd, tmp_db = tempfile.mkstemp(suffix=".db")
+        os.write(fd, db_bytes)
+        os.close(fd)
+        conn = None
+        try:
+            conn = sqlite3.connect(tmp_db)
+            tmdl_stats = _export_tmdl_from_sqlite(conn, tmdl_def)
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp_db)
+            except OSError:
+                pass
+
+    # --- report half ---
+    pbir_tree = os.path.join(work_dir, "Report", "definition")
+    if os.path.isdir(pbir_tree):
+        # PBIR: the work_dir tree IS the edited report — mirror it back.
+        dest = os.path.join(report_dir, "definition")
+        if os.path.isdir(dest):
+            shutil.rmtree(dest)
+        shutil.copytree(pbir_tree, dest)
+        report_note = "definition/ (PBIR tree)"
+    else:
+        layout = _get_layout(work_dir)
+        if layout is not None:
+            with open(os.path.join(report_dir, "report.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(layout, f, indent=2, ensure_ascii=False)
+            report_note = "report.json"
+        else:
+            report_note = "none"
+    static_src = os.path.join(work_dir, "Report", "StaticResources")
+    if os.path.isdir(static_src):
+        dest_static = os.path.join(report_dir, "StaticResources")
+        if os.path.isdir(dest_static):
+            shutil.rmtree(dest_static)
+        shutil.copytree(static_src, dest_static)
+
+    # --- project scaffolding (create only when missing) ---
+    pbip_file = os.path.join(root, f"{base}.pbip")
+    if not os.path.exists(pbip_file):
+        with open(pbip_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "$schema": "https://developer.microsoft.com/json-schemas/fabric/pbip/pbipProperties/1.0.0/schema.json",
+                "version": "1.0",
+                "artifacts": [{"report": {"path": f"{base}.Report"}}],
+                "settings": {"enableAutoRecovery": True},
+            }, f, indent=2)
+    pbism = os.path.join(model_dir, "definition.pbism")
+    if not os.path.exists(pbism):
+        with open(pbism, "w", encoding="utf-8") as f:
+            json.dump({
+                "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/semanticModel/definitionProperties/1.0.0/schema.json",
+                "version": "4.1", "settings": {},
+            }, f, indent=2)
+    pbir_desc = os.path.join(report_dir, "definition.pbir")
+    if not os.path.exists(pbir_desc):
+        with open(pbir_desc, "w", encoding="utf-8") as f:
+            json.dump({
+                "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definitionProperties/2.0.0/schema.json",
+                "version": "1.0",
+                "datasetReference": {"byPath": {"path": f"../{base}.SemanticModel"}},
+            }, f, indent=2)
+
+    return (f"Saved PBIP project: {root}\n"
+            f"  Model: {tmdl_stats.get('tables', 0)} tables, "
+            f"{tmdl_stats.get('measures', 0)} measures -> "
+            f"{base}.SemanticModel/definition/\n"
+            f"  Report: {report_note} -> {base}.Report/")
 
 
 def _sanitize_pbir_name(name: str) -> str:
