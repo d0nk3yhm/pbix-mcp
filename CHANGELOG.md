@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.82] - 2026-08-12
+
+### Fixed — column-backed field parameters refused in aggregating value roles (issue #37, docs r27)
+
+- Residual of #36 (whose measure-parameter fix is Desktop-verified): a field
+  parameter whose fields are raw numeric COLUMNS bound to `Y`/`Values`/
+  `Y2`/`Size` of a chart still rendered an empty visual — a bare column in
+  a value role is dropped by Desktop, and the Sum-wrap alternative breaks
+  the NAMEOF correspondence (#36). Both silent-empty shapes, so
+  `pbix_bind_field_parameter` now REFUSES the bind at author time with an
+  actionable message (names the offending column fields, suggests
+  `pbix_datamodel_add_measure` + repointing the parameter, or a grouping
+  role). Columns remain valid for grouping roles (`Category`/`Axis`/`Rows`
+  — the documented dimension-swap use, projected bare per #36) and for
+  table/slicer wells (Chandoo oracle: covered column in tableEx Values).
+  Also fixed the refusal path leaking its temp metadata `.db` on Windows
+  (handle still open at unlink — the WinError 32 class). Pinned by
+  `TestCoveredColumnStaysBare` (refusal + grouping-role + tableEx cases).
+
 ## [0.9.81] - 2026-08-12
 
 ### Fixed — field parameter bound over COLUMNS rendered an empty visual (issue #36, docs r26)

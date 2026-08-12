@@ -322,14 +322,14 @@ class TestNoDataRoleVisuals:
 
 
 class TestCoveredColumnStaysBare:
-    """Issue #36: a field parameter whose fields are COLUMNS bound into a
-    VALUE role must keep the bare Column projection. The implicit-aggregation
-    pass used to wrap it into Sum(T.Col), which breaks the queryRef <->
-    parameter-field correspondence Desktop's re-derivation needs — it drops
-    the well and the visual renders EMPTY (no bars, no value axis) in Desktop
-    and the service. Ground truth: every parameter-covered well in the
-    Desktop-authored corpus (Furniture Sales, Root Cause, Chandoo) projects
-    the resolved field un-wrapped."""
+    """Issues #36 + #37: a parameter-covered projection is never Sum-wrapped
+    (the wrap breaks the queryRef <-> NAMEOF correspondence Desktop resolves
+    the well through — #36, Desktop-verified). But a RAW COLUMN in an
+    AGGREGATING value role renders empty either way (bare, Desktop drops the
+    un-aggregated well — #37, Desktop-verified), so a column-backed parameter
+    aimed at Y/Values/Y2/Size of a chart is REFUSED at bind time with an
+    actionable message; grouping roles (Category/Axis/Rows — the documented
+    dimension-swap use) still take column parameters, projected bare."""
 
     @pytest.fixture()
     def col_param_report(self, tmp_path):
@@ -384,47 +384,97 @@ class TestCoveredColumnStaysBare:
         except Exception:
             pass
 
-    def test_bound_column_projection_is_bare_and_consistent(
-            self, col_param_report):
+    def test_column_parameter_on_value_role_is_refused(self, col_param_report):
+        # Issue #37: bare column on Y renders empty in Desktop, so the bind
+        # must fail LOUDLY at author time, with an actionable message.
         alias = col_param_report
+        before = _visual(alias, 1)
         r = json.loads(server.pbix_bind_field_parameter(
             alias, 0, 1, "Y", "Metric switch", initial_field="F[Sales]"))
+        assert not r.get("success"), r
+        msg = r.get("message", "")
+        assert "must list MEASURES" in msg
+        assert "'Sales' ('F'[Sales])" in msg          # names the offenders
+        assert "pbix_datamodel_add_measure" in msg    # actionable remedy
+        assert "Category/Axis/Rows" in msg            # the valid alternative
+        assert _visual(alias, 1) == before, \
+            "a refused bind must not mutate the visual"
+
+    def test_column_parameter_on_grouping_role_binds_bare(
+            self, col_param_report):
+        # Grouping roles are the documented dimension-swap use: the covered
+        # column binds, projected BARE (never Sum-wrapped — issue #36), with
+        # the full oracle shape around it.
+        alias = col_param_report
+        r = json.loads(server.pbix_bind_field_parameter(
+            alias, 0, 1, "Category", "Metric switch",
+            initial_field="F[Sales]"))
         assert r.get("success"), r
         config, q, dt = _visual(alias, 1)
         sv = config["singleVisual"]
 
         # 1. the projection is the BARE column ref the NAMEOF resolves to
-        assert sv["projections"]["Y"] == [{"queryRef": "F.Sales"}]
+        assert sv["projections"]["Category"] == [{"queryRef": "F.Sales"}]
         # 2. the prototype select stays a bare Column (no Aggregation wrap),
         #    with the display name as NativeReferenceName
-        y_sel = next(s for s in sv["prototypeQuery"]["Select"]
+        c_sel = next(s for s in sv["prototypeQuery"]["Select"]
                      if s["Name"] == "F.Sales")
-        assert "Column" in y_sel and "Aggregation" not in y_sel
-        assert y_sel["NativeReferenceName"] == "Sales"
+        assert "Column" in c_sel and "Aggregation" not in c_sel
+        assert c_sel["NativeReferenceName"] == "Sales"
         # 3. columnProperties keyed by the ACTUAL projection queryRef
         assert sv["columnProperties"]["F.Sales"] == {"displayName": "Sales"}
         # 4. compiled query: parameter entity joined + NAMEOF Where, and the
         #    select is the same bare column
         qq = q["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
         assert any(f.get("Entity") == "Metric switch" for f in qq["From"])
-        assert [s.get("Name") for s in qq["Select"]] == ["F.Metric", "F.Sales"]
+        assert any(s.get("Name") == "F.Sales" and "Column" in s
+                   for s in qq["Select"])
         where = json.dumps(qq.get("Where"))
         assert "Metric switch Fields" in where
         assert "'''F''[Sales]'" in where
         # 5. dataTransforms mirrors the projection with provenance
-        y_dt = next(s for s in dt["selects"] if s["queryName"] == "F.Sales")
-        assert y_dt["roles"] == {"Y": True}
-        assert y_dt["sourceFieldParameters"] == [{
+        c_dt = next(s for s in dt["selects"] if s["queryName"] == "F.Sales")
+        assert c_dt["roles"] == {"Category": True}
+        assert c_dt["sourceFieldParameters"] == [{
             "expr": {"_kind": 2,
                      "source": {"_kind": 0, "entity": "Metric switch"},
                      "ref": "Metric switch"},
             "displayName": "Metric switch"}]
 
+    def test_column_parameter_on_table_values_still_binds(
+            self, col_param_report):
+        # Chandoo oracle: a covered COLUMN in a tableEx Values well is valid
+        # Desktop shape (tables show raw values) — the refusal must not
+        # catch it.
+        alias = col_param_report
+        r = json.loads(server.pbix_add_visual(
+            alias, 0, "tableEx", 40, 420, 560, 200, json.dumps({
+                "singleVisual": {
+                    "visualType": "tableEx",
+                    "projections": {"Values": [{"queryRef": "F.Metric"}]},
+                    "prototypeQuery": {
+                        "Version": 2,
+                        "From": [{"Name": "f", "Entity": "F", "Type": 0}],
+                        "Select": [{
+                            "Column": {
+                                "Expression": {"SourceRef": {"Source": "f"}},
+                                "Property": "Metric"},
+                            "Name": "F.Metric"}],
+                    },
+                }})))
+        assert r.get("success"), r
+        r = json.loads(server.pbix_bind_field_parameter(
+            alias, 0, 2, "Values", "Metric switch"))
+        assert r.get("success"), r
+        config, _q, _dt = _visual(alias, 2)
+        assert config["singleVisual"]["projections"]["Values"] == [
+            {"queryRef": "F.Sales"}]
+
     def test_unbound_sibling_still_gets_implicit_sum(self, col_param_report):
         # the OTHER chart on the page keeps the normal value-role behavior
         alias = col_param_report
         r = json.loads(server.pbix_bind_field_parameter(
-            alias, 0, 1, "Y", "Metric switch"))
+            alias, 0, 1, "Category", "Metric switch"))
         assert r.get("success"), r
         config, q, _dt = _visual(alias, 0)
         assert config["singleVisual"]["projections"]["Y"] == [

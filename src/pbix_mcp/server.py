@@ -2906,6 +2906,65 @@ def pbix_bind_field_parameter(
         try:
             conn = sqlite3.connect(tmp_path)
             conn.row_factory = sqlite3.Row
+
+            def _field_is_measure(ref: str) -> bool | None:
+                """True=measure, False=column, None=missing from the model."""
+                try:
+                    t_, n_, _c = _normalize_field_ref(ref)
+                except Exception:  # noqa: BLE001
+                    return None
+                tr = conn.execute(
+                    "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
+                    (t_,)).fetchone()
+                if not tr:
+                    return None
+                if conn.execute(
+                        "SELECT 1 FROM Measure WHERE TableID = ? AND Name = ?",
+                        (tr["ID"], n_)).fetchone():
+                    return True
+                if conn.execute(
+                        "SELECT 1 FROM [Column] WHERE TableID = ? AND "
+                        "COALESCE(ExplicitName, InferredName) = ?",
+                        (tr["ID"], n_)).fetchone():
+                    return False
+                return None
+
+            # An AGGREGATING value role can only host measure-backed
+            # parameter fields. A raw column there renders EMPTY whichever
+            # way it is projected — bare, Desktop drops the un-aggregated
+            # well; Sum-wrapped, the queryRef no longer matches any NAMEOF
+            # ref (issue #36) — so both silent-empty shapes are refused
+            # here, loudly, at author time (issue #37). Columns stay valid
+            # for grouping roles (Category/Axis/Rows — the documented
+            # dimension-swap use) and for table/slicer wells, which show
+            # raw values.
+            from pbix_mcp.report_binding import (
+                _SLICER_TYPES,
+                _TABLE_TYPES,
+                _VALUE_ROLES,
+            )
+            aggregating = (target_type not in _TABLE_TYPES
+                           and target_type not in _SLICER_TYPES)
+            if aggregating and role in _VALUE_ROLES:
+                col_fields = [(d, r) for d, r, _o in tuples
+                              if _field_is_measure(r) is False]
+                if col_fields:
+                    listing = ", ".join(
+                        f"'{d}' ({r})" for d, r in col_fields)
+                    example_d, example_r = col_fields[0]
+                    et, en, _ec = _normalize_field_ref(example_r)
+                    raise LayoutParseError(
+                        f"A field parameter bound to the aggregating value "
+                        f"role '{role}' of a '{target_type}' must list "
+                        f"MEASURES, but '{parameter_name}' contains column "
+                        f"field(s): {listing}. A raw column in a value role "
+                        f"renders an EMPTY visual in Power BI (no bars, no "
+                        f"value axis). Add measures — e.g. "
+                        f"pbix_datamodel_add_measure(..., '{et}', "
+                        f"'Total {en}', 'SUM({et}[{en}])') — and point the "
+                        f"parameter at those, or bind this parameter to a "
+                        f"grouping role (Category/Axis/Rows) instead.")
+
             trow = conn.execute(
                 "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
                 (f_table,)).fetchone()
@@ -2925,6 +2984,13 @@ def pbix_bind_field_parameter(
                     f"the model.")
             conn.close()
         finally:
+            # Close BEFORE unlinking: Windows refuses to delete a file with
+            # an open handle (WinError 32), and the refusal paths above raise
+            # while the connection is still open.
+            try:
+                conn.close()
+            except Exception:
+                pass
             try:
                 os.unlink(tmp_path)
             except OSError:
