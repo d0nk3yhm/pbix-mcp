@@ -178,7 +178,7 @@ class TestPackageImports:
 
     def test_version(self):
         from pbix_mcp import __version__
-        assert __version__ == "0.9.80"
+        assert __version__ == "0.9.81"
 
 
 class TestRealPBIXFixture:

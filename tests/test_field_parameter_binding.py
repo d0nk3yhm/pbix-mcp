@@ -319,3 +319,157 @@ class TestNoDataRoleVisuals:
         r = json.loads(server.pbix_bind_field_parameter(
             fp_report, 0, 0, "Y", "Metric"))
         assert r.get("success"), r
+
+
+class TestCoveredColumnStaysBare:
+    """Issue #36: a field parameter whose fields are COLUMNS bound into a
+    VALUE role must keep the bare Column projection. The implicit-aggregation
+    pass used to wrap it into Sum(T.Col), which breaks the queryRef <->
+    parameter-field correspondence Desktop's re-derivation needs — it drops
+    the well and the visual renders EMPTY (no bars, no value axis) in Desktop
+    and the service. Ground truth: every parameter-covered well in the
+    Desktop-authored corpus (Furniture Sales, Root Cause, Chandoo) projects
+    the resolved field un-wrapped."""
+
+    @pytest.fixture()
+    def col_param_report(self, tmp_path):
+        """The issue's own repro: F(Metric, Sales, Cost) + a parameter over
+        the two numeric COLUMNS + two identical column charts."""
+        path = str(tmp_path / f"fp36_{uuid.uuid4().hex[:8]}.pbix")
+        alias = "fp36" + uuid.uuid4().hex[:8]
+        tables = [{
+            "name": "F",
+            "columns": [
+                {"name": "Metric", "data_type": "String"},
+                {"name": "Sales", "data_type": "Double"},
+                {"name": "Cost", "data_type": "Double"},
+            ],
+            "rows": [
+                {"Metric": "Alpha", "Sales": 120.0, "Cost": 80.0},
+                {"Metric": "Beta", "Sales": 200.0, "Cost": 90.0},
+            ],
+        }]
+        r = json.loads(server.pbix_create(path, alias, json.dumps(tables)))
+        assert r.get("success"), r
+        r = json.loads(server.pbix_datamodel_add_field_parameter(
+            alias, "Metric switch", json.dumps([
+                {"display": "Sales", "ref": "F[Sales]"},
+                {"display": "Cost", "ref": "F[Cost]"},
+            ])))
+        assert r.get("success"), r
+        cfg = {"singleVisual": {
+            "visualType": "columnChart",
+            "projections": {"Category": [{"queryRef": "F.Metric"}],
+                            "Y": [{"queryRef": "Sum(F.Sales)"}]},
+            "prototypeQuery": {
+                "Version": 2,
+                "From": [{"Name": "f", "Entity": "F", "Type": 0}],
+                "Select": [
+                    {"Column": {"Expression": {"SourceRef": {"Source": "f"}},
+                                "Property": "Metric"}, "Name": "F.Metric"},
+                    {"Aggregation": {"Expression": {"Column": {
+                        "Expression": {"SourceRef": {"Source": "f"}},
+                        "Property": "Sales"}}, "Function": 0},
+                     "Name": "Sum(F.Sales)"},
+                ],
+            },
+        }}
+        for _ in range(2):
+            r = json.loads(server.pbix_add_visual(
+                alias, 0, "columnChart", 40, 40, 560, 360, json.dumps(cfg)))
+            assert r.get("success"), r
+        yield alias
+        try:
+            server.pbix_close(alias, force=True)
+        except Exception:
+            pass
+
+    def test_bound_column_projection_is_bare_and_consistent(
+            self, col_param_report):
+        alias = col_param_report
+        r = json.loads(server.pbix_bind_field_parameter(
+            alias, 0, 1, "Y", "Metric switch", initial_field="F[Sales]"))
+        assert r.get("success"), r
+        config, q, dt = _visual(alias, 1)
+        sv = config["singleVisual"]
+
+        # 1. the projection is the BARE column ref the NAMEOF resolves to
+        assert sv["projections"]["Y"] == [{"queryRef": "F.Sales"}]
+        # 2. the prototype select stays a bare Column (no Aggregation wrap),
+        #    with the display name as NativeReferenceName
+        y_sel = next(s for s in sv["prototypeQuery"]["Select"]
+                     if s["Name"] == "F.Sales")
+        assert "Column" in y_sel and "Aggregation" not in y_sel
+        assert y_sel["NativeReferenceName"] == "Sales"
+        # 3. columnProperties keyed by the ACTUAL projection queryRef
+        assert sv["columnProperties"]["F.Sales"] == {"displayName": "Sales"}
+        # 4. compiled query: parameter entity joined + NAMEOF Where, and the
+        #    select is the same bare column
+        qq = q["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
+        assert any(f.get("Entity") == "Metric switch" for f in qq["From"])
+        assert [s.get("Name") for s in qq["Select"]] == ["F.Metric", "F.Sales"]
+        where = json.dumps(qq.get("Where"))
+        assert "Metric switch Fields" in where
+        assert "'''F''[Sales]'" in where
+        # 5. dataTransforms mirrors the projection with provenance
+        y_dt = next(s for s in dt["selects"] if s["queryName"] == "F.Sales")
+        assert y_dt["roles"] == {"Y": True}
+        assert y_dt["sourceFieldParameters"] == [{
+            "expr": {"_kind": 2,
+                     "source": {"_kind": 0, "entity": "Metric switch"},
+                     "ref": "Metric switch"},
+            "displayName": "Metric switch"}]
+
+    def test_unbound_sibling_still_gets_implicit_sum(self, col_param_report):
+        # the OTHER chart on the page keeps the normal value-role behavior
+        alias = col_param_report
+        r = json.loads(server.pbix_bind_field_parameter(
+            alias, 0, 1, "Y", "Metric switch"))
+        assert r.get("success"), r
+        config, q, _dt = _visual(alias, 0)
+        assert config["singleVisual"]["projections"]["Y"] == [
+            {"queryRef": "Sum(F.Sales)"}]
+        qq = q["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
+        y = next(s for s in qq["Select"] if s["Name"] == "Sum(F.Sales)")
+        assert "Aggregation" in y
+
+
+class TestApplyImplicitAggregationsSkipsCovered:
+    """Unit level: apply_implicit_aggregations must skip exactly the
+    parameter-covered projections and still wrap uncovered ones."""
+
+    def test_covered_skipped_uncovered_wrapped(self):
+        from pbix_mcp.report_binding import apply_implicit_aggregations
+        sv = {
+            "visualType": "columnChart",
+            "projections": {
+                "Category": [{"queryRef": "T.Cat"}],
+                "Y": [{"queryRef": "T.A"}, {"queryRef": "T.B"}],
+            },
+            "queryFieldParametersByRole": {
+                "Y": [{"index": 0, "length": 1, "expr": {"Column": {
+                    "Expression": {"SourceRef": {"Entity": "P"}},
+                    "Property": "P"}}}],
+            },
+            "prototypeQuery": {
+                "Version": 2,
+                "From": [{"Name": "t", "Entity": "T", "Type": 0}],
+                "Select": [
+                    {"Column": {"Expression": {"SourceRef": {"Source": "t"}},
+                                "Property": "Cat"}, "Name": "T.Cat"},
+                    {"Column": {"Expression": {"SourceRef": {"Source": "t"}},
+                                "Property": "A"}, "Name": "T.A"},
+                    {"Column": {"Expression": {"SourceRef": {"Source": "t"}},
+                                "Property": "B"}, "Name": "T.B"},
+                ],
+            },
+        }
+        renamed = apply_implicit_aggregations(
+            sv, lambda e, p, m: "Double" if p in ("A", "B") else "String")
+        # covered T.A untouched; uncovered T.B wrapped
+        assert "T.A" not in renamed
+        assert renamed.get("T.B") == "Sum(T.B)"
+        assert sv["projections"]["Y"] == [
+            {"queryRef": "T.A"}, {"queryRef": "Sum(T.B)"}]
+        names = [s["Name"] for s in sv["prototypeQuery"]["Select"]]
+        assert names == ["T.Cat", "T.A", "Sum(T.B)"]

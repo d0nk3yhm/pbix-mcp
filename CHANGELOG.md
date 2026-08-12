@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.81] - 2026-08-12
+
+### Fixed — field parameter bound over COLUMNS rendered an empty visual (issue #36, docs r26)
+
+- `pbix_bind_field_parameter` on a well whose parameter fields are numeric
+  COLUMNS produced a chart that draws its title and category axis but **no
+  bars and no value axis**, in Desktop and the service — the silent-wrong-
+  render class. Root cause: the implicit-aggregation pass wrapped the
+  parameter-covered column into `Sum(F.Sales)`, breaking the queryRef ↔
+  parameter-field correspondence (`'F'[Sales]` NAMEOF) that Desktop's query
+  re-derivation resolves the well through — it drops the well entirely.
+  Diffed against three Desktop-authored bindings in the corpus (Furniture
+  Sales, Root Cause Analysis, Chandoo Performance): every parameter-covered
+  select is exactly what the NAMEOF ref resolves to — a bare Column or
+  Measure, never an Aggregation. `apply_implicit_aggregations` now skips
+  projections covered by `queryFieldParametersByRole` (uncovered siblings on
+  the same visual still get their implicit Sum), which also fixes the
+  `columnProperties` key mismatch (`F.Sales` vs a projection renamed to
+  `Sum(F.Sales)`). Measure-backed parameters were unaffected. Pinned by
+  `tests/test_field_parameter_binding.py::TestCoveredColumnStaysBare` (the
+  issue's own A/B repro) and `TestApplyImplicitAggregationsSkipsCovered`.
+
 ## [0.9.80] - 2026-08-11
 
 ### Added — TMDL import + PBIP open/save (issue #34, the OpenBI #14 blocker)

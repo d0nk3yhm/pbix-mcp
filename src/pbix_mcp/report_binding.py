@@ -123,12 +123,35 @@ def apply_implicit_aggregations(single_visual: dict, resolve_type=None) -> dict[
     ref2role = {it.get("queryRef"): role
                 for role, items in projections.items() for it in items}
 
+    # A projection COVERED BY A FIELD PARAMETER must keep the exact queryRef
+    # the parameter's NAMEOF ref resolves to — a bare Column or Measure,
+    # never an implicit Aggregation. Every Desktop-authored binding in the
+    # corpus (Furniture Sales, Root Cause, Chandoo Performance) projects the
+    # covered field un-wrapped; wrapping a covered numeric column into
+    # Sum(T.Col) breaks the queryRef <-> parameter-field correspondence
+    # Desktop's re-derivation needs, so it drops the well and the visual
+    # renders EMPTY — no bars, no value axis (issue #36).
+    param_covered: set = set()
+    for role, entries in (single_visual.get("queryFieldParametersByRole")
+                          or {}).items():
+        items = projections.get(role) or []
+        for entry in entries or []:
+            try:
+                start = int(entry.get("index", 0))
+                length = int(entry.get("length", 1))
+            except (TypeError, ValueError):
+                continue
+            for it in items[start:start + length]:
+                param_covered.add(it.get("queryRef"))
+
     renamed: dict[str, str] = {}
     agg_selects: dict = {}   # (source alias/entity, property) -> mutated select
     for sel in selects:
         if "Column" not in sel:
             continue                       # measures / explicit aggregations
         old_ref = sel.get("Name")
+        if old_ref in param_covered:
+            continue                       # field-parameter well: keep bare
         col = sel["Column"]
         src = col.get("Expression", {}).get("SourceRef", {})
         entity = alias2entity.get(src.get("Source"), src.get("Entity"))
