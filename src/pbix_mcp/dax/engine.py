@@ -42,7 +42,7 @@ import re
 import statistics
 import time
 from calendar import monthrange
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, Optional
 
@@ -4718,8 +4718,10 @@ class DAXEngine:
         return datetime(now.year, now.month, now.day)
 
     def _fn_utcnow(self, args_str: str, ctx: DAXContext) -> Any:
-        """UTCNOW() — current UTC date and time."""
-        return datetime.utcnow()
+        """UTCNOW() — current UTC date and time. NAIVE like every other
+        datetime this engine produces (utcnow() is deprecated; an aware value
+        would break comparisons against the model's naive datetimes)."""
+        return datetime.now(timezone.utc).replace(tzinfo=None)
 
     # --- date-part functions -------------------------------------------------
     # YEAR/MONTH/DAY/QUARTER and friends were not implemented at all, so any
@@ -8640,7 +8642,7 @@ class DAXEngine:
             ",".join([parts[0], parts[1], parts[2]]), ctx)
 
     def _fn_utctoday(self, args_str: str, ctx: DAXContext):
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         return datetime(now.year, now.month, now.day)
 
     # ---- window function family (ROWNUMBER / RANK / INDEX / OFFSET /

@@ -22,10 +22,13 @@ from pbix_mcp.formats.abf_rebuild import (
 
 
 def _windows_filetime_now() -> int:
-    """Get current time as Windows FILETIME (100ns ticks since 1601-01-01)."""
+    """Get current time as Windows FILETIME (100ns ticks since 1601-01-01).
+
+    NAIVE UTC (utcnow() is deprecated): the delta subtracts a naive epoch,
+    and an aware operand would raise TypeError."""
     import datetime
     epoch = datetime.datetime(1601, 1, 1)
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     delta = now - epoch
     return int(delta.total_seconds() * 10_000_000)
 
@@ -127,7 +130,10 @@ def generate_db_xml(db_id: str, object_id: str, db_unique_id: str) -> bytes:
         UTF-8 encoded db.xml bytes
     """
     import datetime
-    ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    # Format on the UTC wall-clock; strftime never emits an offset with this
+    # format string, so the produced timestamp text is unchanged.
+    ts = datetime.datetime.now(
+        datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
 
     xml = _DB_XML_TEMPLATE.format(
         db_id=db_id,

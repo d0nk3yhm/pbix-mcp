@@ -7838,8 +7838,10 @@ def _apply_field_parameter_metadata(dm_path: str, specs: list[dict]) -> tuple[in
         max_id = int(maxid_row[0]) if maxid_row else 0
         import datetime
         epoch = datetime.datetime(1601, 1, 1)
-        filetime = int(
-            (datetime.datetime.utcnow() - epoch).total_seconds() * 10_000_000)
+        # NAIVE UTC (utcnow() is deprecated): the FILETIME delta subtracts a
+        # naive epoch, and an aware operand would raise TypeError.
+        _now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        filetime = int((_now - epoch).total_seconds() * 10_000_000)
 
         for spec in specs:
             tname = spec["table"]
@@ -7945,8 +7947,9 @@ def _apply_calculated_column_metadata(
         c = conn.cursor()
         import datetime
         epoch = datetime.datetime(1601, 1, 1)
-        filetime = int(
-            (datetime.datetime.utcnow() - epoch).total_seconds() * 10_000_000)
+        # NAIVE UTC (utcnow() is deprecated): the delta's epoch is naive.
+        _now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        filetime = int((_now - epoch).total_seconds() * 10_000_000)
         for spec in specs:
             trow = c.execute(
                 "SELECT ID FROM [Table] WHERE Name = ? AND ModelID = 1",
@@ -10097,9 +10100,11 @@ def pbix_datamodel_add_measure(
             max_id = int(maxid_row[0]) if maxid_row else 0
             new_id = max_id + 1
 
-            # Use Windows FILETIME timestamp (matching builder format)
+            # Use Windows FILETIME timestamp (matching builder format).
+            # NAIVE UTC (utcnow() is deprecated): the delta's epoch is naive.
             import datetime
-            now = datetime.datetime.utcnow()
+            now = datetime.datetime.now(
+                datetime.timezone.utc).replace(tzinfo=None)
             epoch = datetime.datetime(1601, 1, 1)
             filetime = int((now - epoch).total_seconds() * 10_000_000)
 

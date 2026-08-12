@@ -717,3 +717,75 @@ class TestKeepFilters:
     def test_outer_filter_on_other_column_untouched(self):
         # a filter on a DIFFERENT column must not be intersected away
         assert self._ev('Keep', {'T.V': [20, 30]}) == 20
+
+
+# ---------------------------------------------------------------------------
+# Issue #38: utcnow() deprecation sweep + NOW()/UTCNOW() semantics
+# ---------------------------------------------------------------------------
+
+class TestUtcnowRetirement:
+    """Issue #38: datetime.utcnow() (deprecated, removal-scheduled) is gone
+    from every call site, with each site's naive/aware requirement kept:
+    the engine's datetimes stay NAIVE, the FILETIME deltas subtract a naive
+    epoch, and metadata_schema's helper is aware ON PURPOSE — .timestamp()
+    on the old naive utcnow() value reinterpreted it as LOCAL time, skewing
+    stored FILETIMEs by the host's UTC offset."""
+
+    def _ev(self, expr):
+        engine = DAXEngine()
+        ctx = DAXContext({'T': {'columns': ['V'], 'rows': [[1]]}},
+                         {'M': expr})
+        return engine.evaluate_measure('M', ctx)
+
+    def test_no_utcnow_call_sites_remain(self):
+        import glob
+        import os
+        root = os.path.join(os.path.dirname(__file__), "..", "src")
+        offenders = []
+        for path in glob.glob(os.path.join(root, "**", "*.py"),
+                              recursive=True):
+            with open(path, encoding="utf-8") as fh:
+                for ln, line in enumerate(fh, 1):
+                    if ".utcnow()" in line:
+                        offenders.append(f"{os.path.basename(path)}:{ln}")
+        assert not offenders, f"utcnow() call sites remain: {offenders}"
+
+    def test_now_family_is_warning_free_and_naive(self):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            now = self._ev('NOW()')
+            utc = self._ev('UTCNOW()')
+            utctoday = self._ev('UTCTODAY()')
+            today = self._ev('TODAY()')
+        for v in (now, utc, utctoday, today):
+            assert v.tzinfo is None, f"{v!r} must stay naive"
+        assert utctoday.hour == 0 and today.hour == 0
+
+    def test_now_is_local_and_utcnow_is_utc(self):
+        import datetime as _dt
+        now = self._ev('NOW()')
+        utc = self._ev('UTCNOW()')
+        # NOW() - UTCNOW() must equal the host's current UTC offset.
+        offset = _dt.datetime.now(
+            _dt.timezone.utc).astimezone().utcoffset().total_seconds()
+        got = (now - utc).total_seconds()
+        assert abs(got - offset) < 5, (
+            f"NOW()-UTCNOW() is {got}s; the host UTC offset is {offset}s")
+
+    def test_filetime_helpers_agree(self):
+        # metadata_schema's helper used to run on the local wall-clock
+        # (naive utcnow -> .timestamp()), so on any host east/west of UTC it
+        # disagreed with builder_v2's epoch-delta helper by the UTC offset.
+        import warnings
+
+        from pbix_mcp.builder_v2 import _windows_filetime_now as ft_builder
+        from pbix_mcp.formats.metadata_schema import (
+            _windows_filetime_now as ft_schema,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            a, b = ft_schema(), ft_builder()
+        assert abs(a - b) < 5 * 10_000_000, (
+            f"FILETIME helpers disagree by {(a - b) / 10_000_000:.1f}s "
+            f"(the old local-time skew was the host's whole UTC offset)")

@@ -12,8 +12,12 @@ import sqlite3
 
 
 def _windows_filetime_now() -> int:
-    """Return current time as Windows FILETIME (100ns intervals since 1601-01-01)."""
-    dt = datetime.datetime.utcnow()
+    """Return current time as Windows FILETIME (100ns intervals since 1601-01-01).
+
+    AWARE UTC deliberately: .timestamp() on the old naive utcnow() value
+    reinterpreted it as LOCAL time, skewing the stored FILETIME by the host's
+    UTC offset. On an aware datetime .timestamp() is exact."""
+    dt = datetime.datetime.now(datetime.timezone.utc)
     return int(dt.timestamp() * 10_000_000) + 116_444_736_000_000_000
 
 

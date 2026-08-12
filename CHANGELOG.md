@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.83] - 2026-08-13
+
+### Fixed — datetime.utcnow() retired at all eight call sites (issue #38, docs r28)
+
+- Python 3.12+ deprecates `datetime.utcnow()` (removal-scheduled); the eight
+  call sites produced ~700 warnings per downstream test run and would become
+  a hard `AttributeError` on removal. Each site was replaced with its
+  naive/aware requirement stated, not a blind sed: the DAX engine's
+  `UTCNOW()`/`UTCTODAY()` stay NAIVE (aware values would break comparisons
+  against the model's naive datetimes), the three FILETIME epoch-delta sites
+  (server.py ×3, builder_v2.py) stay naive because they subtract a naive
+  1601 epoch, and builder_v2's db.xml timestamp formats the UTC wall-clock
+  unchanged.
+- **Latent bug fixed en passant**: `formats/metadata_schema.py`'s
+  `_windows_filetime_now()` called `.timestamp()` on the naive `utcnow()`
+  value — Python reinterprets a naive datetime as LOCAL time, so every
+  FILETIME it stored was skewed by the host's UTC offset (2 h here). It now
+  uses an aware UTC datetime, agreeing with builder_v2's epoch-delta helper.
+- **NOW()/UTCNOW() semantics checked as asked**: they were already split
+  correctly — `NOW()` returns local time, `UTCNOW()` UTC, matching DAX; now
+  pinned. Suite warnings drop from ~950 to 10.
+  `tests/test_dax_engine.py::TestUtcnowRetirement`: no `.utcnow()` call
+  sites remain (source scan), the NOW family is deprecation-free and naive,
+  `NOW()-UTCNOW()` equals the host UTC offset, and the two FILETIME helpers
+  agree.
+
 ## [0.9.82] - 2026-08-12
 
 ### Fixed — column-backed field parameters refused in aggregating value roles (issue #37, docs r27)
