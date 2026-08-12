@@ -125,3 +125,45 @@ def test_corpus_count_matches_docs():
             f"{rel} must state the corpus size as {n} reports "
             f"(download_test_corpus.py fetches {n})."
         )
+
+
+def test_readme_tools_section_is_complete():
+    """The README '## Tools (N)' section must carry the real tool count in
+    its heading, list EVERY registered tool exactly once, list nothing that
+    is not registered, and each category heading's count must match the
+    number of tools listed under it. This is how 'Exposes 130 tools' and
+    '## Tools (128)' coexisted in one file: the phrase ratchet above only
+    checks '{n} tools', which the heading's '(128)' never matched."""
+    import re
+
+    path = os.path.join(_ROOT, "src", "pbix_mcp", "server.py")
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    actual = set(re.findall(r"@mcp\.tool\(\)\s*\ndef (\w+)\(", src))
+    n = len(actual)
+
+    readme = _read("README.md")
+    m = re.search(r"^## Tools \((\d+)\)$(.*?)^## ", readme,
+                  re.MULTILINE | re.DOTALL)
+    assert m, "README.md must have a '## Tools (N)' section"
+    assert int(m.group(1)) == n, (
+        f"README '## Tools ({m.group(1)})' heading is stale — server.py "
+        f"registers {n} tools.")
+    section = m.group(2)
+
+    listed = re.findall(r"`(pbix_\w+)`", section)
+    assert len(listed) == len(set(listed)), (
+        f"README tools section lists duplicates: "
+        f"{sorted(x for x in set(listed) if listed.count(x) > 1)}")
+    missing = actual - set(listed)
+    stale = set(listed) - actual
+    assert not missing, f"tools missing from the README section: {sorted(missing)}"
+    assert not stale, f"README lists unregistered tools: {sorted(stale)}"
+
+    for cat_n, cat_body in re.findall(
+            r"^### .+ \((\d+)\)\n(.*?)(?=^### |\Z)", section,
+            re.MULTILINE | re.DOTALL):
+        got = len(re.findall(r"`(pbix_\w+)`", cat_body))
+        assert got == int(cat_n), (
+            f"a README tool category claims ({cat_n}) but lists {got} tools:"
+            f"\n{cat_body[:200]}")
