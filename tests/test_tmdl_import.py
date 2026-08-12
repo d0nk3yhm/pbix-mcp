@@ -13,7 +13,6 @@ from pbix_mcp import server
 from pbix_mcp.builder import PBIXBuilder
 from pbix_mcp.formats.tmdl_reader import (
     parse_tmdl_document,
-    parse_tmdl_folder,
     parse_tmdl_string,
 )
 

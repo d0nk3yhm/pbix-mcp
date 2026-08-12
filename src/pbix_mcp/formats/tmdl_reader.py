@@ -31,7 +31,6 @@ from __future__ import annotations
 import os
 import re
 
-
 # TOM data-type name (TMDL) <-> AMO ExplicitDataType code, and the builder's
 # type names. Mirrors the exporter's _dtype_map.
 TMDL_TO_AMO_TYPE = {
