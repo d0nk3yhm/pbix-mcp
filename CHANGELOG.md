@@ -2738,7 +2738,7 @@ measures) for zero result drift.
 - **`pbix_recolor` replaces in both theme locations** — BaseThemes AND RegisteredResources JSON files are scanned and updated.
 
 ### Verified
-- **Client brand compliance test** — Briqlab airport dashboard recolored from teal to a client brand palette using only MCP tools (`pbix_extract_colors` → `pbix_recolor` → `pbix_set_theme`). All 531 original colors replaced. Zero non-brand colors remaining. Logo swapped. Verified in PBI Desktop March 2026.
+- **Corporate brand compliance test** — airport dashboard recolored from teal to a corporate brand palette using only MCP tools (`pbix_extract_colors` → `pbix_recolor` → `pbix_set_theme`). All 531 original colors replaced. Zero non-brand colors remaining. Logo swapped. Verified in PBI Desktop March 2026.
 
 ## [0.6.3] - 2026-03-30
 
