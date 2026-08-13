@@ -100,3 +100,60 @@ def test_query_metadata_bad_sql_shows_real_error(model):
     assert not r["success"]
     assert "no such table" in r["message"]
     assert "WinError 32" not in r["message"]
+
+
+class TestCountFamilyTypesInt64:
+    """Issue #40: count-family results are Whole Number in Analysis Services,
+    but the evaluate tools labelled every numeric result "Double" — an int
+    value 5 shipped with data_type "Double" and consumers padded counts to
+    5.00 where Desktop renders 5. Int values now label "Int64", and a
+    declared Measure.DataType of Int64 coerces an integral float result the
+    way AS casts to the declared type."""
+
+    @pytest.fixture()
+    def counts_pbix(self, tmp_path):
+        import uuid as _uuid
+        alias = "i40_" + _uuid.uuid4().hex[:8]
+        p = str(tmp_path / "counts.pbix")
+        tables = [{"name": "ORDER_FACT", "columns": [
+            {"name": "Order ID", "data_type": "Int64"},
+            {"name": "Amount", "data_type": "Double"},
+        ], "rows": [{"Order ID": i, "Amount": 10.5 * i}
+                    for i in range(1, 6)]}]
+        r = json.loads(S.pbix_create(p, alias, json.dumps(tables)))
+        assert r.get("success"), r
+        for name, expr, dt in (
+                ("ProbeTyped", "DISTINCTCOUNT(ORDER_FACT[Order ID])", "Int64"),
+                ("ProbeUntyped", "DISTINCTCOUNT(ORDER_FACT[Order ID])", None),
+                ("Rows", "COUNTROWS(ORDER_FACT)", None),
+                ("SumAmount", "SUM(ORDER_FACT[Amount])", None)):
+            kw = {"data_type": dt} if dt else {}
+            r = json.loads(S.pbix_datamodel_add_measure(
+                alias, "ORDER_FACT", name, expr, **kw))
+            assert r.get("success"), r
+        yield alias
+        S._open_files.pop(alias, None)
+        S._dax_cache.pop(alias, None)
+
+    def test_counts_report_int64_and_bare_int_value(self, counts_pbix):
+        out = json.loads(S.pbix_evaluate_dax(
+            counts_pbix, "ProbeTyped,ProbeUntyped,Rows"))
+        assert out["success"], out
+        by_name = {r["name"]: r for r in out["results"]}
+        for name in ("ProbeTyped", "ProbeUntyped", "Rows"):
+            r = by_name[name]
+            assert r["value"] == 5 and isinstance(r["value"], int), r
+            assert r["data_type"] == "Int64", r
+
+    def test_double_results_stay_double(self, counts_pbix):
+        out = json.loads(S.pbix_evaluate_dax(counts_pbix, "SumAmount"))
+        r = out["results"][0]
+        assert r["value"] == pytest.approx(157.5)
+        assert r["data_type"] == "Double"
+
+    def test_derivation_unit_level(self):
+        from pbix_mcp.models.responses import DAXResult
+        assert DAXResult(name="c", value=5).data_type == "Int64"
+        assert DAXResult(name="s", value=5.0).data_type == "Double"
+        assert DAXResult(name="b", value=True).data_type == "Boolean"
+        assert DAXResult(name="t", value="x").data_type == "String"

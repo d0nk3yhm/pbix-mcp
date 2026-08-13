@@ -179,7 +179,8 @@ class ModelReader:
                    m.Expression,
                    m.FormatString,
                    m.Description,
-                   m.IsHidden
+                   m.IsHidden,
+                   m.DataType
             FROM [Measure] m
             JOIN [Table] t ON m.TableID = t.ID
             ORDER BY t.Name, m.Name

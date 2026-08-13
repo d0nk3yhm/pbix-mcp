@@ -12316,6 +12316,7 @@ def _get_dax_context(alias: str) -> dict:
     measures_list = model.dax_measures
     measure_defs = {}
     measure_tables = {}
+    measure_types = {}
     for m in measures_list:
         measure_defs[m.get('Name', '')] = m.get('Expression', '')
         # A measure's HOME TABLE is what DAX uses to disambiguate an
@@ -12325,6 +12326,10 @@ def _get_dax_context(alias: str) -> dict:
         # to nothing and all six measures on that table read BLANK.
         if m.get('TableName'):
             measure_tables[m.get('Name', '')] = m.get('TableName')
+        # Declared Measure.DataType (AMO code), so a declared Int64 can flow
+        # through to the evaluate tools' result typing (issue #40).
+        if m.get('DataType') is not None:
+            measure_types[m.get('Name', '')] = m.get('DataType')
 
     # Load relationships
     rels_list = model.relationships
@@ -12421,6 +12426,8 @@ def _get_dax_context(alias: str) -> dict:
         'tables': tables,
         'measure_defs': measure_defs,
         'measure_tables': measure_tables,
+        # name -> declared Measure.DataType AMO code (issue #40)
+        'measure_types': measure_types,
         # The MODEL's own column list. `tables` above is a materialized subset,
         # so it cannot be used to decide that a reference is unresolvable.
         'model_columns': model.all_column_names,
@@ -12735,6 +12742,16 @@ def pbix_evaluate_dax(
         dax_results = []
         for name, val in results.items():
             if val is not None:
+                # A declared Measure.DataType of Int64 (6) coerces an integral
+                # float result to int, exactly as Analysis Services casts to
+                # the declared type — so DISTINCTCOUNT-style measures report
+                # data_type "Int64", not "Double" (issue #40). Only the
+                # value-consistent direction is trusted: Measure.DataType is
+                # unreliable the other way (currency measures stored as Int64
+                # with non-integral values keep their real Double typing).
+                if (ctx.get('measure_types', {}).get(name) == 6
+                        and isinstance(val, float) and val.is_integer()):
+                    val = int(val)
                 dax_results.append(DAXResult(name=name, value=val, status="ok"))
             elif name in timed_out:
                 # NOT a blank: the evaluation was abandoned on the wall-clock

@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.85] - 2026-08-13
+
+### Fixed — count-family results typed Int64, declared Measure.DataType flows through (issue #40, docs r30)
+
+- **`pbix_evaluate_dax` labelled every numeric result `data_type: "Double"`**,
+  including count-family values it returned as Python ints — so
+  `DISTINCTCOUNT` came back `value: 5, data_type: "Double"` and consumers
+  formatting by the reported type padded counts to `5.00` where Desktop
+  renders the bare `5` (Analysis Services types the count family Whole
+  Number). `DAXResult`'s type derivation now labels int values **`Int64`**
+  and floats `Double`, matching the engine's own int/float discipline.
+- **A declared `data_type="Int64"` at add_measure time was write-only** for
+  evaluation. `Measure.DataType` now loads into the DAX context and a
+  declared Int64 coerces an integral float result to int (the way AS casts
+  to the declared type) before typing. Only the value-consistent direction
+  is trusted — Measure.DataType is unreliable the other way (currency
+  measures stored as Int64), so a non-integral value keeps its real Double
+  typing.
+- Pinned by `tests/test_issue24_type_info.py::TestCountFamilyTypesInt64`
+  (the issue's ProbeTyped/ProbeUntyped repro: both now `value 5` /
+  `data_type "Int64"`; Double sums stay Double; unit-level derivation).
+
 ## [0.9.84] - 2026-08-13
 
 ### Fixed — CALCULATE predicate sugar vs numeric column types (issue #39, docs r29)

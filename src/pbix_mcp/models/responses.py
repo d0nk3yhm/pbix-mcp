@@ -129,7 +129,7 @@ class DAXResult(BaseModel):
     value: Any = None
     status: str = "ok"  # "ok" | "blank" | "unsupported" | "error"
     error_message: str | None = None
-    data_type: str | None = None  # "Double"|"String"|"DateTime"|"Boolean"
+    data_type: str | None = None  # "Int64"|"Double"|"String"|"DateTime"|"Boolean"
 
     @field_validator("value")
     @classmethod
@@ -144,7 +144,14 @@ class DAXResult(BaseModel):
                 self.data_type = "Boolean"
             elif isinstance(v, (_dt.datetime, _dt.date)):
                 self.data_type = "DateTime"
-            elif isinstance(v, (int, float)):
+            elif isinstance(v, int):
+                # The count family (DISTINCTCOUNT/COUNTROWS/COUNT/COUNTA) and
+                # whole-number arithmetic return Python ints; Analysis
+                # Services types them Whole Number and Desktop renders them
+                # bare (5, not 5.00). Labelling them "Double" made consumers
+                # pad counts to decimals (issue #40).
+                self.data_type = "Int64"
+            elif isinstance(v, float):
                 self.data_type = "Double"
             elif isinstance(v, str):
                 # json_safe_number stringifies IEEE specials; keep them typed
