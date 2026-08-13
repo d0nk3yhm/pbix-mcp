@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.84] - 2026-08-13
+
+### Fixed — CALCULATE predicate sugar vs numeric column types (issue #39, docs r29)
+
+- **`CALCULATE(expr, T[Year]=2024)` returned BLANK on Double-typed columns**
+  while the explicit `FILTER(ALL(T[Year]), …)` form answered 350. The sugar's
+  In-set matched by `str()` in both the `_indices_for_values` fast path and
+  `make_value_matcher` — and `str(2024) != str(2024.0)`, so the filter
+  selected ZERO rows. (The issue's inline-int repro passed; any
+  Double/Decimal column — e.g. everything QlikView-converted — hit it.)
+  Both paths now also match NUMERICALLY whenever both sides parse as
+  numbers, in both directions (int literal vs Double cells and the mirror),
+  covering `=`, `IN {…}`, `NOT(… IN …)`, and caller-supplied
+  `filter_context` In-sets. Bools are excluded — `TRUE` never aliases `1`.
+- **Literal-first predicates (`2024 = T[Year]`) registered NO filter** and
+  silently answered the grand total. A reversed-form parse now flips the
+  comparison onto the column for `=`, `<>`, `<`, `<=`, `>`, `>=`.
+- Pinned by `tests/test_calculate_predicates.py::
+  TestNumericTypeCoercionInFilters` (9 tests: sugar==FILTER equivalence in
+  all four type pairings, IN/NOT-IN, literal-first with flipped operators,
+  no-match still BLANK, strings untouched, bool/1 non-aliasing, caller
+  filter-context coercion). Desktop-conformance goldens unchanged.
+
 ## [0.9.83] - 2026-08-13
 
 ### Fixed — datetime.utcnow() retired at all eight call sites (issue #38, docs r28)

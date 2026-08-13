@@ -175,3 +175,84 @@ class TestInMachinery:
     def test_single_column_table_expression(self):
         vals = de.DAXEngine()._in_set_values('VALUES(P[S])', self._ctx())
         assert sorted(vals) == ["Closed Lost", "Closed Won", "Lead", "Proposal"]
+
+
+class TestNumericTypeCoercionInFilters:
+    """Issue #39: CALCULATE(expr, T[Year]=2024) went BLANK on Double-typed
+    columns — the In-set fast path and make_value_matcher both matched by
+    str(), and str(2024) != str(2024.0), so the sugar selected ZERO rows
+    while the explicit FILTER form (numeric comparison) answered 350. Both
+    sides now match numerically whenever both parse as numbers; the
+    literal-first form (2024=T[Year]) also registers instead of silently
+    applying nothing."""
+
+    DOUBLE_ROWS = [['A', 2024.0, 100], ['B', 2024.0, 250], ['A', 2023.0, 70]]
+    INT_ROWS = [['A', 2024, 100], ['B', 2024, 250], ['A', 2023, 70]]
+
+    def _ev(self, expr, rows):
+        from pbix_mcp.dax.engine import DAXContext, DAXEngine
+        tables = {'Fact': {'columns': ['Cat', 'Year', 'Sales'], 'rows': rows}}
+        return DAXEngine().evaluate_measure(
+            'M', DAXContext(tables, {'M': expr}))
+
+    @pytest.mark.parametrize("rows,lit", [
+        (DOUBLE_ROWS, "2024"),      # the issue's shape: Double cells, int literal
+        (INT_ROWS, "2024.0"),       # and the mirror image
+        (INT_ROWS, "2024"),
+        (DOUBLE_ROWS, "2024.0"),
+    ])
+    def test_equality_sugar_matches_filter_form(self, rows, lit):
+        sugar = self._ev(
+            f"CALCULATE(SUM('Fact'[Sales]), 'Fact'[Year]={lit})", rows)
+        explicit = self._ev(
+            f"CALCULATE(SUM('Fact'[Sales]), "
+            f"FILTER(ALL('Fact'[Year]),'Fact'[Year]={lit}))", rows)
+        assert sugar == explicit == 350
+
+    def test_in_and_not_in_coerce(self):
+        assert self._ev(
+            "CALCULATE(SUM('Fact'[Sales]), 'Fact'[Year] IN {2024})",
+            self.DOUBLE_ROWS) == 350
+        assert self._ev(
+            "CALCULATE(SUM('Fact'[Sales]), NOT('Fact'[Year] IN {2024}))",
+            self.DOUBLE_ROWS) == 70
+
+    def test_literal_first_predicate_registers(self):
+        # used to fall off the filter loop and answer the 420 grand total
+        assert self._ev(
+            "CALCULATE(SUM('Fact'[Sales]), 2024='Fact'[Year])",
+            self.DOUBLE_ROWS) == 350
+        # flipped comparison operators
+        assert self._ev(
+            "CALCULATE(SUM('Fact'[Sales]), 2023<'Fact'[Year])",
+            self.DOUBLE_ROWS) == 350
+        assert self._ev(
+            "CALCULATE(SUM('Fact'[Sales]), 2024>'Fact'[Year])",
+            self.DOUBLE_ROWS) == 70
+
+    def test_no_match_still_blank_and_strings_unaffected(self):
+        assert self._ev(
+            "CALCULATE(SUM('Fact'[Sales]), 'Fact'[Year]=1999)",
+            self.DOUBLE_ROWS) is None
+        assert self._ev(
+            'CALCULATE(SUM(Fact[Sales]), Fact[Cat]="A")',
+            self.DOUBLE_ROWS) == 170
+
+    def test_boolean_true_does_not_alias_one(self):
+        from pbix_mcp.dax.engine import DAXContext, DAXEngine
+        tables = {'T': {'columns': ['Flag', 'V'],
+                        'rows': [[True, 10], [False, 20], [1.0, 40]]}}
+        got = DAXEngine().evaluate_measure('M', DAXContext(
+            tables, {'M': "CALCULATE(SUM(T[V]), T[Flag] IN {1})"}))
+        # the numeric 1.0 row matches; the boolean True row must NOT
+        assert got == 40
+
+    def test_caller_filter_context_coerces_too(self):
+        # the same str() mismatch hit {"Fact.Year": [2024]} from the tools
+        from pbix_mcp.dax.engine import DAXContext, DAXEngine
+        tables = {'Fact': {'columns': ['Cat', 'Year', 'Sales'],
+                           'rows': self.DOUBLE_ROWS}}
+        got = DAXEngine().evaluate_measure('M', DAXContext(
+            tables, {'M': "SUM('Fact'[Sales])"},
+            filter_context={'Fact.Year': [2024]}))
+        assert got == 350

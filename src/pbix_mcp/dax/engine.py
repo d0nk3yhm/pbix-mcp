@@ -474,6 +474,11 @@ _WHOLE_TCOL_RE = re.compile(
     r"^\s*(?:'([^'\[\]]+)'|([^\W\d][\w .]*))\s*\[([^\]]+)\]\s*$")
 _CALC_PRED_RE = re.compile(
     r"^'?([^'\[\]]+?)'?\s*\[([^\]]+)\]\s*(<>|>=|<=|>|<|=)\s*(.+)$", re.S)
+# Literal-first CALCULATE predicate: ``2024 = T[Year]`` (issue #39). The left
+# side may not contain brackets, so a column-vs-column or measure comparison
+# never matches; the column ref is anchored at the end.
+_CALC_PRED_REV_RE = re.compile(
+    r"^([^\[\]]+?)\s*(<>|>=|<=|>|<|=)\s*'?([^'\[\]]+?)'?\s*\[([^\]]+)\]$", re.S)
 _VAR_KW_RE = re.compile(r'\bVAR\b', re.IGNORECASE)
 _RETURN_KW_RE = re.compile(r'\bRETURN\b', re.IGNORECASE)
 
@@ -1038,6 +1043,37 @@ def _extremum(cur, cand, want_max: bool):
         return cur
 
 
+def _numeric_filter_set(values) -> set:
+    """The float values of every filter entry that parses as a number.
+    Bools are excluded (True must not equal 1.0 by accident)."""
+    out = set()
+    for v in values:
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            out.add(float(v))
+        elif isinstance(v, str):
+            try:
+                out.add(float(v))
+            except ValueError:
+                pass
+    return out
+
+
+def _numeric_member(cell, numbers: set) -> bool:
+    """True when ``cell`` parses as a number that is in ``numbers``."""
+    if not numbers or isinstance(cell, bool):
+        return False
+    if isinstance(cell, (int, float)):
+        return float(cell) in numbers
+    if isinstance(cell, str):
+        try:
+            return float(cell) in numbers
+        except ValueError:
+            return False
+    return False
+
+
 def make_value_matcher(spec):
     """Build a predicate ``f(cell) -> bool`` for one filter_context entry.
 
@@ -1066,16 +1102,27 @@ def make_value_matcher(spec):
         # accepts date/datetime/ISO-ish text, never a bare number, so a numeric
         # filter cannot be reinterpreted as a date serial by accident.
         allowed_dates = {d for d in (_as_date(v) for v in values) if d is not None}
-        if not allowed_dates:
+        # NUMBERS have the same problem (issue #39): a Double column's cells
+        # str() as '2024.0' while the filter literal str()s as '2024', so
+        # CALCULATE(expr, T[Year]=2024) selected ZERO rows and returned BLANK
+        # where the explicit FILTER form (numeric comparison) answers 350.
+        # Match numerically whenever both sides parse as numbers. Bools are
+        # excluded: True must not silently equal 1.0.
+        allowed_numbers = _numeric_filter_set(values)
+        if not allowed_dates and not allowed_numbers:
             return lambda cell: str(cell) in allowed
 
-        def _match_with_dates(cell):
+        def _match_full(cell):
             if str(cell) in allowed:
                 return True
-            cd = _as_date(cell)
-            return cd is not None and cd in allowed_dates
+            if _numeric_member(cell, allowed_numbers):
+                return True
+            if allowed_dates:
+                cd = _as_date(cell)
+                return cd is not None and cd in allowed_dates
+            return False
 
-        return _match_with_dates
+        return _match_full
 
     tests = []
     if "op" in spec:
@@ -1086,10 +1133,14 @@ def make_value_matcher(spec):
         tests.append(lambda c: _compare(c, ">=", lo) and _compare(c, "<=", hi))
     if "in" in spec:
         allowed_in = {str(v) for v in spec["in"]}
-        tests.append(lambda c: str(c) in allowed_in)
+        allowed_in_num = _numeric_filter_set(spec["in"])
+        tests.append(lambda c: str(c) in allowed_in
+                     or _numeric_member(c, allowed_in_num))
     if "not_in" in spec:
         denied = {str(v) for v in spec["not_in"]}
-        tests.append(lambda c: str(c) not in denied)
+        denied_num = _numeric_filter_set(spec["not_in"])
+        tests.append(lambda c: str(c) not in denied
+                     and not _numeric_member(c, denied_num))
     if "contains" in spec:
         needle = str(spec["contains"]).lower()
         tests.append(lambda c: needle in str("" if c is None else c).lower())
@@ -1771,6 +1822,24 @@ class DAXContext:
             dv = _as_date(v)
             if dv is not None:
                 keys.add(dv.isoformat())
+            # Numeric alternates (issue #39): the map is keyed str(cell), and
+            # str(2024) != str(2024.0), so an int literal missed every Double
+            # cell (and vice versa) — CALCULATE(expr, T[Year]=2024) selected
+            # zero rows and went BLANK. Add both spellings; bools excluded so
+            # True never aliases 1.
+            if not isinstance(v, bool):
+                fv = None
+                if isinstance(v, (int, float)):
+                    fv = float(v)
+                elif isinstance(v, str):
+                    try:
+                        fv = float(v)
+                    except ValueError:
+                        pass
+                if fv is not None:
+                    keys.add(str(fv))
+                    if fv.is_integer():
+                        keys.add(str(int(fv)))
         found = [vmap[k] for k in keys if k in vmap]
         if not found:
             return frozenset()
@@ -4251,9 +4320,22 @@ class DAXEngine:
             inner = peeled
 
         m = _CALC_PRED_RE.match(inner)
-        if m:
-            tbl, col, op, val_text = (m.group(1).strip(), m.group(2).strip(),
-                                      m.group(3), m.group(4).strip())
+        rev = None if m else _CALC_PRED_REV_RE.match(inner)
+        if rev:
+            # Literal-first form (issue #39): ``2024 = T[Year]``. Flip the
+            # comparison so the column stays on the left; = and <> are
+            # symmetric. Without this the argument fell off the end of the
+            # filter loop, applied NOTHING, and returned the grand total.
+            val_text, op, tbl, col = (rev.group(1).strip(), rev.group(2),
+                                      rev.group(3).strip(),
+                                      rev.group(4).strip())
+            op = {'=': '=', '<>': '<>', '>': '<', '<': '>',
+                  '>=': '<=', '<=': '>='}[op]
+        if m or rev:
+            if m:
+                tbl, col, op, val_text = (m.group(1).strip(),
+                                          m.group(2).strip(),
+                                          m.group(3), m.group(4).strip())
             val = self._eval_expr(val_text, ctx, var_scope)
             if val is None:
                 return ()
