@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.86] - 2026-08-13
+
+### Fixed — metadata edits no longer fail on real-world models with incompressible chunks (issue #41)
+
+- **Every metadata-only edit failed with "Compression failed or not
+  effective"** on PBIX files whose model contains already-compressed
+  VertiPaq chunks — i.e. any substantial real-world file. The xpress9
+  binding's encoder lands ~430 bytes OVER the input on incompressible
+  2 MiB chunks (Power BI's own encoder stores them ~410 bytes UNDER), and
+  the wrapper's strict guard turns that into a hard failure for the whole
+  re-encode.
+- `compress_datamodel` now runs a **fallback ladder**: (1) the primary
+  single-threaded re-encode, byte-compatible with everything previously
+  produced; (2) on incompressible-chunk failure, a **hybrid multi-threaded
+  container** that reuses the original stream's unchanged session prefix
+  BYTE-VERBATIM — sidestepping the encoder for exactly the chunks it cannot
+  emit, and keeping Power BI's superior window-22 encoding for them — and
+  re-encodes only the changed tail as single-chunk thread-groups (each
+  legally its own XPress9 session; empirically pinned: XPress9 LZ77 windows
+  chain within a session, so only session prefixes are reusable, and the
+  multi-threaded container is the format's sanctioned way to mix sessions);
+  (3) the **uncompressed ABF format** (`STREAM_STORAGE_SIGNATURE`), which
+  every reader of this entry accepts, with a warning surfaced on the tool
+  response. Metadata (sqlite) lives near the END of the ABF — chunk 8 of 10
+  on Adventure Works — so the incompressible VertiPaq chunks sit in the
+  reusable prefix and fallback (2) covers the reported repros. Hybrid
+  output is itself reusable, so **repeated edits stay compressed**.
+- Every hybrid container is round-trip-verified against the input before
+  being returned; `original_dm` is threaded through `_modify_metadata_only`,
+  `pbix_datamodel_recompress`, and `pbix_datamodel_replace_file`; the
+  multi-threaded reader caps its thread pool at 16 (the declared thread
+  count is a grouping, not a concurrency requirement).
+- Pinned by `tests/test_incompressible_datamodel.py` (9 tests: hybrid
+  round-trip on the Desktop-authored AW stream, verbatim prefix reuse,
+  hybrid-of-hybrid chaining, the full ladder, unrelated errors still raise,
+  informative terminal error, primary path unchanged for compressible
+  input, end-to-end chained add_measure under a forced incompressible
+  condition with save + reopen + evaluate).
+
 ## [0.9.85] - 2026-08-13
 
 ### Fixed — count-family results typed Int64, declared Measure.DataType flows through (issue #40, docs r30)

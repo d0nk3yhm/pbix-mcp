@@ -9549,7 +9549,19 @@ def _modify_metadata_only(
 
     abf = decompress_datamodel(dm_bytes)
     new_abf = rebuild_abf_with_modified_sqlite(abf, modifier_fn)
-    new_dm = compress_datamodel(new_abf)
+    # original_dm enables chunk reuse when the encoder can't re-emit the
+    # model's incompressible VertiPaq chunks (real-world files; the
+    # "Compression failed or not effective" class).
+    new_dm = compress_datamodel(new_abf, original_dm=dm_bytes)
+
+    from pbix_mcp.formats.datamodel_roundtrip import _detect_format
+    if _detect_format(new_dm) == "uncompressed":
+        # The uncompressed fallback engaged — the edit is intact, but flag it.
+        _responses.add_pending_warning(
+            "DataModel stored UNCOMPRESSED: the model contains chunks the "
+            "XPress9 encoder cannot re-emit and no reusable prefix covered "
+            "the edit. The file stays valid (the PBIX ZIP layer still "
+            "deflates it) but is larger on disk.")
 
     with open(dm_path, "wb") as f:
         f.write(new_dm)
@@ -12132,10 +12144,15 @@ def pbix_datamodel_recompress(alias: str, abf_path: str = "") -> str:
                 ABFRebuildError.code
             ).to_text()
 
-        # Read original DataModel size for comparison
+        # Read original DataModel size for comparison (and for chunk reuse
+        # when the encoder can't re-emit incompressible chunks).
         orig_size = os.path.getsize(dm_path) if os.path.exists(dm_path) else 0
+        orig_dm = None
+        if orig_size:
+            with open(dm_path, "rb") as f:
+                orig_dm = f.read()
 
-        new_dm = compress_datamodel(abf_bytes)
+        new_dm = compress_datamodel(abf_bytes, original_dm=orig_dm)
 
         with open(dm_path, "wb") as f:
             f.write(new_dm)
@@ -12200,7 +12217,7 @@ def pbix_datamodel_replace_file(alias: str, internal_path: str, new_content_path
 
         fname = entry["Path"]
         new_abf = rebuild_abf_with_replacement(abf, {internal_path: new_content})
-        new_dm = compress_datamodel(new_abf)
+        new_dm = compress_datamodel(new_abf, original_dm=dm_bytes)
 
         with open(dm_path, "wb") as f:
             f.write(new_dm)
