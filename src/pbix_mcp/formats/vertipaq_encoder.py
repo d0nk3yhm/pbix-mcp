@@ -1371,7 +1371,18 @@ def _encode_column(
 
 
 def _val_key(v):
-    """Create a hashable key for a value (handles float NaN etc.)."""
+    """Hashable IDENTITY key for a dictionary value.
+
+    Strings fold case (issue #43): VertiPaq's string store is
+    CASE-INSENSITIVE — 'VAN DER SAR' and 'van der SAR' are one value to
+    Analysis Services, and writing both as separate dictionary entries makes
+    Desktop reject the whole model ('A duplicate value has been detected in
+    the Unique Value store'). Folding here dedups every consumer at once
+    (dictionary build, row->index mapping, H$ hierarchy, distinct counts);
+    the STORED spelling stays the first one seen, matching Desktop's own
+    import behavior. NaN keeps its sentinel (NaN != NaN)."""
+    if isinstance(v, str):
+        return v.casefold()
     if isinstance(v, float) and math.isnan(v):
         return ("__nan__",)
     return v
@@ -1450,7 +1461,9 @@ def encode_table_data(
             converted_vals = [_convert_value_for_dict(v, data_type)
                               for v in values]
             non_null = [v for v in converted_vals if v is not None]
-            unique_count = len(set(non_null))
+            # _val_key so case-folded string dedup (issue #43) yields the
+            # same state count the encoder's dictionary build produces.
+            unique_count = len(set(_val_key(v) for v in non_null))
             # Nullable columns store NULL as raw index 0 with values at 1..N,
             # so the bit width must cover N+1 states (PBI ground truth:
             # IT_Support Body/Answer columns). Without this, a column with

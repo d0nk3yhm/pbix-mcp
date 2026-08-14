@@ -16611,6 +16611,51 @@ def pbix_doctor(alias: str) -> str:
             return f"{table_count} tables, {total_rows:,} total rows\n" + "\n".join(lines)
         _check("VertiPaq data (row counts)", check_tables)
 
+        # 8b. String dictionary invariants (DBCC-style, issue #43): VertiPaq's
+        # Unique Value store is CASE-INSENSITIVE, so two stored entries that
+        # differ only by case make Desktop reject the whole model with
+        # "A duplicate value has been detected in the Unique Value store".
+        # Files written by pbix-mcp < 0.9.88 could carry this; flag it here
+        # instead of letting Desktop's load failure be the first symptom.
+        def check_string_dictionaries():
+            _init_datamodel()
+            from pbix_mcp.formats.vertipaq_decoder import decode_dictionary
+            offenders = []
+            scanned = 0
+            for f in abf_files:
+                path = f.get("Path", "")
+                if not path.endswith(".dictionary") or ".tbl\\" not in path:
+                    continue
+                start, size = f.get("m_cbOffsetHeader"), f.get("Size")
+                if start is None or not size:
+                    continue
+                try:
+                    dict_type, values = decode_dictionary(
+                        abf_data[start : start + size])
+                except Exception:
+                    continue  # numeric/undecodable dictionaries: not this check
+                if not values or not isinstance(values[0], str):
+                    continue
+                scanned += 1
+                folded: dict = {}
+                for v in values:
+                    if not isinstance(v, str):
+                        continue
+                    k = v.casefold()
+                    if k in folded and folded[k] != v:
+                        offenders.append(
+                            f"{path}: {folded[k]!r} vs {v!r}")
+                    else:
+                        folded.setdefault(k, v)
+            if offenders:
+                raise Exception(
+                    "case-colliding entries (Desktop WILL refuse to load): "
+                    + "; ".join(offenders[:5])
+                    + (f" (+{len(offenders) - 5} more)"
+                       if len(offenders) > 5 else ""))
+            return f"{scanned} string dictionaries, no case-folded duplicates"
+        _check("String dictionary invariants", check_string_dictionaries)
+
         # 9. Relationships
         def check_relationships():
             _init_datamodel()

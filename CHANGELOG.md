@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.88] - 2026-08-14
+
+### Fixed — case-colliding strings no longer make the file unloadable (issue #43)
+
+- **Two strings differing only by case in one column made the whole .pbix
+  UNLOADABLE** — VertiPaq's string store is case-insensitive, the encoder
+  wrote `"VAN DER SAR"` and `"van der SAR"` as separate dictionary entries,
+  and Desktop rejected the model ("A duplicate value has been detected in
+  the Unique Value store"). Three case pairs among 37,784 rows were enough
+  to keep the reporter's converted document from opening at all.
+- `_val_key` — the encoder's single value-identity function — now folds
+  strings with `casefold()`: one dictionary entry per folded key, the FIRST
+  spelling seen stored, every case variant's rows mapped to it (Desktop's
+  own import behavior). Dictionary build, row→index mapping, H$ hierarchy
+  and distinct counts all fold consistently through the one chokepoint.
+- **`pbix_doctor` gained a DBCC-style "String dictionary invariants"
+  check**: every stored string dictionary is scanned for case-folded
+  duplicates, so files written by pbix-mcp < 0.9.88 are flagged with the
+  offending pairs BEFORE Desktop's load failure is the first symptom.
+- **Desktop-verified**: the issue's exact three-row repro file, which
+  previously raised the duplicate-value dialog, now opens in Power BI
+  Desktop (title bar carries the file name, AS engine loads the model).
+  Pinned by `tests/test_case_insensitive_dictionary.py` (7 tests: fold to
+  first spelling, folded distinct counts, raw stored-dictionary scan,
+  doctor green on new + Desktop-authored files, doctor RED on a simulated
+  pre-fix file naming the colliding pair, DAX sees folded values).
+
 ## [0.9.87] - 2026-08-14
 
 ### Fixed — relationship join keys starting with a date collapsed into one bucket (issue #42)
