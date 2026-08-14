@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.89] - 2026-08-14
+
+### Fixed — ModelReader.statistics reported the first column's DISTINCT count as RowCount (issue #44)
+
+- `statistics` took `RowCount` from a data column's IDFMETA `row_count`,
+  which for dictionary-encoded columns is the DICTIONARY entry count — the
+  column's distinct count, not the table's row count. A 500-row table whose
+  first column held 10 distinct values reported "10 rows" (11 with nulls:
+  10 + the blank); the reporter's 3,495-row table read "191 rows" in the
+  Fields pane, 18× smaller than reality.
+- Now read from `ColumnStorage.Statistics_RowCount` (the segment record
+  count Power BI itself maintains, MAX across the table's columns — the
+  same source `pbix_doctor` already trusts, and as cheap as the metadata
+  bundle), with the ROWNUMBER column's IDFMETA as fallback for files
+  without storage statistics (RowNumber has one entry per physical row, so
+  its count IS the table's — unlike the data columns the old code read).
+- Pinned by `tests/test_model_reader_tempfile.py::TestStatisticsRowCount`
+  (the issue's four shapes: few/all distinct, strings, nulls — all 500;
+  Desktop-authored Adventure Works counts exact).
+
 ## [0.9.88] - 2026-08-14
 
 ### Fixed — case-colliding strings no longer make the file unloadable (issue #43)

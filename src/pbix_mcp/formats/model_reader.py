@@ -336,7 +336,14 @@ class ModelReader:
 
         file_log = list_abf_files(self._abf_bytes)
 
-        # Get table/column info from metadata, including first data column ID
+        # Get table/column info from metadata, including the STORED row count.
+        # ColumnStorage.Statistics_RowCount is the segment record count Power
+        # BI itself maintains per column; MAX across the table's columns is
+        # the table's row count. The previous source — a data column's
+        # IDFMETA `row_count` — is the DICTIONARY entry count for
+        # dictionary-encoded columns, i.e. the column's DISTINCT count
+        # (issue #44): a 500-row table whose first column held 10 distinct
+        # values reported "10 rows".
         tables_meta = self._query_metadata("""
             SELECT t.ID, t.Name AS TableName,
                    -- Count real columns: data (1) + calculated (2) +
@@ -345,9 +352,10 @@ class ModelReader:
                    -- so a measure-only table reported 1 column instead of 0
                    -- and calculated columns went uncounted.
                    COUNT(CASE WHEN c.Type != 3 THEN 1 END) AS ColumnCount,
-                   MIN(CASE WHEN c.Type = 1 THEN c.ID END) AS FirstDataColID
+                   MAX(cs.Statistics_RowCount) AS StoredRowCount
             FROM [Table] t
             LEFT JOIN [Column] c ON c.TableID = t.ID
+            LEFT JOIN ColumnStorage cs ON cs.ColumnID = c.ID
             GROUP BY t.ID, t.Name
             ORDER BY t.Name
         """)
@@ -360,35 +368,28 @@ class ModelReader:
                 continue
             table_id = tm["ID"]
             col_count = tm["ColumnCount"]
-            first_col_id = tm.get("FirstDataColID")
 
-            # Try to get row count from first column's IDFMETA
-            row_count = 0
-            for entry in file_log:
-                path = entry["Path"]
-                # Match by table name/ID and idfmeta extension
-                is_table = (f"{table_name} ({table_id})" in path or
-                           path.startswith(f"{table_name}.tbl"))
-                if not is_table:
-                    continue
-                if not path.endswith(".idfmeta"):
-                    if not (path.endswith("meta") and "column." in path):
+            row_count = tm.get("StoredRowCount") or 0
+            if not row_count:
+                # Fallback for files without ColumnStorage statistics: the
+                # ROWNUMBER column's IDFMETA — RowNumber has one entry per
+                # physical row, so its row_count IS the table's (unlike the
+                # dictionary-encoded data columns the old code read).
+                for entry in file_log:
+                    path = entry["Path"]
+                    is_table = (f"{table_name} ({table_id})" in path or
+                               path.startswith(f"{table_name}.tbl"))
+                    if not is_table or "RowNumber" not in path:
                         continue
-                if "RowNumber" in path:
-                    continue
-                try:
-                    meta_bytes = read_abf_file(self._abf_bytes, entry)
-                    # Any non-RowNumber column of the table carries the table's
-                    # row count, and RowNumber is already excluded by path
-                    # above. The IDFMETA's `is_row_number` was consulted here
-                    # too, but it is a misreading of a field Desktop leaves 0 on
-                    # ordinary columns (see vertipaq_decoder.read_table_from_abf)
-                    # -- when it misfired on every column of a table, the table
-                    # reported 0 rows.
-                    row_count = decode_idfmeta(meta_bytes)["row_count"]
-                    break
-                except Exception:
-                    continue
+                    if not (path.endswith(".idfmeta") or
+                            (path.endswith("meta") and "column." in path)):
+                        continue
+                    try:
+                        meta_bytes = read_abf_file(self._abf_bytes, entry)
+                        row_count = decode_idfmeta(meta_bytes)["row_count"]
+                        break
+                    except Exception:
+                        continue
 
             result.append({
                 "TableName": table_name,

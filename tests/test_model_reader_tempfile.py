@@ -47,3 +47,54 @@ def test_get_model_measures_tool_works(model_path):
         assert "M" in resp["message"]
     finally:
         S.pbix_close("mrt2")
+
+
+class TestStatisticsRowCount:
+    """Issue #44: ModelReader.statistics took RowCount from a data column's
+    IDFMETA, which for dictionary-encoded columns is the DICTIONARY entry
+    count — the column's distinct count, not the table's row count. A
+    500-row table whose first column held 10 distinct values reported
+    '10 rows' (11 with nulls: 10 + the blank). Now read from
+    ColumnStorage.Statistics_RowCount (the segment record count Power BI
+    itself maintains), with the ROWNUMBER column's IDFMETA as fallback."""
+
+    @pytest.mark.parametrize("label,rows,dtype", [
+        ("few_distinct_doubles",
+         [{"V": float(i % 10)} for i in range(500)], "Double"),
+        ("all_distinct_doubles",
+         [{"V": float(i)} for i in range(500)], "Double"),
+        ("few_distinct_strings",
+         [{"V": f"s{i % 10}"} for i in range(500)], "String"),
+        ("few_distinct_with_nulls",
+         [{"V": (None if i % 50 == 0 else float(i % 10))}
+          for i in range(500)], "Double"),
+    ])
+    def test_row_count_is_rows_not_distincts(self, tmp_path, label, rows, dtype):
+        import json as _json
+
+        from pbix_mcp import server
+        from pbix_mcp.formats.model_reader import ModelReader
+        p = str(tmp_path / f"{label}.pbix")
+        alias = f"st_{label}"
+        r = _json.loads(server.pbix_create(p, alias, _json.dumps(
+            [{"name": "T", "columns": [{"name": "V", "data_type": dtype}],
+              "rows": rows}])))
+        assert r.get("success"), r
+        server._open_files.pop(alias, None)
+        st = ModelReader(p).statistics
+        assert st[0]["TableName"] == "T"
+        assert st[0]["RowCount"] == 500, st
+
+    def test_desktop_authored_counts(self):
+        import os as _os
+
+        from pbix_mcp.formats.model_reader import ModelReader
+        aw = _os.path.join(_os.path.dirname(__file__), "..", "test_samples",
+                           "Adventure Works DW 2020.pbix")
+        if not _os.path.exists(aw):
+            pytest.skip("Adventure Works sample not available")
+        by_name = {t["TableName"]: t["RowCount"]
+                   for t in ModelReader(aw).statistics}
+        assert by_name["Sales"] == 121253
+        assert by_name["Sales Territory"] == 11
+        assert by_name["Currency"] == 105
