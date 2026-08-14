@@ -789,3 +789,74 @@ class TestUtcnowRetirement:
         assert abs(a - b) < 5 * 10_000_000, (
             f"FILETIME helpers disagree by {(a - b) / 10_000_000:.1f}s "
             f"(the old local-time skew was the host's whole UTC offset)")
+
+
+# ---------------------------------------------------------------------------
+# Issue #42: date-prefixed compound keys must not merge into one date bucket
+# ---------------------------------------------------------------------------
+
+class TestDatePrefixKeysStayDistinct:
+    """Issue #42: _as_date parses a date PREFIX, and the value-index aliasing
+    keyed every '01/01/2017-CLUSTER n' to the same '2017-01-01' bucket — a
+    filter on ONE key returned every key sharing its date prefix, and via a
+    relationship the fact table came back UNFILTERED (the grand total,
+    silently). Aliasing/equality now use a STRICT whole-value parse; the
+    legitimate alias (same date as datetime cell vs ISO string) survives."""
+
+    KEY_SHAPES = [
+        ["K1-CLUSTER 1", "K1-CLUSTER 2", "K2-CLUSTER 1", "K2-CLUSTER 2"],
+        ["1-CLUSTER 1", "1-CLUSTER 2", "2-CLUSTER 1", "2-CLUSTER 2"],
+        ["01/01/2017-CLUSTER 1", "01/01/2017-CLUSTER 2",
+         "01/02/2017-CLUSTER 1", "01/02/2017-CLUSTER 2"],
+        ["2017-01-01-CLUSTER 1", "2017-01-01-CLUSTER 2",
+         "2017-01-02-CLUSTER 1", "2017-01-02-CLUSTER 2"],
+    ]
+
+    def test_strict_parse_semantics(self):
+        from pbix_mcp.dax.engine import _as_date, _as_date_strict
+        assert _as_date("01/01/2017-CLUSTER 1") is not None   # lenient: prefix
+        assert _as_date_strict("01/01/2017-CLUSTER 1") is None
+        assert _as_date_strict("2017-01-01-CLUSTER 1") is None
+        assert str(_as_date_strict("2017-01-01")) == "2017-01-01"
+        assert str(_as_date_strict("2009-12-01 00:00:00")) == "2009-12-01"
+
+    @pytest.mark.parametrize("keys", KEY_SHAPES,
+                             ids=["text", "number", "us_date", "iso_date"])
+    def test_relationship_filter_stays_filtered(self, keys):
+        tables = {
+            'Dim': {'columns': ['Key', 'Division'],
+                    'rows': [[k, "CLUSTER " + k[-1]] for k in keys]},
+            'Fact': {'columns': ['Key', 'Amt'], 'rows': [[k, 10] for k in keys]},
+        }
+        rels = [{'FromTable': 'Fact', 'FromColumn': 'Key',
+                 'ToTable': 'Dim', 'ToColumn': 'Key', 'IsActive': 1}]
+        got = DAXEngine().evaluate_measure('M', DAXContext(
+            tables, {'M': "SUM(Fact[Amt])"}, None, None,
+            {'Dim.Division': ['CLUSTER 1']}, rels))
+        assert got == 20, f"{keys[0]}: got {got}, the 40 grand total means merged buckets"
+
+    def test_single_compound_key_returns_one_row(self):
+        keys = ["01/01/2017-CLUSTER 1", "01/01/2017-CLUSTER 2",
+                "01/02/2017-CLUSTER 1"]
+        tables = {'Fact': {'columns': ['Key', 'Amt'],
+                           'rows': [[k, 10] for k in keys]}}
+        got = DAXEngine().evaluate_measure('M', DAXContext(
+            tables, {'M': "SUM(Fact[Amt])"},
+            filter_context={'Fact.Key': ['01/01/2017-CLUSTER 1']}))
+        assert got == 10
+
+    def test_legitimate_date_alias_survives(self):
+        from datetime import datetime as _dt
+        # ISO string filter must still find datetime cells (the alias's reason
+        # to exist), in both the index fast path and the matcher path
+        t1 = {'S': {'columns': ['D', 'V'],
+                    'rows': [[_dt(2009, 12, 1), 5], [_dt(2009, 12, 2), 7]]}}
+        assert DAXEngine().evaluate_measure('M', DAXContext(
+            t1, {'M': "SUM(S[V])"},
+            filter_context={'S.D': ['2009-12-01']})) == 5
+        t2 = {'S': {'columns': ['D', 'V'],
+                    'rows': [['2009-12-01 00:00:00', 5],
+                             ['2009-12-02 00:00:00', 7]]}}
+        assert DAXEngine().evaluate_measure('M', DAXContext(
+            t2, {'M': "SUM(S[V])"},
+            filter_context={'S.D': ['2009-12-01']})) == 5

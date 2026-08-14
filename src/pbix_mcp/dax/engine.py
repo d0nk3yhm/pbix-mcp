@@ -780,6 +780,38 @@ def _as_date(v):
     return None
 
 
+@lru_cache(maxsize=100_000)
+def _as_date_str_strict(s: str):
+    """Whole-string date parse: None unless the ENTIRE value is a date.
+
+    _as_date_str parses a PREFIX (s[:len(fmt)+2]) — right for coercing
+    datetime-ish strings, wrong for deciding date-EQUALITY classes: compound
+    keys like '01/01/2017-CLUSTER 1' and '01/01/2017-CLUSTER 2' both
+    prefix-parse to 2017-01-01, so the value-index aliasing merged every
+    distinct key sharing a date prefix into ONE bucket and a filtered fact
+    table came back UNFILTERED (issue #42)."""
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
+                "%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _as_date_strict(v):
+    """Date coercion for EQUALITY/ALIAS use: a string counts only when the
+    whole value is a date (see _as_date_str_strict)."""
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if isinstance(v, str):
+        return _as_date_str_strict(v.strip())
+    return None
+
+
 def _as_datetime(v):
     """Best-effort datetime coercion from a value or ISO-ish string."""
     if isinstance(v, datetime):
@@ -946,7 +978,7 @@ def _compare(cell, op: str, target) -> bool:
     if a_num is not None and b_num is not None:
         a, b = a_num, b_num
     else:
-        a_dt, b_dt = _as_date(cell), _as_date(target)
+        a_dt, b_dt = _as_date_strict(cell), _as_date_strict(target)
         if a_dt is not None and b_dt is not None:
             a, b = a_dt, b_dt
         else:
@@ -1101,7 +1133,8 @@ def make_value_matcher(spec):
         # and return BLANK where Desktop returns $19,260,877. _as_date only
         # accepts date/datetime/ISO-ish text, never a bare number, so a numeric
         # filter cannot be reinterpreted as a date serial by accident.
-        allowed_dates = {d for d in (_as_date(v) for v in values) if d is not None}
+        allowed_dates = {d for d in (_as_date_strict(v) for v in values)
+                         if d is not None}
         # NUMBERS have the same problem (issue #39): a Double column's cells
         # str() as '2024.0' while the filter literal str()s as '2024', so
         # CALCULATE(expr, T[Year]=2024) selected ZERO rows and returned BLANK
@@ -1118,7 +1151,7 @@ def make_value_matcher(spec):
             if _numeric_member(cell, allowed_numbers):
                 return True
             if allowed_dates:
-                cd = _as_date(cell)
+                cd = _as_date_strict(cell)
                 return cd is not None and cd in allowed_dates
             return False
 
@@ -1156,7 +1189,7 @@ def make_value_matcher(spec):
         _lo, _hi = _relative_date_bounds(spec["relative_date"])
 
         def _rd(c, lo=_lo, hi=_hi):
-            d = _as_date(c)
+            d = _as_date_strict(c)
             return d is not None and lo <= d <= hi
 
         tests.append(_rd)
@@ -1781,7 +1814,7 @@ class DAXContext:
                 if isinstance(v, (datetime, date)):
                     dateish = True
                 elif isinstance(v, str):
-                    dateish = _as_date(v) is not None
+                    dateish = _as_date_str_strict(v.strip()) is not None
                 break
             acc: dict = {}
             if dateish:
@@ -1789,7 +1822,10 @@ class DAXContext:
                     v = row[col_idx]
                     sv = str(v)
                     acc.setdefault(sv, []).append(i)
-                    dv = _as_date(v)
+                    # STRICT parse (issue #42): a compound key with a date
+                    # PREFIX must not alias to the bare date, or every key
+                    # sharing that prefix merges into one bucket.
+                    dv = _as_date_strict(v)
                     if dv is not None:
                         iso = dv.isoformat()
                         if iso != sv:
@@ -1819,7 +1855,7 @@ class DAXContext:
         keys = set()
         for v in values:
             keys.add(str(v))
-            dv = _as_date(v)
+            dv = _as_date_strict(v)  # strict: no date-prefix aliasing (#42)
             if dv is not None:
                 keys.add(dv.isoformat())
             # Numeric alternates (issue #39): the map is keyed str(cell), and

@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.87] - 2026-08-14
+
+### Fixed — relationship join keys starting with a date collapsed into one bucket (issue #42)
+
+- `_as_date()` parses a date PREFIX (`s[:len(fmt)+2]`) — right for coercing
+  datetime-ish strings, wrong for deciding date-EQUALITY classes: compound
+  keys like `01/01/2017-CLUSTER 1` and `01/01/2017-CLUSTER 2` both
+  prefix-parsed to `2017-01-01`, and the value-index aliasing merged every
+  distinct key sharing a date prefix into ONE bucket. A filter on one key
+  returned every division's rows for that date, and through a relationship
+  the fact table came back UNFILTERED — the grand total under every
+  selection, `status: ok`, no warning. Ordinary for imported models whose
+  keys are `date & '-' & code`.
+- New STRICT whole-value date parse (`_as_date_strict`) now used at every
+  equality/alias site: `_value_index_map` (cell aliasing + dateish
+  sampling), `_indices_for_values` (filter-value aliasing),
+  `make_value_matcher` (allowed-dates + cell match + relative_date), and
+  `_compare`'s date branch. Coercion sites (DATEADD scans, relative-date
+  anchors) stay lenient. The alias's legitimate case — the same date as a
+  datetime cell on one side and an ISO string on the other — is preserved
+  and pinned.
+- Pinned by `tests/test_dax_engine.py::TestDatePrefixKeysStayDistinct`
+  (the issue's four key-shape repros through a relationship: all 20, never
+  the 40 grand total; single-key filter returns one row; the legitimate
+  date alias still resolves in both the index fast path and the matcher).
+
 ## [0.9.86] - 2026-08-13
 
 ### Fixed — metadata edits no longer fail on real-world models with incompressible chunks (issue #41)
