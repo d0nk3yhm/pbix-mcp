@@ -735,7 +735,7 @@ def _solid_color(hex_color: str) -> dict:
     return {"solid": {"color": _pbi_lit(hex_color)}}
 
 
-def _build_format_objects(fmt: dict) -> dict:
+def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
     """Convert human-readable format dict to PBI objects structures.
 
     Returns dict with two keys:
@@ -745,6 +745,10 @@ def _build_format_objects(fmt: dict) -> dict:
 
     All property names and value formats match PBI Desktop March 2026 ground truth.
     Colors use {"solid": {"color": {"expr": {"Literal": {"Value": "'#hex'"}}}}}
+
+    ``visual_type`` disambiguates the properties whose NAME depends on the
+    target visual (issue #45: a plain card reads categoryLabels.color, a
+    multi-row card reads categoryLabels.categoryLabelFontColor).
     """
     objects: dict[str, list] = {}
     vc_objects: dict[str, list] = {}
@@ -1090,13 +1094,22 @@ def _build_format_objects(fmt: dict) -> dict:
         if "markerSize" in ln: props["markerSize"] = _pbi_lit(int(ln["markerSize"]))
         _add("lineStyles", props)
 
-    # --- categoryLabels (pie/donut) ---
+    # --- categoryLabels (card / multi-row card / pie / donut) ---
     if "categoryLabels" in fmt:
         cl = fmt["categoryLabels"]
         props = {}
         if "show" in cl: props["show"] = _pbi_lit(cl["show"])
         if "fontSize" in cl: props["fontSize"] = _pbi_lit(float(cl["fontSize"]))
-        if "color" in cl: props["categoryLabelFontColor"] = _solid_color(cl["color"])
+        if "color" in cl:
+            # The colour property's NAME depends on the visual (issue #45,
+            # measured by write-save-reopen-readback): a plain card renders
+            # categoryLabels.color; a multi-row card renders
+            # categoryLabels.categoryLabelFontColor. Writing the multi-row
+            # name onto a card was accepted, persisted, and rendered as
+            # nothing.
+            color_prop = ("color" if visual_type == "card"
+                          else "categoryLabelFontColor")
+            props[color_prop] = _solid_color(cl["color"])
         if "fontFamily" in cl: props["fontFamily"] = _pbi_lit(cl["fontFamily"])
         _add("categoryLabels", props)
 
@@ -3269,7 +3282,8 @@ def pbix_format_visual(
                 existing_objects["dataPoint"] = dp_entries
                 fmt["_skip_datacolors"] = True  # Skip the single-color fallback
 
-        result = _build_format_objects(fmt)
+        result = _build_format_objects(
+            fmt, visual_type=sv.get("visualType", ""))
         new_objects = result.get("_objects", {})
         new_vc_objects = result.get("_vcObjects", {})
 

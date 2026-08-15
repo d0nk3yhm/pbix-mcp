@@ -355,3 +355,58 @@ class TestNoLayoutPlanted:
             server.pbix_save(s.alias, out, overwrite=True, backup=False)
         with zipfile.ZipFile(out) as z:
             assert "Report/Layout" not in z.namelist()
+
+
+class TestCategoryLabelColorByVisualType:
+    """Issue #45: categoryLabels.color wrote `categoryLabelFontColor` — the
+    MULTI-ROW card's property — regardless of visual type, so a plain card
+    (which renders `categoryLabels.color`) silently never changed colour.
+    The property name is now keyed off the visual type. Verified the way the
+    issue measured it: write, save, reopen from disk, read the exact path."""
+
+    @pytest.mark.parametrize("vtype,want,not_want", [
+        ("card", "color", "categoryLabelFontColor"),
+        ("multiRowCard", "categoryLabelFontColor", "color"),
+    ])
+    def test_property_name_matches_renderer(self, tmp_path, vtype, want,
+                                            not_want):
+        import uuid as _uuid
+        alias = "cl_" + _uuid.uuid4().hex[:8]
+        p = str(tmp_path / f"{vtype}.pbix")
+        tables = [{"name": "T", "columns": [
+            {"name": "V", "data_type": "Double"}], "rows": [{"V": 1.0}]}]
+        assert json.loads(server.pbix_create(
+            p, alias, json.dumps(tables)))["success"]
+        cfg = json.dumps({"singleVisual": {
+            "visualType": vtype,
+            "projections": {"Values": [{"queryRef": "T.V"}]},
+            "prototypeQuery": {"Version": 2,
+                "From": [{"Name": "t", "Entity": "T", "Type": 0}],
+                "Select": [{"Column": {
+                    "Expression": {"SourceRef": {"Source": "t"}},
+                    "Property": "V"}, "Name": "T.V"}]}}})
+        assert json.loads(server.pbix_add_visual(
+            alias, 0, vtype, 40, 40, 200, 100, cfg))["success"]
+        r = json.loads(server.pbix_format_visual(
+            alias, 0, 0, json.dumps({"categoryLabels": {"color": "#1B6EE0"}})))
+        assert r.get("success"), r
+        out = str(tmp_path / "saved.pbix")
+        assert json.loads(server.pbix_save(
+            alias, output_path=out, overwrite=True))["success"]
+        server._open_files.pop(alias, None)
+        server._dax_cache.pop(alias, None)
+
+        alias2 = alias + "_r"
+        assert json.loads(server.pbix_open(out, alias2))["success"]
+        try:
+            raw = json.loads(json.loads(
+                server.pbix_get_layout_raw(alias2))["message"])
+            sv = json.loads(raw["sections"][0]["visualContainers"][0]
+                            ["config"])["singleVisual"]
+            props = sv["objects"]["categoryLabels"][0]["properties"]
+            assert want in props, props
+            assert "#1B6EE0" in json.dumps(props[want])
+            assert not_want not in props, props
+        finally:
+            server._open_files.pop(alias2, None)
+            server._dax_cache.pop(alias2, None)

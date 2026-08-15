@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.90] - 2026-08-15
+
+### Fixed — categoryLabels.color keyed off the visual type (issue #45)
+
+- `pbix_format_visual(..., {"categoryLabels": {"color": ...}})` always wrote
+  `categoryLabelFontColor` — the MULTI-ROW card's property — so a plain
+  `card`, which renders `categoryLabels.color`, accepted the call, persisted
+  the file, and rendered unchanged. The property name is now selected by the
+  target's visualType: `color` for `card`, `categoryLabelFontColor` for
+  everything else (multi-row card behavior unchanged).
+- Pinned by `tests/test_report_editing.py::TestCategoryLabelColorByVisualType`
+  using the issue's own measurement protocol — write, save, reopen from
+  disk, read the exact property path back — for both visual types, asserting
+  the right name present AND the wrong name absent.
+
 ## [0.9.89] - 2026-08-14
 
 ### Fixed — ModelReader.statistics reported the first column's DISTINCT count as RowCount (issue #44)
