@@ -1062,7 +1062,24 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
         props = {}
         if "show" in ol: props["show"] = _pbi_lit(ol["show"])
         if "weight" in ol: props["weight"] = _pbi_lit(int(ol["weight"]))
-        if "color" in ol: props["color"] = _solid_color(ol["color"])
+        if "color" in ol:
+            # Stroke colour naming is per-visual (issue #47, measured on
+            # Desktop-authored shapes): the `shape` vintage carries it as
+            # outline.lineColor, basicShape as line.lineColor — the generic
+            # outline.color matched no measured shape, so the authored
+            # colour rendered as Desktop's default stroke.
+            if visual_type == "shape":
+                props["lineColor"] = _solid_color(ol["color"])
+            elif visual_type != "basicShape":
+                props["color"] = _solid_color(ol["color"])
+        if visual_type == "basicShape":
+            line_props = {}
+            if "color" in ol: line_props["lineColor"] = _solid_color(ol["color"])
+            if "weight" in ol: line_props["weight"] = _pbi_lit(int(ol["weight"]))
+            if "transparency" in ol:
+                line_props["transparency"] = _pbi_lit(float(ol["transparency"]))
+            _add("line", line_props)
+            props.pop("weight", None)
         _add("outline", props)
 
     # --- shape (buttons, shapes) ---
@@ -1070,7 +1087,27 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
         sh = fmt["shape"]
         props = {}
         if "map" in sh: props["map"] = _pbi_lit(sh["map"])
-        if "rotation" in sh: props["rotation"] = _pbi_lit(int(sh["rotation"]))
+        # Geometry (issue #47): line vs rectangle vs oval vs arrow. Measured
+        # Desktop shapes carry shape.tileShape (`shape` vintage) or
+        # general.shapeType (basicShape).
+        geometry = sh.get("tileShape", sh.get("geometry"))
+        if geometry is not None:
+            if visual_type == "basicShape":
+                _add("general", {"shapeType": _pbi_lit(geometry)})
+            else:
+                props["tileShape"] = _pbi_lit(geometry)
+        if "rotation" in sh:
+            # Rotation lives on its OWN card in every measured Desktop shape
+            # (issue #47): rotation.shapeAngle on `shape`,
+            # rotation.angle on basicShape — never shape.rotation, which
+            # Desktop ignores. Non-shape visuals keep the legacy spelling.
+            if visual_type == "shape":
+                _add("rotation",
+                     {"shapeAngle": _pbi_lit(float(sh["rotation"]))})
+            elif visual_type == "basicShape":
+                _add("rotation", {"angle": _pbi_lit(float(sh["rotation"]))})
+            else:
+                props["rotation"] = _pbi_lit(int(sh["rotation"]))
         _add("shape", props)
 
     # --- fill (shape fill) ---
@@ -1120,14 +1157,36 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
         if "innerRadius" in sl: props["innerRadiusRatio"] = _pbi_lit(int(sl["innerRadius"]))
         _add("slices", props)
 
-    # --- general (objects — action buttons) ---
+    # --- action (vcObjects.visualLink — action buttons) ---
     if "action" in fmt:
         ac = fmt["action"]
         props = {}
+        # Desktop-authored buttons carry the action in vcObjects.visualLink
+        # (issue #48, measured): this key used to write objects.visualLink,
+        # a bucket no Desktop button reads — the documented `action` key
+        # produced a persisted-but-dead action.
+        if "show" in ac: props["show"] = _pbi_lit(ac["show"])
         if "type" in ac: props["type"] = _pbi_lit(ac["type"])
         if "navigationSection" in ac: props["navigationSection"] = _pbi_lit(ac["navigationSection"])
         if "bookmark" in ac: props["bookmark"] = _pbi_lit(ac["bookmark"])
-        _add("visualLink", props)
+        if "webUrl" in ac: props["webUrl"] = _pbi_lit(ac["webUrl"])
+        if "tooltip" in ac: props["tooltip"] = _pbi_lit(ac["tooltip"])
+        _add_vc("visualLink", props)
+
+    # --- text (actionButton label; objects.text with the default-state
+    # selector, matching Desktop-authored buttons — issue #48) ---
+    if "text" in fmt and visual_type == "actionButton":
+        tx = fmt["text"]
+        if isinstance(tx, str):
+            tx = {"text": tx, "show": True}
+        props = {}
+        if "text" in tx: props["text"] = _pbi_lit(tx["text"])
+        if "show" in tx: props["show"] = _pbi_lit(tx["show"])
+        if "fontSize" in tx: props["fontSize"] = _pbi_lit(float(tx["fontSize"]))
+        if "fontColor" in tx: props["fontColor"] = _solid_color(tx["fontColor"])
+        if props:
+            objects["text"] = [{"properties": props,
+                                "selector": {"id": "default"}}]
 
     # --- smallMultiples ---
     if "smallMultiples" in fmt:
@@ -1259,6 +1318,7 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
         if "showDefaultTooltip" in vl: props["showDefaultTooltip"] = _pbi_lit(vl["showDefaultTooltip"])
         if "navigationSection" in vl: props["navigationSection"] = _pbi_lit(vl["navigationSection"])
         if "bookmark" in vl: props["bookmark"] = _pbi_lit(vl["bookmark"])
+        if "webUrl" in vl: props["webUrl"] = _pbi_lit(vl["webUrl"])
         _add_vc("visualLink", props)
 
     # --- visualHeaderTooltip (vcObjects) ---

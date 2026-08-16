@@ -410,3 +410,108 @@ class TestCategoryLabelColorByVisualType:
         finally:
             server._open_files.pop(alias2, None)
             server._dax_cache.pop(alias2, None)
+
+
+class TestShapeAndButtonFormatting:
+    """Issues #47 + #48: pbix_format_visual wrote shape/button properties no
+    Desktop-authored visual carries. Measured ground truth (write -> save ->
+    reopen -> readback): rotation lives on its OWN card (rotation.shapeAngle
+    on `shape`, rotation.angle on basicShape — never shape.rotation), the
+    stroke colour is lineColor (outline card on `shape`, line card on
+    basicShape — never the generic outline.color), geometry is
+    shape.tileShape / general.shapeType, and a button's action lives in
+    vcObjects.visualLink (objects.visualLink is a dead bucket) with webUrl
+    supported and an objects.text default-state label."""
+
+    @pytest.fixture()
+    def gap_report(self, tmp_path):
+        import uuid as _uuid
+        alias = "gp_" + _uuid.uuid4().hex[:8]
+        p = str(tmp_path / "gaps.pbix")
+        tables = [{"name": "T", "columns": [
+            {"name": "V", "data_type": "Double"}], "rows": [{"V": 1.0}]}]
+        assert json.loads(server.pbix_create(
+            p, alias, json.dumps(tables)))["success"]
+        for vt in ("shape", "basicShape", "actionButton"):
+            assert json.loads(server.pbix_add_visual(
+                alias, 0, vt, 40, 40, 200, 100, ""))["success"]
+        yield alias, p
+        server._open_files.pop(alias, None)
+        server._dax_cache.pop(alias, None)
+
+    def _saved_visuals(self, alias, tmp_path):
+        out = str(tmp_path / "saved.pbix")
+        assert json.loads(server.pbix_save(
+            alias, output_path=out, overwrite=True))["success"]
+        server._open_files.pop(alias, None)
+        alias2 = alias + "_r"
+        assert json.loads(server.pbix_open(out, alias2))["success"]
+        raw = json.loads(json.loads(
+            server.pbix_get_layout_raw(alias2))["message"])
+        server._open_files.pop(alias2, None)
+        server._dax_cache.pop(alias2, None)
+        return [json.loads(vc["config"])["singleVisual"]
+                for vc in raw["sections"][0]["visualContainers"]]
+
+    def test_shape_writes_measured_property_names(self, gap_report, tmp_path):
+        alias, _p = gap_report
+        assert json.loads(server.pbix_format_visual(alias, 0, 0, json.dumps({
+            "shape": {"rotation": 30, "tileShape": "line"},
+            "outline": {"show": True, "weight": 2, "color": "#0000FF"},
+        })))["success"]
+        sv = self._saved_visuals(alias, tmp_path)[0]
+        o = sv["objects"]
+        rot = o["rotation"][0]["properties"]
+        assert "shapeAngle" in rot and "30" in json.dumps(rot["shapeAngle"])
+        shp = o["shape"][0]["properties"]
+        assert "tileShape" in shp and "'line'" in json.dumps(shp["tileShape"])
+        assert "rotation" not in shp
+        ol = o["outline"][0]["properties"]
+        assert "lineColor" in ol and "#0000FF" in json.dumps(ol["lineColor"])
+        assert "color" not in ol
+
+    def test_basicshape_writes_measured_property_names(self, gap_report,
+                                                       tmp_path):
+        alias, _p = gap_report
+        assert json.loads(server.pbix_format_visual(alias, 0, 1, json.dumps({
+            "shape": {"rotation": 45, "geometry": "rectangle"},
+            "outline": {"color": "#FF0000", "weight": 3},
+        })))["success"]
+        sv = self._saved_visuals(alias, tmp_path)[1]
+        o = sv["objects"]
+        assert "angle" in o["rotation"][0]["properties"]
+        assert "shapeType" in o["general"][0]["properties"]
+        ln = o["line"][0]["properties"]
+        assert "lineColor" in ln and "#FF0000" in json.dumps(ln["lineColor"])
+
+    def test_action_writes_vcobjects_with_weburl_and_text_label(
+            self, gap_report, tmp_path):
+        alias, _p = gap_report
+        assert json.loads(server.pbix_format_visual(alias, 0, 2, json.dumps({
+            "text": {"text": "Open docs", "show": True},
+            "action": {"show": True, "type": "WebUrl",
+                       "webUrl": "https://example.com/x"},
+        })))["success"]
+        sv = self._saved_visuals(alias, tmp_path)[2]
+        vl = sv["vcObjects"]["visualLink"][0]["properties"]
+        assert "'WebUrl'" in json.dumps(vl["type"])
+        assert "https://example.com/x" in json.dumps(vl["webUrl"])
+        assert "show" in vl
+        # the dead bucket must NOT be written
+        assert "visualLink" not in sv["objects"]
+        txt = sv["objects"]["text"][0]
+        assert txt["selector"] == {"id": "default"}
+        assert "'Open docs'" in json.dumps(txt["properties"]["text"])
+
+    def test_non_shape_visuals_keep_legacy_spellings(self, gap_report,
+                                                     tmp_path):
+        # a table's outline keeps the generic color property — only shape
+        # vintages get the per-visual names
+        alias, _p = gap_report
+        assert json.loads(server.pbix_add_visual(
+            alias, 0, "tableEx", 300, 40, 200, 100, ""))["success"]
+        assert json.loads(server.pbix_format_visual(alias, 0, 3, json.dumps({
+            "outline": {"color": "#123456"}})))["success"]
+        sv = self._saved_visuals(alias, tmp_path)[3]
+        ol = sv["objects"]["outline"][0]["properties"]
+        assert "color" in ol and "lineColor" not in ol

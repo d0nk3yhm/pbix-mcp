@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.92] - 2026-08-17
+
+### Fixed — shape and actionButton formatting keys match measured Desktop visuals (issues #47, #48)
+
+- **Shape rotation landed on the `shape` card as `rotation`** — a property
+  no measured Desktop shape carries; Desktop ignored it. It now writes the
+  measured card: `rotation.shapeAngle` on `shape`, `rotation.angle` on
+  `basicShape` (other visual types keep the legacy spelling).
+- **Outline stroke colour was written as the generic `outline.color`**,
+  which matches no measured shape — the authored colour rendered as
+  Desktop's default stroke (the #45 silent class). It now writes
+  `lineColor`: on the `outline` card for `shape`, on the `line` card
+  (with weight/transparency) for `basicShape`; non-shape visuals keep the
+  generic spelling.
+- **No formatting key existed for shape geometry** — `shape.tileShape` /
+  `shape.geometry` now writes `shape.tileShape` (`shape`) or
+  `general.shapeType` (`basicShape`), so line/rectangle/oval/arrow no
+  longer needs hand-built config_json (QlikView line/arrow conversion).
+- **The `action` key wrote `objects.visualLink`** — a bucket no
+  Desktop-authored button reads — producing persisted-but-dead actions.
+  It now writes `vcObjects.visualLink` (the measured bucket) and gained
+  `show`, `webUrl` and `tooltip`; the `visualLink` key also gained
+  `webUrl`, so a `type: "WebUrl"` action can carry its URL.
+- **New `text` formatting key for actionButton labels** — writes
+  `objects.text` with the measured default-state selector
+  (`{"id": "default"}`); accepts a bare string or
+  `{text, show, fontSize, fontColor}`.
+- Pinned by `tests/test_report_editing.py::TestShapeAndButtonFormatting`
+  (the issues' own write → save → reopen → readback protocol on all three
+  visual types, wrong spellings asserted ABSENT, plus a tableEx control
+  keeping the legacy outline spelling).
+
 ## [0.9.91] - 2026-08-16
 
 ### Added — streaming/append row load (issue #46). 131 tools (was 130)
