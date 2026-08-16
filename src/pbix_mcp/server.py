@@ -2219,6 +2219,35 @@ def pbix_duplicate_visual(alias: str, page: str, visual_index: int,
         raise LayoutParseError(str(e))
 
 
+def _read_ndjson_rows(path: str) -> list[dict]:
+    """Stream an NDJSON file (one JSON object per line) into a row list.
+
+    The STREAMING row source (issue #46): a caller converting a large table
+    writes batches to the file and frees them as it goes, then hands over
+    the path — instead of holding source rows + a row-dict list + the whole
+    serialized JSON text simultaneously (measured at 3x the data size).
+    Blank lines are skipped; a malformed line errors with its line number.
+    """
+    rows: list[dict] = []
+    with open(path, "r", encoding="utf-8-sig") as f:
+        for ln, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"{path}:{ln}: not valid JSON ({e.msg}). NDJSON needs "
+                    f"exactly one JSON object per line.") from e
+            if not isinstance(obj, dict):
+                raise ValueError(
+                    f"{path}:{ln}: expected a JSON object per line, got "
+                    f"{type(obj).__name__}.")
+            rows.append(obj)
+    return rows
+
+
 @mcp.tool()
 def pbix_create(
     file_path: str,
@@ -2242,6 +2271,12 @@ def pbix_create(
               "rows": [{"Amount": 100.0, "Product": "Widget"}]}]'
             Supported data_type values: String, Int64, Double, DateTime, Decimal, Boolean
             Optional per-table fields:
+            - "rows_path": path to an NDJSON file (one JSON row object per
+              line) used INSTEAD of inline "rows" — the streaming row source
+              for large tables: write batches to the file and free them,
+              then pass the path, instead of serializing the whole dataset
+              into this one string (which costs ~3x the data size in RAM).
+              Mutually exclusive with "rows".
             - "source_csv": "/path/to/data.csv" — M expression references CSV for Refresh
             - "source_db": {"type": "sqlserver", "server": "localhost", "database": "mydb",
               "table": "orders"} — M expression references database for Refresh/DirectQuery.
@@ -2267,10 +2302,23 @@ def pbix_create(
 
         if tables_json:
             for tdef in json.loads(tables_json):
+                rows = tdef.get("rows")
+                rows_path = tdef.get("rows_path")
+                if rows_path:
+                    if rows:
+                        return ToolResponse.error(
+                            f"Table '{tdef.get('name')}': 'rows' and "
+                            f"'rows_path' are mutually exclusive — pass one "
+                            f"row source.", "INVALID_INPUT").to_text()
+                    if not os.path.exists(rows_path):
+                        return ToolResponse.error(
+                            f"Table '{tdef.get('name')}': rows_path not "
+                            f"found: {rows_path}", "INVALID_INPUT").to_text()
+                    rows = _read_ndjson_rows(rows_path)
                 builder.add_table(
                     tdef["name"],
                     tdef.get("columns", []),
-                    rows=tdef.get("rows"),
+                    rows=rows,
                     hidden=tdef.get("hidden", False),
                     source_csv=tdef.get("source_csv"),
                     source_db=tdef.get("source_db"),
@@ -9478,6 +9526,138 @@ def pbix_update_table_rows(alias: str, table_name: str, rows_json: str) -> str:
         ).to_text()
     except json.JSONDecodeError as e:
         return ToolResponse.error(f"Invalid JSON: {e}", ABFRebuildError.code).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_append_table_rows(alias: str, table_name: str, rows_json: str = "",
+                           rows_path: str = "") -> str:
+    """APPEND rows to an existing table (issue #46 — the batching load).
+
+    Unlike pbix_set_table_data / pbix_update_table_rows, which REPLACE the
+    table's rows, this reads the current rows from VertiPaq, extends them
+    with the batch, and re-encodes — so a large load can be pushed in
+    batches, each call freeing the previous batch on the caller's side.
+    Column schema is inferred from the existing table (like
+    pbix_update_table_rows); missing keys in a batch row store as NULL.
+
+    Cost note: every call re-encodes the WHOLE table (VertiPaq needs the
+    full column view), so appending N batches costs O(N * table size). For
+    a single huge initial load, prefer the streaming source instead:
+    pbix_create's per-table "rows_path" (an NDJSON file) encodes once.
+
+    Args:
+        alias: The alias of the open file
+        table_name: Name of the existing table
+        rows_json: JSON array of row objects to append
+        rows_path: Path to an NDJSON file (one JSON row object per line) to
+            append instead of rows_json — mutually exclusive with it.
+    """
+    try:
+        info = _ensure_open(alias)
+        if bool(rows_json) == bool(rows_path):
+            return ToolResponse.error(
+                "Pass exactly one of rows_json or rows_path.",
+                "INVALID_INPUT").to_text()
+        if rows_path:
+            if not os.path.exists(rows_path):
+                return ToolResponse.error(
+                    f"rows_path not found: {rows_path}",
+                    "INVALID_INPUT").to_text()
+            new_rows = _read_ndjson_rows(rows_path)
+        else:
+            new_rows = json.loads(rows_json)
+            if not isinstance(new_rows, list):
+                return ToolResponse.error(
+                    "rows_json must be a JSON array of row objects.",
+                    "INVALID_INPUT").to_text()
+        if not new_rows:
+            return ToolResponse.error(
+                "No rows to append.", "INVALID_INPUT").to_text()
+
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error("No DataModel found.", DataModelCompressionError.code).to_text()
+
+        from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
+        from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
+        from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
+
+        with open(dm_path, "rb") as f:
+            dm_bytes = f.read()
+        abf = decompress_datamodel(dm_bytes)
+        meta_bytes = read_metadata_sqlite(abf)
+
+        # Existing schema (data columns only — calculated columns are
+        # recomputed by the rebuild's preservation pass).
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.write(meta_bytes)
+        tmp.close()
+        conn = None
+        try:
+            conn = sqlite3.connect(tmp.name)
+            conn.row_factory = sqlite3.Row
+            _AMO_TO_TYPE = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime",
+                            10: "Decimal", 11: "Boolean"}
+            col_rows = conn.execute(
+                """SELECT c.ExplicitName, c.ExplicitDataType, c.DataCategory
+                   FROM [Column] c
+                   JOIN [Table] t ON c.TableID = t.ID
+                   WHERE t.Name = ? AND c.Type = 1
+                   ORDER BY c.ID""",
+                (table_name,)).fetchall()
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+        if not col_rows:
+            return ToolResponse.error(
+                f"Table '{table_name}' not found or has no user columns.",
+                "TABLE_NOT_FOUND").to_text()
+        columns = [{"name": cr["ExplicitName"],
+                    "data_type": _AMO_TO_TYPE.get(cr["ExplicitDataType"], "String"),
+                    "data_category": cr["DataCategory"]}
+                   for cr in col_rows]
+        col_names = [c["name"] for c in columns]
+
+        # Current rows from VertiPaq (data columns only, matching the schema).
+        td = read_table_from_abf(abf, table_name, meta_bytes,
+                                 include_calculated=False)
+        existing_cols = td.get("columns") or []
+        idx = {c: existing_cols.index(c) for c in col_names
+               if c in existing_cols}
+        combined = [
+            {c: (row[idx[c]] if c in idx else None) for c in col_names}
+            for row in (td.get("rows") or [])
+        ]
+        prev_count = len(combined)
+        combined.extend(new_rows)
+
+        old_size, new_size = _rebuild_preserving_calc(
+            alias, info,
+            table_updates={table_name: {"columns": columns, "rows": combined}},
+        )
+        info["modified"] = True
+        return ToolResponse.ok(
+            f"Table '{table_name}': appended {len(new_rows)} rows "
+            f"({prev_count:,} -> {len(combined):,})\n"
+            f"  Columns: {', '.join(col_names)}\n"
+            f"  DataModel: {old_size:,} → {new_size:,} bytes"
+        ).to_text()
+    except json.JSONDecodeError as e:
+        return ToolResponse.error(f"Invalid JSON: {e}", ABFRebuildError.code).to_text()
+    except ValueError as e:
+        return ToolResponse.error(str(e), "INVALID_INPUT").to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:

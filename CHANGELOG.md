@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.91] - 2026-08-16
+
+### Added — streaming/append row load (issue #46). 131 tools (was 130)
+
+- **NDJSON streaming row source**: `pbix_create`'s per-table specs accept
+  `"rows_path"` — a file with one JSON row object per line — instead of
+  inline `"rows"`. A caller converting a large table writes batches to the
+  file and frees them as it goes, then passes the path, instead of holding
+  source rows + a row-dict list + the whole serialized JSON string
+  simultaneously (measured by the reporter at ~3x the data size; a 2.94M-row
+  conversion peaked at 10.1 GB and had to be killed, while the encoder
+  itself is linear at ~149 µs/row). Malformed lines error with their line
+  number; `rows` and `rows_path` are mutually exclusive.
+- **`pbix_append_table_rows`** — ADDS rows to an existing table (both prior
+  row APIs were replace-only, making batching impossible). Schema inferred
+  from the existing table like `pbix_update_table_rows`; missing keys store
+  as NULL; accepts `rows_json` or an NDJSON `rows_path`. Documented cost:
+  each call re-encodes the whole table (VertiPaq needs the full column
+  view), so a single huge initial load should prefer `rows_path` on create.
+- Pinned by `tests/test_streaming_rows.py` (8 tests: create-from-NDJSON,
+  mutual exclusion, missing file, malformed-line line numbers, append
+  accumulates + persists through save/reopen with exact COUNTROWS/SUM,
+  missing keys → NULL, error paths). The doc ratchet also caught — and
+  this release fixes before it ever shipped — a helper accidentally
+  registered as an MCP tool in place of `pbix_create`.
+
 ## [0.9.90] - 2026-08-15
 
 ### Fixed — categoryLabels.color keyed off the visual type (issue #45)
