@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.93] - 2026-08-17
+
+### Fixed — CALCULATE filter-argument semantics (issues #49, #50)
+
+- **Filter arguments now evaluate in the OUTER filter context** (issue
+  #49). They were evaluated sequentially against the context as already
+  modified by the preceding arguments, so
+  `CALCULATE(MAX(col), ALLSELECTED(), VALUES(T[dim]))` had VALUES see the
+  post-ALLSELECTED (widened) context and return every dim value — only
+  133/231 grouped cells matched Desktop. Every evaluation site in the
+  filter loop (table/FILTER args, TREATAS, time-intelligence, DATEADD /
+  SAMEPERIODLASTYEAR, predicate value expressions) now reads the outer
+  context while its result still lands on the cumulative context, so
+  multiple filter arguments continue to AND together.
+- **Bare `REMOVEFILTERS()` was a silent no-op** (issue #50) — the
+  reference regex cannot match empty parens, so
+  `CALCULATE(expr, REMOVEFILTERS())` evaluated identically to `expr`. It
+  now clears every filter in the context, slicer selection included.
+- **`ALLEXCEPT` as a CALCULATE argument was a silent no-op** (issue #50) —
+  it starts with `ALL`, landed in the generic ALL branch, and its
+  multi-argument call defeated the single-reference regex there. It now
+  clears every filter on the named table — propagated filters included,
+  with the same live-filter snapshot `ALL(Table)` uses — except the listed
+  columns' own filters.
+- Pinned by `tests/test_issue49_50_calculate.py` (grouped-evaluation
+  repros from the issues; five of the six tests fail on the pre-fix
+  engine).
+
 ## [0.9.92] - 2026-08-17
 
 ### Fixed — shape and actionButton formatting keys match measured Desktop visuals (issues #47, #48)

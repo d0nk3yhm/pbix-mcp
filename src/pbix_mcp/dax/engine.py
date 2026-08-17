@@ -4030,6 +4030,54 @@ class DAXEngine:
                         [k for k in new_ctx.filter_context
                          if k not in outer_sel]).with_filters(outer_sel)
                     continue
+                # Bare REMOVEFILTERS() / ALL() — same empty-paren blind spot as
+                # bare ALLSELECTED() above: the reference regex cannot match
+                # empty parens, so CALCULATE(expr, REMOVEFILTERS()) evaluated
+                # identically to expr (issue #50 — only the 33/231 grouped
+                # cells whose own value happened to equal the all-cleared
+                # value looked right). Desktop clears EVERY filter in the
+                # context, whatever table it sits on.
+                if not selected and re.match(
+                        r"(?is)^(?:REMOVEFILTERS|ALL)\s*\(\s*\)\s*$",
+                        filter_arg.strip()):
+                    new_ctx = new_ctx.without_filters(
+                        list(new_ctx.filter_context.keys()))
+                    continue
+                # ALLEXCEPT('T', T[keep1], ...) — starts with "ALL" so it
+                # landed here, but the single-reference regex below cannot
+                # parse a multi-argument call, so it fell through as a SILENT
+                # NO-OP (issue #50; the standalone parser's __ALLEXCEPT__
+                # marker had no consumer either). Desktop semantics: ALL(T),
+                # then put back the filters on the listed columns — i.e. clear
+                # every filter on T except the kept columns' own.
+                if filter_arg.upper().startswith('ALLEXCEPT'):
+                    _inner = filter_arg[filter_arg.find('(') + 1:
+                                        filter_arg.rfind(')')]
+                    _parts = self._split_args(_inner)
+                    if _parts:
+                        _tbl = _parts[0].strip().strip("'")
+                        _kept = set()
+                        for _p in _parts[1:]:
+                            _km = re.match(
+                                r"^\s*'?([^'\[\]]+?)'?\s*\[([^\]]+)\]\s*$",
+                                _p.strip())
+                            if _km:
+                                _kept.add(f"{_km.group(1).strip()}."
+                                          f"{_km.group(2).strip()}")
+                        new_ctx = new_ctx.without_filters(
+                            [k for k in new_ctx.filter_context
+                             if k.startswith(f"{_tbl}.") and k not in _kept])
+                        # Same propagation stop ALL(Table) applies below: a
+                        # filter reaching T through a relationship is a filter
+                        # on T's columns and ALLEXCEPT clears it too. The
+                        # snapshot skips direct `T.` keys, so the kept
+                        # columns' own filters stay in force.
+                        new_ctx._no_propagate = new_ctx._no_propagate | {_tbl}
+                        new_ctx._no_prop_keys = {
+                            **new_ctx._no_prop_keys,
+                            _tbl: new_ctx._filter_snapshot(_tbl),
+                        }
+                    continue
                 # Extract the column/table reference. Exclude [ ] from the table
                 # capture so an UNQUOTED Sales[Region] splits into table=Sales +
                 # col=Region (else the whole "Sales[Region]" was captured as a
@@ -4091,21 +4139,23 @@ class DAXEngine:
                         }
                 continue
 
-            # DATEADD
+            # DATEADD — the shift is computed from the OUTER context (issue
+            # #49: Desktop evaluates every filter argument there), then its
+            # delta lands on the cumulative new_ctx.
             if filter_arg.upper().startswith('DATEADD'):
-                _shifted_ctx = self._apply_dateadd_filter(filter_arg, new_ctx)
+                _shifted_ctx = self._apply_dateadd_filter(filter_arg, ctx)
                 if _shifted_ctx is None:
                     return None          # period outside the date table -> BLANK
-                new_ctx = _shifted_ctx
+                new_ctx = self._rebase_filter_delta(ctx, _shifted_ctx, new_ctx)
                 continue
 
             # SAMEPERIODLASTYEAR
             if filter_arg.upper().startswith('SAMEPERIODLASTYEAR'):
                 _shifted_ctx = self._apply_dateadd_filter(
-                    f"DATEADD({filter_arg[19:-1].strip()}, -1, YEAR)", new_ctx)
+                    f"DATEADD({filter_arg[19:-1].strip()}, -1, YEAR)", ctx)
                 if _shifted_ctx is None:
                     return None          # period outside the date table -> BLANK
-                new_ctx = _shifted_ctx
+                new_ctx = self._rebase_filter_delta(ctx, _shifted_ctx, new_ctx)
                 continue
 
             # USERELATIONSHIP(col1, col2) — activate a specific (usually inactive)
@@ -4122,9 +4172,10 @@ class DAXEngine:
                 new_ctx = self._apply_crossfilter(filter_arg, new_ctx)
                 continue
 
-            # TREATAS
+            # TREATAS — evaluated in the OUTER context (issue #49), applied
+            # to the cumulative new_ctx.
             if filter_arg.upper().startswith('TREATAS'):
-                result = self._eval_expr(filter_arg, new_ctx)
+                result = self._eval_expr(filter_arg, ctx)
                 if isinstance(result, dict) and '__treatas__' in result:
                     extra = {}
                     for fk, fv in result.items():
@@ -4143,7 +4194,9 @@ class DAXEngine:
                            'DATESBETWEEN', 'DATESINPERIOD')
             fa_upper = filter_arg.upper().split('(')[0].strip()
             if fa_upper in ti_prefixes:
-                result = self._eval_expr(filter_arg, new_ctx)
+                # Evaluated in the OUTER context (issue #49); the date-key
+                # replacement below still applies to the cumulative new_ctx.
+                result = self._eval_expr(filter_arg, ctx)
                 if isinstance(result, list) and not result:
                     # A period that falls OUTSIDE the date table is an empty
                     # filter table, and an empty filter table means BLANK -- the
@@ -4175,8 +4228,16 @@ class DAXEngine:
 
             # FILTER(table, condition) or other table-returning expressions
             # Evaluate the filter arg — if it returns a list of row dicts,
-            # extract filter values grouped by table.column
-            result = self._eval_expr(filter_arg, new_ctx)
+            # extract filter values grouped by table.column.
+            #
+            # Evaluated against the OUTER ctx, not new_ctx: Desktop evaluates
+            # CALCULATE's filter arguments independently in the outer filter
+            # context and only THEN intersects/applies them (issue #49).
+            # Sequential evaluation made VALUES(T[dim]) see the context
+            # ALLSELECTED() had already widened, so
+            # CALCULATE(MAX(col), ALLSELECTED(), VALUES(T[dim])) restored
+            # only 133/231 grouped cells.
+            result = self._eval_expr(filter_arg, ctx)
             if isinstance(result, list) and not result:
                 # An EMPTY filter table removes every row, so the expression is
                 # BLANK. Falling through here treated it as "no filter at all"
@@ -4253,7 +4314,7 @@ class DAXEngine:
             # KEEPFILTERS peeled. Handled BEFORE the legacy equality regex below,
             # which would otherwise match the wrapper text of NOT(T[C] = v) and
             # register a filter on a column named "NOT(T".
-            spec = self._calculate_filter_spec(filter_arg, new_ctx)
+            spec = self._calculate_filter_spec(filter_arg, ctx)
             if spec:
                 key, value, keep = spec
                 if keep and key not in applied_here:
@@ -4276,7 +4337,7 @@ class DAXEngine:
             if eq_match:
                 tbl_name = eq_match.group(1).strip()
                 col_name = eq_match.group(2).strip()
-                val = self._eval_expr(eq_match.group(3).strip(), new_ctx)
+                val = self._eval_expr(eq_match.group(3).strip(), ctx)
                 if val is not None:
                     new_ctx = new_ctx.with_filters({f"{tbl_name}.{col_name}": [val]})
                 continue
@@ -4468,6 +4529,36 @@ class DAXEngine:
                           ctx.date_column, ctx.filter_context, new_rels)
         _nc._filter_idx_cache = ctx._filter_idx_cache
         return _nc
+
+    @staticmethod
+    def _rebase_filter_delta(base: DAXContext, shifted: DAXContext,
+                             target: DAXContext) -> DAXContext:
+        """Apply the filter delta between ``base`` and ``shifted`` to ``target``.
+
+        CALCULATE evaluates every filter argument in the OUTER filter context
+        (issue #49), so a time-intel shift is computed from ``base`` (the outer
+        ctx) — but its result must land on ``target``, the context the
+        preceding filter arguments already built, or those arguments would be
+        silently discarded.
+        """
+        removed = [k for k in base.filter_context
+                   if k not in shifted.filter_context
+                   and k in target.filter_context]
+        changed = {}
+        for k, v in shifted.filter_context.items():
+            old = base.filter_context.get(k)
+            if old is v:
+                continue
+            try:
+                if old == v:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            changed[k] = v
+        out = target.without_filters(removed) if removed else target
+        if changed:
+            out = out.with_filters(changed)
+        return out
 
     def _apply_dateadd_filter(self, expr: str,
                               ctx: DAXContext) -> Optional[DAXContext]:
