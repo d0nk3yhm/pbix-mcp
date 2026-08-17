@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.96] - 2026-08-17
+
+### Fixed — names that collide only by case are refused instead of producing an unopenable file (issue #53)
+
+- **`pbix_create` accepted two columns whose names differed only by case**
+  (`DEST_WAC` and `Dest_WAC`), built successfully, gave both distinct
+  internal ids, and every engine-side readback showed two columns — but
+  Analysis Services treats column names as case-insensitive, so Power BI
+  Desktop refused the saved file with *"The Column with the name of
+  'Dest_WAC' already exists in the 'T' Table"*. Nothing engine-side could
+  fault the file, so the first symptom was a customer double-clicking it.
+  Pre-build validation now rejects the collision, naming **both** spellings
+  so the caller can decide which to keep, and writes no file. Exact
+  duplicates are caught by the same check (they previously died deep in the
+  encoder with `UNIQUE constraint failed: AttributeHierarchy.ID`).
+- The same rule is applied to **table** names, which produce the identically
+  unopenable file.
+- Because the check lives in the builder's pre-build pass, it covers every
+  path that rebuilds — `pbix_create`, `pbix_set_table_data` and
+  `pbix_append_table_rows` alike, so an EDIT cannot introduce a collision
+  either.
+- **`pbix_doctor` gained a "Table / column name collisions" check** for files
+  already written this way. The issue's core complaint was that a silent
+  accept could not be checked by any engine-side readback; now it can.
+- Same failure class as #43 (case-colliding *values* in one column), one
+  level up, and it uses the same casefold identity.
+- Pinned by `tests/test_issue53_name_collisions.py` — the issue's own
+  three-column repro, exact duplicates, an edit-time collision, planted
+  metadata caught end-to-end by the doctor, plus negative controls
+  (shared prefixes and same-named columns on *different* tables must still
+  build). Six of the eight fail on 0.9.95.
+
+### Fixed — doctor check count in the docs
+
+- README and `docs/tool-contracts.md` advertised a "17-point diagnostic"
+  while `pbix_doctor` ran 19 checks — the invariants added for #43 and #53
+  never reached the prose. Both now say 20, and
+  `tests/test_doc_numbers.py::test_doctor_check_count_matches_docs` ties the
+  number to the code so it cannot drift again.
+
 ## [0.9.95] - 2026-08-17
 
 ### Fixed — bookmarks capture visual state, and both tools return the internal name (issue #52)

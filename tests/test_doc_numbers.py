@@ -107,6 +107,27 @@ def test_tool_count_matches_docs():
         )
 
 
+def _doctor_check_count():
+    """Authoritative pbix_doctor check count: the _check() calls in its body."""
+    import inspect
+    import re
+
+    from pbix_mcp import server
+    return len(re.findall(r'_check\("', inspect.getsource(server.pbix_doctor)))
+
+
+def test_doctor_check_count_matches_docs():
+    """'17-point diagnostic' sat in the docs while the tool ran 19 checks —
+    two invariants (issues #43 and #53) had been added without the prose
+    following. Tie the number to the code so it cannot drift again."""
+    n = _doctor_check_count()
+    phrase = f"{n}-point"
+    for rel in ("README.md", "docs/tool-contracts.md"):
+        assert phrase in _read(rel), (
+            f"{rel} must state '{phrase} diagnostic' (pbix_doctor runs {n} "
+            f"_check() calls).")
+
+
 def _corpus_count():
     """Default public test corpus size = the download script's two dicts."""
     import importlib.util

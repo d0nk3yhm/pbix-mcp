@@ -17120,6 +17120,55 @@ def pbix_doctor(alias: str) -> str:
             return f"{scanned} string dictionaries, no case-folded duplicates"
         _check("String dictionary invariants", check_string_dictionaries)
 
+        # 8c. Name collisions (issue #53): Analysis Services treats table and
+        # column names as CASE-INSENSITIVE, so 'DEST_WAC' and 'Dest_WAC' on
+        # one table are the same name. Nothing engine-side notices — both get
+        # distinct ids and every readback shows two columns — and Desktop
+        # refuses the file with "The Column with the name of 'X' already
+        # exists in the 'T' Table". Files written by pbix-mcp < 0.9.96 can
+        # carry this, and it is otherwise undetectable without Desktop.
+        def check_name_collisions():
+            _init_datamodel()
+            c = db_conn.cursor()
+            offenders = []
+            c.execute("SELECT ID, Name FROM [Table] WHERE ModelID=1")
+            tables = c.fetchall()
+            # Compared by VALUE, not identity: equal short strings are often
+            # the same interned object, so an `is`-based check would miss
+            # exact duplicates.
+            seen_t: dict = {}
+            for _tid, tname in tables:
+                key = str(tname).casefold()
+                if key in seen_t:
+                    offenders.append(f"tables {seen_t[key]!r} vs {tname!r}")
+                else:
+                    seen_t[key] = tname
+            checked = 0
+            for tid, tname in tables:
+                c.execute(
+                    "SELECT COALESCE(ExplicitName, InferredName) FROM [Column] "
+                    "WHERE TableID=?", (tid,))
+                seen_c: dict = {}
+                for (cname,) in c.fetchall():
+                    if not cname:
+                        continue
+                    checked += 1
+                    key = str(cname).casefold()
+                    if key in seen_c:
+                        offenders.append(
+                            f"{tname}[{seen_c[key]}] vs {tname}[{cname}]")
+                    else:
+                        seen_c[key] = cname
+            if offenders:
+                raise Exception(
+                    "case-colliding names (Desktop WILL refuse to open): "
+                    + "; ".join(offenders[:5])
+                    + (f" (+{len(offenders) - 5} more)"
+                       if len(offenders) > 5 else ""))
+            return (f"{len(tables)} tables, {checked} columns, "
+                    f"no case-folded name collisions")
+        _check("Table / column name collisions", check_name_collisions)
+
         # 9. Relationships
         def check_relationships():
             _init_datamodel()

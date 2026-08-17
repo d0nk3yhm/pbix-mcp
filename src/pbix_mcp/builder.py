@@ -1227,6 +1227,24 @@ class PBIXBuilder:
         if not self._tables:
             issues.append("CRITICAL: No tables defined — file will be empty")
 
+        # Table names carry the same case-insensitive rule as column names
+        # (issue #53), and produce the same file Desktop will not open.
+        seen_tables: dict[str, str] = {}
+        for t in self._tables:
+            tname = str(t["name"])
+            key = tname.casefold()
+            if key not in seen_tables:
+                seen_tables[key] = tname
+            else:
+                first = seen_tables[key]
+                same = "duplicate" if first == tname else "differ only by case"
+                issues.append(
+                    f"CRITICAL: Two tables have names that {same}: '{first}' "
+                    f"and '{tname}'. Analysis Services treats table names as "
+                    f"case-insensitive, so Power BI Desktop refuses to open "
+                    f"the file. Rename or drop one of them."
+                )
+
         for t in self._tables:
             if not t["columns"]:
                 # A table with no data columns is a MEASURE-ONLY container (e.g.
@@ -1238,6 +1256,39 @@ class PBIXBuilder:
                         f"{len(t['rows'])} rows")
             elif not t["rows"]:
                 issues.append(f"WARNING: Table '{t['name']}' has no rows (empty table)")
+            # Column names collide CASE-INSENSITIVELY (issue #53). Analysis
+            # Services treats `DEST_WAC` and `Dest_WAC` as one name, but
+            # nothing engine-side notices: the build succeeds, both columns
+            # get distinct internal ids, and every readback (including
+            # pbix_get_model_schema) shows two columns. Desktop then refuses
+            # the file outright — "The Column with the name of 'Dest_WAC'
+            # already exists in the 'T' Table" — so the first person to learn
+            # of it is the customer double-clicking the .pbix. Same class as
+            # #43 (case-colliding VALUES), one level up, and the same
+            # casefold identity that fixed it.
+            seen_cols: dict[str, str] = {}
+            for c in t["columns"]:
+                cname = str(c["name"])
+                key = cname.casefold()
+                if key not in seen_cols:
+                    seen_cols[key] = cname
+                else:
+                    # Compare by VALUE, never by identity: equal short strings
+                    # are often the same interned object, which made an
+                    # `is`-based check miss exact duplicates entirely.
+                    first = seen_cols[key]
+                    same = "duplicate" if first == cname else \
+                        "differ only by case"
+                    issues.append(
+                        f"CRITICAL: Table '{t['name']}' has two columns whose "
+                        f"names {same}: '{first}' and '{cname}'. Analysis "
+                        f"Services treats column names as case-insensitive, "
+                        f"so Power BI Desktop refuses to open the file with "
+                        f"\"The Column with the name of '{cname}' already "
+                        f"exists in the '{t['name']}' Table\". Rename or drop "
+                        f"one of them."
+                    )
+
             # Check row data matches column definitions
             col_names = {c["name"] for c in t["columns"]}
             for i, row in enumerate(t.get("rows", [])):
