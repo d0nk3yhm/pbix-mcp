@@ -515,3 +515,163 @@ class TestShapeAndButtonFormatting:
         sv = self._saved_visuals(alias, tmp_path)[3]
         ol = sv["objects"]["outline"][0]["properties"]
         assert "color" in ol and "lineColor" not in ol
+
+
+class TestComboSecondaryValueAxis:
+    """Issue #51: a combo chart keeps BOTH value axes on the one `valueAxis`
+    card, the secondary under sec*-prefixed property names plus alignZeros.
+    The humanized mapper handled only the primary axis, so every sec* key was
+    dropped and pbix_format_visual refused the whole call — and the refusal
+    named the CARD as unrecognised while listing that same card as supported.
+    Measured names (write -> save -> reopen -> readback)."""
+
+    @pytest.fixture()
+    def combo(self, tmp_path):
+        import uuid as _uuid
+        alias = "cb_" + _uuid.uuid4().hex[:8]
+        p = str(tmp_path / "combo.pbix")
+        tables = [{"name": "T", "columns": [
+            {"name": "V", "data_type": "Double"}], "rows": [{"V": 1.0}]}]
+        assert json.loads(server.pbix_create(
+            p, alias, json.dumps(tables)))["success"]
+        assert json.loads(server.pbix_add_visual(
+            alias, 0, "lineClusteredColumnComboChart",
+            40, 40, 400, 300, ""))["success"]
+        yield alias, p
+        server._open_files.pop(alias, None)
+        server._dax_cache.pop(alias, None)
+
+    def _saved_value_axis(self, alias, tmp_path):
+        out = str(tmp_path / "saved.pbix")
+        assert json.loads(server.pbix_save(
+            alias, output_path=out, overwrite=True))["success"]
+        server._open_files.pop(alias, None)
+        alias2 = alias + "_r"
+        assert json.loads(server.pbix_open(out, alias2))["success"]
+        raw = json.loads(json.loads(
+            server.pbix_get_layout_raw(alias2))["message"])
+        server._open_files.pop(alias2, None)
+        server._dax_cache.pop(alias2, None)
+        sv = json.loads(raw["sections"][0]["visualContainers"][0][
+            "config"])["singleVisual"]
+        return sv["objects"]["valueAxis"][0]["properties"]
+
+    def test_issue_repro_calls_now_apply(self, combo, tmp_path):
+        """The issue's three calls: each returned "none of ['valueAxis'] is a
+        recognised key" and left objects null."""
+        alias, _p = combo
+        for payload in ({"valueAxis": {"secShow": True}},
+                        {"valueAxis": {"secShowAxisTitle": True,
+                                       "secAxisTitle": "Units"}},
+                        {"valueAxis": {"alignZeros": False}}):
+            r = json.loads(server.pbix_format_visual(
+                alias, 0, 0, json.dumps(payload)))
+            assert r["success"], r
+        va = self._saved_value_axis(alias, tmp_path)
+        assert "true" in json.dumps(va["secShow"])
+        assert "true" in json.dumps(va["secShowAxisTitle"])
+        assert "'Units'" in json.dumps(va["secAxisTitle"])
+        assert "false" in json.dumps(va["alignZeros"])
+
+    def test_full_secondary_axis_property_set(self, combo, tmp_path):
+        alias, _p = combo
+        assert json.loads(server.pbix_format_visual(alias, 0, 0, json.dumps({
+            "valueAxis": {
+                "secShow": True, "secFontSize": 11, "secColor": "#FF0000",
+                "secDisplayUnits": "thousands", "secTitle": "Units",
+                "secStart": 0, "secEnd": 500, "alignZeros": True,
+            }})))["success"]
+        va = self._saved_value_axis(alias, tmp_path)
+        assert "11" in json.dumps(va["secFontSize"])
+        assert "#FF0000" in json.dumps(va["secLabelColor"])
+        assert "secLabelDisplayUnits" in va
+        # secTitle mirrors the primary `title`: naming it turns it on
+        assert "true" in json.dumps(va["secShowAxisTitle"])
+        assert "'Units'" in json.dumps(va["secAxisTitle"])
+        assert "0" in json.dumps(va["secStart"])
+        assert "500" in json.dumps(va["secEnd"])
+        assert "true" in json.dumps(va["alignZeros"])
+        # raw Desktop names only — no invented spellings
+        for bad in ("secColor", "secDisplayUnits", "secTitle"):
+            assert bad not in va
+
+    def test_primary_axis_untouched_by_secondary_keys(self, combo, tmp_path):
+        """A sec* write must not disturb the primary axis's own properties."""
+        alias, _p = combo
+        assert json.loads(server.pbix_format_visual(alias, 0, 0, json.dumps({
+            "valueAxis": {"show": True, "title": "Revenue", "start": 0,
+                          "secShow": True, "secStart": 10}})))["success"]
+        va = self._saved_value_axis(alias, tmp_path)
+        assert "'Revenue'" in json.dumps(va["axisTitle"])
+        assert "true" in json.dumps(va["showAxisTitle"])
+        assert "10" in json.dumps(va["secStart"])
+        assert "0" in json.dumps(va["start"])
+        assert "secAxisTitle" not in va
+
+    def test_explicit_secshowaxistitle_beats_sectitle_alias(self, combo,
+                                                            tmp_path):
+        alias, _p = combo
+        assert json.loads(server.pbix_format_visual(alias, 0, 0, json.dumps({
+            "valueAxis": {"secTitle": "Units",
+                          "secShowAxisTitle": False}})))["success"]
+        va = self._saved_value_axis(alias, tmp_path)
+        assert "'Units'" in json.dumps(va["secAxisTitle"])
+        assert "false" in json.dumps(va["secShowAxisTitle"])
+
+
+class TestNothingAppliedMessageNamesProperties:
+    """Issue #51's second problem: the "nothing applied" error called the
+    card unrecognised AND listed it as supported, sending the caller after
+    the wrong bug. It must name the dropped PROPERTIES instead."""
+
+    @pytest.fixture()
+    def chart(self, tmp_path):
+        import uuid as _uuid
+        alias = "na_" + _uuid.uuid4().hex[:8]
+        p = str(tmp_path / "na.pbix")
+        tables = [{"name": "T", "columns": [
+            {"name": "V", "data_type": "Double"}], "rows": [{"V": 1.0}]}]
+        assert json.loads(server.pbix_create(
+            p, alias, json.dumps(tables)))["success"]
+        assert json.loads(server.pbix_add_visual(
+            alias, 0, "columnChart", 40, 40, 200, 100, ""))["success"]
+        yield alias
+        server._open_files.pop(alias, None)
+        server._dax_cache.pop(alias, None)
+
+    def test_recognised_card_with_junk_props_names_the_props(self, chart):
+        r = json.loads(server.pbix_format_visual(chart, 0, 0, json.dumps(
+            {"valueAxis": {"noSuchProperty": 1, "alsoNot": 2}})))
+        assert not r["success"]
+        msg = r["message"]
+        assert "valueAxis: no recognised properties in " in msg
+        assert "alsoNot" in msg and "noSuchProperty" in msg
+        # the self-contradiction is gone: it must not be called unrecognised
+        assert "none of ['valueAxis'] is a recognised key" not in msg
+
+    def test_unknown_card_is_still_reported_as_unrecognised(self, chart):
+        r = json.loads(server.pbix_format_visual(chart, 0, 0, json.dumps(
+            {"notACard": {"x": 1}})))
+        assert not r["success"]
+        assert "unrecognised card(s): ['notACard']" in r["message"]
+
+    def test_internal_underscore_keys_are_not_reported(self, chart):
+        r = json.loads(server.pbix_format_visual(chart, 0, 0, json.dumps(
+            {"valueAxis": {"nope": 1}})))
+        assert not r["success"]
+        assert "_skip_datacolors" not in r["message"]
+
+
+def test_format_cards_constant_matches_mapper():
+    """Ratchet: _FORMAT_CARDS drives the "recognised card" half of the
+    "nothing applied" message, so a card added to the mapper without being
+    listed there would be misreported as unrecognised all over again."""
+    import inspect
+    import re as _re
+    src = inspect.getsource(server._build_format_objects)
+    read = set(_re.findall(r'"([A-Za-z]\w*)"\s+in\s+fmt', src))
+    read |= set(_re.findall(r'fmt\.get\("([A-Za-z]\w*)"', src))
+    read = {k for k in read if not k.startswith("_")}
+    assert read == set(server._FORMAT_CARDS), (
+        f"only in mapper: {sorted(read - set(server._FORMAT_CARDS))}; "
+        f"only in _FORMAT_CARDS: {sorted(set(server._FORMAT_CARDS) - read)}")

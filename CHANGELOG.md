@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.94] - 2026-08-17
+
+### Fixed — combo chart's secondary value axis is reachable from `pbix_format_visual` (issue #51)
+
+- **The humanized `valueAxis` card handled only the PRIMARY axis.** Power BI
+  keeps both of a combo chart's value axes on that one card, the second
+  under `sec`-prefixed property names, and the mapper produced no `sec*`
+  property and no `alignZeros` — so every such key was dropped, the props
+  dict came out empty, and the whole call was refused with the visual left
+  unchanged. The card now writes the measured names `secShow`,
+  `secFontSize`, `secLabelColor`, `secLabelDisplayUnits`, `secAxisTitle`,
+  `secShowAxisTitle`, `secStart`, `secEnd` and `alignZeros`, with friendly
+  aliases `secColor` / `secDisplayUnits` / `secTitle` mapping onto those
+  same measured names (`secTitle` turns the title on, mirroring the
+  primary `title`; an explicit `secShowAxisTitle` still wins).
+- **The "nothing applied" error named the wrong thing.** It called the card
+  unrecognised *and* listed that same card among the supported keys, so a
+  caller went looking for the wrong bug. It now separates a recognised card
+  whose properties were all dropped (`valueAxis: no recognised properties
+  in ['secShow']`) from a genuinely unknown card (`unrecognised card(s):
+  ['notACard']`), names the visual type, and no longer leaks internal
+  underscore-prefixed keys.
+- Pinned by `tests/test_report_editing.py::TestComboSecondaryValueAxis`
+  (the issue's own three repro calls plus the full property set, through
+  write → save → reopen → readback) and
+  `::TestNothingAppliedMessageNamesProperties`, with a
+  `test_format_cards_constant_matches_mapper` ratchet keeping the new
+  `_FORMAT_CARDS` list in step with the cards the mapper actually reads.
+
 ## [0.9.93] - 2026-08-17
 
 ### Fixed — CALCULATE filter-argument semantics (issues #49, #50)

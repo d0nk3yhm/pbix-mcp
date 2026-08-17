@@ -735,6 +735,26 @@ def _solid_color(hex_color: str) -> dict:
     return {"solid": {"color": _pbi_lit(hex_color)}}
 
 
+#: Every format-card name :func:`_build_format_objects` reads out of ``fmt``.
+#: Used ONLY to tell "card I don't know" apart from "card I know whose
+#: properties I all dropped" when nothing was applied (issue #51: the old
+#: message called ``valueAxis`` unrecognised while listing it as supported,
+#: sending the caller after the wrong bug). Kept honest by
+#: ``tests/test_report_editing.py::TestFormatCardsConstantMatchesMapper``,
+#: which scans the mapper for the cards it actually reads.
+_FORMAT_CARDS = frozenset({
+    "title", "subtitle", "background", "border", "dropShadow", "padding",
+    "spacing", "divider", "visualHeader", "visualTooltip", "stylePreset",
+    "altText", "lockAspect", "legend", "dataLabels", "labels",
+    "categoryAxis", "valueAxis", "dataColors", "grid", "columnHeaders",
+    "values", "total", "outline", "shape", "fill", "line", "categoryLabels",
+    "slices", "action", "text", "smallMultiples", "rowHeaders", "subTotals",
+    "referenceLine", "donut", "bubbles", "markers", "imageScaling", "card",
+    "cardTitle", "columnFormatting", "zoom", "general", "visualLink",
+    "visualHeaderTooltip",
+})
+
+
 def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
     """Convert human-readable format dict to PBI objects structures.
 
@@ -988,6 +1008,35 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
         if "end" in va: props["end"] = _pbi_lit(float(va["end"]))
         if "switchAxisPosition" in va: props["switchAxisPosition"] = _pbi_lit(va["switchAxisPosition"])
         if "decimalPlaces" in va: props["labelPrecision"] = _pbi_lit(int(va["decimalPlaces"]))
+        # Secondary axis of a combo chart (issue #51). Power BI keeps BOTH
+        # axes on this one card, the second under `sec`-prefixed property
+        # names, so a combo's secondary axis was unreachable through the
+        # humanized mapper -- every sec* key was dropped and the visual came
+        # back unchanged. Only the measured property names are written; the
+        # friendly aliases below map onto those same names.
+        if "secShow" in va: props["secShow"] = _pbi_lit(va["secShow"])
+        _sec_fs = va.get("secFontSize")
+        if _sec_fs is not None: props["secFontSize"] = _pbi_lit(float(_sec_fs))
+        _sec_color = va.get("secLabelColor", va.get("secColor"))
+        if _sec_color is not None: props["secLabelColor"] = _solid_color(_sec_color)
+        _sec_units = va.get("secLabelDisplayUnits", va.get("secDisplayUnits"))
+        if _sec_units is not None:
+            raw = _DISPLAY_UNITS.get(_sec_units, f"{_sec_units}D")
+            props["secLabelDisplayUnits"] = {"expr": {"Literal": {"Value": raw}}}
+        # `secTitle` mirrors the primary `title`: naming it turns it on.
+        # `secAxisTitle` / `secShowAxisTitle` are the raw pair, and an
+        # explicit secShowAxisTitle wins over the alias's implied True.
+        if "secTitle" in va:
+            props["secShowAxisTitle"] = _pbi_lit(True)
+            props["secAxisTitle"] = _pbi_lit(va["secTitle"])
+        if "secAxisTitle" in va: props["secAxisTitle"] = _pbi_lit(va["secAxisTitle"])
+        if "secShowAxisTitle" in va:
+            props["secShowAxisTitle"] = _pbi_lit(va["secShowAxisTitle"])
+        if "secStart" in va: props["secStart"] = _pbi_lit(float(va["secStart"]))
+        if "secEnd" in va: props["secEnd"] = _pbi_lit(float(va["secEnd"]))
+        # alignZeros pins the two axes' zero lines together — a whole-card
+        # property, not a per-axis one.
+        if "alignZeros" in va: props["alignZeros"] = _pbi_lit(va["alignZeros"])
         _add("valueAxis", props)
 
     # --- dataColors (dataPoint) ---
@@ -3261,9 +3310,13 @@ def pbix_format_visual(
                 position: "top", "bottom", "left", "right", "topCenter"
             categoryAxis: {show, fontSize, color, title, gridlineShow, innerPadding,
                 invertAxis, axisType, start, end, switchAxisPosition}
-            valueAxis: {show, fontSize, displayUnits, title, gridlineShow, start, end,
-                decimalPlaces, switchAxisPosition}
+            valueAxis: {show, fontSize, color, displayUnits, title, titleFontSize,
+                gridlineShow, start, end, decimalPlaces, switchAxisPosition,
+                secShow, secFontSize, secColor, secDisplayUnits, secTitle,
+                secAxisTitle, secShowAxisTitle, secStart, secEnd, alignZeros}
                 displayUnits: "none", "thousands", "millions", "billions", "auto"
+                sec* = a combo chart's SECONDARY value axis (both axes share
+                this one card); alignZeros pins the two zero lines together
             background: {color, transparency}
             border: {show, color, radius, width}
             dropShadow: {show, color, angle, blur, distance, spread, transparency,
@@ -3390,8 +3443,8 @@ def pbix_format_visual(
                 existing_objects["dataPoint"] = dp_entries
                 fmt["_skip_datacolors"] = True  # Skip the single-color fallback
 
-        result = _build_format_objects(
-            fmt, visual_type=sv.get("visualType", ""))
+        visual_type = sv.get("visualType", "")
+        result = _build_format_objects(fmt, visual_type=visual_type)
         new_objects = result.get("_objects", {})
         new_vc_objects = result.get("_vcObjects", {})
 
@@ -3423,14 +3476,33 @@ def pbix_format_visual(
         applied = list(new_objects.keys()) + list(new_vc_objects.keys())
         if not applied:
             # Reporting success for a no-op is the worst failure shape: the
-            # caller believes the formatting landed. Name what was ignored.
-            ignored = sorted(fmt.keys()) if isinstance(fmt, dict) else []
+            # caller believes the formatting landed. Name what was ignored --
+            # and name it ACCURATELY. Blaming the card while listing that same
+            # card as supported (issue #51: "none of ['valueAxis'] is a
+            # recognised key ... Supported keys include: ... valueAxis") sent
+            # the caller after the wrong bug; the real fault was that every
+            # PROPERTY inside the recognised card was dropped.
+            ignored = (sorted(k for k in fmt if not k.startswith("_"))
+                       if isinstance(fmt, dict) else [])
+            known = [k for k in ignored if k in _FORMAT_CARDS]
+            unknown = [k for k in ignored if k not in _FORMAT_CARDS]
+            parts = []
+            for k in known:
+                inner = fmt.get(k)
+                props = (sorted(inner) if isinstance(inner, dict)
+                         else [repr(inner)])
+                parts.append(f"{k}: no recognised properties in {props}")
+            if unknown:
+                parts.append(f"unrecognised card(s): {unknown}")
+            detail = "; ".join(parts) or "(empty input)"
+            vt = f" on visual type '{visual_type}'" if visual_type else ""
             raise LayoutParseError(
-                f"No formatting was applied — none of {ignored or '(empty input)'} "
-                f"is a recognised key, so the visual is unchanged. Supported "
-                f"keys include: title, subtitle, background, border, padding, "
-                f"dataLabels, legend, categoryAxis, valueAxis, dataColors, "
-                f"visualHeader, altText. Values are human-readable, e.g. "
+                f"No formatting was applied{vt}, so the visual is unchanged "
+                f"— {detail}. Some properties are only recognised on the "
+                f"visual type that owns them. Supported cards include: "
+                f"title, subtitle, background, border, padding, dataLabels, "
+                f"legend, categoryAxis, valueAxis, dataColors, visualHeader, "
+                f"altText. Values are human-readable, e.g. "
                 f'{{"title": {{"text": "Sales", "show": true}}}} — not raw '
                 f"Power BI object descriptors.")
 
