@@ -30,7 +30,7 @@ the PBIR `Report/definition/` tree the service produces. Tools go through
 | Duplicate / copy visual across pages | ✅ `pbix_duplicate_visual` | |
 | Format a visual | ✅ `pbix_format_visual`, `pbix_set_visual_property`, `pbix_update_visual_json` | |
 | Sort a visual | ✅ `pbix_set_visual_sort` | |
-| Bookmarks | ✅ `pbix_add_bookmark`, `pbix_get_bookmarks`, `pbix_remove_bookmark` | Persisted to `definition/bookmarks/` on PBIR |
+| Bookmarks | ✅ `pbix_add_bookmark`, `pbix_get_bookmarks`, `pbix_remove_bookmark` | Persisted to `definition/bookmarks/` on PBIR. Captures visual data state (slicer selections, visual filters); `clear_selections` authors a Clear-all bookmark. Both tools return the internal `name` a button's bookmark action needs |
 | Report / page filters | ✅ `pbix_get_filters`, `pbix_set_filters` | |
 | Themes | ✅ `pbix_get_theme`, `pbix_set_theme`, `pbix_recolor`, `pbix_extract_colors` | |
 | Images and resources | ✅ `pbix_add_image`, `pbix_set_image`, `pbix_register_resource`, `pbix_list_resources` | |

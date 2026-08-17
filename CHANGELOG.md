@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.95] - 2026-08-17
+
+### Fixed — bookmarks capture visual state, and both tools return the internal name (issue #52)
+
+- **Every bookmark recorded `singleVisual: {}` for each visual it targeted**,
+  so applying one restored nothing: a slicer selection live at capture time
+  was lost, and no bookmark could clear one either. `pbix_add_bookmark` now
+  captures each targeted visual's data state — the selection at
+  `objects.general[].properties.filter` plus the visual's own filters —
+  controlled by the new `capture_visual_state` (default on; set False for a
+  display-only bookmark).
+- **New `clear_selections` option** records the CLEARED state: each targeted
+  selection is written with its `Where` clause dropped, an explicit "nothing
+  selected" that applying the bookmark restores. An *absent* filter means
+  "do not override", which is why a Clear-all bookmark could not be authored
+  before.
+- **The internal bookmark name is now returned.** An action button's
+  bookmark action must reference it (`vcObjects.visualLink[0].properties.bookmark`),
+  but `pbix_add_bookmark` returned only a message and `pbix_get_bookmarks`
+  listed display names — which are not unique — forcing callers to read
+  `Report/Layout` raw and match on the label. `pbix_add_bookmark` now returns
+  `data.name` (plus displayName, page and index) and `pbix_get_bookmarks`
+  returns a `data.bookmarks` array carrying `name` beside `displayName`,
+  the active section, the targeted visuals and how many of them actually
+  carry state.
+- Per-visual filters are written as the PBIR bookmark schema requires — a
+  `FiltersState` object keyed `byName`, with only the `FilterContainerState`
+  properties that schema allows — not the container's plain array. Verified
+  by the existing `tests/test_pbir_schema_conformance.py`, which rejected the
+  array outright.
+- Pinned by `tests/test_issue52_bookmarks.py` (the issue's own probe: save →
+  close → reopen → read the layout back); all nine fail on 0.9.94.
+- Visibility bookmarks are unchanged: hidden visuals still get
+  `display.mode = "hidden"`, visible ones still omit `mode`.
+
 ## [0.9.94] - 2026-08-17
 
 ### Fixed — combo chart's secondary value axis is reachable from `pbix_format_visual` (issue #51)

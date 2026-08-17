@@ -3752,7 +3752,11 @@ def pbix_set_settings(alias: str, settings_json: str) -> str:
 
 @mcp.tool()
 def pbix_get_bookmarks(alias: str) -> str:
-    """Get report bookmarks.
+    """Get report bookmarks, with the internal name beside the display name.
+
+    An action button's bookmark action references the INTERNAL name
+    (``vcObjects.visualLink[0].properties.bookmark``), and display names are
+    not unique, so both are listed and returned in ``data``.
 
     Args:
         alias: The alias of the open file
@@ -3777,14 +3781,109 @@ def pbix_get_bookmarks(alias: str) -> str:
             return ToolResponse.ok("No bookmarks found.").to_text()
 
         lines = [f"Report has {len(bookmarks)} bookmark(s):\n"]
+        rows = []
         for i, bm in enumerate(bookmarks):
-            name = bm.get("displayName", bm.get("name", f"Bookmark {i}"))
-            lines.append(f"  [{i}] {name}")
-        return ToolResponse.ok("\n".join(lines)).to_text()
+            display = bm.get("displayName", bm.get("name", f"Bookmark {i}"))
+            internal = bm.get("name", "")
+            state = bm.get("explorationState") or {}
+            targets = (bm.get("options") or {}).get("targetVisualNames") or []
+            # How many targeted visuals actually carry state — a bookmark that
+            # targets visuals but records nothing for them restores nothing.
+            containers = {}
+            for sec in (state.get("sections") or {}).values():
+                containers.update(sec.get("visualContainers") or {})
+            with_state = sum(
+                1 for e in containers.values()
+                if e.get("filters")
+                or (e.get("singleVisual") or {}).get("objects"))
+            lines.append(f"  [{i}] {display}  (name: {internal})")
+            rows.append({"index": i, "displayName": display,
+                         "name": internal,
+                         "activeSection": state.get("activeSection", ""),
+                         "targetVisualNames": targets,
+                         "visuals_with_state": with_state})
+        return ToolResponse.ok("\n".join(lines), data={"bookmarks": rows}).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         raise LayoutParseError(str(e))
+
+
+#: Properties a bookmark's FilterContainerState may carry (PBIR bookmark
+#: schema 1.0.0, additionalProperties: false, `name` required).
+_BOOKMARK_FILTER_KEYS = frozenset({
+    "name", "type", "filter", "expression", "restatement", "howCreated",
+    "precedence", "isTransient", "cachedDisplayNames",
+    "filterExpressionMetadata",
+})
+
+
+def _bookmark_visual_state(vc: dict, vc_config: dict, capture: bool,
+                           clear: bool) -> dict:
+    """One visual's data state for a bookmark's ``explorationState``.
+
+    Every bookmark used to record ``{"singleVisual": {}}`` for every visual it
+    targeted, so applying it restored NOTHING — a slicer selection live at
+    capture time was simply lost (issue #52). A slicer's selection lives at
+    ``singleVisual.objects.general[].properties.filter.filter`` (a query
+    filter with a ``Where`` clause) and a visual's own filters live on the
+    CONTAINER, next to ``config``; both are copied here.
+
+    ``clear`` records the same filters with their ``Where`` clause dropped:
+    that is an explicit "nothing selected" state, which applying the bookmark
+    restores, as opposed to an ABSENT filter, which means "do not override".
+    That distinction is what makes a Clear-all bookmark work at all.
+
+    Returns the visualContainer entry's state-bearing parts: ``objects`` sits
+    INSIDE ``singleVisual``, ``filters`` is its sibling.
+    """
+    state: dict = {"singleVisual": {}}
+    if not capture:
+        return state
+
+    sv = vc_config.get("singleVisual", {})
+    general = sv.get("objects", {}).get("general", [])
+    kept = []
+    for gen in general:
+        props = gen.get("properties", {})
+        if "filter" not in props:
+            continue
+        entry = copy.deepcopy(gen)
+        if clear:
+            inner = entry.get("properties", {}).get("filter", {}).get("filter")
+            if isinstance(inner, dict):
+                inner.pop("Where", None)
+        kept.append(entry)
+    if kept:
+        state["singleVisual"]["objects"] = {"general": kept}
+
+    # Visual-level filters (the filter pane) are authored, not selected, so
+    # `clear` leaves them alone -- a Clear-all button drops SELECTIONS.
+    raw_filters = vc.get("filters")
+    if isinstance(raw_filters, str) and raw_filters.strip():
+        try:
+            raw_filters = json.loads(raw_filters)
+        except json.JSONDecodeError:
+            raw_filters = None
+    if isinstance(raw_filters, list) and raw_filters:
+        # A bookmark's filters are a FiltersState OBJECT keyed by how the
+        # filter is identified — NOT the plain array the container holds.
+        # Each entry is a FilterContainerState: `name` is required and
+        # additionalProperties is false, so container-only keys (ordinal,
+        # displayName, isHiddenInViewMode, ...) are dropped rather than
+        # carried through into a schema-invalid bookmark.
+        by_name = {}
+        for f in raw_filters:
+            if not isinstance(f, dict):
+                continue
+            fname = f.get("name")
+            if not isinstance(fname, str) or not fname:
+                continue
+            by_name[fname] = {k: copy.deepcopy(v) for k, v in f.items()
+                              if k in _BOOKMARK_FILTER_KEYS}
+        if by_name:
+            state["filters"] = {"byName": by_name}
+    return state
 
 
 @mcp.tool()
@@ -3794,8 +3893,14 @@ def pbix_add_bookmark(
     target_page: str = "",
     hidden_visuals: str = "",
     report_filter_json: str = "",
+    capture_visual_state: bool = True,
+    clear_selections: bool = False,
 ) -> str:
     """Create a report bookmark that captures page and visual state.
+
+    Returns the bookmark's INTERNAL name in ``data.name`` (e.g.
+    "Bookmark46feb78c853946feae45"). That is what an action button's
+    bookmark action must reference — not the display name.
 
     Args:
         alias: The alias of the open file
@@ -3808,6 +3913,16 @@ def pbix_add_bookmark(
         report_filter_json: Optional JSON array of report-level filters to apply
                             when bookmark is activated, e.g.
                             '[{"target":{"table":"Sales","column":"Region"},"operator":"In","values":["West"]}]'
+        capture_visual_state: Capture each targeted visual's CURRENT data state —
+                              the slicer selection in objects.general[].properties.filter
+                              plus the visual's own filters — so applying the bookmark
+                              restores it. Set False for a display-only bookmark that
+                              changes visibility and leaves data state alone.
+        clear_selections: Capture the CLEARED state instead of the live one: every
+                          targeted slicer's selection is recorded as empty, so
+                          applying the bookmark clears selections (a "Clear all"
+                          bookmark to wire to a button). Visual-level filters from
+                          the filter pane are still captured as authored.
     """
     import uuid as _uuid
 
@@ -3864,6 +3979,8 @@ def pbix_add_bookmark(
                 visual_states[vname] = {
                     "visualType": vc_config.get("singleVisual", {}).get("visualType", "unknown"),
                     "hidden": vname in hidden_set,
+                    "state": _bookmark_visual_state(
+                        vc, vc_config, capture_visual_state, clear_selections),
                 }
 
         # Build bookmark object
@@ -3889,17 +4006,19 @@ def pbix_add_bookmark(
         # "hidden"}} and visible ones get a bare {"singleVisual":{}} (no mode).
         # `sections` is required by the PBIR bookmark schema and is present in
         # every Desktop-authored bookmark, so it is written unconditionally.
+        #
+        # The captured data state (slicer selection / visual filters) is
+        # merged in alongside: recording only the display mode is what left
+        # every bookmark restoring nothing (issue #52).
+        vc_states = {}
+        for vname, state in visual_states.items():
+            entry = copy.deepcopy(state["state"])
+            entry.setdefault("singleVisual", {})
+            if state["hidden"]:
+                entry["singleVisual"]["display"] = {"mode": "hidden"}
+            vc_states[vname] = entry
         bookmark["explorationState"]["sections"] = {
-            section_name: {
-                "visualContainers": {
-                    vname: (
-                        {"singleVisual": {"display": {"mode": "hidden"}}}
-                        if state["hidden"]
-                        else {"singleVisual": {}}
-                    )
-                    for vname, state in visual_states.items()
-                }
-            }
+            section_name: {"visualContainers": vc_states}
         }
 
         # Add report-level filters if provided
@@ -3927,9 +4046,28 @@ def pbix_add_bookmark(
         info["modified"] = True
 
         hidden_msg = f", hiding: {hidden_visuals}" if hidden_visuals else ""
+        captured = sum(
+            1 for s in visual_states.values()
+            if s["state"].get("filters")
+            or s["state"].get("singleVisual", {}).get("objects"))
+        if not capture_visual_state:
+            state_msg = ", no data state captured"
+        elif clear_selections:
+            state_msg = f", cleared state captured for {captured} visual(s)"
+        else:
+            state_msg = f", data state captured for {captured} visual(s)"
+        # The INTERNAL name is what a button's bookmark action must reference;
+        # returning only the display name forced callers to read Report/Layout
+        # raw and match on displayName, which is not even unique (issue #52).
         return ToolResponse.ok(
-            f"Created bookmark '{display_name}' → page '{target_section.get('displayName')}'"
-            f"{hidden_msg}. Total bookmarks: {len(config['bookmarks'])}"
+            f"Created bookmark '{display_name}' (name: {bookmark['name']}) → "
+            f"page '{target_section.get('displayName')}'"
+            f"{hidden_msg}{state_msg}. "
+            f"Total bookmarks: {len(config['bookmarks'])}",
+            data={"name": bookmark["name"], "displayName": display_name,
+                  "page": target_section.get("displayName"),
+                  "index": len(config["bookmarks"]) - 1,
+                  "visuals_with_state": captured},
         ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
