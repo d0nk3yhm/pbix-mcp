@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.97] - 2026-08-18
+
+### Fixed — a data column named `RowNumber` was silently deleted (issue #55)
+
+- **The first calculated column added to a table DELETED any data column
+  named `RowNumber`** — no error, no warning, and the file still opened.
+  That is the one failure class a caller cannot catch by readback, because
+  everything else about the file is valid; it surfaced only when a converted
+  document happened to carry the name and a later step compared column
+  counts.
+- Cause: the system row-number column is `Type = 3` and carries a GUID
+  suffix (`RowNumber-2662979B-…`), but thirteen places excluded it by NAME —
+  `NOT LIKE 'RowNumber%'`, `startswith("RowNumber")`, `"RowNumber" in path`.
+  A user column called `RowNumber` matched every one of them. All now test
+  the column's `Type` (or, on the display side, `IsHidden`, which already
+  excluded the system column), so the name is no longer load-bearing
+  anywhere: metadata planning, the property snapshot, the VertiPaq encoder's
+  system-column branch, the decoder's column-file lookup and the
+  schema/doc/perf listings.
+- The user's column now survives create → calculated column → save → reopen
+  with its values intact.
+
+### Fixed — a string literal ending in a backslash broke the enclosing call (issue #56)
+
+- **A calculated table whose DAX contained a literal ending in a backslash**
+  — an ordinary Windows path like `"D:\Projects\"` — **did not
+  materialize.** DAX escapes a quote by DOUBLING it and treats a backslash
+  as an ordinary character, but the function-argument scan applied the
+  C/Python rule and read `\"` as an escaped quote. The scan then never
+  found the closing paren, the call fell through to the tail case, and the
+  whole expression evaluated to `None` with nothing naming the cause.
+- The scan now implements DAX's doubled-quote rule (the same rule the rest
+  of the engine already used). Interior backslashes, trailing single and
+  trailing doubled backslashes all work, and `""` escaping is unaffected.
+- This was one site — the only place in the codebase that assumed
+  backslash-escaping.
+
+### Fixed — an all-blank calculated column is accepted (issue #54)
+
+- **A calculated column that is legitimately blank on every row was refused**
+  with "the expression likely references a column or name that doesn't
+  resolve in this engine" — a guess that was measurably false. An
+  unresolved reference is already detected precisely, and named, by the
+  check immediately above it, so anything reaching that point has resolved
+  every column it names. `IF(LEFT(T[Tag],1) <> "$", T[Tag])` over rows whose
+  tags all begin with `$` is blank on every row because that is the correct
+  answer — the source QlikView list box shows nothing either.
+- The stale heuristic is removed; such a column now materializes and
+  persists. A genuinely unresolved reference is still refused, by name.
+
+- All three pinned by `tests/test_issue54_55_56_calc.py`; six of the eleven
+  fail on 0.9.96 (the rest are controls that must keep passing).
+
 ## [0.9.96] - 2026-08-17
 
 ### Fixed — names that collide only by case are refused instead of producing an unopenable file (issue #53)

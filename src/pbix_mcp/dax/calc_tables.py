@@ -1825,14 +1825,14 @@ def evaluate_row_context_column(
         return None, (
             "references a column this engine cannot resolve in row context: "
             + ", ".join(sorted(unresolved)))
-    # All-blank used to be refused outright as a tell-tale of an unresolved
-    # reference. That is now detected directly above, and the guess had a false
-    # positive that blocked a whole file: a column whose expression is literally
-    # BLANK() is legitimately blank on every row.
-    if rows and all(v is None for v in values) and _refs_any_column(clean):
-        return None, (
-            "every row evaluated to blank — the expression likely references "
-            "a column or name that doesn't resolve in this engine")
+    # An all-blank result is ACCEPTED. It used to be refused as a tell-tale of
+    # an unresolved reference, but that is detected precisely directly above --
+    # by NAME -- so anything reaching here has already resolved every column it
+    # names. The guess was therefore not just unnecessary but measurably false
+    # (issue #54): `IF(LEFT(T[Tag],1) <> "$", T[Tag])` over rows whose tags all
+    # start with "$" resolves T[Tag] fine and is blank on every row because
+    # that is the CORRECT answer -- the source QlikView list box shows nothing
+    # either. Refusing it sent callers hunting a naming bug that did not exist.
     return values, None
 
 

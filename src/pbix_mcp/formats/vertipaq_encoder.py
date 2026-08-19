@@ -1661,7 +1661,10 @@ def update_table_in_abf(
         sc_name = sc["ExplicitName"]
         sc_type = sc["Type"]  # 3 = RowNumber
         dt_code = sc["ExplicitDataType"] or 6
-        is_rn = "RowNumber" in sc_name
+        # The system row-number column is Type 3. Matching on the NAME made
+        # a USER column called "RowNumber" encode with system-column
+        # parameters (issue #55).
+        is_rn = sc_type == 3
 
         # Generate system column data
         if is_rn:

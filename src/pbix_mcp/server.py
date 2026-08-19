@@ -8104,7 +8104,6 @@ def _detect_field_parameter_shape(conn, tid: int) -> dict | None:
         "SELECT COALESCE(ExplicitName, InferredName) AS ExplicitName, "
         "       ExplicitDataType, InferredDataType FROM [Column] "
         "WHERE TableID = ? AND Type IN (1, 4) "
-        "AND COALESCE(ExplicitName, InferredName) NOT LIKE 'RowNumber%' "
         "ORDER BY ID",
         (tid,),
     ).fetchall()
@@ -8185,7 +8184,7 @@ def _apply_field_parameter_metadata(dm_path: str, specs: list[dict]) -> tuple[in
             tid = trow["ID"]
             crows = c.execute(
                 "SELECT ID FROM [Column] WHERE TableID = ? AND Type IN (1, 4) "
-                "AND ExplicitName NOT LIKE 'RowNumber%' ORDER BY ID",
+                "ORDER BY ID",
                 (tid,)).fetchall()
             if len(crows) != 3:
                 raise ValueError(
@@ -8364,8 +8363,7 @@ def _apply_calculated_table_metadata(
             for crow in c.execute(
                 "SELECT ID, ExplicitName, Type FROM [Column] WHERE TableID = ? "
                 "ORDER BY ID", (tid,)).fetchall():
-                if crow["Type"] == 3 or (
-                        crow["ExplicitName"] or "").startswith("RowNumber"):
+                if crow["Type"] == 3:
                     c.execute("UPDATE [Column] SET SystemFlags = 2 WHERE ID = ?",
                               (crow["ID"],))
                     continue
@@ -8598,7 +8596,7 @@ def _snapshot_object_properties(conn: sqlite3.Connection) -> dict:
         "JOIN [Table] t ON c.TableID = t.ID WHERE t.ModelID = 1"
     ):
         nm = r["ExplicitName"] or r["InferredName"]
-        if not nm or nm.startswith("RowNumber"):
+        if not nm or r["Type"] == 3:
             continue
         d = {p: r[p] for p in cprops}
         if "SortByColumnID" in have_c and r["SortByColumnID"]:
@@ -12037,7 +12035,7 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
         owned_calc_columns = [
             r[0] for r in conn.execute(
                 "SELECT ExplicitName FROM [Column] WHERE TableID = ? "
-                "AND Type = 2 AND ExplicitName NOT LIKE 'RowNumber%' "
+                "AND Type = 2 "
                 "ORDER BY ID", (tid,))
             if r[0]]
 
@@ -12120,8 +12118,7 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
     existing = conn.execute(
         "SELECT t.Name AS tbl, c.ExplicitName AS col, c.Expression AS expr "
         "FROM [Column] c JOIN [Table] t ON c.TableID = t.ID "
-        "WHERE c.Type = 2 AND t.ModelID = 1 "
-        "AND c.ExplicitName NOT LIKE 'RowNumber%'").fetchall()
+        "WHERE c.Type = 2 AND t.ModelID = 1").fetchall()
     dropped = {t.lower(): {c.lower() for c in cols}
                for t, cols in (drop_columns or {}).items()}
     # Table -> column names for the WHOLE model, from metadata only (no data
@@ -12132,8 +12129,7 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
         "SELECT t.Name AS tbl, "
         "       COALESCE(c.ExplicitName, c.InferredName) AS col "
         "FROM [Column] c JOIN [Table] t ON c.TableID = t.ID "
-        "WHERE t.ModelID = 1 "
-        "AND COALESCE(c.ExplicitName, c.InferredName) NOT LIKE 'RowNumber%'"):
+        "WHERE t.ModelID = 1 AND c.Type <> 3"):
         model_tables.setdefault(r["tbl"], []).append(r["col"])
     calc_by_table: dict[str, list[dict]] = {}
     for r in existing:
@@ -12181,8 +12177,7 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
         for cr in conn.execute(
             "SELECT COALESCE(ExplicitName, InferredName) AS nm, "
             "       ExplicitDataType, InferredDataType "
-            "FROM [Column] WHERE TableID = ? AND Type IN (1, 3, 4) "
-            "AND COALESCE(ExplicitName, InferredName) NOT LIKE 'RowNumber%' "
+            "FROM [Column] WHERE TableID = ? AND Type IN (1, 4) "
             "ORDER BY ID",
                 (trow["ID"],)):
             edt = cr["ExplicitDataType"]
@@ -14815,7 +14810,7 @@ def pbix_evaluate_calculated_columns(alias: str) -> str:
                 FROM [Column] c JOIN [Table] t ON c.TableID = t.ID
                 WHERE c.Expression IS NOT NULL AND c.Expression != ''
                   AND c.ExplicitName IS NOT NULL
-                  AND c.ExplicitName NOT LIKE 'RowNumber%'
+                  AND c.Type <> 3
                   AND t.ModelID = 1
             """).fetchall()
             conn.close()
@@ -16267,8 +16262,7 @@ def pbix_performance(alias: str) -> str:
                 str_cols = [c for c in schema
                             if c["TableName"] == t["TableName"]
                             and c["DataType"] == "String"
-                            and not c.get("IsHidden")
-                            and "RowNumber" not in c["ColumnName"]]
+                            and not c.get("IsHidden")]
                 if len(str_cols) > 5:
                     warn(f"{t['TableName']}: {len(str_cols)} string columns on {t['RowCount']:,} rows — potential high cardinality")
 
@@ -16423,7 +16417,7 @@ def pbix_diff(alias_a: str, alias_b: str) -> str:
                     tn = c["TableName"]
                     if tn.startswith(("H$", "R$", "U$", "LocalDateTable", "DateTableTemplate")):
                         continue
-                    if c.get("IsHidden") or "RowNumber" in c["ColumnName"]:
+                    if c.get("IsHidden"):
                         continue
                     result[f"{tn}.{c['ColumnName']}"] = c["DataType"]
                 return result
@@ -16647,7 +16641,7 @@ def pbix_document(alias: str, output_path: str = "") -> str:
 
             for tname in sorted(by_table.keys()):
                 cols = by_table[tname]
-                visible = [c for c in cols if not c.get("IsHidden") and "RowNumber" not in c["ColumnName"]]
+                visible = [c for c in cols if not c.get("IsHidden")]
                 if not visible:
                     continue
                 md(f"### {tname}")

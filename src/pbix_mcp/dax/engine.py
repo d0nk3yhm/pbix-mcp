@@ -2925,17 +2925,37 @@ class DAXEngine:
             return None
         depth = 0
         in_string = False
-        for i, ch in enumerate(expr):
-            if ch == '"' and (i == 0 or expr[i-1] != '\\'):
-                in_string = not in_string
+        i = 0
+        n = len(expr)
+        while i < n:
+            ch = expr[i]
+            # DAX escapes a quote by DOUBLING it; a backslash is an ORDINARY
+            # character. Treating a backslash before a quote as an escape (the
+            # C/Python rule) left this scan inside the string forever for any
+            # literal ending in a backslash -- a Windows path such as
+            # "D:\Projects\" -- so the closing paren was never found, the call
+            # fell through to the tail case, and the whole expression
+            # evaluated to None. A calculated table built on one simply did
+            # not materialize, with nothing naming the cause (issue #56).
             if in_string:
+                if ch == '"':
+                    if i + 1 < n and expr[i + 1] == '"':
+                        i += 2
+                        continue
+                    in_string = False
+                i += 1
+                continue
+            if ch == '"':
+                in_string = True
+                i += 1
                 continue
             if ch == '(':
                 depth += 1
             elif ch == ')':
                 depth -= 1
                 if depth == 0:
-                    return expr[:i+1]
+                    return expr[:i + 1]
+            i += 1
         return None
 
     def _split_args(self, args_str: str) -> list:

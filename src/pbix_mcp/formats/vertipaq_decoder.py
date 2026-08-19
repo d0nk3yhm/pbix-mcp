@@ -864,7 +864,10 @@ def read_table_from_abf(
                 continue
 
             # Match by column ID in path (real PBIX format)
-            if col_id_pattern in path and "RowNumber" not in path:
+            # The ID pattern "(1027)" is unique to this column, so the
+            # extra name guard added nothing -- except skipping the
+            # files of a user column named "RowNumber" (issue #55).
+            if col_id_pattern in path:
                 if path.endswith(".idfmeta"):
                     meta_entry = entry
                 elif path.endswith(".idf"):
@@ -922,7 +925,9 @@ def read_table_from_abf(
         # on -- IT_Support dim_Date[Date], dim_Clusters[Cluster_ID],
         # fact_IT_Support[Similarity_Score] -- in a file every existing check
         # reported as clean. The metadata is authoritative and free of guesses.
-        if col["Type"] == 3 or col_name.startswith("RowNumber"):
+        # Type 3 IS the system row-number column; the extra name test also
+        # discarded a user column legitimately called "RowNumber" (#55).
+        if col["Type"] == 3:
             col_data.append((col_name, data_type, None))
             continue
 
