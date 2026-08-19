@@ -81,6 +81,27 @@ class TestPerColumnTableFormatting:
         assert by_col["Sales.Region"]["selector"] == \
             {"metadata": "Sales.Region"}
 
+    @pytest.mark.parametrize("width,want", [
+        (200, "200D"),        # issue #62: was "200.0D"
+        (288, "288D"),
+        (168.0, "168D"),      # a float that happens to be integral
+        (155, "155D"),
+        (258.5, "258.5D"),    # non-integral keeps its decimal form
+    ])
+    def test_integral_widths_are_spelled_the_desktop_way(self, width, want):
+        """Desktop-authored files carry "288D" / "155D" / "168D" -- never a
+        fractional part on an integral width (issue #62)."""
+        got = B({"columnWidth": {"T.C": width}})["_objects"]["columnWidth"][0]
+        assert got["properties"]["value"]["expr"]["Literal"]["Value"] == want
+
+    def test_page_transparency_uses_the_same_spelling(self):
+        """The page background card has the same rule, and now shares the
+        one helper rather than duplicating the logic."""
+        from pbix_mcp.server import _pbi_double_lit
+        assert _pbi_double_lit(0)["expr"]["Literal"]["Value"] == "0D"
+        assert _pbi_double_lit(25)["expr"]["Literal"]["Value"] == "25D"
+        assert _pbi_double_lit(12.5)["expr"]["Literal"]["Value"] == "12.5D"
+
     def test_column_formatting_takes_a_per_column_selector(self):
         got = B({"columnFormatting": {
             "Sales.Amount": {"alignment": "Center", "decimalPlaces": 1},

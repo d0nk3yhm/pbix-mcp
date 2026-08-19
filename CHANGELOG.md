@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.100] - 2026-08-19
+
+### Fixed — `columnWidth` spells integral widths the way Desktop does (issue #62)
+
+- The `columnWidth` card added in 0.9.99 wrote every **integral** width with
+  a fractional part — `200` became `"200.0D"`, `288` became `"288.0D"` —
+  where Desktop-authored files carry `"288D"`, `"155D"`, `"168D"` and never
+  a `.0`. Only half-integral values such as `258.5` happened to match.
+  Byte-compatibility with Desktop saves is the whole point of the card, so
+  the spelling moved every written literal off the measured form and broke
+  diff-based round-trip comparisons.
+- New `_pbi_double_lit` emits `int` form when the value is integral and the
+  decimal form otherwise. The generic `_pbi_lit` is deliberately unchanged:
+  altering it would move every font size and offset in the codebase at once,
+  and none of those has been measured against Desktop the way these have.
+- The page background/wallpaper `transparency` property had the same rule
+  and an inline copy of the logic; it now shares the one helper.
+- Verified against a Desktop-authored file in the local corpus
+  (`"288D"`, `"155D"`, `"168D"`).
+- Pinned by `tests/test_issue57_59_page_column_format.py` — five parametrised
+  spellings plus the shared-helper check; all five fail on 0.9.99.
+
 ## [0.9.99] - 2026-08-18
 
 ### Added — `pbix_format_page`: page background and wallpaper (issue #57)

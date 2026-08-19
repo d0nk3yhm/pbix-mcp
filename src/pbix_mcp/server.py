@@ -688,6 +688,24 @@ def _pbi_lit(value) -> dict:
     return {"expr": {"Literal": {"Value": raw}}}
 
 
+def _pbi_double_lit(value) -> dict:
+    """A `D` literal spelled the way Desktop spells it.
+
+    Desktop writes an INTEGRAL double without a fractional part — measured on
+    Desktop-authored files: `"288D"`, `"155D"`, `"168D"`, never `"288.0D"`.
+    `_pbi_lit(float(x))` always emits the Python repr, so every integral
+    width came out as `200.0D` (issue #62). Non-integral values keep their
+    decimal form, so `258.5` stays `258.5D`.
+
+    Used where the literal is compared against Desktop-authored files byte
+    for byte; the generic `_pbi_lit` is unchanged, since altering it would
+    move every font size and offset in the codebase at once.
+    """
+    v = float(value)
+    raw = f"{int(v)}D" if v == int(v) else f"{v}D"
+    return {"expr": {"Literal": {"Value": raw}}}
+
+
 def _pbi_props(mapping: dict, src: dict) -> dict:
     """Build PBI properties dict from a key mapping and source values.
 
@@ -1398,7 +1416,7 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
                 w = float(width)
             except (TypeError, ValueError):
                 continue
-            entries.append({"properties": {"value": _pbi_lit(w)},
+            entries.append({"properties": {"value": _pbi_double_lit(w)},
                             "selector": {"metadata": str(ref)}})
         _add_entries("columnWidth", entries)
 
@@ -4786,9 +4804,7 @@ def _page_bg_props(info: dict, layout: dict, spec, card: str) -> dict:
     if "transparency" in spec:
         # Desktop writes an integral transparency as "0D", not "0.0D"
         # (measured on a Desktop-authored page background).
-        t = float(spec["transparency"])
-        props["transparency"] = {"expr": {"Literal": {"Value": (
-            f"{int(t)}D" if t == int(t) else f"{t}D")}}}
+        props["transparency"] = _pbi_double_lit(spec["transparency"])
     img_path = spec.get("image_path") or spec.get("image") or ""
     img_b64 = spec.get("image_base64") or ""
     if img_path or img_b64:
