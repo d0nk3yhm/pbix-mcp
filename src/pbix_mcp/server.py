@@ -12912,9 +12912,36 @@ def _get_dax_context(alias: str) -> dict:
         'relationships': relationships,
         'default_filters': default_filters,
         'work_dir': info["work_dir"],
+        # The MODEL's own culture. FORMAT() renders a STRING the canvas prints
+        # verbatim, so its separators come from here, not the reader's host
+        # (issue #60).
+        'culture': _read_model_culture(alias),
     }
     _dax_cache[alias] = ctx
     return ctx
+
+
+def _read_model_culture(alias: str) -> str | None:
+    """``Model.Culture`` for an open file, or None when it states nothing."""
+    try:
+        info, conn, tmp_path = _read_metadata_db(alias)
+    except Exception:
+        return None
+    try:
+        row = conn.execute("SELECT Culture FROM Model LIMIT 1").fetchone()
+        val = row["Culture"] if row is not None else None
+        return str(val) if val else None
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
 
 # Measure references accepted by the evaluate tools: bare (Pipeline Value),
@@ -13209,7 +13236,8 @@ def pbix_evaluate_dax(
             fc, ctx['date_table'], ctx['date_column'],
             ctx.get('relationships'), simulate_row_context=False,
             measure_tables=ctx.get('measure_tables'),
-            model_columns=ctx.get('model_columns')
+            model_columns=ctx.get('model_columns'),
+            culture=ctx.get('culture')
         )
 
         # Build structured response with DAXResult objects
@@ -15661,10 +15689,24 @@ def pbix_get_cultures(alias: str) -> str:
         info, conn, tmp_path = _read_metadata_db(alias)
         try:
             cultures = conn.execute("SELECT ID, Name FROM Culture ORDER BY Name").fetchall()
+            # The MODEL's own culture is a different thing from the TRANSLATION
+            # cultures listed below, and it is the one a caller checks to know
+            # what FORMAT() and collation will do. Reporting only translations
+            # let this answer contradict the model it describes (issue #60).
+            try:
+                _mrow = conn.execute(
+                    "SELECT Culture FROM Model LIMIT 1").fetchone()
+                model_culture = _mrow["Culture"] if _mrow is not None else None
+            except Exception:
+                model_culture = None
+            head = f"Model culture: {model_culture or '(not set — FORMAT() uses en-US)'}"
             if not cultures:
-                return ToolResponse.ok("No cultures defined in this file.").to_text()
+                return ToolResponse.ok(
+                    head + "\nTranslation cultures: none defined in this file.",
+                    data={"model_culture": model_culture,
+                          "translation_cultures": []}).to_text()
 
-            lines = [f"Cultures ({len(cultures)}):\n"]
+            lines = [head, f"\nTranslation cultures ({len(cultures)}):\n"]
             for cu in cultures:
                 cid, cname = cu["ID"], cu["Name"]
                 count = conn.execute(
@@ -15691,7 +15733,11 @@ def pbix_get_cultures(alias: str) -> str:
                     lines.append(f"    {otype} '{s['ObjName']}' {prop} = \"{s['Value']}\"")
                 lines.append("")
 
-            return ToolResponse.ok("\n".join(lines)).to_text()
+            return ToolResponse.ok(
+                "\n".join(lines),
+                data={"model_culture": model_culture,
+                      "translation_cultures":
+                          [c["Name"] for c in cultures]}).to_text()
         finally:
             conn.close()
             try:
@@ -15702,6 +15748,61 @@ def pbix_get_cultures(alias: str) -> str:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+@mcp.tool()
+def pbix_set_model_culture(alias: str, culture_name: str) -> str:
+    """Set the MODEL's own culture (Model.Culture / SourceQueryCulture).
+
+    This is not a translation culture. It is the culture FORMAT() resolves
+    its separators from and the model collates by, so it is what decides
+    whether ``FORMAT(1477000, "#,##0.00")`` renders 1,477,000.00 or
+    1.477.000,00. Use ``pbix_add_culture`` for translations.
+
+    Args:
+        alias: The alias of the open file
+        culture_name: BCP-47 culture code (e.g. "pt-BR", "nb-NO", "de-DE")
+    """
+    try:
+        info = _ensure_open(alias)
+        name = (culture_name or "").strip()
+        if not name:
+            return ToolResponse.error(
+                "culture_name is required, e.g. \"pt-BR\".",
+                InvalidPBIXError.code).to_text()
+        dm_path = os.path.join(info["work_dir"], "DataModel")
+        if not os.path.exists(dm_path):
+            return ToolResponse.error(
+                "No DataModel found.",
+                DataModelCompressionError.code).to_text()
+
+        previous: list = [None]
+
+        def _do_set(conn: sqlite3.Connection):
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT Culture FROM Model LIMIT 1").fetchone()
+            previous[0] = row["Culture"] if row is not None else None
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(Model)")}
+            conn.execute("UPDATE Model SET Culture = ?", (name,))
+            # SourceQueryCulture governs how the mashup engine parses literals
+            # coming from the source; Desktop keeps the two in step.
+            if "SourceQueryCulture" in cols:
+                conn.execute("UPDATE Model SET SourceQueryCulture = ?", (name,))
+            conn.commit()
+
+        _modify_metadata_only(dm_path, _do_set)
+        info["modified"] = True
+        _dax_cache.pop(alias, None)   # FORMAT() reads the culture from here
+        was = previous[0] or "(none)"
+        return ToolResponse.ok(
+            f"Model culture set to '{name}' (was '{was}'). FORMAT() now "
+            f"resolves separators from it; a FORMAT(..., locale) argument "
+            f"still overrides it.",
+            data={"culture": name, "previous": previous[0]}).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise DataModelCompressionError(str(e))
 
 
 @mcp.tool()

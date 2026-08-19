@@ -300,7 +300,103 @@ _NAMED_FORMATS = {
 }
 
 
-def _format_number(val: float, fmt: str):
+#: Decimal/group separators by culture, for FORMAT() (issue #60). Power BI
+#: renders a FORMAT() result as a STRING the canvas prints verbatim, so its
+#: separators come from the MODEL's culture, not the reader's host.
+#:
+#: Keyed by the language part, with a few region overrides in front. Only the
+#: separators are modelled: month and day NAMES still render en-US, which is
+#: recorded as a known limit rather than guessed at.
+_CULTURE_SEPS_BY_REGION = {
+    # Spanish-speaking regions that use the en-US convention
+    "es-mx": (",", "."), "es-pa": (",", "."), "es-pr": (",", "."),
+    "es-do": (",", "."), "es-ni": (",", "."), "es-gt": (",", "."),
+    "es-hn": (",", "."), "es-sv": (",", "."), "es-pe": (",", "."),
+    # French Switzerland groups with an apostrophe
+    "fr-ch": ("'", "."), "de-ch": ("'", "."), "it-ch": ("'", "."),
+    "en-za": (" ", ","), "en-in": (",", "."),
+}
+
+_CULTURE_SEPS_BY_LANG = {
+    "en": (",", "."), "ja": (",", "."), "zh": (",", "."), "ko": (",", "."),
+    "he": (",", "."), "th": (",", "."), "ga": (",", "."), "ms": (",", "."),
+    "pt": (".", ","), "es": (".", ","), "it": (".", ","), "de": (".", ","),
+    "nl": (".", ","), "da": (".", ","), "id": (".", ","), "tr": (".", ","),
+    "vi": (".", ","), "el": (".", ","), "ro": (".", ","), "ca": (".", ","),
+    "sl": (".", ","), "hr": (".", ","), "sr": (".", ","), "bs": (".", ","),
+    "mk": (".", ","), "sq": (".", ","), "is": (".", ","),
+    "fr": (" ", ","), "ru": (" ", ","), "uk": (" ", ","), "pl": (" ", ","),
+    "cs": (" ", ","), "sk": (" ", ","), "hu": (" ", ","), "sv": (" ", ","),
+    "nb": (" ", ","), "no": (" ", ","), "nn": (" ", ","), "fi": (" ", ","),
+    "et": (" ", ","), "lv": (" ", ","), "lt": (" ", ","), "bg": (" ", ","),
+    "af": (" ", ","), "kk": (" ", ","),
+}
+
+
+def _culture_seps(culture):
+    """``(group_sep, decimal_sep)`` for a culture name; en-US when unknown.
+
+    Unknown cultures deliberately fall back to en-US rather than guessing:
+    a wrong separator is indistinguishable from a right one in the output.
+    """
+    if not culture:
+        return (",", ".")
+    key = str(culture).strip().lower().replace("_", "-")
+    if key in _CULTURE_SEPS_BY_REGION:
+        return _CULTURE_SEPS_BY_REGION[key]
+    return _CULTURE_SEPS_BY_LANG.get(key.split("-")[0], (",", "."))
+
+
+def _fmt_split_sections(fmt: str) -> list:
+    """Split a format picture on `;` that are OUTSIDE quoted literals."""
+    out, buf, in_q = [], [], False
+    i, n = 0, len(fmt)
+    while i < n:
+        ch = fmt[i]
+        if ch == '"':
+            in_q = not in_q
+            buf.append(ch)
+        elif ch == ";" and not in_q:
+            out.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    out.append("".join(buf))
+    return out
+
+
+def _fmt_mask_quoted(section: str) -> str:
+    """`section` with every quoted literal blanked to a neutral filler.
+
+    The digit-run search must not see placeholders that live INSIDE a quoted
+    literal: `"0 items"#,##0` has a `0` in its prefix text. Masking to a
+    character that is not a placeholder keeps every index aligned with the
+    original string, so prefix/suffix can be sliced back out of it.
+    """
+    out, in_q = [], False
+    for ch in section:
+        if ch == '"':
+            in_q = not in_q
+            out.append("\x00")
+            continue
+        out.append("\x00" if in_q else ch)
+    return "".join(out)
+
+
+def _fmt_unquote(text: str) -> str:
+    """Drop the quote CHARACTERS of a format picture's quoted literals.
+
+    VBA/DAX format pictures escape literal text by quoting it, and Desktop
+    emits the contents without the quotes: `FORMAT(1234.5, "\"$ \"#,##0")` is
+    `$ 1,235`. Printing the quotes verbatim (issue #58) is what made every
+    carried-over currency picture render wrongly.
+    """
+    return text.replace('"', "")
+
+
+def _format_number(val: float, fmt: str, group_sep: str = ",",
+                   dec_sep: str = "."):
     """FORMAT() for a numeric custom format string. None = not understood.
 
     Implements the parts of the VB/Excel numeric format that Power BI's own
@@ -325,7 +421,8 @@ def _format_number(val: float, fmt: str):
         if named == '':
             return _dax_number_str(val)
         fmt = named
-    sections = fmt.split(';')
+    # `;` inside a quoted literal is text, not a section break.
+    sections = _fmt_split_sections(fmt)
     if val < 0 and len(sections) > 1 and sections[1]:
         section, explicit_sign = sections[1], True
         val = abs(val)
@@ -333,13 +430,16 @@ def _format_number(val: float, fmt: str):
         section, explicit_sign = sections[2], True
     else:
         section, explicit_sign = sections[0], False
-    m = _FMT_RUN_RE.search(section)
+    # Search the MASKED section so a digit inside a quoted literal is not
+    # mistaken for a placeholder, then slice the ORIGINAL by the same indices.
+    m = _FMT_RUN_RE.search(_fmt_mask_quoted(section))
     if not m:
         # A section with no digit placeholder is a pure literal, which is how
         # the zero section is normally written: Desktop renders
         # FORMAT(0, "0.0;(0.0);zero") as "zero".
-        return section if explicit_sign else None
-    prefix, run, suffix = section[:m.start()], m.group(0), section[m.end():]
+        return _fmt_unquote(section) if explicit_sign else None
+    prefix, run = section[:m.start()], section[m.start():m.end()]
+    suffix = section[m.end():]
     if '%' in prefix or '%' in suffix:
         val *= 100
     int_pat, _dot, dec_pat = run.partition('.')
@@ -377,7 +477,13 @@ def _format_number(val: float, fmt: str):
     # A format that HAS a decimal section keeps its separator even when every
     # optional decimal dropped -- Desktop renders FORMAT(2, "0.##") as "2.".
     tail = ('.' + dec_part) if (max_dec and (dec_part or _dot)) else ''
-    out = prefix + int_part + tail + suffix
+    # Re-separate for the model's culture (issue #60). The body was built with
+    # the en-US pair, so swap through a placeholder to avoid clobbering.
+    if group_sep != ',' or dec_sep != '.':
+        int_part = int_part.replace(',', '\x00')
+        tail = tail.replace('.', dec_sep, 1) if tail else tail
+        int_part = int_part.replace('\x00', group_sep)
+    out = _fmt_unquote(prefix) + int_part + tail + _fmt_unquote(suffix)
     if neg and not explicit_sign:
         out = '-' + out
     return out
@@ -1305,6 +1411,11 @@ class DAXContext:
         # was applied. Only those are suppressed; a filter created later
         # inside a nested CALCULATE still propagates, as Desktop does.
         self._no_prop_keys: dict = {}
+        # The MODEL's own culture (Model.Culture, e.g. "pt-BR"). FORMAT()
+        # returns a STRING the canvas prints verbatim, so its separators come
+        # from the model rather than from the reader's host (issue #60).
+        # None = the model states nothing, which means en-US.
+        self.culture: Optional[str] = None
         # Rows of the group being evaluated by GROUPBY's extension columns;
         # CURRENTGROUP() reads it.
         self._current_group: Optional[list] = None
@@ -1982,6 +2093,7 @@ class DAXContext:
         ctx._no_prop_keys = dict(self._no_prop_keys)
         ctx._expanded_keys = set(self._expanded_keys)
         ctx.group_keys = set(self.group_keys)
+        ctx.culture = self.culture
         ctx.selected_filters = (None if self.selected_filters is None
                                 else dict(self.selected_filters))
         ctx.measure_tables = self.measure_tables
@@ -2005,6 +2117,7 @@ class DAXContext:
         ctx._no_prop_keys = dict(self._no_prop_keys)
         ctx._expanded_keys = set(self._expanded_keys)
         ctx.group_keys = set(self.group_keys)
+        ctx.culture = self.culture
         ctx.selected_filters = (None if self.selected_filters is None
                                 else dict(self.selected_filters))
         ctx.measure_tables = self.measure_tables
@@ -5205,6 +5318,18 @@ class DAXEngine:
         args = self._split_args(args_str)
         val = self._eval_expr(args[0].strip(), ctx)
         fmt = self._eval_expr(args[1].strip(), ctx) if len(args) > 1 else None
+        # FORMAT(value, format, [locale]) -- DAX's third argument names the
+        # culture to render in. It was ignored entirely, so there was no way
+        # to ask for non-en-US separators at all (issue #60). The argument
+        # wins over the model's own culture; the model's culture is the
+        # fallback; en-US when neither states one.
+        culture = None
+        if len(args) > 2:
+            loc = self._eval_expr(args[2].strip(), ctx)
+            if isinstance(loc, str) and loc.strip():
+                culture = loc.strip()
+        if culture is None:
+            culture = getattr(ctx, 'culture', None)
         if val is None:
             return ''
         # A date can reach here as an ISO STRING rather than a datetime (row
@@ -5224,7 +5349,8 @@ class DAXEngine:
         if isinstance(val, (datetime, date)) and fmt:
             return self._format_datetime_pattern(val, str(fmt))
         if fmt and isinstance(val, (int, float)) and not isinstance(val, bool):
-            out = _format_number(float(val), str(fmt))
+            group_sep, dec_sep = _culture_seps(culture)
+            out = _format_number(float(val), str(fmt), group_sep, dec_sep)
             if out is not None:
                 return out
         return _concat_str(val)
@@ -10966,7 +11092,8 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
                             date_table: str | None = None, date_column: str | None = None,
                             relationships: list | None = None,
                             group_keys: set | None = None,
-                            selected_filters: dict | None = None) -> dict:
+                            selected_filters: dict | None = None,
+                            culture: str | None = None) -> dict:
     """Evaluate multiple measures, returning { name: value }.
 
     ``group_keys`` names the filter_context keys that came from GROUPED
@@ -10980,6 +11107,7 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
         ctx.group_keys = set(group_keys)
     if selected_filters is not None:
         ctx.selected_filters = dict(selected_filters)
+    ctx.culture = culture
     results = {}
     for name in measure_names:
         results[name] = _engine.evaluate_measure(name, ctx)
@@ -11184,7 +11312,8 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
                             relationships: list | None = None,
                             simulate_row_context: bool = True,
                             measure_tables: dict | None = None,
-                            model_columns: dict | None = None) -> dict:
+                            model_columns: dict | None = None,
+                            culture: str | None = None) -> dict:
     """Evaluate measures with smart fallback for SELECTEDVALUE-dependent measures.
 
     When a measure returns BLANK and its expression uses SELECTEDVALUE on a
@@ -11205,6 +11334,7 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
     # unqualified [Column] several tables share -- see _resolve_bare_column.
     ctx.measure_tables = measure_tables or {}
     ctx.model_columns = model_columns or {}
+    ctx.culture = culture
     results = {}
 
     for name in measure_names:

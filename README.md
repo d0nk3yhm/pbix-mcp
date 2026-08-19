@@ -8,7 +8,7 @@
 
 An MCP server for **creating**, reading, writing, and evaluating Power BI `.pbix` and `.pbit` files — **no Power BI Desktop required**. The PBIX binary format is independently reimplemented in pure Python — every structure pbix-mcp's supported capabilities require, with no templates, skeletons, or Microsoft binaries. Generated files open in PBI Desktop with full interactivity: view data, add measures, create visuals, and refresh — verified with PBI Desktop March 2026. The DAX engine has **verified parity with Power BI Desktop on 100% of the DAX surface Desktop can evaluate in a query** — all 435 query-evaluable of the engine's 467 functions (the other 32 are proven not query-evaluable by Desktop itself, so there is nothing to match). Two proof layers: per-function goldens captured from Desktop's own workspace engine (359 value probes, 1e-9 tolerance) and a full-corpus 1:1 match — **432/432** grand totals, **1,705/1,705** measure×dimension filter-context cells, **397/397** calculated columns (v0.9.63; latest sweep 534/534 comparable measures across the corpus).
 
-Exposes 131 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing (rename / reorder / hide / duplicate pages, move & copy visuals — identically on classic `Report/Layout` and service-authored **PBIR**), visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, sort-by-column, TMDL export/import + PBIP project open/save, incremental refresh, DAX evaluation (100% of Desktop's query-evaluable DAX surface — 435 functions, conformance-verified against Desktop; corpus 1:1), RLS security, and binary format internals.
+Exposes 132 tools covering report creation (all 6 data types, cross-table relationships, CSV/SQLite/SQL Server/MySQL/PostgreSQL/Excel/JSON/Azure SQL data sources, DirectQuery, and DAX measures), layout editing (rename / reorder / hide / duplicate pages, move & copy visuals — identically on classic `Report/Layout` and service-authored **PBIR**), visual management, bookmarks, custom visuals, custom **HTML/CSS/SVG visuals** (with report cross-filtering — see [docs/html-visuals.md](docs/html-visuals.md)), service-portable **rich content** (certified AppSource visual references incl. Deneb, SVG data-URI image measures, Desktop-complete field parameters — see [docs/rich-content.md](docs/rich-content.md)), field parameters, calculation groups, sort-by-column, TMDL export/import + PBIP project open/save, incremental refresh, DAX evaluation (100% of Desktop's query-evaluable DAX surface — 435 functions, conformance-verified against Desktop; corpus 1:1), RLS security, and binary format internals.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
@@ -145,7 +145,7 @@ Every artifact is generated, including `CryptKey.bin` — a 144-byte fixed-forma
 | PBIP Export | **Stable** | Convert PBIX to PBIP (Power BI Project) folder structure via `pbix_export_pbip` — full TMDL semantic model + report layout + static resources, ready for Git |
 | Perspectives | **Stable** | Create/list/remove perspectives via `pbix_add_perspective`, `pbix_get_perspectives`, `pbix_remove_perspective` |
 | User Hierarchies | **Stable** | Create/list/remove drill-down hierarchies via `pbix_add_hierarchy`, `pbix_get_hierarchies`, `pbix_remove_hierarchy`. Works with builder-created and PBI Desktop files |
-| Cultures & Translations | **Stable** | Add cultures, translate table/column/measure names via `pbix_add_culture`, `pbix_add_translations`, `pbix_get_cultures`, `pbix_remove_culture` |
+| Cultures & Translations | **Stable** | Set the MODEL's own culture with `pbix_set_model_culture` (what `FORMAT()` resolves separators from); add translation cultures and translate table/column/measure names via `pbix_add_culture`, `pbix_add_translations`, `pbix_get_cultures`, `pbix_remove_culture` |
 | Partition Management | **Partial** | List/remove partitions via `pbix_get_partitions`, `pbix_remove_partition`. `pbix_add_partition` blocked for PBIX (needs PartitionStorage in VertiPaq), works for PBIP/TMDL export |
 | Sensitivity Labels | **Stable** | Strip MSIP sensitivity labels via `pbix_save(strip_sensitivity_label=True)` |
 | Custom Visuals | **Beta** | Import any `.pbiviz` via `pbix_add_custom_visual` (embeds by GUID + `publicCustomVisuals`), place with `pbix_add_visual` |
@@ -175,7 +175,7 @@ Every artifact is generated, including `CryptKey.bin` — a 144-byte fixed-forma
 - **Full DataModel rebuild** — `set_table_data`, `update_table_rows`, `add/remove_relationship`, `remove_table` trigger a full DataModel rebuild via the builder pipeline. Most other tools (`add_measure`, `modify_measure`, `modify_column`, `set_rls_role`, `add_perspective`, `add_culture`, `add_translations`, `update_data_source`, etc.) use a lightweight metadata-only path.
 
 
-## Tools (131)
+## Tools (132)
 
 ### Create & File Management (6)
 `pbix_create` · `pbix_open` · `pbix_open_pbip` · `pbix_save` · `pbix_close` · `pbix_list_open`
@@ -207,8 +207,8 @@ Every artifact is generated, including `CryptKey.bin` — a 144-byte fixed-forma
 ### User Hierarchies (3)
 `pbix_get_hierarchies` · `pbix_add_hierarchy` · `pbix_remove_hierarchy`
 
-### Cultures & Translations (4)
-`pbix_get_cultures` · `pbix_add_culture` · `pbix_add_translations` · `pbix_remove_culture`
+### Cultures & Translations (5)
+`pbix_get_cultures` · `pbix_set_model_culture` · `pbix_add_culture` · `pbix_add_translations` · `pbix_remove_culture`
 
 ### Partition Management (3)
 `pbix_get_partitions` · `pbix_add_partition` · `pbix_remove_partition`
@@ -594,7 +594,7 @@ PBIX file (ZIP)
 
 ```
 src/pbix_mcp/
-  server.py              # MCP server (131 tools)
+  server.py              # MCP server (132 tools)
   cli.py                 # Entry point (pbix-mcp-server --log-level debug)
   builder.py             # PBIX builder (metadata, VertiPaq, layout, relationships)
   html_templates.py      # HTML/SVG template builders (kpi_card, bar_chart, gauge, table, …)

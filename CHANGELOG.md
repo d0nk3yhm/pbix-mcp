@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.98] - 2026-08-18
+
+### Fixed — FORMAT() interprets quoted literals in a format picture (issue #58)
+
+- **A VBA/DAX format picture escapes literal text by QUOTING it**, and Desktop
+  emits the contents without the quote characters. The engine printed them
+  verbatim, so `FORMAT(1234.5, "\"$ \"#,##0")` came back as `"$ "1,235`
+  instead of `$ 1,235`. Currency pictures are exactly the shape that uses
+  this, so every number format carried over from a source document rendered
+  wrongly under `pbix_evaluate_dax` even though the numbers themselves were
+  right.
+- Quoted spans are now stripped of their quote characters on output, and —
+  just as importantly — they are excluded from the placeholder search and
+  from section splitting, so a digit inside a literal (`"0 of "0`) is text
+  and a `;` inside one is not a section break.
+
+### Added — FORMAT() resolves separators from the model's culture (issue #60)
+
+- **`FORMAT()` ignored `Model.Culture` and its own third `locale` argument**,
+  so there was no way to obtain non-en-US separators at all. A model whose
+  culture is `pt-BR` rendered `FORMAT(1477000, "#,##0.00")` as
+  `1,477,000.00` where DAX renders `1.477.000,00`. This matters because a
+  `FORMAT()` result is a STRING the canvas prints verbatim — its separators
+  come from the model, not from the reader's host.
+- Resolution order is now: the `locale` argument if given, else
+  `Model.Culture`, else en-US. An unknown culture falls back to en-US
+  rather than guessing, since a wrong separator is indistinguishable from a
+  right one in the output.
+- **Known limit, stated rather than guessed at:** only the decimal and
+  group SEPARATORS are culture-resolved. Month and day NAMES still render
+  en-US.
+
+### Added — `pbix_set_model_culture` (issue #60)
+
+- The model's own culture is a first-class property and no longer needs raw
+  SQL through `pbix_datamodel_modify_metadata`. Sets `Model.Culture` and
+  keeps `SourceQueryCulture` in step, the way Desktop does, and drops the
+  DAX context cache so `FORMAT()` picks it up immediately. Distinct from
+  `pbix_add_culture`, which adds a TRANSLATION culture.
+
+### Fixed — `pbix_get_cultures` reports the model's own culture (issue #60)
+
+- It listed translation cultures only, so its answer could contradict the
+  model it described: after setting the culture to `pt-BR` it still said
+  `en-US — 0 translation(s)` and nothing else. It now leads with
+  `Model culture: <name>` and lists the translation cultures separately,
+  returning both in `data` (`model_culture`, `translation_cultures`).
+
+- Pinned by `tests/test_issue58_60_format.py` (24 tests: the reporter's five
+  currency pictures, the literal/section-splitting edge cases, the
+  resolution order, a separator table, and the setter/readback through
+  set → save → close → reopen). Verified failing on 0.9.97.
+- Tool count 131 → 132; the doc ratchet caught the drift.
+
 ## [0.9.97] - 2026-08-18
 
 ### Fixed — a data column named `RowNumber` was silently deleted (issue #55)
