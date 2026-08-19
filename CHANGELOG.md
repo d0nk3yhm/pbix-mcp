@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.99] - 2026-08-18
+
+### Added — `pbix_format_page`: page background and wallpaper (issue #57)
+
+- **A report page could not be given a background colour or a wallpaper image
+  at all**, so every converted sheet landed on a plain white canvas even when
+  the source painted the whole sheet — one of the largest single contributors
+  to a converted report reading as a layout skeleton rather than the original.
+- New `pbix_format_page(alias, page_index, format_json)` — the page-level
+  counterpart of `pbix_format_visual`. Two cards:
+  - `background` — the canvas: `color`, `transparency`,
+    `image_path`/`image_base64`, `scaling`, `name`
+  - `wallpaper` — the area around the canvas, Power BI's `outspace` card,
+    same keys (`outspace` is accepted as a synonym)
+  A bare string is taken as the colour (`{"background": "#F2F6F6"}`), images
+  are registered as report resources the way `pbix_add_image` does, and a
+  second call MERGES into a card rather than replacing its sibling
+  properties.
+- Card names are Microsoft's own: the published PBIR page schema
+  (`page/2.1.0`) defines `background` and `outspace` with the same
+  `{color, image, transparency}` shape. `color` and `transparency` match a
+  Desktop-authored page byte for byte, including the integral-transparency
+  literal `0D` (not `0.0D`). The image sub-object reuses the
+  ResourcePackageItem mechanism measured for image visuals; its inner
+  nesting follows the card's structured-value convention and is **derived
+  rather than measured**, as no Desktop-authored page wallpaper was
+  available locally to diff against.
+
+### Added — per-column table formatting (issue #59)
+
+- **New `columnWidth` card**, keyed by column:
+  `{"columnWidth": {"Sales.Amount": 258.5}}` writes one entry per column
+  carrying `value` and a `{"metadata": "Table.Column"}` selector — the shape
+  Desktop-authored files use. There was no such card at all, so a converter
+  that knows every source column's width could express none of it.
+- **`columnFormatting` now takes a per-column selector.** It wrote a single
+  selector-less entry, so a property could not be aimed at one column. The
+  per-column form `{"Sales.Amount": {"alignment": "Center"}}` emits one
+  selector-bearing entry per column; the flat form still writes the legacy
+  default entry, so existing callers are unaffected. Per-column `fontColor`,
+  `backColor`, `fontSize`, `fontFamily`, `bold` and `italic` were added
+  alongside the existing alignment/units/precision/style properties.
+
+- Pinned by `tests/test_issue57_59_page_column_format.py`; 11 of the 12 fail
+  on 0.9.98.
+- Tool count 132 → 133.
+
 ## [0.9.98] - 2026-08-18
 
 ### Fixed — FORMAT() interprets quoted literals in a format picture (issue #58)

@@ -66,7 +66,7 @@ DAX evaluation returns extended results:
 | `pbix_save` | `strip_sensitivity_label` | `False` | Removes MSIP sensitivity labels when True |
 | `pbix_close` | `force` | `False` | Refuses to close with unsaved changes |
 
-## Tool Categories (132 tools)
+## Tool Categories (133 tools)
 
 ### Create & File Management (7)
 `pbix_create` · `pbix_open` · `pbix_open_pbip` · `pbix_save` · `pbix_close` · `pbix_list_open` · `pbix_report_format`

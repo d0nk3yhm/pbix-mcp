@@ -750,8 +750,8 @@ _FORMAT_CARDS = frozenset({
     "values", "total", "outline", "shape", "fill", "line", "categoryLabels",
     "slices", "action", "text", "smallMultiples", "rowHeaders", "subTotals",
     "referenceLine", "donut", "bubbles", "markers", "imageScaling", "card",
-    "cardTitle", "columnFormatting", "zoom", "general", "visualLink",
-    "visualHeaderTooltip",
+    "cardTitle", "columnFormatting", "columnWidth", "zoom", "general",
+    "visualLink", "visualHeaderTooltip",
 })
 
 
@@ -780,6 +780,16 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
     def _add_vc(category: str, props: dict):
         if props:
             vc_objects[category] = [{"properties": props}]
+
+    def _add_entries(category: str, entries: list):
+        """A card whose entries each carry their own selector.
+
+        Per-COLUMN properties of a table/matrix are one entry per column,
+        selected by ``{"metadata": "Table.Column"}`` -- the shape every
+        Desktop-authored file uses (issue #59).
+        """
+        if entries:
+            objects[category] = entries
 
     # ================================================================
     # vcObjects — visual container formatting
@@ -1333,17 +1343,64 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
         _add("cardTitle", props)
 
     # --- columnFormatting (table/matrix) ---
-    if "columnFormatting" in fmt:
-        cf = fmt["columnFormatting"]
-        props = {}
+    # Two accepted shapes:
+    #   flat        {"alignment": "Center"}                 -> one default entry
+    #   per-column  {"Sales.Amount": {"alignment": "Center"}} -> one entry per
+    #               column, each with a {"metadata": "Table.Column"} selector
+    # The per-column form is what Desktop writes and the only way to aim a
+    # property at ONE column; the card used to emit a selector-less entry
+    # only, so per-column formatting was unreachable (issue #59).
+    def _column_format_props(cf: dict) -> dict:
+        props: dict = {}
         if "alignment" in cf: props["alignment"] = _pbi_lit(cf["alignment"])
         if "displayUnits" in cf:
             raw = _DISPLAY_UNITS.get(cf["displayUnits"], f"{cf['displayUnits']}D")
             props["labelDisplayUnits"] = {"expr": {"Literal": {"Value": raw}}}
-        if "decimalPlaces" in cf: props["labelPrecision"] = _pbi_lit(int(cf["decimalPlaces"]))
+        if "decimalPlaces" in cf:
+            props["labelPrecision"] = _pbi_lit(int(cf["decimalPlaces"]))
         if "styleHeader" in cf: props["styleHeader"] = _pbi_lit(cf["styleHeader"])
         if "styleTotal" in cf: props["styleTotal"] = _pbi_lit(cf["styleTotal"])
-        _add("columnFormatting", props)
+        # Per-column colour and font, measured on Desktop-authored tables.
+        if "fontColor" in cf: props["fontColor"] = _solid_color(cf["fontColor"])
+        if "color" in cf: props["fontColor"] = _solid_color(cf["color"])
+        if "backColor" in cf: props["backColor"] = _solid_color(cf["backColor"])
+        if "fontSize" in cf: props["fontSize"] = _pbi_lit(float(cf["fontSize"]))
+        if "fontFamily" in cf: props["fontFamily"] = _pbi_lit(cf["fontFamily"])
+        if "bold" in cf: props["bold"] = _pbi_lit(cf["bold"])
+        if "italic" in cf: props["italic"] = _pbi_lit(cf["italic"])
+        return props
+
+    if "columnFormatting" in fmt:
+        cf_all = fmt["columnFormatting"]
+        if isinstance(cf_all, dict) and any(
+                isinstance(v, dict) for v in cf_all.values()):
+            entries = []
+            for ref, spec in cf_all.items():
+                if not isinstance(spec, dict):
+                    continue
+                props = _column_format_props(spec)
+                if props:
+                    entries.append({"properties": props,
+                                    "selector": {"metadata": str(ref)}})
+            _add_entries("columnFormatting", entries)
+        elif isinstance(cf_all, dict):
+            _add("columnFormatting", _column_format_props(cf_all))
+
+    # --- columnWidth (table/matrix, per column) ---
+    # {"Sales.Amount": 258.5} -> one entry per column carrying `value` and a
+    # {"metadata": "Table.Column"} selector, the measured Desktop shape. There
+    # was no columnWidth card at all, so a converter that knows every source
+    # column's width could not express any of it (issue #59).
+    if "columnWidth" in fmt and isinstance(fmt["columnWidth"], dict):
+        entries = []
+        for ref, width in fmt["columnWidth"].items():
+            try:
+                w = float(width)
+            except (TypeError, ValueError):
+                continue
+            entries.append({"properties": {"value": _pbi_lit(w)},
+                            "selector": {"metadata": str(ref)}})
+        _add_entries("columnWidth", entries)
 
     # --- zoom (scatter chart zoom slider) ---
     if "zoom" in fmt:
@@ -4704,6 +4761,152 @@ def pbix_register_resource(
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
+
+
+def _page_bg_props(info: dict, layout: dict, spec, card: str) -> dict:
+    """One page background card's properties.
+
+    Card names are Microsoft's own: a page's canvas background is
+    ``background`` and its wallpaper is ``outspace``; the published PBIR page
+    schema (page/2.1.0) defines BOTH with the same shape --
+    ``{color, image, transparency}``.
+
+    ``color`` and ``transparency`` match Desktop-authored files byte for byte.
+    The ``image`` sub-object reuses the ResourcePackageItem mechanism measured
+    for image visuals, wrapped in the structured-value form the card uses for
+    colour (``color`` -> ``{"solid": {...}}``, so ``image`` -> ``{"image":
+    {...}}``); no Desktop-authored page wallpaper was available locally to
+    diff against, so that inner nesting is derived, not measured.
+    """
+    if not isinstance(spec, dict):
+        spec = {"color": spec}
+    props: dict = {}
+    if spec.get("color"):
+        props["color"] = _solid_color(spec["color"])
+    if "transparency" in spec:
+        # Desktop writes an integral transparency as "0D", not "0.0D"
+        # (measured on a Desktop-authored page background).
+        t = float(spec["transparency"])
+        props["transparency"] = {"expr": {"Literal": {"Value": (
+            f"{int(t)}D" if t == int(t) else f"{t}D")}}}
+    img_path = spec.get("image_path") or spec.get("image") or ""
+    img_b64 = spec.get("image_base64") or ""
+    if img_path or img_b64:
+        data, ext = _resolve_image_source(img_path, img_b64)
+        item_name = _register_resource(
+            info, layout, data, spec.get("name") or img_path or card, ext, 100)
+        scaling = str(spec.get("scaling") or "Fit").strip()
+        scale = _IMAGE_SCALING.get(scaling.lower())
+        if scale is None:
+            raise LayoutParseError(
+                f"Invalid scaling {scaling!r} for the {card} image — use "
+                f"Fit, Fill, or Normal.")
+        props["image"] = {"image": {
+            "name": {"expr": {"Literal": {"Value": f"'{item_name}'"}}},
+            "url": {"expr": {"ResourcePackageItem": {
+                "PackageName": "RegisteredResources",
+                "PackageType": 1,
+                "ItemName": item_name,
+            }}},
+            "scaling": {"expr": {"Literal": {"Value": f"'{scale}'"}}},
+        }}
+    return props
+
+
+@mcp.tool()
+def pbix_format_page(alias: str, page_index: int, format_json: str) -> str:
+    """Format a report PAGE — canvas background and wallpaper.
+
+    The page-level counterpart of pbix_format_visual. A page could not be
+    given a background colour or a wallpaper image at all, so every converted
+    report landed on a plain white canvas (issue #57).
+
+    Args:
+        alias: The alias of the open file
+        page_index: Zero-based page index
+        format_json: JSON object with any of:
+            background: the CANVAS background — {color, transparency,
+                image_path | image_base64, scaling, name}
+            wallpaper:  the area around the canvas (Power BI's `outspace`
+                card) — same keys
+            A bare string is accepted as the colour:
+                {"background": "#F2F6F6"}
+            scaling: "Fit" (default), "Fill", or "Normal"
+            transparency: 0-100
+
+    Example:
+        {"background": {"color": "#F2F6F6", "transparency": 0},
+         "wallpaper": {"image_path": "sheet.png", "scaling": "Fill"}}
+    """
+    try:
+        info = _ensure_open(alias)
+        try:
+            fmt = json.loads(format_json) if format_json else {}
+        except json.JSONDecodeError as e:
+            raise LayoutParseError(f"format_json is not valid JSON: {e}")
+        if not isinstance(fmt, dict) or not fmt:
+            raise LayoutParseError(
+                'format_json must be a non-empty JSON object, e.g. '
+                '{"background": {"color": "#F2F6F6"}}')
+
+        layout = _get_layout(info["work_dir"])
+        if not layout:
+            raise LayoutParseError("No layout found")
+        sections = layout.get("sections", [])
+        if page_index < 0 or page_index >= len(sections):
+            raise LayoutParseError(
+                f"Page index {page_index} out of range (0-{len(sections) - 1})")
+        page = sections[page_index]
+
+        # `wallpaper` is the friendly name for Power BI's `outspace` card;
+        # both are accepted so a caller can use either vocabulary.
+        cards = {"background": "background", "wallpaper": "outspace",
+                 "outspace": "outspace"}
+        unknown = [k for k in fmt if k not in cards]
+        applied = []
+        cfg = page.get("config", "{}")
+        if isinstance(cfg, str):
+            try:
+                cfg = json.loads(cfg)
+            except json.JSONDecodeError:
+                cfg = {}
+        objects = cfg.setdefault("objects", {})
+
+        for key, card in cards.items():
+            if key not in fmt:
+                continue
+            props = _page_bg_props(info, layout, fmt[key], card)
+            if not props:
+                continue
+            existing = objects.get(card) or [{}]
+            entry = existing[0] if isinstance(existing[0], dict) else {}
+            merged = dict(entry.get("properties") or {})
+            merged.update(props)
+            entry["properties"] = merged
+            objects[card] = [entry] + list(existing[1:])
+            applied.append(card)
+
+        if not applied:
+            detail = (f"unrecognised key(s): {sorted(unknown)}" if unknown
+                      else "no recognised properties in " + str(sorted(fmt)))
+            raise LayoutParseError(
+                f"No page formatting was applied, so the page is unchanged — "
+                f"{detail}. Supported: background, wallpaper — each takes "
+                f"color, transparency, image_path/image_base64, scaling.")
+
+        page["config"] = json.dumps(cfg, ensure_ascii=False)
+        _set_layout(info["work_dir"], layout)
+        info["modified"] = True
+        note = f" (ignored: {sorted(unknown)})" if unknown else ""
+        return ToolResponse.ok(
+            f"Formatted page {page_index} "
+            f"('{page.get('displayName', '')}'): {', '.join(applied)}{note}",
+            data={"page_index": page_index, "cards": applied,
+                  "ignored": sorted(unknown)}).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        raise LayoutParseError(str(e))
 
 
 @mcp.tool()
