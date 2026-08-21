@@ -17483,6 +17483,80 @@ def pbix_doctor(alias: str) -> str:
                     f"no case-folded name collisions")
         _check("Table / column name collisions", check_name_collisions)
 
+        # 8d. Dictionary width vs its declared flag (issue #63):
+        # DictionaryStorage.IsOperatingOn32 states the element WIDTH — 1 for
+        # 4-byte entries, 0 for 8-byte. A numeric dictionary whose blob holds
+        # 8-byte entries under a 4-byte promise makes Desktop refuse the whole
+        # file ("An error occurred while loading Vertipaq data objects"), and
+        # every engine-side check passed such a file. This compares the flag
+        # against the width in the bytes themselves.
+        def check_dictionary_widths():
+            _init_datamodel()
+            from pbix_mcp.formats.vertipaq_encoder import (
+                dictionary_element_size_from_blob,
+            )
+            c = db_conn.cursor()
+            declared = {}
+            # this cursor yields plain tuples, not sqlite3.Row
+            for tbl, col, op32 in c.execute(
+                "SELECT t.Name, COALESCE(col.ExplicitName, col.InferredName), "
+                "       ds.IsOperatingOn32 "
+                "FROM DictionaryStorage ds "
+                "JOIN ColumnStorage cs ON ds.ColumnStorageID = cs.ID "
+                "JOIN [Column] col ON cs.ColumnID = col.ID "
+                "JOIN [Table] t ON col.TableID = t.ID "
+                "WHERE t.ModelID = 1 AND col.Type <> 3"
+            ).fetchall():
+                if col:
+                    declared[(str(tbl), str(col))] = op32
+
+            offenders, checked = [], 0
+            for f in abf_files:
+                path = f.get("Path", "")
+                if not path.endswith(".dictionary"):
+                    continue
+                start, size = f.get("m_cbOffsetHeader"), f.get("Size")
+                if start is None or not size:
+                    continue
+                blob = abf_data[start:start + size]
+                width = dictionary_element_size_from_blob(blob)
+                if width is None:
+                    continue          # string dictionary or unreadable
+                # The hash block follows the entry WIDTH too, and a file with
+                # the right flag but the 4-byte block on 8-byte entries still
+                # hangs Desktop — so check both, or this catches only half of
+                # what makes such a file unopenable.
+                try:
+                    hash_info = struct.unpack_from("<6i", blob, 4)
+                except struct.error:
+                    hash_info = None
+                want_hash = ((-1, 16, 64, 3, -1, -1) if width == 8
+                             else (-1, 8, 64, 6, -1, -1))
+                for (tbl, col), op32 in declared.items():
+                    if f".{col} (" not in path or f"{tbl} (" not in path:
+                        continue
+                    checked += 1
+                    promised = 4 if op32 == 1 else 8
+                    if promised != width:
+                        offenders.append(
+                            f"{tbl}[{col}]: {width}-byte entries but "
+                            f"IsOperatingOn32={op32} (promises {promised})")
+                    elif hash_info is not None and hash_info != want_hash:
+                        offenders.append(
+                            f"{tbl}[{col}]: {width}-byte entries carry "
+                            f"hash_information {hash_info}, Desktop writes "
+                            f"{want_hash}")
+                    break
+            if offenders:
+                raise Exception(
+                    "dictionary width contradicts its flag (Desktop WILL "
+                    "refuse to open): " + "; ".join(offenders[:5])
+                    + (f" (+{len(offenders) - 5} more)"
+                       if len(offenders) > 5 else ""))
+            return (f"{checked} numeric dictionaries, width matches "
+                    f"IsOperatingOn32")
+        _check("Dictionary width vs IsOperatingOn32", check_dictionary_widths)
+
         # 9. Relationships
         def check_relationships():
             _init_datamodel()

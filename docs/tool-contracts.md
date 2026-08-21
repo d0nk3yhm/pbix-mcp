@@ -120,7 +120,7 @@ List/remove M partitions and set a table's M query definition (`pbix_set_partiti
 Get/set incremental refresh policies. `pbix_set_incremental_refresh` works for files with a data source (source_csv/source_db); embedded-only files return a clear error (same as PBI Desktop).
 
 ### Diagnostics & Security (5)
-20-point diagnostic (`pbix_doctor`), report documentation (`pbix_document`), file diff (`pbix_diff`), performance analysis (`pbix_performance`), password extraction (`pbix_get_password`).
+21-point diagnostic (`pbix_doctor`), report documentation (`pbix_document`), file diff (`pbix_diff`), performance analysis (`pbix_performance`), password extraction (`pbix_get_password`).
 
 ## Image & Resource Tools
 

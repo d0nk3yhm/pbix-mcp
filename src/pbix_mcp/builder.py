@@ -2760,11 +2760,20 @@ def _modify_metadata_and_encode(
 
                 # DictionaryStorage (Type=1 = external, with file)
                 # DictionaryFlags: 3 for string columns, 0 for numeric
-                # IsOperatingOn32: 1 for Int64 (4-byte elements), 0 for String/Double/DateTime
                 dict_flags = 3 if data_type == "String" else 0
-                # IsOperatingOn32: 1 for integer types (4-byte dict entries), 0 for string/float
-                # AMO 6=Int64, 10=Decimal (stored as int64×10000), 11=Boolean (0/1)
-                is_op32 = 1 if amo_type in (6, 10, 11) else 0
+                # IsOperatingOn32 declares the dictionary's element WIDTH:
+                # 1 = 4-byte entries, 0 = 8-byte. Hardcoding 1 for every
+                # integer-backed type contradicted the encoder, which widens
+                # to 8 bytes once a value leaves signed-32 range, and Desktop
+                # refuses such a file outright (issue #63). Derive it from the
+                # column's own values through the encoder's own predicate.
+                from pbix_mcp.formats.vertipaq_encoder import (
+                    dictionary_is_operating_on_32,
+                )
+                is_op32 = dictionary_is_operating_on_32(
+                    data_type,
+                    [r.get(col_name) for r in tdef.get("rows", [])],
+                )
                 c.execute(
                     """INSERT INTO DictionaryStorage (
                         ID, ColumnStorageID, Type, DataType, DataVersion,

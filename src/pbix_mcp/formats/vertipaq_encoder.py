@@ -244,26 +244,80 @@ def _element_size_for_dict_type(dict_type: int, unique_values: list | None = Non
     return 8
 
 
+def dictionary_element_size_from_blob(blob: bytes) -> int | None:
+    """Element width read back out of an encoded NUMERIC dictionary blob.
+
+    Layout: dictionary_type (4) + hash_information (6 x 4) + element_count
+    (8) + element_size (4). Returns None when the blob is too short or the
+    width is not a value this encoder writes, so a caller can fall back
+    rather than trust a misparse.
+    """
+    if not blob or len(blob) < 40:
+        return None
+    try:
+        size = struct.unpack_from("<I", blob, 36)[0]
+    except struct.error:
+        return None
+    return size if size in (4, 8) else None
+
+
+def dictionary_is_operating_on_32(data_type: str, values) -> int:
+    """``DictionaryStorage.IsOperatingOn32`` for a column's raw values.
+
+    The metadata flag declares the dictionary's element WIDTH: 1 means the
+    entries are 4-byte, 0 means 8-byte. It was hardcoded to 1 for every
+    integer-backed type, while :func:`_element_size_for_dict_type` widens the
+    entries to 8 bytes as soon as one value leaves signed-32 range. Any column
+    past that boundary therefore shipped 8-byte entries under a 4-byte
+    promise, and Desktop refuses the whole file — "An error occurred while
+    loading Vertipaq data objects" (issue #63).
+
+    Derived here from the SAME conversion and predicate the encoder uses, so
+    the flag cannot drift from the bytes again. The conversion matters:
+    Decimal is stored scaled by 10000, so 214749.0 becomes 2,147,490,000 and
+    needs 8-byte entries even though the unscaled value looks small.
+    """
+    dict_type = _dict_type_for_data_type(data_type)
+    if dict_type != DICT_TYPE_LONG:
+        return 0                       # strings and float64 are never 4-byte
+    converted = [_convert_value_for_dict(v, data_type) for v in (values or [])]
+    converted = [v for v in converted if v is not None]
+    return 1 if _element_size_for_dict_type(dict_type, converted) == 4 else 0
+
+
 # ---------------------------------------------------------------------------
 # Dictionary encoder
 # ---------------------------------------------------------------------------
 
-def _encode_dict_hash_info(unique_values: list, dict_type: int) -> bytes:
+def _encode_dict_hash_info(unique_values: list, dict_type: int,
+                           element_size: int | None = None) -> bytes:
     """
     Encode the hash_information block (6 x int32) that appears after
     dictionary_type.
 
-    Bug #9: integers use (-1, 8, 64, 6, -1, -1), floats use (-1, 16, 64, 3, -1, -1)
-    Bug #11: strings use (0, 8, 64, 6, -1, -1)
+    For a NUMERIC dictionary these parameters follow the ENTRY WIDTH, not the
+    logical type. Measured across a Desktop-authored model (Contoso BI Sales
+    Dashboard, 49 numeric dictionaries):
+
+        LONG  4-byte entries -> (-1,  8, 64, 6, -1, -1)
+        LONG  8-byte entries -> (-1, 16, 64, 3, -1, -1)
+        REAL  8-byte entries -> (-1, 16, 64, 3, -1, -1)
+
+    An 8-byte LONG carries the SAME block as an 8-byte REAL. Keying this on
+    dict_type alone gave every wide integer dictionary the 4-byte parameters,
+    and Analysis Services then hangs loading the model — the second half of
+    issue #63, alongside the IsOperatingOn32 width flag.
+
+    Bug #11: strings use (0, 8, 64, 6, -1, -1).
     """
     if dict_type == DICT_TYPE_STRING:
         # Bug #11: string hash_info = (0, 8, 64, 6, -1, -1)
-        vals = (0, 8, 64, 6, -1, -1)
-    elif dict_type == DICT_TYPE_REAL:
-        # Bug #9: float hash_info = (-1, 16, 64, 3, -1, -1)
+        return struct.pack("<6i", 0, 8, 64, 6, -1, -1)
+    if element_size is None:
+        element_size = _element_size_for_dict_type(dict_type, unique_values)
+    if element_size == 8:
         vals = (-1, 16, 64, 3, -1, -1)
     else:
-        # Bug #9: integer hash_info = (-1, 8, 64, 6, -1, -1)
         vals = (-1, 8, 64, 6, -1, -1)
     return struct.pack("<6i", *vals)
 
@@ -528,13 +582,15 @@ def _encode_numeric_dictionary(unique_values: list, dict_type: int) -> bytes:
     """
     buf = bytearray()
 
-    # dictionary_type
-    buf += _s4(dict_type)
-    # hash_information (Bug #9)
-    buf += _encode_dict_hash_info(unique_values, dict_type)
-
+    # The hash block depends on the entry WIDTH (issue #63), so decide the
+    # width before writing it.
     count = len(unique_values)
     element_size = _element_size_for_dict_type(dict_type, unique_values)  # Bug #10
+
+    # dictionary_type
+    buf += _s4(dict_type)
+    # hash_information (Bug #9, width-dependent per issue #63)
+    buf += _encode_dict_hash_info(unique_values, dict_type, element_size)
 
     # VectorOfVectors
     buf += _u8(count)
@@ -2037,15 +2093,26 @@ def _apply_metadata_updates(
             (col_storage_id,)
         ).fetchone()
         if dict_row:
-            _OP32_TYPES = {"Int64", "Decimal", "Boolean"}
-            is_op32 = 1 if data_type in _OP32_TYPES else 0
             dict_flags = 3 if data_type == "String" else 0
             # Get dict size and LastId from IDFMETA
             dict_size = 0
+            dict_blob = None
             for path, data in encoded_files.items():
                 if path.endswith(f"column.{col_name}.dict"):
                     dict_size = len(data)
+                    dict_blob = data
                     break
+            # IsOperatingOn32 declares the dictionary's element WIDTH (1 =
+            # 4-byte, 0 = 8-byte). It was hardcoded to 1 for every
+            # integer-backed type while the encoder widens to 8 bytes past
+            # signed-32, so any such column shipped 8-byte entries under a
+            # 4-byte promise and Desktop refused the file (issue #63). Read
+            # the width back out of the bytes actually written -- the one
+            # source that cannot disagree with them.
+            is_op32 = 0
+            if _dict_type_for_data_type(data_type) == DICT_TYPE_LONG:
+                width = dictionary_element_size_from_blob(dict_blob)
+                is_op32 = 1 if width == 4 else 0
             last_id = 0
             if idfmeta_bytes and len(idfmeta_bytes) >= 95:
                 try:

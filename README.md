@@ -157,7 +157,7 @@ Every artifact is generated, including `CryptKey.bin` — a 144-byte fixed-forma
 | Report diff (`pbix_diff`) | **Stable** | Compare two PBIX files — tables, columns, measures, relationships, pages/visuals, data sources, theme colors. Shows added/removed/changed |
 | Report documentation (`pbix_document`) | **Stable** | Auto-generate full report documentation (markdown + .docx) — tables, columns, measures, relationships, data sources, pages/visuals, RLS roles, theme colors |
 | Performance analysis (`pbix_performance`) | **Stable** | Flags oversized tables, empty tables, wide schemas, high-cardinality strings, complex measures, inactive/bidirectional relationships, orphaned tables |
-| Diagnostic tool (`pbix_doctor`) | **Stable** | 20-point comprehensive diagnostic — data sources, storage modes, columns, relationships, measures, RLS, VertiPaq row counts, string dictionary invariants, table/column name collisions, table/storage consistency, referential integrity, Expression/DataMashup consistency, MAXID |
+| Diagnostic tool (`pbix_doctor`) | **Stable** | 21-point comprehensive diagnostic — data sources, storage modes, columns, relationships, measures, RLS, VertiPaq row counts, string dictionary invariants, table/column name collisions, dictionary width vs IsOperatingOn32, table/storage consistency, referential integrity, Expression/DataMashup consistency, MAXID |
 
 ## Known Limitations
 

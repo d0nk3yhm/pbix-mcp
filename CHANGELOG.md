@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.101] - 2026-08-21
+
+### Fixed — Int64 values past signed-32 produced a file Desktop refuses to open (issue #63)
+
+Any column whose values leave `[-2^31, 2^31-1]` shipped a dictionary that
+Analysis Services could not load. **Two** independent contradictions, both
+keyed on the dictionary's entry WIDTH:
+
+- **`DictionaryStorage.IsOperatingOn32`** declares the width (1 = 4-byte
+  entries, 0 = 8-byte) and was hardcoded to 1 for every integer-backed type,
+  while the encoder widens to 8 bytes as soon as a value leaves signed-32
+  range. The blob held 8-byte entries under a 4-byte promise. Now derived at
+  both write sites from the encoder's own conversion and predicate, so the
+  flag cannot drift from the bytes again.
+- **`hash_information`** — the 6 x int32 block after `dictionary_type` —
+  follows the entry width too, and was keyed on the logical type alone.
+  Measured across a Desktop-authored model (49 numeric dictionaries):
+  4-byte integers carry `(-1, 8, 64, 6, -1, -1)`, **8-byte integers carry
+  `(-1, 16, 64, 3, -1, -1)` — the same block as an 8-byte float.** Wide
+  integer dictionaries were getting the 4-byte parameters.
+
+Fixing only the flag was **not** enough: Desktop still hung loading such a
+file. Both had to be right.
+
+**Decimal is affected too** — the issue listed it as an untested adjacent
+risk, and it is real. Decimal is stored scaled by 10000, so `214749.0`
+becomes 2,147,490,000 and needs 8-byte entries while the unscaled value
+looks small. Boolean is unaffected.
+
+**Desktop-verified** (Power BI Desktop, one file per shape): `[1, 2]`,
+`2147483647`, `7000000000`, `800000000000000`, Decimal `1.5` and Decimal
+`214749.0` all open. Before the fix the last three hung on "Loading data
+model" indefinitely while the controls loaded in ~11s.
+
+### Added — `pbix_doctor` checks dictionary width against its declared flag
+
+The issue's sharpest point was that every engine-side check passed a file
+Desktop refuses. The new **"Dictionary width vs IsOperatingOn32"** check
+compares the width in the dictionary bytes against both the metadata flag
+and the `hash_information` block, so either contradiction is caught without
+Desktop. Doctor is now a 21-point diagnostic.
+
+- Pinned by `tests/test_issue63_int64_dictionary_width.py` (18 tests: the
+  flag predicate incl. nulls and non-integer types, built-file width and
+  hash for six shapes, and the doctor check on a planted contradiction).
+  Verified against released 0.9.100, where both fields are wrong for every
+  value past signed-32.
+
 ## [0.9.100] - 2026-08-19
 
 ### Fixed — `columnWidth` spells integral widths the way Desktop does (issue #62)
