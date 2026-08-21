@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.102] - 2026-08-22
+
+### Fixed — a visual background image is refused by name instead of silently dropped (issue #64)
+
+- **`pbix_format_visual` accepted `background: {image_base64: …}` on a
+  VISUAL, dropped the image, and answered "Formatted visual N on page M:
+  background"** — naming the card as though it had been written. Nothing was
+  registered under `RegisteredResources` and the saved card held only
+  `show`, so a caller could not tell honoured from discarded. The nested
+  `background: {image: {…}}` spelling behaved the same.
+- **Power BI has no background image on a visual**, so the fix is to refuse,
+  not implement. Verified independently of the report across 168 local
+  reports: page backgrounds carry an `image` 30 times, visual backgrounds
+  carry it **zero** times out of 1,507 property occurrences, and the
+  vocabulary is exactly `show` / `color` / `transparency`.
+- The refusal names the offending property and where to go instead:
+
+      background.image_base64 is not a visual-level property — Power BI has
+      no background image on a VISUAL (its background card is show / color /
+      transparency only). Use pbix_format_page for a page background or
+      wallpaper image, or place a separate `image` visual behind this one
+      (z-order is add-order, later wins). Nothing was written.
+
+  Nothing is written and no resource is registered on the refused path.
+- **`show` is no longer fabricated when nothing else was recognised.** That
+  auto-`show` is what made a dropped image report as success: it guaranteed
+  the card was non-empty, so the card name appeared in the "formatted"
+  message regardless. It is still implied by naming a colour or
+  transparency, so `{"background": {"color": "#…"}}` is unchanged; an empty
+  or unrecognised background now falls through to the honest "no recognised
+  properties" refusal added in #51.
+- Page background and wallpaper images (`pbix_format_page`) are unaffected —
+  that is where the capability legitimately lives, and a test pins it.
+- Pinned by `tests/test_issue64_visual_background_image.py` (11 tests: four
+  image spellings refused by name, no orphan resource, nothing written to
+  the saved card, the colour/`show` controls, the empty-background refusal,
+  and page background still honoured). Seven fail on 0.9.101.
+
 ## [0.9.101] - 2026-08-21
 
 ### Fixed — Int64 values past signed-32 produced a file Desktop refuses to open (issue #63)

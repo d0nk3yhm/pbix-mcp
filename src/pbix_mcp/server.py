@@ -847,11 +847,38 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
     # --- background ---
     if "background" in fmt:
         bg = fmt["background"]
+        if not isinstance(bg, dict):
+            bg = {"color": bg}
+        # A VISUAL background has no image. Measured across 168 reports: page
+        # backgrounds carry an `image` 30 times, visual backgrounds carry it
+        # ZERO times out of 1,507 property occurrences, and the vocabulary is
+        # exactly show / color / transparency.
+        #
+        # This used to be accepted and dropped: the image keys were ignored,
+        # `show` was written regardless, and the tool answered "Formatted
+        # visual N: background" — so a caller could not tell honoured from
+        # discarded (issue #64). Refuse by name instead, at the call site.
+        _img_keys = [k for k in bg
+                     if k in ("image", "image_base64", "image_path",
+                              "imageUrl", "imageBase64", "imagePath")]
+        if _img_keys:
+            raise LayoutParseError(
+                f"background.{_img_keys[0]} is not a visual-level property — "
+                f"Power BI has no background image on a VISUAL (its background "
+                f"card is show / color / transparency only). Use "
+                f"pbix_format_page for a page background or wallpaper image, "
+                f"or place a separate `image` visual behind this one "
+                f"(z-order is add-order, later wins). Nothing was written.")
         props = {}
         if "color" in bg: props["color"] = _solid_color(bg["color"])
         if "transparency" in bg: props["transparency"] = _pbi_lit(float(bg["transparency"]))
-        if "show" in bg: props["show"] = _pbi_lit(bg["show"])
-        else: props["show"] = _pbi_lit(True)
+        if "show" in bg:
+            props["show"] = _pbi_lit(bg["show"])
+        elif props:
+            # `show` is implied by naming a colour/transparency, but must NOT
+            # be fabricated on its own: an otherwise-unrecognised background
+            # would then look applied when nothing landed.
+            props["show"] = _pbi_lit(True)
         _add_vc("background", props)
 
     # --- border ---
