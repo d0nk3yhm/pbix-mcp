@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.103] - 2026-08-22
+
+### Fixed — `title.alignment` is written lowercase (issue #65)
+
+- **`pbix_format_visual` wrote `'Center'` / `'Left'` / `'Right'` on the
+  `title` card**, a spelling Power BI never produces. Desktop does not
+  recognise it and renders the title flush left. The value round-trips
+  perfectly through save → reopen, so a readback test can never catch it —
+  which is why it survived.
+- **Power BI's casing is not uniform, and that is the trap.** Censused
+  independently across the local Desktop-authored corpus:
+
+  | card.property | casing | n |
+  |---|---|---|
+  | `vcObjects.title.alignment` | **lowercase** | 36 (0 counter-examples) |
+  | `columnFormatting.alignment` | Capitalized | 57 |
+  | `columnHeaders.alignment` | Capitalized | 13 |
+  | `columnHeaders.titleAlignment` | Capitalized | 8 |
+  | `rowHeaders.alignment` | Capitalized | 9 |
+
+  A blanket rule either way breaks one side, so only the title card changed.
+  The three table cards pass the caller's string through untouched, which
+  was already correct.
+- The caller's own casing is normalized, so `"Center"`, `"CENTER"` and
+  `"  Center  "` all reach Desktop as `'center'` — a converter should not
+  have to know the convention to get a centred title.
+- `_ALIGNMENTS` is used by the title card only; its values are now
+  lowercase, with the measurement recorded at the definition so a future
+  tidy-up does not "unify" the two conventions.
+- Pinned by `tests/test_issue65_title_alignment_casing.py` (16 tests),
+  including one assertion holding **both** conventions side by side so a
+  unifying change fails with the reason attached. Ten fail on 0.9.102; the
+  six that pass are the table-card controls that must stay Capitalized.
+
 ## [0.9.102] - 2026-08-22
 
 ### Fixed — a visual background image is refused by name instead of silently dropped (issue #64)

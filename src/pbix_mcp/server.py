@@ -670,7 +670,18 @@ _LEGEND_POSITIONS = {
     "bottomCenter": "'BottomCenter'", "leftCenter": "'LeftCenter'",
     "rightCenter": "'RightCenter'",
 }
-_ALIGNMENTS = {"left": "'Left'", "center": "'Center'", "right": "'Right'"}
+# The title card's alignment is LOWERCASE. Power BI's own casing is not
+# uniform, which is the trap here: measured across Desktop-authored reports,
+# `vcObjects.title.alignment` is lowercase 36 times with zero counter-examples,
+# while the TABLE cards (columnFormatting 57, columnHeaders 13, rowHeaders 9)
+# are Capitalized, also without exception. A blanket rule either way breaks
+# one side. This constant serves the title card ONLY -- the table cards pass
+# the caller's string through untouched, which is already correct.
+#
+# The capitalized form round-trips perfectly through save/reopen, so a
+# readback test can never catch it: Desktop simply does not recognise the
+# string and renders the title flush left (issue #65).
+_ALIGNMENTS = {"left": "'left'", "center": "'center'", "right": "'right'"}
 
 
 def _pbi_lit(value) -> dict:
@@ -825,7 +836,11 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
         if "bold" in t: props["bold"] = _pbi_lit(t["bold"])
         if "italic" in t: props["italic"] = _pbi_lit(t["italic"])
         if "alignment" in t:
-            raw = _ALIGNMENTS.get(t["alignment"], f"'{t['alignment']}'")
+            # Normalize the caller's casing: "Center", "CENTER" and "center"
+            # all have to reach Desktop as 'center', or the title silently
+            # renders flush left.
+            _al = str(t["alignment"]).strip().lower()
+            raw = _ALIGNMENTS.get(_al, f"'{_al}'")
             props["alignment"] = {"expr": {"Literal": {"Value": raw}}}
         if "heading" in t: props["heading"] = _pbi_lit(t["heading"])
         if "titleWrap" in t: props["titleWrap"] = _pbi_lit(t["titleWrap"])
