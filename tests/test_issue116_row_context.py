@@ -20,7 +20,7 @@ Expected values: Power BI Desktop 2.152 over ADOMD, one EVALUATE ROW per probe,
 generated from its output:
 
 - build_b116.py: Orders / Dim. r16, RELATEDTABLE(Dim) over a fact row, is
-  #115 and is left out;
+  #115's (test_issue115_transition_expanded.py);
 - build_b143.py: CALCULATE's filter arguments inside an iterator, over a marked
   (Dt) and an unmarked (Du) calendar;
 - build_b144.py: the row-context probes.

@@ -34,6 +34,7 @@ Supports 150+ DAX functions:
 import bisect
 import calendar
 import decimal
+import hashlib
 import json
 import math
 import os
@@ -1293,6 +1294,9 @@ def _value_keys(v, dateish: bool = True) -> tuple:
     return (('text', _column_text_key(str(v))),)
 
 
+_FILTER_VALUE_KEYS_CACHE: dict = {}
+
+
 def _filter_value_keys(v) -> frozenset:
     """The cell keys (see _value_keys) one FILTER value selects.
 
@@ -1301,7 +1305,27 @@ def _filter_value_keys(v) -> frozenset:
     string its number, and 'true' / 'false' the boolean. 'None' is the
     engine's own spelling of BLANK in internal filter sets. Never another time
     of the same day, and never '01' for '1'.
-    """
+
+    Memoized by type and value: a text value that is no date costs a strptime
+    per format, and an iteration's row filters ask for the same few values
+    again and again."""
+    ck: Optional[tuple] = (type(v), v)
+    try:
+        hit = _FILTER_VALUE_KEYS_CACHE.get(ck)
+    except TypeError:
+        ck = hit = None
+    if hit is not None:
+        cached: frozenset = hit
+        return cached
+    out = _filter_value_keys_uncached(v)
+    if ck is not None:
+        if len(_FILTER_VALUE_KEYS_CACHE) > 200_000:
+            _FILTER_VALUE_KEYS_CACHE.clear()
+        _FILTER_VALUE_KEYS_CACHE[ck] = out
+    return out
+
+
+def _filter_value_keys_uncached(v) -> frozenset:
     keys = set(_value_keys(v))
     if isinstance(v, str):
         s = v.strip()
@@ -1521,8 +1545,8 @@ def _relationship_indexes(relationships: list) -> tuple:
                 # Directional copy: a filter flows ONE -> MANY (ToTable ->
                 # FromTable) by default; the reverse edge exists only for a
                 # bidirectional relationship. The symmetric index above
-                # stays, but propagation may only take the reverse
-                # direction for EXPANDED keys (see _expanded_keys).
+                # serves the joins that go the other way: an expanded
+                # table's related rows (DAXContext.expansion_filters).
                 rel_dir[(ft, tt)] = {'from_col': fc, 'to_col': tc}
                 if rel.get('CrossFilteringBehavior') == 2:
                     rel_dir[(tt, ft)] = {'from_col': tc, 'to_col': fc}
@@ -1869,6 +1893,35 @@ def _row_value(vals: list, shadow: Optional[list]) -> RowContextValues:
     return tagged
 
 
+class _ColumnsRow(dict):
+    """A row of a table of COLUMNS -- SUMMARIZE, SELECTCOLUMNS, GROUPBY -- as
+    opposed to a row of its base table (``__table__``). Its columns keep
+    their lineage, but it filters no expanded table: Power BI Desktop 2.152,
+    SUMX(SUMMARIZE(Orders, Orders[Region], Orders[Revenue]),
+    CALCULATE(COUNTROWS(Dim))) is 9 while SUMX(Orders, ...) is 3, and
+    CALCULATE(ISFILTERED(Dim), SELECTCOLUMNS(Orders, "Region", Orders[Region],
+    "Revenue", Orders[Revenue])) is FALSE (build_b115b.py, issue #115)."""
+
+
+class _SigDict(dict):
+    """A dict of filters that carries their signatures (`sigd`, key ->
+    DAXContext._filter_sig), so a context it is applied to signs them in one
+    update (DAXContext._filters_sigd). A row's expansion is one (issue #115)."""
+    sigd: dict = {}
+
+
+class _ExpansionValues(RowContextValues):
+    """A row transition's filter on a column of the row's EXPANDED table
+    beyond the row's own table (issue #115). ``origin`` is the iterated table
+    and ``anchor_key`` its join column toward this one. While a filter on
+    ``anchor_key`` keeps the row's value (``anchor_sig``), it selects the
+    related rows already, so this filter adds nothing on ``origin`` and is
+    not propagated back to it (_get_cross_table_filters_uncached)."""
+    origin: str = ''
+    anchor_key: str = ''
+    anchor_sig: Any = None
+
+
 def _iteration_tagged(v) -> bool:
     """A filter an iteration put there: a grouping or a row transition."""
     return isinstance(v, (GroupByValues, GroupByPredicate, RowContextValues, RowContextPredicate))
@@ -1968,14 +2021,6 @@ class DAXContext:
         # Rows of the group being evaluated by GROUPBY's extension columns;
         # CURRENTGROUP() reads it.
         self._current_group: Optional[list] = None
-        # Filter keys registered by a TABLE filter argument (FILTER(T,...),
-        # ALL(T) row sets). Desktop's rule, pinned on MS_Employee_Hiring:
-        # a filter on a TABLE filters its EXPANDED table, so it reaches the
-        # one-side dimensions the table points at (MAX('Date'[PeriodNumber])
-        # drops 201612 -> 201412 under FILTER(Employee, ...)); a filter on a
-        # COLUMN does not (Employee[FP]="FT" leaves it at 201612). Keys in
-        # this set may propagate MANY -> ONE; every other filter is one->many.
-        self._expanded_keys: set = set()
         # Pre-transition (outer) context, set by _make_row_context. In real DAX a
         # row context does NOT filter — only CALCULATE / a measure invocation
         # performs the row->filter transition. This engine applies the transition
@@ -2303,10 +2348,7 @@ class DAXContext:
         for k, v in self.filter_context.items():
             if k.startswith(f"{table}."):
                 continue
-            try:
-                snap[k] = self._filter_sig(v)
-            except TypeError:
-                snap[k] = None
+            snap[k] = self._filter_sig_exact(v)
         return snap
 
     def model_table(self, name: str) -> str:
@@ -2339,6 +2381,214 @@ class DAXContext:
                     todo.append(nxt)
         return frozenset(out)
 
+    def expansion_filters(self, table: str, values: dict, blank: bool = False) -> dict:
+        """The filters a filter on rows of ``table`` puts on the rest of its
+        EXPANDED table (issue #115): every column of each table it reaches
+        many-to-one, transitively (both ends of a one-to-one), holding that
+        column's values over the related rows, and BLANK for the blank row a
+        key that matches nothing relates to. ``values`` maps ``table``'s
+        columns to their values over the rows; ``blank`` says the rows take
+        in ``table``'s own blank row. A table that reaches no other gets {}.
+
+        Power BI Desktop 2.152 over ADOMD (build_b115.py): with Orders
+        many-to-one Dim, SUMX(Orders, CALCULATE(COUNTROWS(Dim))) is 3, one
+        Dim row per order, and REMOVEFILTERS(Dim[Region]) leaves the zone."""
+        if not self._expand_adj.get(table):
+            return {}
+        return self._expand_from([(table, values, blank)], {table})
+
+    def _expand_from(self, todo: list, seen: set) -> dict:
+        """expansion_filters' walk: from each ``(table, values, blank)`` in
+        ``todo`` across the many-to-one hops to the tables not ``seen``."""
+        adj = self._expand_adj
+        out: dict = {}
+        while todo:
+            cur, cur_vals, cur_blank = todo.pop()
+            for nxt in adj.get(cur, ()):
+                rel = self._rel_index.get((cur, nxt))
+                if nxt in seen or not rel:
+                    continue
+                keys = cur_vals.get(rel['from_col'])
+                if keys is None:
+                    continue        # the rows do not carry the join column
+                hop = self._hop_rows(cur, nxt, rel, keys, cur_blank)
+                if hop is None:
+                    continue
+                seen.add(nxt)
+                nxt_vals, nxt_blank = hop
+                for c, vs in nxt_vals.items():
+                    out[f"{nxt}.{c}"] = vs
+                todo.append((nxt, nxt_vals, nxt_blank))
+        return out
+
+    def _hop_rows(self, cur: str, nxt: str, rel: dict, keys: list, cur_blank: bool):
+        """One hop of an expanded table: ``(values by column, blank)`` of the
+        rows of ``nxt`` related to the rows of ``cur`` whose join column holds
+        ``keys`` -- the blank row of ``nxt`` when one of them matches nothing.
+        None when a table or column is missing. A single key, a row
+        transition's, is memoized on the model-wide cache; the lists returned
+        are shared and must not be changed."""
+        ck = None
+        if len(keys) == 1:
+            k = keys[0]
+            ck = ('hop-rows', cur, nxt, rel['from_col'], type(k).__name__, k, cur_blank, self._rels_sig)
+            try:
+                hit = self._filter_idx_cache.get(ck)
+            except TypeError:
+                ck = hit = None
+            if hit is not None:
+                cached: tuple = hit
+                return cached
+        cur_tbl, nxt_tbl = self.tables.get(cur), self.tables.get(nxt)
+        if not cur_tbl or not nxt_tbl:
+            return None
+        cur_idx = self._find_col_idx(cur_tbl['columns'], rel['from_col'])
+        nxt_idx = self._find_col_idx(nxt_tbl['columns'], rel['to_col'])
+        if cur_idx < 0 or nxt_idx < 0:
+            return None
+        pad = [None] * cur_idx
+        allowed = self._hop_keys(cur, [pad + [k] for k in dict.fromkeys(keys)],
+                                 cur_blank, cur_idx, nxt, nxt_idx)
+        hit_idx = self._indices_for_values(nxt_tbl, nxt_idx, allowed)
+        nxt_blank = 'None' in allowed and nxt in self.blank_row_tables()
+        rows = nxt_tbl['rows']
+        picked = [rows[i] for i in sorted(hit_idx or ())]
+        nxt_vals: dict = {}
+        for ci, c in enumerate(nxt_tbl['columns']):
+            vs = [r[ci] if ci < len(r) else None for r in picked]
+            if nxt_blank:
+                vs.append(None)
+            nxt_vals[c] = vs
+        out = (nxt_vals, nxt_blank)
+        if ck is not None:
+            self._filter_idx_cache[ck] = out
+        return out
+
+    def _row_expansion(self, t: str, part: dict, shadow) -> dict:
+        """expansion_filters for one whole row of ``t``, as _ExpansionValues
+        carrying the iteration's rows (``shadow``) and the row's join column
+        toward each table. Built once per iteration and join value: the rows
+        of a fact table share a few thousand dimension members."""
+        cache = self._filter_idx_cache.setdefault('__row_expansion__', [])
+        slot = next((s for s in cache if s[0] is shadow), None)
+        if slot is None:
+            if len(cache) >= 4:
+                cache.pop(0)
+            slot = (shadow, {})
+            cache.append(slot)
+        memo: dict = slot[1]
+        blank = bool(part.get('__blank_row__'))
+        subs: list = []
+        for nxt in self._expand_adj.get(t, ()):
+            rel = self._rel_index.get((t, nxt))
+            if not rel or rel['from_col'] not in part:
+                continue
+            fk = rel['from_col']
+            v = part[fk]
+            mk: Optional[tuple] = (t, nxt, fk, type(v).__name__, v, blank, self._rels_sig)
+            try:
+                sub = memo.get(mk)
+            except TypeError:
+                mk = sub = None
+            if sub is None:
+                # the values and their signatures, once per model and member
+                rk = ('row-expansion', mk) if mk is not None else None
+                got = self._filter_idx_cache.get(rk) if rk is not None else None
+                if got is None:
+                    hop = self._hop_rows(t, nxt, rel, [v], blank)
+                    if hop is None:
+                        continue
+                    raw = {f"{nxt}.{c}": vs for c, vs in hop[0].items()}
+                    raw.update(self._expand_from([(nxt, hop[0], hop[1])], {t, nxt}))
+                    got = (raw, {k: self._filter_sig_exact(vs) for k, vs in raw.items()},
+                           f"{t}.{fk}", self._filter_sig([v]))
+                    if rk is not None:
+                        self._filter_idx_cache[rk] = got
+                raw, sigd, anchor_key, anchor_sig = got
+                sub = _SigDict()
+                for k, vs in raw.items():
+                    w = _ExpansionValues(vs)
+                    w.shadow, w.origin, w.anchor_key, w.anchor_sig = shadow, t, anchor_key, anchor_sig
+                    w._sig = sigd[k]  # type: ignore[attr-defined]
+                    sub[k] = w
+                sub.sigd = sigd
+                if mk is not None:
+                    if len(memo) > 50_000:
+                        memo.clear()
+                    memo[mk] = sub
+            subs.append(sub)
+        if len(subs) == 1:
+            only: dict = subs[0]
+            return only
+        out = _SigDict()
+        out.sigd = {}
+        for sub in reversed(subs):      # the first hop's table wins a column two reach
+            out.update(sub)
+            out.sigd.update(sub.sigd)
+        return out
+
+    def transition_filters(self) -> dict:
+        """What the transition of this context's iterated rows filters beyond
+        the rows' own columns, which the engine applies eagerly: the rest of
+        each row's EXPANDED table (expansion_filters), so CALCULATE or a
+        measure inside SUMX(Orders, ...) sees each one-side dimension at the
+        row's related member (issue #115). The rows are those bound along
+        _outer_ctx, which no CALCULATE or measure reference has transitioned
+        yet, innermost first; a column an inner row filters keeps the inner
+        row's value, and so does a column a row's own part filters (Desktop:
+        SUMX(CROSSJOIN(Orders, Cat), CALCULATE(COUNTROWS(Dim))) is 3, the
+        Cat part's zone over the one the Orders part reaches; build_b116.py
+        r40, SUMX(Dim, SUMX(Orders, CALCULATE(COUNTROWS(Dim)))), is 9)."""
+        row = self._current_row
+        if (self._outer_ctx is not None and self._outer_ctx._outer_ctx is None
+                and isinstance(row, dict) and not row.get('__parts__')):
+            # One row of one table, the common case: its expansion never
+            # names the table's own columns.
+            t = row.get('__table__')
+            tbl = self.tables.get(t) if isinstance(t, str) else None
+            if (not isinstance(t, str) or not tbl or not self._expand_adj.get(t) or isinstance(row, _ColumnsRow)
+                    or not all(col in row for col in tbl['columns'])):
+                return {}
+            shadow = next((s for s in (getattr(self.filter_context.get(f"{t}.{col}"), 'shadow', None)
+                                       for col in tbl['columns']) if s is not None), None)
+            return self._row_expansion(t, row, shadow)
+        out: dict = {}
+        owned: set = set()
+        c = self
+        while c._outer_ctx is not None:
+            row_ctx, c = c, c._outer_ctx
+            row = row_ctx._current_row
+            if not isinstance(row, dict):
+                continue
+            parts = [p for p in (row.get('__parts__') or (row,))
+                     if isinstance(p, dict) and isinstance(p.get('__table__'), str)]
+            owns = []
+            for part in parts:
+                t = part['__table__']
+                own = {f"{t}.{k}" for k in part if not k.startswith('__')}
+                if part.get('__column__'):
+                    own.add(f"{t}.{part['__column__']}")
+                owns.append(own)
+                owned |= own
+            for part, own in zip(parts, owns):
+                t = part['__table__']
+                tbl = self.tables.get(t)
+                if (not tbl or not self._expand_adj.get(t) or isinstance(part, _ColumnsRow)
+                        or not all(col in part for col in tbl['columns'])):
+                    continue        # not a whole row of a table
+                # The row's expanded table, as the iteration's filters
+                # (ALLSELECTED puts back the related rows of every iterated
+                # row; _shadow_values).
+                shadow = next((s for s in (getattr(row_ctx.filter_context.get(k), 'shadow', None)
+                                           for k in own) if s is not None), None)
+                exp = self._row_expansion(t, part, shadow)
+                for k, v in exp.items():
+                    if k not in owned and k not in out:
+                        out[k] = v
+            for k in out:
+                owned.add(k)
+        return out
+
     def is_directly_filtered(self, table: str, column: str | None = None) -> bool:
         """ISFILTERED's test: a DIRECT filter on ``table[column]``, or on any
         column of ``table`` when ``column`` is None -- a filter on the column
@@ -2347,10 +2597,11 @@ class DAXContext:
         a relationship is a cross filter: ISFILTERED(Orders) stays FALSE under
         Dim[Zone] = "z1" (Power BI Desktop 2.152 over ADOMD).
 
-        Not modelled yet: a TABLE filter argument filters every column of its
-        EXPANDED table directly -- Desktop says ISFILTERED(Dim[Zone]) is TRUE
-        under FILTER(Orders, ...) -- because this engine keeps a table filter
-        as filters on the table's own columns (see _expanded_keys).
+        A TABLE filter argument, and the transition of a table's row, filter
+        every column of the table's EXPANDED table directly: Desktop says
+        ISFILTERED(Dim[Zone]) is TRUE under FILTER(Orders, ...) and inside
+        SUMX(Orders, CALCULATE(...)). Those columns carry filters of their own
+        (expansion_filters; issues #114, #115).
 
         A key naming a column the table does not have filters nothing
         (_surviving_indices skips it), so it is no filter here either."""
@@ -2428,11 +2679,11 @@ class DAXContext:
         """The live filters ALL(table) must still keep away from ``table``
         after the filters on its expanded table are gone (see _no_prop_keys).
 
-        Two kinds only. A TABLE filter argument on a many-side table
-        (FILTER(Employee, ...), which may restrict ``table`` many -> one):
-        ALL takes ``table``'s columns out of it. And a filter on the date
-        table where no relationship joins it to ``table`` (the
-        _get_date_cross_filter path). Every other filter stays in force: one
+        One kind only: a filter on the date table where no relationship joins
+        it to ``table`` (the _get_date_cross_filter path). A TABLE filter
+        argument on a many-side table (FILTER(Employee, ...)) filters
+        ``table``'s own columns (expansion_filters, issue #114), which ALL
+        takes out with the rest of the expanded table. Every other filter stays in force: one
         on a table outside the expanded table still reaches ``table`` through
         a many-to-many or a bidirectional relationship -- Desktop 2.152 keeps
         the Tags[TagName] grouping under ALL(Fact) (27 / 18, not 45), and
@@ -2446,12 +2697,8 @@ class DAXContext:
             t, sep, _c = k.partition('.')
             if not sep or t in expanded:
                 continue
-            if k in self._expanded_keys or (
-                    t == self.date_table and not self._rel_dir.get((table, t))):
-                try:
-                    snap[k] = self._filter_sig(v)
-                except TypeError:
-                    snap[k] = None
+            if t == self.date_table and not self._rel_dir.get((table, t)):
+                snap[k] = self._filter_sig_exact(v)
         return snap
 
     def _get_cross_table_filters(self, table_name: str) -> list:
@@ -2498,11 +2745,8 @@ class DAXContext:
         try:
             if self._rels_sig is None:
                 raise TypeError
-            ck = (id(tbl), 'xtf', tuple(sorted(
-                (k, self._filter_sig(v)) for k, v in self.filter_context.items())),
+            ck = (id(tbl), 'xtf', self._filters_sig(),
                 tuple(sorted((self._no_prop_keys.get(table_name) or {}).items())),
-                tuple(sorted(k for k in self._expanded_keys
-                             if k in self.filter_context)),
                 self._rels_sig)
         except TypeError:
             ck = None
@@ -2532,7 +2776,15 @@ class DAXContext:
             # Owners[Manager]="Weiler, Anne", an inner "Low, Spencer" inside
             # ALL('Cases') gives Spencer's 4.13796627491058 / 3914 rows, not
             # Anne's and not the global.
-            if fk in _suppressed and _suppressed[fk] == self._filter_sig(values):
+            if fk in _suppressed and _suppressed[fk] == self._filter_sig_exact(values):
+                continue
+            if (type(values) is _ExpansionValues and values.origin == table_name
+                    and self._filter_sig(self.filter_context.get(values.anchor_key))
+                    == values.anchor_sig):
+                # A row transition's filter on the row's dimension, back on
+                # the iterated table: the row's own join value selects those
+                # rows already (issue #115 -- skipping it keeps an iteration
+                # over a fact table as fast as before).
                 continue
             parts = fk.split('.', 1)
             if len(parts) == 2:
@@ -2547,22 +2799,14 @@ class DAXContext:
             if not src_tbl:
                 continue
 
-            # Find relationship between source dim table and target table.
-            # Directional first (one -> many, plus bidirectional). The reverse
-            # direction -- the MANY side restricting the ONE side -- is DAX's
-            # expanded-table behaviour and is taken only for keys a TABLE
-            # filter argument registered: FILTER(Employee, ...) restricts Date
-            # ([Actives] = 32,401 needs exactly that), while a column filter
-            # like DimStore[StoreType]="Catalog" must NOT reach DimEmployee
-            # (Desktop: COUNTROWS(DimEmployee) stays 293, SELECTEDVALUE BLANK).
+            # Find relationship between source dim table and target table:
+            # one -> many, plus bidirectional. A column filter on the MANY side
+            # does not reach the one side -- DimStore[StoreType]="Catalog"
+            # leaves COUNTROWS(DimEmployee) at 293 in Desktop. A TABLE filter
+            # on it does, and so does the transition of its row, by filtering
+            # the one side's own columns (expansion_filters; FILTER(Employee,
+            # ...) restricts Date, [Actives] = 32,401).
             rel = self._rel_dir.get((table_name, src_table))
-            if not rel:
-                expanded = [cf for cf in col_filters
-                            if f"{src_table}.{cf[0]}" in self._expanded_keys]
-                if expanded:
-                    rel = self._rel_index.get((table_name, src_table))
-                    if rel:
-                        col_filters = expanded
             if not rel:
                 # Try via date table special handling (for Year/Month filters on date dim)
                 if src_table == self.date_table:
@@ -2737,6 +2981,69 @@ class DAXContext:
         cache = getattr(self, "_column_data_cache", None)
         if cache:
             cache.clear()
+        self._fc_sig: Optional[frozenset] = None
+        self._fc_sigd: Optional[dict] = None
+        # (parent, parent's filter dict, keys set, keys removed): with_filters /
+        # without_filters derive the signature from the parent's (_filters_sigd)
+        self._sig_base: Optional[tuple] = None
+        self._has_tuple: Optional[bool] = None
+
+    def has_tuple_filters(self) -> bool:
+        """Is any filter one on column combinations (TREATAS onto several
+        columns)? Known from the parent when the context was derived."""
+        h = self._has_tuple
+        if h is None:
+            h = self._has_tuple = any(k.startswith(_TUPLE_FILTER_PREFIX)
+                                      for k in self._filter_context)
+        return h
+
+    def _filters_sig(self) -> frozenset:
+        """The signature of the whole filter set (each filter's
+        _filter_sig_exact), built once per filter set: every table a measure
+        reads asks for it."""
+        sig = self._fc_sig
+        if sig is None:
+            sig = self._fc_sig = frozenset(self._filters_sigd().items())
+        return sig
+
+    def _filters_sigd(self) -> dict:
+        """{key: _filter_sig_exact} of the filter set. A context derived by
+        with_filters / without_filters signs only what it changed on its
+        parent's: an iteration's contexts differ from the one they came from
+        in a few filters, and signing all of them again for every row was most
+        of the cost of a fact-row transition (issue #115)."""
+        chain = []
+        c: Optional[DAXContext] = self
+        while c is not None and c._fc_sigd is None:
+            chain.append(c)
+            base = c._sig_base
+            c = base[0] if base is not None and base[0]._filter_context is base[1] else None
+        d = c._fc_sigd if c is not None else None
+        for ctx in reversed(chain):
+            base = ctx._sig_base
+            fc = ctx._filter_context
+            if d is not None and base is not None and base[0]._fc_sigd is d:
+                d = dict(d)
+                for k in base[3]:
+                    d.pop(k, None)
+                if type(base[2]) is _SigDict:
+                    d.update(base[2].sigd)
+                else:
+                    for k in base[2]:
+                        if k in fc:
+                            d[k] = ctx._sig_of(fc[k])
+            else:
+                d = {k: ctx._sig_of(v) for k, v in fc.items()}
+            ctx._fc_sigd = d
+            ctx._sig_base = None
+        out: dict = self._fc_sigd if self._fc_sigd is not None else {}
+        return out
+
+    @classmethod
+    def _sig_of(cls, v):
+        # a row transition's value carries its signature (_filter_sig)
+        s = v.__dict__.get('_sig') if isinstance(v, RowContextValues) else None
+        return s if s is not None else cls._filter_sig_exact(v)
 
     def _row_root(self) -> 'DAXContext':
         """The context the enclosing row contexts were opened in: the filter
@@ -2782,13 +3089,51 @@ class DAXContext:
             except (TypeError, ValueError):
                 return None
         if isinstance(allowed, (list, tuple, set, frozenset)):
+            # A row transition's value is built once and read for every
+            # memo key below it, so it keeps its signature.
+            tagged = isinstance(allowed, RowContextValues)
+            if tagged:
+                cached = allowed.__dict__.get('_sig')
+                if cached is not None:
+                    return cached
             if len(allowed) > 4096:
                 return None
             try:
-                return ('l', tuple(sorted(str(v) for v in allowed)))
+                sig = ('l', tuple(sorted(str(v) for v in allowed)))
             except TypeError:
                 return None
+            if tagged:
+                allowed._sig = sig  # type: ignore[attr-defined]
+            return sig
         return ('s', str(allowed))
+
+    @classmethod
+    def _filter_sig_exact(cls, allowed):
+        """_filter_sig, and for a filter too large for it a digest of its
+        sorted values -- never None. A memo keyed on it, or a snapshot
+        compared through it, cannot take two different filters for one: the
+        cross-filter memo signed every filter of more than 4096 values as
+        None, so CALCULATE over the dates before 2015 was served the result
+        for the dates before 2014 (issue #149; Desktop 2.152, build_b149.py:
+        [b] - [a] is 365, the engine answered 0)."""
+        sig = cls._filter_sig(allowed)
+        if sig is not None:
+            return sig
+        if isinstance(allowed, (list, tuple, set, frozenset)):
+            tagged = isinstance(allowed, RowContextValues)
+            if tagged:
+                cached = allowed.__dict__.get('_xsig')
+                if cached is not None:
+                    return cached
+            h = hashlib.blake2b(digest_size=20)
+            for s in sorted(str(v) for v in allowed):
+                h.update(s.encode('utf-8', 'surrogatepass'))
+                h.update(b'\x1f')
+            sig = ('L', len(allowed), h.digest())
+            if tagged:
+                allowed._xsig = sig  # type: ignore[attr-defined]
+            return sig
+        return ('x', repr(allowed))
 
     def _value_index_map(self, tbl: dict, col_idx: int) -> dict:
         """``{value-key: frozenset(row indices)}`` for one column, built once.
@@ -3188,7 +3533,6 @@ class DAXContext:
         ctx._filter_idx_cache = self._filter_idx_cache
         ctx._no_propagate = set(self._no_propagate)
         ctx._no_prop_keys = dict(self._no_prop_keys)
-        ctx._expanded_keys = set(self._expanded_keys)
         ctx.group_keys = set(self.group_keys)
         ctx.culture = self.culture
         ctx.selected_filters = (None if self.selected_filters is None
@@ -3204,6 +3548,11 @@ class DAXContext:
         ctx._measure_cache = self._measure_cache
         ctx._measure_cache_unsupported = self._measure_cache_unsupported
         ctx._shield_cache = self._shield_cache
+        ctx._sig_base = (self, self._filter_context,
+                         extra_filters if type(extra_filters) is _SigDict else tuple(extra_filters), ())
+        if self._has_tuple is False:
+            ctx._has_tuple = type(extra_filters) is not _SigDict and any(
+                k.startswith(_TUPLE_FILTER_PREFIX) for k in extra_filters)
         return ctx
 
     def with_relationships(self, relationships: list) -> 'DAXContext':
@@ -3232,10 +3581,13 @@ class DAXContext:
         new_filters = {k: v for k, v in self.filter_context.items() if k not in keys}
         ctx = DAXContext(self.tables, self.measures, self.date_table,
                          self.date_column, new_filters, self.relationships)
+        ctx._sig_base = (self, self._filter_context, (),
+                         tuple(k for k in self.filter_context if k not in new_filters))
+        if self._has_tuple is False:
+            ctx._has_tuple = False
         ctx._filter_idx_cache = self._filter_idx_cache
         ctx._no_propagate = set(self._no_propagate)
         ctx._no_prop_keys = dict(self._no_prop_keys)
-        ctx._expanded_keys = set(self._expanded_keys)
         ctx.group_keys = set(self.group_keys)
         ctx.culture = self.culture
         ctx.selected_filters = (None if self.selected_filters is None
@@ -3777,6 +4129,14 @@ class DAXEngine:
                 if _name.lower() == lowered:
                     measure_name = _name
                     break
+        if ctx._outer_ctx is not None:
+            # The reference transitions the iterated rows: each filters its
+            # expanded table (issue #115), and the memo key sees that.
+            _tf = ctx.transition_filters()
+            if _tf:
+                _row = ctx._current_row
+                ctx = ctx.with_filters(_tf)
+                ctx._current_row = _row
         # Calculation groups (issue #121): the selected item of highest
         # precedence that this evaluation path has not applied yet replaces
         # the reference with its own expression (see _cg_chain).
@@ -3808,13 +4168,13 @@ class DAXEngine:
                 tag = type(v).__name__ if type(v) not in (list, dict) else ''
                 if isinstance(v, list):
                     if tag:
-                        shadow = self._shadow_token(k, v) if _shadow_on else None
+                        shadow = self._shadow_token(k, v, ctx) if _shadow_on else None
                         return (tag, tuple(v)) if shadow is None else (tag, tuple(v), shadow)
                     return tuple(v)
                 if isinstance(v, dict):
                     return ("__pred__" + tag, json.dumps(v, sort_keys=True,
                                                          default=str),
-                            self._shadow_token(k, v) if _shadow_on else None)
+                            self._shadow_token(k, v, ctx) if _shadow_on else None)
                 return v
             # Filters the measure provably cannot see are keyed by what it
             # does see of them (_shielded_keys): "the last week with sales"
@@ -4134,16 +4494,12 @@ class DAXEngine:
             tbl = ctx.tables.get(t)
             if tbl is None:
                 continue
-            # A table filter's expanded propagation is not replaced by a row
-            # transition, so a table with one keeps its full key.
             prefix = t + '.'
-            if any(k.startswith(prefix) for k in ctx._expanded_keys):
-                continue
             for c in tbl['columns']:
                 k = prefix + c
                 v = ctx.filter_context.get(k)
                 if isinstance(v, (RowContextValues, RowContextPredicate)):
-                    out[k] = ('shadow', self._shadow_token(k, v) if shadow_on else None)
+                    out[k] = ('shadow', self._shadow_token(k, v, ctx) if shadow_on else None)
                 elif isinstance(v, (GroupByValues, GroupByPredicate)):
                     out[k] = ('grouping',)
         return out
@@ -4198,7 +4554,7 @@ class DAXEngine:
                     todo.append(str(ctx.measures.get(m) or ''))
         return False
 
-    def _shadow_token(self, key: str, value) -> Optional[int]:
+    def _shadow_token(self, key: str, value, ctx: Optional[DAXContext] = None) -> Optional[int]:
         """A small number standing for the distinct values of ``key``'s column
         among ``value``'s iteration rows (None without them). Numbers are
         never reused, so two different shadows never share one."""
@@ -4211,7 +4567,7 @@ class DAXEngine:
         if hit is not None and hit[0] is shadow:
             tok: int = hit[1]
             return tok
-        vals = self._shadow_values(shadow, table, col)
+        vals = self._shadow_values(shadow, table, col, ctx)
         fp = tuple(sorted((type(x).__name__, repr(x)) for x in vals))
         known: Optional[int] = self._shadow_tokens.get(fp)
         if known is None:
@@ -5572,8 +5928,11 @@ class DAXEngine:
     #     others included: CALCULATE(COUNTROWS(ALLSELECTED(Dt[Date])),
     #     Dt[Month] = 2) is all 91 dates.
 
-    def _shadow_values(self, shadow: list, table: str, col: str) -> list:
-        """The distinct values of ``table.col`` among an iteration's rows."""
+    def _shadow_values(self, shadow: list, table: str, col: str,
+                       ctx: Optional[DAXContext] = None) -> list:
+        """The distinct values of ``table.col`` among an iteration's rows. A
+        column of a table the rows reach through their expanded table takes
+        the related rows' values (issue #115), read through ``ctx``."""
         key = (id(shadow), table, col)
         hit = self._shadow_cache.get(key)
         if hit is not None and hit[0] is shadow:
@@ -5583,11 +5942,13 @@ class DAXEngine:
             self._shadow_cache.clear()
         vals: list = []
         seen: set = set()
+        others: set = set()
         for r in shadow:
             if not isinstance(r, dict):
                 continue
             for part in (r.get('__parts__') or (r,)):
                 if part.get('__table__') != table:
+                    others.add(part.get('__table__'))
                     continue
                 if part.get('__column__') == col:
                     v = part.get('__value__')
@@ -5599,17 +5960,50 @@ class DAXEngine:
                 if marker not in seen:
                     seen.add(marker)
                     vals.append(v)
+        if not vals and ctx is not None:
+            for t in others:
+                if isinstance(t, str) and table in ctx.expanded_tables(t) and t != table:
+                    for v in self._shadow_expansion(shadow, t, ctx).get(f"{table}.{col}", ()):
+                        marker = (type(v).__name__, repr(v))
+                        if marker not in seen:
+                            seen.add(marker)
+                            vals.append(v)
         self._shadow_cache[key] = (shadow, vals)
         return vals
 
-    def _restore_selected(self, key: str, value):
+    def _shadow_expansion(self, shadow: list, table: str, ctx: DAXContext) -> dict:
+        """expansion_filters over the whole rows of ``table`` among an
+        iteration's rows, once per iteration."""
+        key = ('expansion', id(shadow), table)
+        hit = self._shadow_cache.get(key)
+        if hit is not None and hit[0] is shadow:
+            cached: dict = hit[1]
+            return cached
+        tbl = ctx.tables.get(table) or {}
+        cols = tbl.get('columns') or []
+        values: dict = {c: [] for c in cols}
+        blank = False
+        for r in shadow:
+            if not isinstance(r, dict):
+                continue
+            for part in (r.get('__parts__') or (r,)):
+                if (part.get('__table__') == table and not isinstance(part, _ColumnsRow)
+                        and all(c in part for c in cols)):
+                    for c in cols:
+                        values[c].append(part[c])
+                    blank = blank or bool(part.get('__blank_row__'))
+        out = ctx.expansion_filters(table, values, blank) if cols else {}
+        self._shadow_cache[key] = (shadow, out)
+        return out
+
+    def _restore_selected(self, key: str, value, ctx: Optional[DAXContext] = None):
         """What ALLSELECTED puts back for ``key``, whose filter ``value`` an
         iteration put there: the values among the iteration's rows, else the
         query's selection, else None (no filter)."""
         shadow = getattr(value, 'shadow', None)
         if shadow is not None:
             table, _, col = key.partition('.')
-            return list(self._shadow_values(shadow, table, col))
+            return list(self._shadow_values(shadow, table, col, ctx))
         return self._selected_filters().get(key)
 
     def _allselected_ctx(self, ctx: DAXContext, in_scope) -> DAXContext:
@@ -5622,7 +6016,7 @@ class DAXEngine:
         for k, v in ctx.filter_context.items():
             if k.startswith(_TUPLE_FILTER_PREFIX) or not in_scope(k) or not _iteration_tagged(v):
                 continue
-            back = self._restore_selected(k, v)
+            back = self._restore_selected(k, v, ctx)
             if back is None:
                 removes.append(k)
             else:
@@ -5689,7 +6083,7 @@ class DAXEngine:
             if not own(k):
                 continue
             if _iteration_tagged(v):
-                back = self._restore_selected(k, v)
+                back = self._restore_selected(k, v, ctx)
                 if back is not None:
                     keep[k] = back
             else:
@@ -6292,6 +6686,14 @@ class DAXEngine:
 
         base_expr = args[0].strip()
         new_ctx = ctx
+        if ctx._outer_ctx is not None:
+            # The transition: the iterated rows filter their expanded tables
+            # (issue #115) before the filter arguments apply, so
+            # REMOVEFILTERS(Dim[Region]) can take one column back out.
+            _tf = ctx.transition_filters()
+            if _tf:
+                new_ctx = ctx.with_filters(_tf)
+                new_ctx._current_row = ctx._current_row
         # Keys this CALL has filtered, so two predicates on the SAME column
         # INTERSECT (DAX ANDs multiple filter arguments) while a predicate on a
         # column the OUTER context already filtered still REPLACES it -- that
@@ -6466,19 +6868,21 @@ class DAXEngine:
             # #49: Desktop evaluates every filter argument there), then its
             # delta lands on the cumulative new_ctx.
             if filter_arg.upper().startswith('DATEADD'):
-                _shifted_ctx = self._apply_dateadd_filter(filter_arg, ctx)
+                _base = self._dates_base(filter_arg, ctx)
+                _shifted_ctx = self._apply_dateadd_filter(filter_arg, _base)
                 if _shifted_ctx is None:
                     return None          # period outside the date table -> BLANK
-                new_ctx = self._rebase_filter_delta(ctx, _shifted_ctx, new_ctx)
+                new_ctx = self._rebase_filter_delta(_base, _shifted_ctx, new_ctx)
                 continue
 
             # SAMEPERIODLASTYEAR
             if filter_arg.upper().startswith('SAMEPERIODLASTYEAR'):
+                _base = self._dates_base(filter_arg, ctx)
                 _shifted_ctx = self._apply_dateadd_filter(
-                    f"DATEADD({filter_arg[19:-1].strip()}, -1, YEAR)", ctx)
+                    f"DATEADD({filter_arg[19:-1].strip()}, -1, YEAR)", _base)
                 if _shifted_ctx is None:
                     return None          # period outside the date table -> BLANK
-                new_ctx = self._rebase_filter_delta(ctx, _shifted_ctx, new_ctx)
+                new_ctx = self._rebase_filter_delta(_base, _shifted_ctx, new_ctx)
                 continue
 
             # USERELATIONSHIP(col1, col2) — activate a specific (usually inactive)
@@ -6699,18 +7103,42 @@ class DAXEngine:
                         # the grand total, so that filter still propagates.
                         tbls = {r['__table__'] for r in result
                                 if isinstance(r, dict) and '__table__' in r}
-                        new_ctx = new_ctx.without_filters(
-                            [k for k in new_ctx.filter_context
-                             if any(k.startswith(f"{t}.") for t in tbls)])
-                        snaps = {t: new_ctx._filter_snapshot(t) for t in tbls}
-                        new_ctx = new_ctx.with_filters(groups)
-                        # These keys came from a TABLE filter argument, so they
-                        # filter the EXPANDED table and may ride the reverse
-                        # (many -> one) direction in _get_cross_table_filters.
-                        new_ctx._expanded_keys = (
-                            new_ctx._expanded_keys | set(groups))
-                        new_ctx._no_propagate = new_ctx._no_propagate | tbls
-                        new_ctx._no_prop_keys = {**new_ctx._no_prop_keys, **snaps}
+                        # KEEPFILTERS keeps the filters in force on every column
+                        # the rows filter and intersects them (issue #148; under
+                        # Orders[Region] = "N", KEEPFILTERS(FILTER(ALL(Orders),
+                        # Orders[Revenue] > 100)) leaves no order -- BLANK).
+                        keep = filter_arg.upper().startswith('KEEPFILTERS')
+                        snaps: dict = {}
+                        if not keep:
+                            new_ctx = new_ctx.without_filters(
+                                [k for k in new_ctx.filter_context
+                                 if any(k.startswith(f"{t}.") for t in tbls)])
+                            snaps = {t: new_ctx._filter_snapshot(t) for t in tbls}
+                        # A TABLE filter filters the table's EXPANDED table: the
+                        # columns of the one-side tables it reaches take the
+                        # related rows' values (issue #114), so they are filtered
+                        # themselves (ISFILTERED(Dim) is TRUE under FILTER(Orders,
+                        # ...)), one of them can be taken back out (Desktop:
+                        # REMOVEFILTERS(Dim[Region]) leaves Dim filtered by zone,
+                        # 3 rows), and they reach the facts that share them.
+                        expanded = self._table_filter_expansion(new_ctx, result, groups, tbls)
+                        written = {**expanded, **groups}
+                        if keep:
+                            for key, vals in list(written.items()):
+                                outer = new_ctx.filter_context.get(key)
+                                if outer is not None:
+                                    written[key] = _keep_scope_tag(outer, {"all": [outer, vals]})
+                        for key, vals in list(written.items()):
+                            # The filter arguments of one CALCULATE all apply:
+                            # a column two of them filter keeps what both keep
+                            # (issue #148: two FILTER(Orders, ...) arguments).
+                            if key in applied_here:
+                                written[key] = {"all": [applied_here[key], vals]}
+                            applied_here[key] = written[key]
+                        new_ctx = new_ctx.with_filters(written)
+                        if not keep:
+                            new_ctx._no_propagate = new_ctx._no_propagate | tbls
+                            new_ctx._no_prop_keys = {**new_ctx._no_prop_keys, **snaps}
                     elif groups:
                         # Single-column row set (ALL(T[Col]), VALUES): replaces
                         # the filter on that ONE column, and a filter reaching
@@ -6771,7 +7199,7 @@ class DAXEngine:
 
         if _kf_before is not None:
             keep_keys |= self._written_keys(_kf_before, new_ctx)
-        if any(k.startswith(_TUPLE_FILTER_PREFIX) for k in new_ctx.filter_context):
+        if new_ctx.has_tuple_filters():
             # A column this CALCULATE overwrote leaves an OUTER filter on
             # column combinations: DAX keeps its projection onto the others.
             over = {k for k in self._written_keys(ctx, new_ctx) - keep_keys
@@ -6799,6 +7227,44 @@ class DAXEngine:
         finally:
             new_ctx._outer_ctx = _prev_outer
             new_ctx._current_row = _prev_row
+
+    _DATES_COLUMN_ARG_RE = re.compile(
+        r"(?is)^\s*(?:DATEADD|SAMEPERIODLASTYEAR)\s*\(\s*(?:'(?:[^']|'')+'|[^'\[(),]+?)\s*\[[^\]]+\]\s*[,)]")
+
+    def _dates_base(self, filter_arg: str, ctx: DAXContext) -> DAXContext:
+        """The context CALCULATE's DATEADD / SAMEPERIODLASTYEAR filter reads
+        its <dates> in. A COLUMN is CALCULATETABLE(DISTINCT(<dates>)), which
+        transitions an iterator's row: inside SUMX(VALUES(Dt[Month]), ...)
+        each month shifts its own dates, as PREVIOUSMONTH already did. The
+        shift used the dates of the context the rows were opened in, so every
+        month got the selection's previous month (issue #147; Desktop 2.152,
+        build_b147.py: 210, where the engine answered 630)."""
+        if ctx._outer_ctx is not None and self._DATES_COLUMN_ARG_RE.match(filter_arg):
+            return self._row_transitioned(ctx)
+        return ctx
+
+    @staticmethod
+    def _table_filter_expansion(ctx: DAXContext, result: list, groups: dict, tbls) -> dict:
+        """The rest of the expanded table a table filter argument's rows
+        filter (issue #114): DAXContext.expansion_filters over the whole rows
+        of each table, keyed apart from ``groups`` (the rows' own columns).
+        A row set that is not whole rows of its table -- the columns
+        SELECTCOLUMNS or SUMMARIZE keep -- filters only its own columns."""
+        out: dict = {}
+        for t in tbls:
+            tbl = ctx.tables.get(t)
+            if not tbl:
+                continue
+            cols = tbl['columns']
+            rows = [r for r in result if isinstance(r, dict) and r.get('__table__') == t]
+            if not rows or isinstance(rows[0], _ColumnsRow) or not all(c in rows[0] for c in cols):
+                continue
+            vals = {c: groups.get(f"{t}.{c}", []) for c in cols}
+            blank = any(r.get('__blank_row__') for r in rows)
+            for k, v in ctx.expansion_filters(t, vals, blank).items():
+                if k not in groups and k not in out:
+                    out[k] = v
+        return out
 
     @staticmethod
     def _written_keys(before: DAXContext, after: DAXContext) -> set:
@@ -8334,7 +8800,8 @@ class DAXEngine:
         # Parse name/expression pairs
         extended = []
         for row_item in table_ref:
-            new_item = dict(row_item) if isinstance(row_item, dict) else row_item
+            # a copy of the same kind: ADDCOLUMNS keeps SUMMARIZE's rows rows of columns
+            new_item = type(row_item)(row_item) if isinstance(row_item, dict) else row_item
             if isinstance(row_item, dict) and '__table__' in row_item:
                 row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
             else:
@@ -8396,7 +8863,7 @@ class DAXEngine:
                     r[nm] = False
         if rollup_cols and base:
             tname = base[0].get("__table__") if isinstance(base[0], dict) else None
-            sub = {"__table__": tname, "__row__": True}
+            sub = _ColumnsRow({"__table__": tname, "__row__": True})
             for rc in rollup_cols:
                 m = _TCOL_RE.match(rc)
                 if m:
@@ -8494,7 +8961,7 @@ class DAXEngine:
             if key in seen:
                 continue
             seen.add(key)
-            row_dict = {'__table__': table_name}
+            row_dict = _ColumnsRow({'__table__': table_name})
             for col_name, col_idx in group_cols:
                 row_dict[col_name] = row[col_idx]
             # Use first group col as the iteration column
@@ -8558,7 +9025,7 @@ class DAXEngine:
             filters = {key: [val] for key, _disp, val in combo}
             if not ctx.with_filters(filters).get_filtered_rows(table_name):
                 continue  # combination doesn't exist in the base table
-            row_dict = {'__table__': table_name}
+            row_dict = _ColumnsRow({'__table__': table_name})
             for _key, disp, val in combo:
                 row_dict[disp] = val
             first_disp, first_val = combo[0][1], combo[0][2]
@@ -8676,7 +9143,7 @@ class DAXEngine:
             result = self._summarizecolumns_blank_group(
                 result, group_refs, tail, ctx)
         if rollup_subtotal and isinstance(result, list):
-            sub = {'__table__': group_refs[0][0], '__row__': True}
+            sub = _ColumnsRow({'__table__': group_refs[0][0], '__row__': True})
             for _t, _c in group_refs:
                 sub[_c] = None
             result = result + [sub]
@@ -8728,7 +9195,7 @@ class DAXEngine:
                 row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
             else:
                 row_ctx = ctx
-            new_row = {}
+            new_row = _ColumnsRow()
             i = 1
             first_name = None
             first_val = None
@@ -9246,8 +9713,9 @@ class DAXEngine:
     def _row_transitioned(ctx: DAXContext) -> DAXContext:
         """``ctx`` with its row context's transition in force: the eager row
         filters read as filters, the row itself still bound (the arguments
-        other than <dates> may read it). For the _ROW_TRANSITION_FNS."""
-        out = ctx.with_filters({})
+        other than <dates> may read it). For the _ROW_TRANSITION_FNS. A row
+        filters its expanded table (issue #115)."""
+        out = ctx.with_filters(ctx.transition_filters())
         out._current_row = ctx._current_row
         return out
 
@@ -10209,7 +10677,7 @@ class DAXEngine:
             groups.setdefault(key, []).append(r)
         out = []
         for key, grp_rows in groups.items():
-            new_row = {'__table__': rows[0]['__table__'], '__row__': True}
+            new_row = _ColumnsRow({'__table__': rows[0]['__table__'], '__row__': True})
             for c, v in zip(group_cols, key):
                 new_row[c] = v
             j = 0

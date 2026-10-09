@@ -40,9 +40,20 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-09 (0.9.127): docs 1-56 and GitHub issues/PRs #1-#113 and
-#116-#146 except #117 and #136 are closed; #114, #115, #117 and #136 are
-open.** 0.9.127 closes doc 56 = #143: PBIXBuilder marks a projection
+**Updated 2026-10-09 (0.9.128): docs 1-56 and GitHub issues/PRs #1-#116 and
+#118-#149 except #136 are closed; #117 and #136 are open.** 0.9.128 closes
+#115 and #114, both OpenBI's: the transition of a table's row and a table
+filter argument filter the EXPANDED table -- the columns of every table the
+rows reach many-to-one carry the related rows' values, so ISFILTERED sees
+them, REMOVEFILTERS of one leaves the others and they reach the facts that
+share the dimension (build_b115b.py 111 of 112, build_b114.py 38 of 39,
+build_b115.py 51 of 55; the misses are #117). Found working on them: #147
+(DATEADD inside an iterator shifts the row's dates), #148 (table filters
+intersect within one CALCULATE and under KEEPFILTERS) and #149 (two filters
+of more than 4096 values shared a memo entry).
+
+As of 0.9.127, docs 1-56 and #1-#113 and #116-#146 except #117 and #136
+were closed; #114, #115, #117 and #136 were open. 0.9.127 closes doc 56 = #143: PBIXBuilder marks a projection
 `active` as Desktop does -- a drillable role's first entry (its top level),
 every entry with "expanded": true, never a measure well -- so a two-field axis
 no longer opens expanded. And #146, found verifying #145: date arithmetic is

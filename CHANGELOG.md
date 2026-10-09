@@ -5,6 +5,107 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.128] - 2026-10-09
+
+A table's row, as an iterator transitions it, and a table filter argument now filter their EXPANDED table, as Desktop does. Both came from OpenBI: #115 (the transition) and #114 (the table filter). Working on them turned up three more fixes:
+
+- DATEADD inside an iterator (#147);
+- table filters that replaced filters they must intersect (#148);
+- a memo that took two large filters for one (#149).
+
+Checked against Power BI Desktop 2.152 over ADOMD:
+
+| Battery | 0.9.128 | 0.9.127 | Notes |
+|---|---|---|---|
+| `build_b115b.py` (112 probes) | 111 | 42 | The miss is #117. Covers a snowflake, a dimension shared by two facts, an orphan key, and which table expressions keep the expanded table. |
+| `build_b113.py` | 276 of 276 | 270 | ISFILTERED of a dimension under a fact-table filter (#114). |
+| `build_b114.py` | 38 of 39 | 25 | The miss is #117's SUMMARIZE lineage. |
+| `build_b115.py` | 51 of 55 | 42 | The 4 misses are #117's SUMMARIZE lineage. |
+| `build_b116.py` | 40 of 40 | 39 | |
+| `build_b147.py` | 24 of 24 | 8 | |
+| `build_b149.py` | 8 of 8 | 3 | |
+
+Every other Desktop probe answers as before.
+
+### Fixed — the context transition of a table's row filters its expanded table (issue #115)
+
+**What was wrong:** an iterated row's transition filtered the row's own columns only. A filter on the many side does not reach the one side, so CALCULATE or a measure inside `SUMX(Orders, ...)` saw every dimension whole. Desktop, with Orders many-to-one Dim and three orders:
+
+- `SUMX(Orders, CALCULATE(COUNTROWS(Dim)))` is 3, one dimension row per order (the engine said 9);
+- over a snowflake Orders → Dim → Cat, `SUMX(Orders, CALCULATE(SUM(Cat[Weight])))` is 40 (90);
+- `SUMX(Orders, CALCULATE(COUNTROWS(Orders2)))`, where Orders2 is a fact that shares Dim, is 5 (15);
+- `SUMX(Orders, CALCULATE(IF(ISFILTERED(Dim[Zone]), 1, 0)))` is 3 (0).
+
+**The fix:** CALCULATE, a measure reference, time intelligence and RELATEDTABLE now transition each iterated whole row into filters on its expanded table. That is every column of each table the row reaches many-to-one, holding the related row's values, or BLANK for a key that matches nothing. These are filters of their own:
+
+- `REMOVEFILTERS(Dim[Region])` leaves the zone in force (5);
+- `ALL(Dim)` and `ALL(Orders)` take them out (9);
+- ALLSELECTED puts back the related rows of every iterated row (9);
+- an inner row keeps its own columns: `SUMX(Dim, SUMX(Orders, CALCULATE(COUNTROWS(Dim))))` is 9, as #116 pinned;
+- in a CROSSJOIN row, each part's own columns win over another part's expansion.
+
+**Which rows keep the expanded table:**
+
+- **Yes:** a row of the table itself, and a row of FILTER, ALL, VALUES, DISTINCT, TOPN, CALCULATETABLE, RELATEDTABLE or ADDCOLUMNS over it.
+- **No:** a row of SUMMARIZE or SELECTCOLUMNS, even when it carries every column. `SUMX(SUMMARIZE(Orders, Orders[Region], Orders[Revenue]), CALCULATE(COUNTROWS(Dim)))` is 9.
+
+**Speed:** a row's dimension filters are built once per iteration and dimension member, with their signatures once per model. They are not propagated back to the iterated table while the row's own key filter is in force. The corpus census (1,508 measures) takes 2,890 s, against 2,869 s on 0.9.127. A fact-row iteration that transitions every row now carries one filter per dimension column, so it is slower. On a 20,000-row fact with three 16-column dimensions, with the model's caches warm:
+
+| Expression | 0.9.128 | 0.9.127 |
+|---|---|---|
+| `SUMX(Fact, CALCULATE(SUM(Fact[Amt])))` | 2.5 s | 1.3 s |
+| `SUMX(Fact, [S])` | 5.0 s | 1.7 s |
+| `SUMX(Fact, Fact[Qty] * Fact[Amt])`, with no transition | no change | |
+
+**Pinned** by `tests/test_issue115_transition_expanded.py`: 85 tests. **61 fail on 0.9.127.**
+
+### Fixed — a table filter argument filters its expanded table (issue #114)
+
+**What was wrong:** `FILTER(Orders, ...)` as a CALCULATE filter was kept on Orders' own columns, which also reached the one side through the relationship. Desktop treats it as a filter on the expanded table:
+
+- `CALCULATE(ISFILTERED(Dim), FILTER(Orders, Orders[Revenue] > 100))` is TRUE (FALSE);
+- after `REMOVEFILTERS(Dim[Region])`, Dim is still filtered by the zones of the kept orders: 3 rows (2);
+- an outer filter on the dimension is overwritten: `CALCULATE(CALCULATE(COUNTROWS(Dim), FILTER(ALL(Orders), Orders[Revenue] > 100)), Dim[Zone] = "z2")` is 2 (1);
+- the filter reaches a fact that shares the dimension: `CALCULATE(COUNTROWS(Orders2), FILTER(Orders, Orders[Revenue] > 100))` is 3 (5).
+
+**The fix:**
+
+- The rows' expanded table is written as filters on the one-side columns, the same expansion as #115.
+- The one-hop many-to-one propagation the engine kept for table filters (`_expanded_keys`) is gone.
+- Under KEEPFILTERS, those columns intersect with the filters in force.
+
+**Pinned** by `tests/test_issue114_table_filter_expanded.py`: 74 tests. **28 fail on 0.9.127.**
+
+### Fixed — DATEADD / SAMEPERIODLASTYEAR inside an iterator shift the row's dates (issue #147)
+
+**What was wrong:** CALCULATE's fast path for `DATEADD(<column>, ...)` and `SAMEPERIODLASTYEAR(<column>)` read the dates of the context the rows were opened in. Each month of `SUMX(VALUES(Dt[Month]), CALCULATE([FS], DATEADD(Dt[Date], -1, MONTH)))` shifted the whole selection: 630, where Desktop says 210.
+
+**The fix:** the column form transitions the row first. Desktop reads it as `CALCULATETABLE(DISTINCT(<dates>))`, as PREVIOUSMONTH and a measure reference already did.
+
+**Pinned** by `tests/test_issue147_dateadd_in_iterator.py`: 24 tests from `build_b147.py`, over a marked and an unmarked calendar. **16 fail on 0.9.127.**
+
+### Fixed — table filter arguments intersect what they must keep (issue #148)
+
+**What was wrong:** a multi-column table filter removed every filter on its table's columns before applying its rows.
+
+- A second `FILTER(Orders, ...)` in the same CALCULATE threw the first away: 2 orders, where Desktop says 1.
+- `KEEPFILTERS(FILTER(ALL(Orders), ...))` replaced an outer `Orders[Region] = "N"`: 2, where Desktop says BLANK.
+
+**The fix:**
+
+- The filter arguments of one CALCULATE intersect on any column they share.
+- KEEPFILTERS keeps the filters in force on every column its rows filter.
+
+**Pinned** by `tests/test_issue148_table_filters_intersect.py`: 6 tests. **3 fail on 0.9.127.**
+
+### Fixed — two filters of more than 4096 values no longer share a memo entry (issue #149)
+
+**What was wrong:** the memo of the filters that reach a table through relationships is model-wide. It signed a filter of more than 4096 values as None. With a 6000-day calendar, `CALCULATE(SUM(F[Amt]), FILTER(ALL(D[Date]), D[Date] < DATE(2015, 1, 1)))` was served the result for the dates before 2014, so `[b] - [a]` was 0 where Desktop says 365. A running total over a long calendar repeated one value. The ALL() snapshot compared signatures the same way.
+
+**The fix:** a filter too large for the short signature is signed by a digest of its sorted values (`_filter_sig_exact`).
+
+**Pinned** by `tests/test_issue149_large_filter_signature.py`: 9 tests. **6 fail on 0.9.127.**
+
 ## [0.9.127] - 2026-10-09
 
 Date arithmetic is typed as Desktop types it (#146, found verifying #145), and PBIXBuilder marks a projection `active` as Desktop does, as OpenBI reported (#143). Checked against Power BI Desktop 2.152 over ADOMD:
