@@ -1873,6 +1873,45 @@ def calc_table_unsupported_reason(expression: str) -> Optional[str]:
     return None
 
 
+def _flatten_part_rows(result: list) -> list:
+    """Rows that carry ``__parts__`` as plain rows of their columns.
+
+    A CROSSJOIN row (#108) keeps one part per source table beside merged keys
+    the right table's names get a ``_2_`` prefix in, so its columns are each
+    part's columns in order, then the columns ADDCOLUMNS added on top. A
+    SUMMARIZE row over several tables (#117) keeps its merged columns in the
+    order written. A column name two parts share raises ValueError: Power BI
+    Desktop 2.152 refuses CROSSJOIN(VALUES(Dim[Region]), VALUES(Orders[Region]))
+    as a calculated table ("a column named Region already exists", #151)."""
+    out = []
+    for r in result:
+        parts = r.get("__parts__") if isinstance(r, dict) else None
+        if not parts:
+            out.append(r)
+            continue
+        part_cols: list = []
+        part_vals: list = []
+        for part in parts:
+            plain = [k for k in part if not str(k).startswith("__")]
+            if plain:
+                part_cols += plain
+                part_vals += [part[k] for k in plain]
+            elif part.get("__column__"):
+                part_cols.append(part["__column__"])
+                part_vals.append(part.get("__value__"))
+        dup = next((c for c in part_cols if part_cols.count(c) > 1), None)
+        if dup is not None:
+            raise ValueError(f"a column named '{dup}' comes from two tables")
+        if any(str(k).startswith("_2_") for k in r):
+            row = dict(zip(part_cols, part_vals))
+            row.update({k: v for k, v in r.items() if not str(k).startswith(("__", "_2_"))
+                        and k not in row})
+        else:
+            row = {k: v for k, v in r.items() if not str(k).startswith("__")}
+        out.append(row)
+    return out
+
+
 def evaluate_calc_table_expression(
     expression: str,
     tables: Dict[str, dict],
@@ -1906,9 +1945,15 @@ def evaluate_calc_table_expression(
                       "(this engine cannot reproduce it)")
     if not all(isinstance(r, dict) for r in result):
         return None, "expression did not evaluate to a row set"
+    try:
+        result = _flatten_part_rows(result)
+    except ValueError as e:
+        return None, str(e)
 
     # __blank_row__ marks the blank row ALL(T) / VALUES(T) can carry (#82)
-    meta = {"__table__", "__column__", "__value__", "__row__", "__blank_row__"}
+    # __parts__: a row of column combinations keeps one part per table beside
+    # its merged columns (SUMMARIZE over several tables, #117)
+    meta = {"__table__", "__column__", "__value__", "__row__", "__blank_row__", "__parts__"}
     # Single-column shape produced by DISTINCT()/VALUES(). Only when the rows
     # carry NO named columns of their own — some results (DATATABLE, SUMMARIZE)
     # set __column__/__value__ *alongside* real named columns, and treating
@@ -2347,8 +2392,12 @@ def _convert_dax_result(result: list, tdef: dict) -> Optional[dict]:
     """Convert DAX engine result (list of dicts) to table format."""
     if not result or not isinstance(result[0], dict):
         return None
+    try:
+        result = _flatten_part_rows(result)    # CROSSJOIN / SUMMARIZE parts (#151)
+    except ValueError:
+        return None
 
-    meta_keys = {'__table__', '__column__', '__value__', '__blank_row__'}
+    meta_keys = {'__table__', '__column__', '__value__', '__blank_row__', '__parts__'}
     sample = result[0]
     result_cols = [k for k in sample.keys() if k not in meta_keys]
 

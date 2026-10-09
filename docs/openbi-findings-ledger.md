@@ -40,8 +40,27 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-09 (0.9.128): docs 1-56 and GitHub issues/PRs #1-#116 and
-#118-#149 except #136 are closed; #117 and #136 are open.** 0.9.128 closes
+**Updated 2026-10-09 (0.9.129): docs 1-56 and GitHub issues/PRs #1-#135 and
+#137-#154 are closed; #136 is open.** 0.9.129 closes #117 (OpenBI's):
+SUMMARIZE by a related table's column groups the SOURCE rows and keeps each
+column's lineage -- one part per table, as a CROSSJOIN row, so the table
+filters the combinations and a transition over it filters each table -- and
+an extension column sees its group's source rows: the columns they carry,
+and for a table's rows their expanded table; a source of columns (ALL /
+ALLSELECTED of several, VALUES, SUMMARIZE) expands to nothing, and a group
+column it cannot reach is Desktop's error (build_b117.py 115 of 115;
+build_b115.py, build_b114.py and build_b115b.py now match in full). Found
+working on it: #152, ALL / ALLSELECTED of several columns was taken for the
+table's rows (as a filter it dropped the table's other filters and
+relationships: 24 for Desktop's 3); #153 and #154, a table filter on several
+columns, or of a table's rows, kept each column's values and not the
+combinations its rows have (12 for 11); #151, a CROSSJOIN calculated table
+takes each part's columns (Desktop's own tables through TOM, 8 of 8); and
+#150, the measure memo key of a fact-row transition is the context's own
+signature, not a sorted copy of every filter (the cost 0.9.128 added).
+
+As of 0.9.128, docs 1-56 and #1-#116 and #118-#149 except #136 were closed;
+#117 and #136 were open. 0.9.128 closes
 #115 and #114, both OpenBI's: the transition of a table's row and a table
 filter argument filter the EXPANDED table -- the columns of every table the
 rows reach many-to-one carry the related rows' values, so ISFILTERED sees

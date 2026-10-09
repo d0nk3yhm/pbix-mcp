@@ -5,6 +5,124 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.129] - 2026-10-09
+
+SUMMARIZE takes its groups from the source rows and keeps each column's lineage (#117, from OpenBI). Working on it turned up four more:
+
+- ALL / ALLSELECTED of several columns was taken for the table's rows (#152);
+- a table filter on several columns of one table kept each column's values, not the combinations its rows have (#153), and so did a table filter of a table's rows (#154);
+- a CROSSJOIN calculated table could not be added (#151).
+
+And a measure referenced in an iteration over a fact table costs about what CALCULATE does again (#150, a cost 0.9.128 added). Checked against Power BI Desktop 2.152 over ADOMD:
+
+| Battery | 0.9.129 | 0.9.128 |
+|---|---|---|
+| `build_b117.py` (117 probes) | 115 of 115, and Desktop's 2 errors | 45 |
+| `build_b115.py` | 55 of 55 | 51 |
+| `build_b114.py` | 39 of 39 | 38 |
+| `build_b115b.py` | 112 of 112 | 111 |
+| Desktop calculated tables (TOM) | 8 of 8 shapes | — |
+
+Every other Desktop probe answers as before. The corpus census (1,508 measures) changes only the 15 that use RAND or RANDBETWEEN. The 1,463 that finish on both versions take 786 s, against 837 s on 0.9.128. The 45 that run into the 30-second budget answer on neither. How long one runs before the budget stops it varies from run to run, and the same measures in the same order take the same time on both (2,954 s in all, against 2,890 s).
+
+### Fixed — SUMMARIZE by a related table's column (issue #117)
+
+**What was wrong:** `SUMMARIZE(<source>, <a related table's column>)` had two faults.
+
+- **The groups came from the whole table.** A table-expression source was ignored. `COUNTROWS(SUMMARIZE(FILTER(Orders, Orders[Region] = "W"), Dim[Zone]))` was 2; Desktop says 1.
+- **Every column carried the base table's lineage.** Tagged `{'__table__': 'Orders', 'Zone': ...}`, the columns broke in three places:
+  - as a CALCULATE filter, `Dim[Zone]` filtered a column Orders does not have: 450 instead of Desktop's 250;
+  - a transition over the rows filtered nothing. `ADDCOLUMNS(SUMMARIZE(Orders, Dim[Zone]), "r", CALCULATE(SUM(Orders[Revenue])))` summed to 900, not 450, as a measure and as a calculated table;
+  - `Dim[Zone]` inside an iteration over the rows read as a column marker (`CONCATENATEX` printed `N('Dim', 'Zone')`).
+
+**The fix:**
+
+- The groups are the distinct combinations among the source rows. Each related column is read through the source's expanded table, BLANK for a key that matches nothing (#82). The columns come back in the order written.
+- A group of one column is a row of that column's table. A group of several columns carries one part per table (as a CROSSJOIN row does, #108) beside the merged columns. As a filter it filters their combinations (#103): two columns of one table now filter both, where only the first used to (Desktop: 4 rows, not 5).
+- An extension column is evaluated in its group's context, as Desktop does. That context includes the group's source rows expanded to their dimensions:
+  - `SUMX(SUMMARIZE(FILTER(Orders, Orders[Revenue] > 100), Dim[Zone], "r", SUM(Orders[Revenue])), [r])` is 400, the kept orders' revenue (the engine said 450);
+  - a dimension member that no row of the group uses drops out (2, not 3);
+  - ALLSELECTED inside puts the source rows back (8).
+- A source's rows are read part by part, so every kind of source works the same way:
+  - **A source of columns** (ALL or ALLSELECTED of several columns, VALUES, another SUMMARIZE): its rows filter the columns they carry and nothing more. They have no expanded table, even when they carry every column of their table. Desktop: `SUMMARIZE(FILTER(ALL(Orders2[Region], Orders2[Qty]), Orders2[Qty] >= 2), Orders2[Region], "q", SUM(Orders2[Qty]))` sums the kept quantities (14), and the same with `"d", COUNTROWS(Dim)` gives 9, with no Dim row filtered. IT Support's `Time Wasting Patterns` (over `ALLSELECTED(fact[Cluster_ID], fact[Queue])`) keeps Desktop's 4 alerts.
+  - **A CROSSJOIN source:** its rows filter every part's columns (9, not 15).
+  - **A group column the source does not carry and cannot reach** is an error, as Desktop says: `SUMMARIZE(ALL(Orders[Region]), Dim[Zone])` names a column not in the input table.
+- SUMMARIZECOLUMNS, which has no source table, still evaluates its expressions in the group's columns only.
+
+**Pinned** by `tests/test_issue117_summarize_lineage.py`: 96 tests generated from Desktop's output. **56 fail on 0.9.128.**
+
+### Fixed — ALL / ALLSELECTED of several columns is a table of columns, not the table's rows (issue #152)
+
+**What was wrong:** `ALL(T[a], T[b])` returns the combinations of those columns, but its rows were marked as rows of `T`.
+
+- **As a CALCULATE filter**, `FILTER(ALL(T[a], T[b]), ...)` went through the branch for a table's rows. This is the running-total shape over `'Date'[Year]` and `'Date'[Month]`. The branch removed every filter of `T`, including its other columns and an iterator's own row, and blocked the relationships into `T`. When the columns were all of `T`'s, it also filtered `T`'s expanded table.
+- **In a transition**, rows that carried every column of `T` filtered its expanded table.
+
+Desktop, with T4(A, B, C, V) and Orders2 many-to-one Dim:
+
+- `SUMX(VALUES(T4[A]), CALCULATE(SUM(T4[V]), FILTER(ALL(T4[B], T4[C]), ...)))` is 3 (the engine said 24);
+- under `Dim[Zone] = "z1"`, `FILTER(ALL(Orders2[Region], Orders2[Qty]), Orders2[Qty] >= 3)` leaves 1 order (3), and `ISFILTERED(Dim)` stays FALSE (TRUE);
+- `SUMX(ALL(Orders2[Region], Orders2[Qty]), CALCULATE(COUNTROWS(Dim)))` is 15 (5).
+
+**The fix:** the rows are rows of a table of columns, as SUMMARIZE's are. As a filter argument, such a table:
+
+- replaces the filters on its own columns;
+- intersects them under KEEPFILTERS;
+- leaves the table's other filters and relationships in place;
+- has no expanded table.
+
+**Pinned** by `tests/test_issue152_column_tables.py`: 15 tests. **8 fail on 0.9.128.**
+
+### Fixed — a table filter over several columns keeps the combinations its rows have (issue #153)
+
+**What was wrong:** `FILTER(ALL(T[a], T[b]), ...)` as a CALCULATE filter wrote each column's values as a filter of its own. A combination none of its rows has came back whenever its values each appeared in some row. T4 has no key. Leaving out (b1, c2), `CALCULATE(SUM(T4[V]), FILTER(ALL(T4[B], T4[C]), NOT (T4[B] = "b1" && T4[C] = "c2")))` is 11 in Desktop; the engine said 12. The same happened under KEEPFILTERS, beside a filter on another column, and in SUMMARIZE's extension columns over such a source.
+
+**The fix:**
+
+- Each column's values stay the filters on the columns.
+- Where those values admit combinations no row has, a filter on the rows' combinations is added. TREATAS onto several columns, a CROSSJOIN's rows and SUMMARIZE's already work this way (#103, #108).
+- An inner filter on one of the columns keeps the projection onto the others (Desktop: 2).
+
+**Pinned** by `tests/test_issue153_column_combinations.py`: 18 tests. **13 fail on 0.9.128.**
+
+### Fixed — a table filter of a table's rows keeps those rows (issue #154)
+
+**What was wrong:** `FILTER(T, ...)` and `FILTER(ALL(T), ...)` wrote each column's values among the rows. A row the argument left out came back when each of its values appeared in a row it kept. With T4's row (a1, b1, c2, 1), `CALCULATE(SUM(T4[V]), FILTER(T4, NOT (T4[B] = "b1" && T4[C] = "c2")))` is 11 in Desktop; the engine said 12. SUMMARIZE's extension columns over such a source did the same.
+
+**The fix:**
+
+- The engine counts the rows of the table that each column's values admit on their own, and compares them with the argument's rows.
+- Where the values admit more, a filter on the rows' combinations is added.
+- Mostly they admit no more, because a key or a column the condition alone decides tells the rows apart. Then nothing changes.
+- SUMMARIZE runs the check once over all its source rows.
+- A table's rows as a filter also replace an outer filter on combinations that names their columns, keeping its other tables' part.
+
+**Pinned** by `tests/test_issue154_whole_row_combinations.py`: 4 tests. **4 fail on 0.9.128.**
+
+### Fixed — a CROSSJOIN calculated table takes each part's columns (issue #151)
+
+**What was wrong:** the calculated-table evaluator returned a CROSSJOIN row's internal keys as its columns: the right table's `_2_`-prefixed names and the `__parts__` tuple (#108). `pbix_datamodel_add_calculated_table` then failed with `INTERNAL_ERROR: unhashable type: 'dict'`.
+
+**The fix:** a row's columns are each part's columns in order, then the columns ADDCOLUMNS added. A name two tables share is refused, as Desktop refuses it ("a column named Region already exists"). A SUMMARIZE over several tables keeps the order written.
+
+**Checked:** Desktop's own calculated tables, added through its TOM library and recalculated (`tom_calc_tables.ps1`), give the same columns and row counts for all 8 expressions, the two refusals included. A CROSSJOIN table the tool added reads the same data in Desktop before and after a refresh.
+
+**Pinned** by `tests/test_issue151_crossjoin_calc_table.py`: 11 tests. **9 fail on 0.9.128.**
+
+### Fixed — a measure reference inside a fact-row iteration costs what CALCULATE does (issue #150)
+
+**What was wrong:** 0.9.128 (#115) gave every fact-row transition one filter per dimension column. `evaluate_measure` copied every filter's values into its memo key and sorted the key, so `SUMX(Fact, [S])` took twice as long as the same iteration written with CALCULATE.
+
+**The fix:**
+
+- The memo key is the context's own signature, built once per filter set.
+- Each filter is signed once and carries its signature; a row's dimension filters take theirs from the expansion's cache.
+- A context derived from another signs only what it changed.
+
+On the #115 benchmark (20,000 fact rows, warm), `SUMX(Fact, [S])` takes 2.9 s, against 5.0 s on 0.9.128 and 1.7 s on 0.9.127.
+
+**Pinned** by `tests/test_issue150_memo_key_speed.py`: the measure-reference iteration within 1.45x of the CALCULATE one (0.9.128: 1.8x), and the key is the context's signature. **2 fail on 0.9.128.**
+
 ## [0.9.128] - 2026-10-09
 
 A table's row, as an iterator transitions it, and a table filter argument now filter their EXPANDED table, as Desktop does. Both came from OpenBI: #115 (the transition) and #114 (the table filter). Working on them turned up three more fixes:

@@ -1894,13 +1894,30 @@ def _row_value(vals: list, shadow: Optional[list]) -> RowContextValues:
 
 
 class _ColumnsRow(dict):
-    """A row of a table of COLUMNS -- SUMMARIZE, SELECTCOLUMNS, GROUPBY -- as
-    opposed to a row of its base table (``__table__``). Its columns keep
-    their lineage, but it filters no expanded table: Power BI Desktop 2.152,
-    SUMX(SUMMARIZE(Orders, Orders[Region], Orders[Revenue]),
+    """A row of a table of COLUMNS -- SUMMARIZE, SELECTCOLUMNS, GROUPBY, ALL /
+    ALLSELECTED of several columns -- as opposed to a row of its base table
+    (``__table__``), even when it carries every column of it. Its columns
+    keep their lineage, but it filters no expanded table: Power BI Desktop
+    2.152, SUMX(SUMMARIZE(Orders, Orders[Region], Orders[Revenue]),
     CALCULATE(COUNTROWS(Dim))) is 9 while SUMX(Orders, ...) is 3, and
     CALCULATE(ISFILTERED(Dim), SELECTCOLUMNS(Orders, "Region", Orders[Region],
-    "Revenue", Orders[Revenue])) is FALSE (build_b115b.py, issue #115)."""
+    "Revenue", Orders[Revenue])) is FALSE (build_b115b.py, issue #115);
+    SUMX(ALL(Orders2[Region], Orders2[Qty]), CALCULATE(COUNTROWS(Dim))) is 15
+    though Orders2 has only those two columns (build_b117.py, issue #152)."""
+
+
+def _row_parts(row: dict) -> tuple:
+    """A row of a table expression as its parts, one per table: a CROSSJOIN
+    row's (#108), else the row itself."""
+    return tuple(row.get('__parts__') or (row,))
+
+
+def _part_value(part: dict, col: str):
+    """``col`` in one part of a row: a column it carries, or the value of a
+    single-column row of that column."""
+    if col in part:
+        return part[col]
+    return part.get('__value__') if part.get('__column__') == col else None
 
 
 class _SigDict(dict):
@@ -2500,18 +2517,19 @@ class DAXContext:
                         continue
                     raw = {f"{nxt}.{c}": vs for c, vs in hop[0].items()}
                     raw.update(self._expand_from([(nxt, hop[0], hop[1])], {t, nxt}))
-                    got = (raw, {k: self._filter_sig_exact(vs) for k, vs in raw.items()},
-                           f"{t}.{fk}", self._filter_sig([v]))
+                    sigs = {k: self._filter_sig_exact(vs) for k, vs in raw.items()}
+                    got = (raw, sigs, f"{t}.{fk}", self._filter_sig([v]),
+                           {k: (s, '_ExpansionValues') for k, s in sigs.items()})
                     if rk is not None:
                         self._filter_idx_cache[rk] = got
-                raw, sigd, anchor_key, anchor_sig = got
+                raw, sigd, anchor_key, anchor_sig, tagged = got
                 sub = _SigDict()
                 for k, vs in raw.items():
                     w = _ExpansionValues(vs)
                     w.shadow, w.origin, w.anchor_key, w.anchor_sig = shadow, t, anchor_key, anchor_sig
                     w._sig = sigd[k]  # type: ignore[attr-defined]
                     sub[k] = w
-                sub.sigd = sigd
+                sub.sigd = tagged
                 if mk is not None:
                     if len(memo) > 50_000:
                         memo.clear()
@@ -3041,9 +3059,13 @@ class DAXContext:
 
     @classmethod
     def _sig_of(cls, v):
-        # a row transition's value carries its signature (_filter_sig)
+        """One filter's part of the filter-set signature: its values
+        (_filter_sig_exact; a row transition's value carries them) and its
+        tag, as a grouping or an iteration's filter answers ISINSCOPE and
+        ALLSELECTED differently from a plain one of the same values."""
         s = v.__dict__.get('_sig') if isinstance(v, RowContextValues) else None
-        return s if s is not None else cls._filter_sig_exact(v)
+        return (s if s is not None else cls._filter_sig_exact(v),
+                type(v).__name__ if type(v) not in (list, dict) else '')
 
     def _row_root(self) -> 'DAXContext':
         """The context the enclosing row contexts were opened in: the filter
@@ -4168,8 +4190,13 @@ class DAXEngine:
                 tag = type(v).__name__ if type(v) not in (list, dict) else ''
                 if isinstance(v, list):
                     if tag:
+                        # A row transition's value is signed once (_filter_sig):
+                        # a fact-row iteration keys every row's measure on its
+                        # dimension filters too (issue #150).
+                        vals = (DAXContext._sig_of(v)[0] if isinstance(v, RowContextValues)
+                                else tuple(v))
                         shadow = self._shadow_token(k, v, ctx) if _shadow_on else None
-                        return (tag, tuple(v)) if shadow is None else (tag, tuple(v), shadow)
+                        return (tag, vals) if shadow is None else (tag, vals, shadow)
                     return tuple(v)
                 if isinstance(v, dict):
                     return ("__pred__" + tag, json.dumps(v, sort_keys=True,
@@ -4181,10 +4208,16 @@ class DAXEngine:
             # called once per date row is then evaluated once.
             _repl = (self._shielded_keys(measure_name, ctx)
                      if ctx.filter_context and not _cg_sig else {})
-            fc_key = tuple(sorted(
-                (k, _repl[k] if k in _repl else _fc_part(k, v))
-                for k, v in ctx.filter_context.items()
-            )) if ctx.filter_context else ()
+            if not ctx.filter_context:
+                fc_key: frozenset = frozenset()
+            elif not _shadow_on and not _repl:
+                # the context's own signature, built once per filter set and
+                # derived from its parent's (_filters_sigd; issue #150)
+                fc_key = ctx._filters_sig()
+            else:
+                fc_key = frozenset(
+                    (k, _repl[k] if k in _repl else _fc_part(k, v))
+                    for k, v in ctx.filter_context.items())
             # Under the same filters, a reference whose item applies and one
             # whose item is already applied (inside the item, or nested in the
             # measure) have different values: the items are part of the key.
@@ -6108,7 +6141,9 @@ class DAXEngine:
         [Queue] column and produced no rows at all.
 
         Returns None when this is not the multi-column shape, so the callers
-        fall through to their single-column and table-level paths.
+        fall through to their single-column and table-level paths. The rows
+        are rows of a table of columns (_ColumnsRow), not of the table: they
+        filter their own columns only, with no expanded table (issue #152).
         """
         args = self._split_args(ref)
         if len(args) < 2:
@@ -6138,7 +6173,7 @@ class DAXEngine:
             if key in seen:
                 continue
             seen.add(key)
-            rd = {'__table__': table_name, '__row__': True}
+            rd = _ColumnsRow({'__table__': table_name, '__row__': True})
             for (_t, c), v in zip(cols, key):
                 rd[c] = v
             out.append(rd)
@@ -6147,7 +6182,7 @@ class DAXEngine:
         if blank_key not in seen and not no_blank_row and (
                 sel.blank_row_visible(table_name) if sel is not None
                 else table_name in ctx.blank_row_tables()):
-            rd = {'__table__': table_name, '__row__': True}
+            rd = _ColumnsRow({'__table__': table_name, '__row__': True})
             for _t, c in cols:
                 rd[c] = None
             out.append(rd)
@@ -7062,6 +7097,48 @@ class DAXEngine:
                     applied_here[cj_key] = cj_spec
                     new_ctx = new_ctx.with_filters({cj_key: cj_spec})
                     continue
+                cols_spec = self._columns_table_filter(new_ctx, result, first)
+                if cols_spec is not None:
+                    # A table of COLUMNS of one table -- ALL / ALLSELECTED of
+                    # several columns, a FILTER over one, GROUPBY: a filter on
+                    # the combinations of its columns and on nothing else, the
+                    # table's other filters, and those its relationships bring,
+                    # staying. Taking it for the table's rows replaced every
+                    # filter of the table, blocked its relationships and,
+                    # carrying every column, filtered its expanded table; each
+                    # column's values on their own let other combinations back
+                    # in (issues #152, #153). Power BI Desktop 2.152 over ADOMD
+                    # (build_b117.py), T4(A, B, C, V) with (a1, b1, c2) left
+                    # out: CALCULATE(SUM(T4[V]), FILTER(ALL(T4[B], T4[C]), NOT
+                    # (T4[B] = "b1" && T4[C] = "c2"))) is 11, not 12, and
+                    # SUMX(VALUES(T4[A]), <its transition>) 3, not 24; under
+                    # Dim[Zone] = "z1", FILTER(ALL(Orders2[Region],
+                    # Orders2[Qty]), Orders2[Qty] >= 3) leaves 1 order, not 3,
+                    # and ISFILTERED(Dim) stays FALSE.
+                    c_cols, c_written, c_combo = cols_spec
+                    keep_c = filter_arg.upper().startswith('KEEPFILTERS')
+                    if not keep_c:
+                        c_set = set(c_cols)
+                        new_ctx = new_ctx.without_columns(
+                            lambda t, c: (t, c) in c_set, keep_keys=applied_here)
+                    for key, vals in list(c_written.items()):
+                        if keep_c:
+                            outer = new_ctx.filter_context.get(key)
+                            if outer is not None:
+                                vals = _keep_scope_tag(outer, {"all": [outer, vals]})
+                        if key in applied_here:
+                            vals = {"all": [applied_here[key], vals]}
+                        c_written[key] = applied_here[key] = vals
+                    if c_combo is not None:
+                        c_key, c_spec = c_combo
+                        prev = new_ctx.filter_context.get(c_key) if keep_c else None
+                        if prev is not None:
+                            c_spec = _intersect_tuple_filters(prev, c_spec)
+                        if c_key in applied_here:
+                            c_spec = _intersect_tuple_filters(applied_here[c_key], c_spec)
+                        c_written[c_key] = applied_here[c_key] = c_spec
+                    new_ctx = new_ctx.with_filters(c_written)
+                    continue
                 if isinstance(first, dict) and '__table__' in first:
                     groups: dict = {}
                     if '__row__' in first:
@@ -7110,9 +7187,9 @@ class DAXEngine:
                         keep = filter_arg.upper().startswith('KEEPFILTERS')
                         snaps: dict = {}
                         if not keep:
-                            new_ctx = new_ctx.without_filters(
-                                [k for k in new_ctx.filter_context
-                                 if any(k.startswith(f"{t}.") for t in tbls)])
+                            # a filter on combinations keeps its other tables' part
+                            new_ctx = new_ctx.without_columns(
+                                lambda t, c: any(f"{t}.{c}".startswith(f"{tb}.") for tb in tbls))
                             snaps = {t: new_ctx._filter_snapshot(t) for t in tbls}
                         # A TABLE filter filters the table's EXPANDED table: the
                         # columns of the one-side tables it reaches take the
@@ -7139,6 +7216,18 @@ class DAXEngine:
                         if not keep:
                             new_ctx._no_propagate = new_ctx._no_propagate | tbls
                             new_ctx._no_prop_keys = {**new_ctx._no_prop_keys, **snaps}
+                        # the rows themselves, where each column's values let
+                        # other rows of the table in (issue #154)
+                        combos = self._whole_rows_combos(new_ctx, result, groups, tbls)
+                        for key, spec in list(combos.items()):
+                            prev = new_ctx.filter_context.get(key) if keep else None
+                            if prev is not None:
+                                spec = _intersect_tuple_filters(prev, spec)
+                            if key in applied_here:
+                                spec = _intersect_tuple_filters(applied_here[key], spec)
+                            combos[key] = applied_here[key] = spec
+                        if combos:
+                            new_ctx = new_ctx.with_filters(combos)
                     elif groups:
                         # Single-column row set (ALL(T[Col]), VALUES): replaces
                         # the filter on that ONE column, and a filter reaching
@@ -7264,6 +7353,70 @@ class DAXEngine:
             for k, v in ctx.expansion_filters(t, vals, blank).items():
                 if k not in groups and k not in out:
                     out[k] = v
+        return out
+
+    @staticmethod
+    def _columns_table_filter(ctx: DAXContext, result: list, first: dict):
+        """``(columns, values, combinations)`` for a table filter argument
+        whose rows are a table of COLUMNS of one table -- rows of one
+        (_ColumnsRow), or rows carrying only some of the table's columns: its
+        ``(table, column)``s, each column's values (key -> list), and -- only
+        where those values admit combinations no row has -- ``(key, filter)``
+        on the combinations (issues #152, #153). None for whole rows of a
+        table and for every other shape."""
+        if not isinstance(first, dict) or '__row__' not in first or first.get('__parts__'):
+            return None
+        t = ctx.model_table(str(first.get('__table__', '')))
+        tbl = ctx.tables.get(t)
+        if not tbl:
+            return None
+        cols = [c for c in tbl['columns'] if c in first]
+        if not cols or (len(cols) == len(tbl['columns']) and not isinstance(first, _ColumnsRow)):
+            return None
+        rows = [r for r in result if isinstance(r, dict)]
+        values = {f"{t}.{c}": list(dict.fromkeys(r.get(c) for r in rows)) for c in cols}
+        tcols = [(t, c) for c in cols]
+        combos = list(dict.fromkeys(tuple(r.get(c) for c in cols) for r in rows))
+        span = 1
+        for vals in values.values():
+            span *= len(vals)
+        combo = None
+        if len(cols) > 1 and span > len(combos):
+            combo = (_tuple_filter_key(tcols),
+                     {'tuple_columns': [list(x) for x in tcols], 'rows': [list(x) for x in combos]})
+        return tcols, values, combo
+
+    @staticmethod
+    def _whole_rows_combos(ctx: DAXContext, result: list, groups: dict, tbls) -> dict:
+        """For a table filter of WHOLE rows: a filter on the combinations of
+        every column of each table whose rows, column by column (``groups``),
+        admit rows of the table they are not -- {} where they admit none, as
+        they mostly do (a key, or a column the condition alone decides, tells
+        the rows apart). Power BI Desktop 2.152 over ADOMD (build_b117.py,
+        issue #154): T4(A, B, C, V) has (a1, b1, c2, 1) and no key, and
+        CALCULATE(SUM(T4[V]), FILTER(T4, NOT (T4[B] = "b1" && T4[C] = "c2")))
+        is 11 -- each column's values alone kept that row too (12)."""
+        out: dict = {}
+        for t in tbls:
+            tbl = ctx.tables.get(t)
+            if not tbl or not tbl.get('rows'):
+                continue
+            cols = tbl['columns']
+            rows = [r for r in result if isinstance(r, dict) and r.get('__table__') == t
+                    and not r.get('__blank_row__')]
+            if (not rows or len(rows) >= len(tbl['rows']) or isinstance(rows[0], _ColumnsRow)
+                    or not all(c in rows[0] for c in cols)):
+                continue
+            # the table's rows each column's values admit, the others' filters aside
+            alone = ctx.without_filters(list(ctx.filter_context)).with_filters(
+                {f"{t}.{c}": groups[f"{t}.{c}"] for c in cols if f"{t}.{c}" in groups})
+            alone._no_propagate, alone._no_prop_keys = set(), {}
+            if len(alone.get_filtered_rows(t)) <= len(rows):
+                continue
+            tcols = [(t, c) for c in cols]
+            combos = dict.fromkeys(tuple(r.get(c) for c in cols) for r in rows)
+            out[_tuple_filter_key(tcols)] = {'tuple_columns': [list(x) for x in tcols],
+                                             'rows': [list(x) for x in combos]}
         return out
 
     @staticmethod
@@ -8873,7 +9026,7 @@ class DAXEngine:
             base = base + [sub]
         return base
 
-    def _fn_summarize(self, args_str: str, ctx: DAXContext) -> Any:
+    def _fn_summarize(self, args_str: str, ctx: DAXContext, rows_filter: bool = True) -> Any:
         """SUMMARIZE(table, groupBy..., [name, expression]...) — group + aggregate.
 
         The trailing ``"Name", <expression>`` EXTENSION columns used to be
@@ -8886,7 +9039,6 @@ class DAXEngine:
         if len(args) < 2:
             return []
         table_name = args[0].strip().strip("'")
-        rows = ctx.get_filtered_rows(table_name)
         tbl = ctx.tables.get(table_name)
         if tbl is None:
             # A table EXPRESSION, not a table name. Only a bare name was ever
@@ -8896,34 +9048,16 @@ class DAXEngine:
             src = self._eval_expr(args[0].strip(), ctx)
             if not isinstance(src, list) or not src:
                 return []
-            first = src[0]
-            if not isinstance(first, dict) or '__table__' not in first:
-                return []
-            table_name = first['__table__']
-            tbl = ctx.tables.get(table_name)
-            if tbl is None:
-                return []
-            cols = tbl['columns']
-            rows = []
-            for rd in src:
-                if not isinstance(rd, dict):
-                    continue
-                if '__row__' in rd or '__column__' not in rd:
-                    rows.append([rd.get(c) for c in cols])
-                else:
-                    # Single-column shape: place the value in its own column.
-                    row = [None] * len(cols)
-                    ci = ctx._find_col_idx(cols, rd.get('__column__', ''))
-                    if ci >= 0:
-                        row[ci] = rd.get('__value__')
-                    rows.append(row)
-        if not tbl or not rows:
+            return self._summarize_expression(src, args[1:], ctx)
+        rows = ctx.get_filtered_rows(table_name)
+        if not rows:
             return []
 
         # Split the tail into group-by column refs and (name, expression) pairs.
         # A quoted string literal starts the extension-column section.
         group_cols: list = []
         remote_cols: list = []
+        order: list = []        # the group columns as written: ('base', i) / ('remote', i)
         extensions: list = []
         i = 1
         while i < len(args):
@@ -8936,11 +9070,13 @@ class DAXEngine:
                 if ref_table == table_name or ref_table not in ctx.tables:
                     col_idx = ctx._find_col_idx(tbl['columns'], ref_col)
                     if col_idx >= 0:
+                        order.append(('base', len(group_cols)))
                         group_cols.append((ref_col, col_idx))
                 else:
                     # Grouping the base table by a RELATED table's column — the
                     # canonical "fact by dimension" shape. This used to be
                     # dropped, so the whole result came back empty.
+                    order.append(('remote', len(remote_cols)))
                     remote_cols.append((ref_table, ref_col))
             i += 1
         while i + 1 < len(args):
@@ -8950,104 +9086,336 @@ class DAXEngine:
 
         if remote_cols:
             return self._summarize_with_related(
-                table_name, tbl, group_cols, remote_cols, extensions, ctx)
+                table_name, tbl, group_cols, remote_cols, extensions, ctx, rows,
+                rows_filter, order)
         if not group_cols:
             return []
 
-        seen = set()
-        result = []
+        members: dict = {}
         for row in rows:
-            key = tuple(row[idx] for _, idx in group_cols)
-            if key in seen:
-                continue
-            seen.add(key)
-            row_dict = _ColumnsRow({'__table__': table_name})
-            for col_name, col_idx in group_cols:
-                row_dict[col_name] = row[col_idx]
-            # Use first group col as the iteration column
-            row_dict['__column__'] = group_cols[0][0]
-            row_dict['__value__'] = row[group_cols[0][1]]
-            result.append(row_dict)
+            members.setdefault(tuple(row[idx] for _, idx in group_cols), []).append(row)
+        cols = [(table_name, c) for c, _i in group_cols]
+        # each column with its lineage; several filter their combinations (#117)
+        result = [self._summarize_row(cols, key) for key in members]
         if extensions:
-            # Each group is an ITERATION's row: ALLSELECTED inside an
-            # extension puts back the groups, not the group (#118). As plain
-            # lists they read as explicit filters, and IT Support's "Time
-            # Wasting Patterns" counted 1 alert where Desktop counts 4.
-            group_names = [c for c, _i in group_cols]
-            for row_dict in result:
-                group_ctx = self._transitioned_ctx(ctx, {
-                    f"{table_name}.{c}": _row_value([row_dict[c]], result)
-                    for c in group_names})
-                for ext_name, ext_expr in extensions:
-                    row_dict[ext_name] = self._eval_expr(ext_expr, group_ctx)
+            self._summarize_extensions(table_name, tbl, result, cols, list(members),
+                                       members if rows_filter else None, rows,
+                                       extensions, ctx)
         return result
 
     def _summarize_with_related(self, table_name, tbl, group_cols, remote_cols,
-                                extensions, ctx: DAXContext) -> Any:
-        """SUMMARIZE where at least one group-by column lives on a RELATED table.
+                                extensions, ctx: DAXContext, rows: list,
+                                rows_filter: bool = True,
+                                order: Optional[list] = None) -> Any:
+        """SUMMARIZE of a TABLE where at least one group-by column lives on a
+        RELATED table.
 
-        Each candidate group is expressed as a filter context and handed to the
-        engine's own relationship propagation, so the base rows for the group
-        are resolved exactly the way every other filtered evaluation resolves
-        them. Combinations with no base rows are skipped, matching DAX (which
-        only returns combinations present in the table).
+        The groups are the distinct combinations among the table's rows, each
+        related column read through the relationships of its expanded table,
+        BLANK where a key matches nothing (Desktop: COUNTROWS(SUMMARIZE(BF,
+        BD[Name])) = 4, issue #82). Each column keeps its own table's lineage
+        (_summarize_row). Power BI Desktop 2.152 over ADOMD (build_b117.py,
+        issue #117): COUNTROWS(SUMMARIZE(FILTER(Orders, Orders[Region] = "W"),
+        Dim[Zone])) is 1, not 2, and that table as a CALCULATE filter leaves
+        250 of Orders' revenue and 1 Dim row, where the engine answered 450
+        and 3 -- it read every group from the whole table and filtered a
+        column Orders does not have. A table EXPRESSION's rows:
+        _summarize_expression.
         """
+        getters = [ctx._tuple_column_getter(table_name, rt, rc) for rt, rc in remote_cols]
+        cols = [(table_name, c) for c, _i in group_cols] + [(rt, rc) for rt, rc in remote_cols]
+        members: Optional[dict] = None
+        if all(g is not None for g in getters):
+            idxs = [i for _c, i in group_cols]
+            members = {}
+            for row in rows:
+                key = tuple(row[i] for i in idxs) + tuple(g(row) for g in getters)  # type: ignore[misc]
+                members.setdefault(key, []).append(row)
+            combos = list(members)
+        else:
+            # A column the table's expanded table does not reach: SUMMARIZECOLUMNS
+            # takes its first group column's table as the source, and auto-exist
+            # keeps the combinations of values some row of that table joins.
+            combos = self._existing_combos(table_name, group_cols, remote_cols, ctx)
+            if combos is None:
+                return []
+        # the columns in the order written, as Desktop returns them
+        perm = [(len(group_cols) + j) if kind == 'remote' else j for kind, j in (order or ())]
+        if perm and perm != list(range(len(cols))):
+            cols = [cols[k] for k in perm]
+            combos = [tuple(combo[k] for k in perm) for combo in combos]
+            if members is not None:
+                members = {tuple(key[k] for k in perm): grp for key, grp in members.items()}
+        result = [self._summarize_row(cols, combo) for combo in combos]
+        if extensions and combos:
+            self._summarize_extensions(table_name, tbl, result, cols, combos,
+                                       members if rows_filter else None, rows,
+                                       extensions, ctx)
+        return result
+
+    def _summarize_extensions(self, table_name, tbl, result: list, cols: list, combos: list,
+                              members: Optional[dict], rows: list,
+                              extensions: list, ctx: DAXContext) -> None:
+        """SUMMARIZE's extension columns over a TABLE, each group's in the
+        group's context: its columns filtered, each on its own table, and --
+        given its rows (``members``) -- those rows' EXPANDED table, as a
+        transition over them would filter it. Power BI Desktop 2.152
+        (build_b117.py, issue #117): COUNTROWS(Dim3) in SUMMARIZE(Fact3,
+        Dim3[Grp], ...) counts only the members some row of the group uses
+        (2, not 3). The group's columns select the table's rows already; the
+        expanded table takes their join columns. The groups, and the rows, are
+        an iteration's rows: ALLSELECTED in an extension puts them back (#118;
+        Desktop: 8). A table EXPRESSION's groups: _summarize_expression."""
+        keys = [f"{t}.{c}" for t, c in cols]
+        shadows: dict = {}
+        for combo in combos:
+            for key, (t, c), val in zip(keys, cols, combo):
+                shadows.setdefault(key, []).append(
+                    {'__table__': t, '__column__': c, '__value__': val})
+        tcols = tbl['columns']
+        fks = {rel['from_col'] for nxt in ctx._expand_adj.get(table_name, ())
+               if (rel := ctx._rel_index.get((table_name, nxt)))}
+        wanted = [(i, c) for i, c in enumerate(tcols) if c in fks]
+        src: Optional[list] = None
+        for row_dict, combo in zip(result, combos):
+            filters: dict = {}
+            if members is not None and wanted:
+                grp = members.get(combo) or []
+                vals = {c: list(dict.fromkeys(r[i] for r in grp)) for i, c in wanted}
+                exp = ctx.expansion_filters(table_name, vals)
+                if exp:
+                    if src is None:
+                        src = [dict(zip(tcols, r), __table__=table_name) for r in rows]
+                    filters.update({k: _row_value(v, src) for k, v in exp.items()})
+            filters.update({key: _row_value([val], shadows[key]) for key, val in zip(keys, combo)})
+            group_ctx = self._transitioned_ctx(ctx, filters)
+            for ext_name, ext_expr in extensions:
+                row_dict[ext_name] = self._eval_expr(ext_expr, group_ctx)
+
+    def _summarize_expression(self, src: list, args: list, ctx: DAXContext) -> Any:
+        """SUMMARIZE over a table EXPRESSION -- FILTER(T, ...), ALLSELECTED(
+        T[a], T[b]), a CROSSJOIN, another SUMMARIZE: the groups are its rows'.
+
+        A row is one part per table (a CROSSJOIN row has several, #108), each
+        carrying some of its table's columns, and a part is a WHOLE row of its
+        table only when it carries every column and is no row of a table of
+        columns (_ColumnsRow). A group column is read from the part of its
+        table or -- from a whole row only -- through that row's expanded
+        table; a column neither reaches is not in the input table.
+
+        An extension column sees its group's rows: each column they carry,
+        filtered to the group's values -- to the group's combinations of them
+        where the values alone admit more -- and, for whole rows, their
+        expanded table. Power BI Desktop 2.152 over ADOMD (build_b117.py,
+        issues #117, #152, #153), Orders2(Region, Qty) many-to-one Dim(Region):
+
+            SUMMARIZE(FILTER(Orders, Orders[Revenue] > 100), Dim[Zone],
+                "r", SUM(Orders[Revenue]))                     400 in all
+            SUMMARIZE(FILTER(ALL(Orders2[Region], Orders2[Qty]),
+                Orders2[Qty] >= 2), Orders2[Region],
+                "q", SUM(Orders2[Qty]))                        14, the rows kept
+            ... over SUMMARIZE(FILTER(Orders2, Orders2[Qty] >= 2),
+                Orders2[Region], Orders2[Qty])                 14
+            ... "d", COUNTROWS(Dim)                            9, Dim unfiltered
+                (over FILTER(Orders2, ...) itself: 3)
+            SUMMARIZE(FILTER(CROSSJOIN(VALUES(Dim[Zone]), VALUES(Orders2[Qty])),
+                Orders2[Qty] >= 4), Dim[Zone], "q", SUM(Orders2[Qty]))   9
+            COUNTROWS(SUMMARIZE(ALL(Orders[Region]), Dim[Zone]))  an error
+
+        IT Support's "Time Wasting Patterns" groups ALLSELECTED(fact[Cluster_ID],
+        fact[Queue]) by both and counts its 4 alerts in such an extension."""
+        first = src[0]
+        if not isinstance(first, dict) or '__table__' not in first:
+            return []
+        # Per part: its table, the columns it carries, whether it is a whole row.
+        layout: list = []
+        for p in _row_parts(first):
+            t = p.get('__table__') if isinstance(p, dict) else None
+            tb = ctx.tables.get(t) if isinstance(t, str) else None
+            if tb is None:
+                layout.append((t, [], False))
+                continue
+            tcols = tb['columns']
+            carried = [c for c in tcols if c in p]
+            if not carried and p.get('__column__') in tcols:
+                carried = [p['__column__']]
+            layout.append((t, carried, '__row__' in p and not isinstance(p, _ColumnsRow)
+                           and len(carried) == len(tcols)))
+        if not any(carried for _t, carried, _w in layout):
+            return []
+        rows = [rd for rd in src if isinstance(rd, dict) and len(_row_parts(rd)) == len(layout)]
+
+        group: list = []        # ((table, column), reader of a source row)
+        i = 0
+        while i < len(args):
+            arg = args[i].strip()
+            if arg.startswith('"'):
+                break
+            i += 1
+            ref = self._column_arg(arg, ctx)
+            if not (isinstance(ref, tuple) and len(ref) == 2):
+                continue
+            col = self._summarize_source_column(layout, ref[0], ref[1], ctx)
+            if col is None:
+                raise _DAXEvaluationError(
+                    f"The column '{ref[1]}' specified in the 'SUMMARIZE' function "
+                    "was not found in the input table.")
+            group.append(col)
+        extensions: list = []
+        while i + 1 < len(args):
+            extensions.append((args[i].strip().strip('"'), args[i + 1].strip()))
+            i += 2
+        if not group:
+            return []
+
+        members: dict = {}
+        for rd in rows:
+            members.setdefault(tuple(read(rd) for _c, read in group), []).append(rd)
+        cols = [c for c, _r in group]
+        result = [self._summarize_row(cols, key) for key in members]
+        if not extensions:
+            return result
+        keys = [f"{t}.{c}" for t, c in cols]
+        shadows: dict = {}
+        for combo in members:
+            for key, (t, c), val in zip(keys, cols, combo):
+                shadows.setdefault(key, []).append(
+                    {'__table__': t, '__column__': c, '__value__': val})
+        # each part's rows: the iteration's rows, which ALLSELECTED puts back (#118)
+        part_rows = [[_row_parts(rd)[pi] for rd in rows] for pi in range(len(layout))]
+        loose = [(pi, t, c) for pi, (t, carried, whole) in enumerate(layout)
+                 if not whole for c in carried]
+        # Whole rows whose columns, value by value, admit other rows of their
+        # table filter as their combinations (issue #154). Checked once over
+        # all the rows: a group's key is its rows' own, so where all of them
+        # admit no other row, no group's do.
+        inexact = {pi for pi, (t, carried, whole) in enumerate(layout)
+                   if whole and self._whole_rows_combos(
+                       ctx, part_rows[pi],
+                       {f"{t}.{c}": [_part_value(p, c) for p in part_rows[pi]] for c in carried},
+                       {t})}
+        for row_dict, (combo, grp) in zip(result, members.items()):
+            filters: dict = {}
+            for pi, (t, carried, whole) in enumerate(layout):
+                if not carried:
+                    continue
+                gparts = [_row_parts(rd)[pi] for rd in grp]
+                vals = {c: list(dict.fromkeys(_part_value(p, c) for p in gparts)) for c in carried}
+                if whole:
+                    # a part's own columns win over another part's expansion
+                    for k, v in ctx.expansion_filters(t, vals).items():
+                        filters.setdefault(k, _row_value(v, part_rows[pi]))
+                for c, v in vals.items():
+                    filters[f"{t}.{c}"] = _row_value(v, part_rows[pi])
+                if pi in inexact:
+                    tcols = [(t, c) for c in carried]
+                    filters[_tuple_filter_key(tcols)] = {
+                        'tuple_columns': [list(x) for x in tcols],
+                        'rows': [list(x) for x in dict.fromkeys(
+                            tuple(_part_value(p, c) for c in carried)
+                            for p in gparts if not p.get('__blank_row__'))]}
+            if len(loose) > 1:
+                combos = list(dict.fromkeys(
+                    tuple(_part_value(_row_parts(rd)[pi], c) for pi, _t, c in loose)
+                    for rd in grp))
+                span = 1
+                for j in range(len(loose)):
+                    span *= len({x[j] for x in combos})
+                if span > len(combos):
+                    # the values alone admit combinations no row has (Desktop:
+                    # T4's (a1, b1, c2) stays out, 11 not 12; issue #153)
+                    tcols = [(t, c) for _pi, t, c in loose]
+                    filters[_tuple_filter_key(tcols)] = {
+                        'tuple_columns': [list(x) for x in tcols],
+                        'rows': [list(x) for x in combos]}
+            filters.update({key: _row_value([val], shadows[key]) for key, val in zip(keys, combo)})
+            group_ctx = self._transitioned_ctx(ctx, filters)
+            for ext_name, ext_expr in extensions:
+                row_dict[ext_name] = self._eval_expr(ext_expr, group_ctx)
+        return result
+
+    @staticmethod
+    def _summarize_source_column(layout: list, table, col: str, ctx: DAXContext):
+        """A group column of SUMMARIZE over a table expression's rows
+        (``layout``: per part, its table, the columns it carries, whether it
+        is a whole row): ``((table, column), reader of a source row)``, or None
+        when the column is not in the input table."""
+        want = ctx.model_table(table) if isinstance(table, str) else ''
+        named = want in ctx.tables          # else a bare [Column]: any part's
+        for pi, (t, carried, _whole) in enumerate(layout):
+            if named and t != want:
+                continue
+            ci = ctx._find_col_idx(carried, col)
+            if ci >= 0:
+                c = carried[ci]
+                return (t, c), (lambda rd, pi=pi, c=c: _part_value(_row_parts(rd)[pi], c))
+        if not named:
+            return None
+        wtb = ctx.tables[want]
+        wi = ctx._find_col_idx(wtb['columns'], col)
+        if wi < 0:
+            return None
+        for pi, (t, _carried, whole) in enumerate(layout):
+            if not whole or t == want:
+                continue
+            get = ctx._tuple_column_getter(t, want, col)
+            if get is not None:
+                tcols = ctx.tables[t]['columns']
+                return ((want, wtb['columns'][wi]),
+                        (lambda rd, pi=pi, get=get, tcols=tcols:
+                         get([_row_parts(rd)[pi].get(x) for x in tcols])))
+        return None
+
+    def _existing_combos(self, table_name, group_cols, remote_cols, ctx: DAXContext):
+        """The combinations of the group columns' values for which some row
+        of ``table_name`` survives their filters -- the relationship
+        propagation decides, so a column of any related table counts. None
+        when a column is missing; [] on a combinatorial blow-up."""
         import itertools
 
         axes = []
         for col_name, col_idx in group_cols:
-            vals = list(dict.fromkeys(
-                r[col_idx] for r in ctx.get_filtered_rows(table_name)))
-            axes.append([(f"{table_name}.{col_name}", col_name, v)
-                         for v in vals])
+            axes.append([(f"{table_name}.{col_name}", v) for v in dict.fromkeys(
+                r[col_idx] for r in ctx.get_filtered_rows(table_name))])
         for rt, rc in remote_cols:
             rtbl = ctx.tables.get(rt) or {}
-            ridx = ctx._find_col_idx(rtbl.get('columns', []), rc)
-            if ridx < 0:
-                return []
+            if ctx._find_col_idx(rtbl.get('columns', []), rc) < 0:
+                return None
             # The base rows whose key matches no row of rt group under BLANK
             # (Desktop: COUNTROWS(SUMMARIZE(BF, BD[Name])) = 4, issue #82).
-            vals = self._values_with_blank(rt, rc, ctx)
-            axes.append([(f"{rt}.{rc}", rc, v) for v in vals])
-        if not axes:
-            return []
-
-        # Guard against a combinatorial blow-up on wide group-by sets.
+            axes.append([(f"{rt}.{rc}", v) for v in self._values_with_blank(rt, rc, ctx)])
         total = 1
         for a in axes:
             total *= max(len(a), 1)
         if total > 100_000:
             return []
-
-        result = []
-        combos = []
+        out = []
         for combo in itertools.product(*axes):
-            filters = {key: [val] for key, _disp, val in combo}
-            if not ctx.with_filters(filters).get_filtered_rows(table_name):
-                continue  # combination doesn't exist in the base table
-            row_dict = _ColumnsRow({'__table__': table_name})
-            for _key, disp, val in combo:
-                row_dict[disp] = val
-            first_disp, first_val = combo[0][1], combo[0][2]
-            row_dict['__column__'] = first_disp
-            row_dict['__value__'] = first_val
-            result.append(row_dict)
-            combos.append(combo)
-        if extensions and combos:
-            # The groups are an iteration's rows; ALLSELECTED in an extension
-            # puts back the groups, per column (#118).
-            shadows: dict = {}
-            for combo in combos:
-                for key, _disp, val in combo:
-                    t, _, c = key.partition('.')
-                    shadows.setdefault(key, []).append(
-                        {'__table__': t, '__column__': c, '__value__': val})
-            for row_dict, combo in zip(result, combos):
-                group_ctx = self._transitioned_ctx(ctx, {key: _row_value([val], shadows[key])
-                                                         for key, _disp, val in combo})
-                for ext_name, ext_expr in extensions:
-                    row_dict[ext_name] = self._eval_expr(ext_expr, group_ctx)
-        return result
+            if ctx.with_filters({key: [val] for key, val in combo}).get_filtered_rows(table_name):
+                out.append(tuple(val for _key, val in combo))
+        return out
+
+    @staticmethod
+    def _summarize_row(cols: list, combo: tuple) -> '_ColumnsRow':
+        """One group of SUMMARIZE as a row of columns that keep their lineage:
+        ``cols`` are its ``(table, column)``s, ``combo`` their values. One
+        column is a single-column row of its own table. Several carry one
+        part per table, as a CROSSJOIN row does (#108), beside the merged
+        columns: as a CALCULATE filter the row filters the combinations
+        (#103), and its transition filters each table's own columns
+        (issue #117)."""
+        (t0, c0), v0 = cols[0], combo[0]
+        if len(cols) == 1:
+            return _ColumnsRow({'__table__': t0, c0: v0, '__column__': c0, '__value__': v0})
+        by_table: dict = {}
+        for (t, c), v in zip(cols, combo):
+            by_table.setdefault(t, {})[c] = v
+        row = _ColumnsRow({'__table__': t0})
+        for (_t, c), v in zip(cols, combo):
+            row.setdefault(c, v)
+        row['__column__'], row['__value__'] = c0, v0
+        row['__parts__'] = tuple(_ColumnsRow({'__table__': t, **vals}) for t, vals in by_table.items())
+        return row
 
     def _fn_summarizecolumns(self, args_str: str, ctx: DAXContext) -> Any:
         """SUMMARIZECOLUMNS(groupBy1, ..., name, expression) — summarize with measures.
@@ -9138,7 +9506,9 @@ class DAXEngine:
         tail = args[len(group_refs):]
         if tail:
             inner += ", " + ", ".join(a.strip() for a in tail)
-        result = self._fn_summarize(inner, ctx)
+        # SUMMARIZECOLUMNS has no source table: an expression sees its group's
+        # columns only, not the rows of the table borrowed as the source
+        result = self._fn_summarize(inner, ctx, rows_filter=False)
         if isinstance(result, list):
             result = self._summarizecolumns_blank_group(
                 result, group_refs, tail, ctx)
@@ -9173,12 +9543,9 @@ class DAXEngine:
         vals = {name: self._eval_expr(expr, bctx) for name, expr in exts}
         if exts and all(v is None for v in vals.values()):
             return result
-        row: dict = {'__table__': table_name}
-        for _t, c in group_refs:
-            row[c] = None
+        row = self._summarize_row([(table_name, c) for _t, c in group_refs],
+                                  (None,) * len(group_refs))
         row.update(vals)
-        row['__column__'] = group_refs[0][1]
-        row['__value__'] = None
         return result + [row]
 
     def _fn_selectcolumns(self, args_str: str, ctx: DAXContext) -> Any:
