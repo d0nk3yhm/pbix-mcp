@@ -3760,18 +3760,21 @@ class DAXEngine:
             # returned for the grouped row with the same value.
             # A row transition's value also carries its iteration's rows, which
             # ALLSELECTED restores (#118): the same row under two iterations
-            # can have two values, so the iteration is part of the key.
+            # can have two values, so the iteration is part of the key -- for
+            # a measure that can reach ALLSELECTED (_reads_shadow).
+            _shadow_on = bool(ctx.filter_context) and self._reads_shadow(measure_name, ctx)
+
             def _fc_part(k, v):
                 tag = type(v).__name__ if type(v) not in (list, dict) else ''
                 if isinstance(v, list):
                     if tag:
-                        shadow = self._shadow_token(k, v)
+                        shadow = self._shadow_token(k, v) if _shadow_on else None
                         return (tag, tuple(v)) if shadow is None else (tag, tuple(v), shadow)
                     return tuple(v)
                 if isinstance(v, dict):
                     return ("__pred__" + tag, json.dumps(v, sort_keys=True,
                                                          default=str),
-                            self._shadow_token(k, v))
+                            self._shadow_token(k, v) if _shadow_on else None)
                 return v
             # Filters the measure provably cannot see are keyed by what it
             # does see of them (_shielded_keys): "the last week with sales"
@@ -4083,6 +4086,7 @@ class DAXEngine:
         tables = self._shielded_tables(name, ctx)
         if not tables or not ctx.filter_context:
             return {}
+        shadow_on = self._reads_shadow(name, ctx)
         out: dict = {}
         for t in tables:
             tbl = ctx.tables.get(t)
@@ -4097,10 +4101,60 @@ class DAXEngine:
                 k = prefix + c
                 v = ctx.filter_context.get(k)
                 if isinstance(v, (RowContextValues, RowContextPredicate)):
-                    out[k] = ('shadow', self._shadow_token(k, v))
+                    out[k] = ('shadow', self._shadow_token(k, v) if shadow_on else None)
                 elif isinstance(v, (GroupByValues, GroupByPredicate)):
                     out[k] = ('grouping',)
         return out
+
+    _ALLSELECTED_RE = re.compile(r"(?i)\bALLSELECTED\s*\(")
+    _BRACKET_REF_RE = re.compile(r"\[((?:[^\]]|\]\])+)\]")
+
+    def _reads_shadow(self, name: str, ctx: DAXContext) -> bool:
+        """Can evaluating measure ``name`` reach ALLSELECTED, the one reader of
+        an iteration's rows (_restore_selected)? Through its own text, a
+        measure it references, or any calculation item. Conservative: a
+        column reference spelled like a measure counts as the measure.
+
+        Without ALLSELECTED one row has one value under every iteration, so
+        the memo key leaves the iteration out (issue #140). #118 had keyed it
+        for every measure: the passes of FILTER and AVERAGEX over the same
+        employees no longer shared [MTD Total Sales], and Agents Performance's
+        "Employees Avg MTD Sales - Adjusted" took twice as long."""
+        cache = ctx._shield_cache
+        key = ('reads-shadow', name)
+        hit = cache.get(key)
+        if hit is not None:
+            return bool(hit)
+        if ('reads-shadow-items',) not in cache:
+            # An applied item stands in for any measure, and its own measure
+            # references count (Awesome Chocolates' QOQ item reaches
+            # ALLSELECTED through [Max Previous Quarter Not Blank]).
+            groups = _calc_registry(ctx.measures)[0]
+            cache[('reads-shadow-items',)] = self._reaches_allselected(
+                [str(item.get('expression') or '') for g in groups for item in g.items], ctx)
+        found = bool(cache[('reads-shadow-items',)]) or self._reaches_allselected(
+            [str(ctx.measures.get(name) or '')], ctx, {name})
+        cache[key] = found
+        return found
+
+    def _reaches_allselected(self, texts: list, ctx: DAXContext, seen: set | None = None) -> bool:
+        """Does one of the DAX ``texts``, or a measure they reference
+        (transitively), call ALLSELECTED?"""
+        lower = ctx._shield_cache.get(('measure-names',))
+        if lower is None:
+            lower = ctx._shield_cache[('measure-names',)] = {m.lower(): m for m in ctx.measures}
+        seen = set(seen or ())
+        todo = list(texts)
+        while todo:
+            expr = todo.pop()
+            if self._ALLSELECTED_RE.search(expr):
+                return True
+            for ref in self._BRACKET_REF_RE.findall(expr):
+                m = lower.get(ref.replace(']]', ']').strip().lower())
+                if m is not None and m not in seen:
+                    seen.add(m)
+                    todo.append(str(ctx.measures.get(m) or ''))
+        return False
 
     def _shadow_token(self, key: str, value) -> Optional[int]:
         """A small number standing for the distinct values of ``key``'s column

@@ -31,6 +31,12 @@ ALLSELECTED keeps the measure's own CALCULATE filters, as OpenBI reported (#118)
 - **Still open:** a FILTER condition that holds an aggregate and reads the row's own column, such as `Dt[Month] = MAXX(FILTER(ALLSELECTED(Dt), ...), Dt[Month])`. That is #116. Also, an outer row's other columns are not seen inside `FILTER(ALLSELECTED(D[Date]), ...)` in Desktop (`build_b137.py`: `MINX(D, CALCULATE(MAXX(FILTER(ALLSELECTED(D[Date]), NOT ISBLANK([M])), D[Date])))` is the last sale date, 31 March). The engine still sees them and answers 31 January (#137).
 - **Pinned** by `tests/test_issue118_allselected_explicit.py`: 409 tests, every expected value generated from Desktop's output. **247 fail on 0.9.122.** `tests/test_issue120_allselected_table.py` gains the 16 explicit-filter cells it left out, and `tests/test_storage_and_scope.py` now expects Desktop's 1 for an inner filter on the ALLSELECTED column.
 
+### Fixed — the measure memo keys an iteration only where ALLSELECTED can read it (issue #140)
+
+- **Found by this release's corpus census, before it shipped:** with #118's iteration in every memo key, a measure that FILTER and then AVERAGEX evaluate over the same rows ran twice. Agents Performance's `Employees Avg MTD Sales - Adjusted`, `Employees Avg Total Discount - Adjusted` and `Rank Filtering Employyees MTD` took 41–43 s instead of 22–23 s (each alone in a fresh process), so the census's 30 s cap read BLANK. Their values were Desktop's all along.
+- **The fix:** only ALLSELECTED reads an iteration's rows. A measure's key carries the iteration only when the measure can reach ALLSELECTED: in its own text, in a measure it references (transitively), or in any calculation item (`_reads_shadow`). The three measures are back to 23–28 s.
+- **Pinned** by `tests/test_issue140_memo_iterations.py`: 9 tests. **7 fail on #118's commit alone**, 8 on 0.9.122. FILTER's and AVERAGEX's passes evaluate a measure once per row between them, and a measure that reaches ALLSELECTED keeps each pass's own value (2 + 2, not 10 + 10).
+
 ## [0.9.122] - 2026-10-09
 
 Calculation groups are applied (OpenBI doc 52). Also three fixes reported by OpenBI (docs 53, 54 and 55), six found while verifying them, one found by the 0.9.121 corpus census (#132), and one reported by @allanon2 (PR #123). All were checked against Power BI Desktop 2.152 over ADOMD:

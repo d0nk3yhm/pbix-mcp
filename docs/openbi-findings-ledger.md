@@ -41,11 +41,13 @@ and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
 **Updated 2026-10-09 (0.9.123): docs 1-55 and GitHub issues/PRs #1-#113,
-#118-#135 are closed; #114-#117 and #136 are open.** 0.9.123 closes #118:
-ALLSELECTED keeps the measure's own CALCULATE filters and puts back what
+#118-#135 and #140 are closed; #114-#117 and #136 are open.** 0.9.123 closes
+#118: ALLSELECTED keeps the measure's own CALCULATE filters and puts back what
 an iteration iterated (its shadow), measured on 420 cells (build_b118.py);
-Awesome Chocolates and the Financial Sample's Arrow Chart now match Desktop
-on every measure.
+the Financial Sample's Arrow Chart now matches Desktop on every measure and
+Awesome Chocolates at the grand total. #140, found by its own census before
+release: the memo keys an iteration only for a measure that can reach
+ALLSELECTED, so a measure FILTER and AVERAGEX share is evaluated once.
 
 As of 0.9.122, docs 1-55 and #1-#113, #119-#135 were closed; #114-#118
 were open. 0.9.122 also solves PR #123 by
