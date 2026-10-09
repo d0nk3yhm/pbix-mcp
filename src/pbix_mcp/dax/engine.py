@@ -4520,6 +4520,36 @@ class DAXEngine:
         sel.model_columns = ctx.model_columns
         return sel
 
+    def _selected_on_columns(self, ctx: DAXContext, table: str, columns) -> DAXContext:
+        """The selection ALLSELECTED's COLUMN form keeps: the query/slicer
+        filters on those columns of ``table`` and nothing else (a filter on
+        column combinations is projected onto them).
+
+        Power BI Desktop 2.152 (issue #120), T(Region, Cat, Amount) many-to-one
+        D(Region, Zone), one slicer at a time: COUNTROWS(ALLSELECTED(T[Region]))
+        is 1 only under a T[Region] slicer, and stays 2 under slicers on
+        T[Amount], T[Cat], D[Zone] and D[Region] that leave one region. The
+        TABLE form keeps every selection reaching the table (_selected_ctx)."""
+        tl = table.lower()
+        cl = {str(c).lower() for c in columns}
+        keep: dict = {}
+        for k, v in self._selected_filters().items():
+            if k.startswith(_TUPLE_FILTER_PREFIX):
+                pos = [i for i, (t, c) in enumerate(v.get('tuple_columns') or [])
+                       if str(t).lower() == tl and str(c).lower() in cl]
+                if pos:
+                    spec = _project_tuple_filter(v, pos)
+                    keep[_tuple_filter_key(spec['tuple_columns'])] = spec
+                continue
+            t, sep, c = k.partition('.')
+            if sep and t.lower() == tl and c.lower() in cl:
+                keep[k] = v
+        sel = DAXContext(ctx.tables, ctx.measures, ctx.date_table,
+                         ctx.date_column, keep, ctx.relationships)
+        sel.measure_tables = ctx.measure_tables
+        sel.model_columns = ctx.model_columns
+        return sel
+
     def _multi_column_all(self, ref: str, ctx: DAXContext, selected: bool,
                           no_blank_row: bool = False):
         """ALL/ALLSELECTED over SEVERAL columns -> their distinct combinations.
@@ -4552,8 +4582,9 @@ class DAXEngine:
         idxs = [ctx._find_col_idx(tbl['columns'], c) for _t, c in cols]
         if any(i < 0 for i in idxs):
             return None
-        rows = (tbl['rows'] if not selected
-                else self._selected_ctx(ctx).get_filtered_rows(table_name))
+        sel = (self._selected_on_columns(ctx, table_name, [c for _t, c in cols])
+               if selected else None)       # its own columns' selection only (#120)
+        rows = tbl['rows'] if sel is None else sel.get_filtered_rows(table_name)
         seen, out = set(), []
         for row in rows:
             key = tuple(row[i] for i in idxs)
@@ -4567,7 +4598,7 @@ class DAXEngine:
         # The blank row's combination: every column BLANK (issue #82).
         blank_key = tuple(None for _ in idxs)
         if blank_key not in seen and not no_blank_row and (
-                self._selected_ctx(ctx).blank_row_visible(table_name) if selected
+                sel.blank_row_visible(table_name) if sel is not None
                 else table_name in ctx.blank_row_tables()):
             rd = {'__table__': table_name, '__row__': True}
             for _t, c in cols:
@@ -7770,10 +7801,19 @@ class DAXEngine:
         return ('__ALLEXCEPT__', args_str.strip())
 
     def _fn_allselected(self, args_str: str, ctx: DAXContext) -> Any:
-        """ALLSELECTED(column_or_table) — respect only external (slicer) filters.
-        Approximation: returns all distinct values from filtered context (same as VALUES)."""
-        # NOTE: True ALLSELECTED requires distinguishing external vs internal filters,
-        # which is not tracked in this simplified engine. We approximate with VALUES behavior.
+        """ALLSELECTED(column_or_table, ...) as a TABLE expression. (As a
+        CALCULATE filter argument it is a modifier, handled there by its text.)
+
+        Power BI Desktop 2.152, one slicer at a time (issue #120):
+          * the column form keeps only the selection on its OWN columns
+            (_selected_on_columns), BLANK included when that keeps the blank
+            row (ALLSELECTED(BD[Name]) = 4, #82);
+          * the table form is the table's rows under every selection that
+            reaches it (_selected_ctx), as full-row dicts like ALL(T)'s, so an
+            iterator transitions over each row. It answered no rows at all:
+            MINX(ALLSELECTED('Date'), [Sales]) was BLANK where Desktop gives
+            the selected days' minimum.
+        A grouping is never part of the selection."""
         ref = args_str.strip()
         multi = self._multi_column_all(ref, ctx, selected=True)
         if multi is not None:
@@ -7783,12 +7823,27 @@ class DAXEngine:
             # groups: 'quoted name' | bare name | column
             table_name = (col_match.group(1) or col_match.group(2) or '').strip()
             col_name = col_match.group(3).strip()
-            # The selected values, BLANK included when the selection keeps
-            # the table's blank row (Desktop: ALLSELECTED(BD[Name]) = 4).
-            values = self._values_with_blank(table_name, col_name,
-                                             self._selected_ctx(ctx))
+            values = self._values_with_blank(
+                table_name, col_name,
+                self._selected_on_columns(ctx, table_name, [col_name]))
             return [{'__table__': table_name, '__column__': col_name,
                      '__value__': v} for v in values]
+        name = (ref[1:-1].replace("''", "'")
+                if len(ref) > 1 and ref[0] == ref[-1] == "'" else ref).strip()
+        table_name = ctx.model_table(name) if name else name
+        tbl = ctx.tables.get(table_name) if name else None
+        if tbl is not None:
+            sel = self._selected_ctx(ctx)
+            cols = tbl['columns']
+            out = []
+            for row in sel.get_filtered_rows(table_name):
+                rd = {'__table__': table_name, '__row__': True}
+                for ci, col in enumerate(cols):
+                    rd[col] = row[ci] if ci < len(row) else None
+                out.append(rd)
+            if sel.blank_row_visible(table_name):
+                out.append(sel.blank_row_dict(table_name))
+            return out
         return ('__ALLSELECTED__', ref)
 
     def _fn_keepfilters(self, args_str: str, ctx: DAXContext) -> Any:

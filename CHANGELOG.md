@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.121] - 2026-10-08
+
+Two fixes reported by OpenBI (docs 50 and 51).
+
+- **ALLSELECTED:** checked against Power BI Desktop 2.152 over ADOMD. A 400-cell matrix has 390 cells matching; 0.9.120 matched 139. The other 10 are #118.
+- **Colours:** checked against Desktop's own code and a render. The recoloured Desktop-authored template keeps its white and grey cells.
+- **No regressions:** every Desktop probe from earlier releases still matches.
+
+### Fixed — a palette colour's ColorId counts white and black first (issue #119)
+
+- **What was wrong:** a `ThemeDataColor` reference was read as `dataColors[ColorId]`. Desktop's colour picker row is pure white, pure black, then the theme's first eight data colours, and ColorId indexes that row. So:
+  - `pbix_extract_colors` reported "White, 10% darker", the commonest panel fill, as a blue (`#0F7EE5`) instead of `#E6E6E6`;
+  - `pbix_recolor`, remapping the theme's first data colour, rewrote every white and grey fill to the new colour. Desktop 2.152 then painted the Matrix Bubble Chart template's cells magenta.
+- **Ground truth:** Desktop's own code (`desktop.min.js`). `DataColorPalette.basePickerColors` is `[#FFFFFF, #000000]` plus `_.take(dataColors, 8)`, and `getThemeDataColor` returns `basePickerColors[ColorId]`. Two consequences:
+  - 0 and 1 are fixed white and black, not the theme's background and foreground, which answers the question OpenBI's ledger had left open;
+  - ColorId 10 and up name no colour.
+- **The fix:**
+  - ColorId resolves through that row;
+  - the Percent shade is a port of Desktop's own function. Each channel moves |Percent| of the way to white or black, rounded as JS `Math.round` does. Run verbatim under Node, Desktop's function and the port agree on all 7,560 colour/percent pairs tried;
+  - a reference that names no colour is listed as unresolved, and `pbix_recolor` leaves it alone. Before, it was drawn as a made-up `#808080`.
+- **Measured:** on Matrix Bubble Chart, recolouring the first data colour now leaves its seven white and grey references as theme references, and Desktop renders them as before. 0.9.120 turned all seven into the new colour.
+- **Pinned** by `tests/test_issue119_theme_data_color.py`: 28 tests, all failing on 0.9.120. They cover the picker row, Desktop's shades, and the two tools on a built report.
+
+### Fixed — ALLSELECTED(<table>) as a table returns the selected rows (issue #120)
+
+- **What was wrong:** used as a table, iterated by COUNTROWS, MINX, MAXX, SUMX, FILTER or CONCATENATEX, `ALLSELECTED(T)` returned a marker only CALCULATE understands, so the iterator saw no rows. Matrix Bubble Chart's `MINX(ALLSELECTED('Date'), [Sales])` was BLANK, so no bubble drew.
+- **Desktop 2.152's rules,** measured one slicer at a time:
+  - **the table form** is the table's rows under every selection that reaches it. A `D[Zone]` slicer leaves `ALLSELECTED(T)` two of four rows;
+  - **the column form** keeps only the selection on its own columns. `COUNTROWS(ALLSELECTED(T[Region]))` stays 2 under slicers on `T[Amount]`, `T[Cat]`, `D[Zone]` and `D[Region]`, and is 1 only under a `T[Region]` slicer. 0.9.120 applied every selection to the column form too, so it gave 1 under those slicers, as did OpenBI's port, whose expected value in doc 51 was 1;
+  - a grouping is never part of the selection, in either form.
+- **The fix:** the table form returns the table's rows under the selection, plus the blank row when the selection keeps it. They are full rows, like `ALL(T)`'s, so an iterator transitions over each one. The column and multi-column forms keep only the selection on their own columns. As a CALCULATE filter argument ALLSELECTED is unchanged.
+- **Measured:** Desktop's answers for 25 measures under 11 query shapes (ungrouped, grouped, under a slicer, grouped under a slicer). 390 of 400 cells match, against 139 on 0.9.120. The 10 that don't keep an explicit CALCULATE filter inside the measure, which is #118.
+- **Pinned** by `tests/test_issue120_allselected_table.py`: 384 tests, every expected value generated from Desktop's output. **245 fail on 0.9.120.**
+- **Still open (#116):** the running-total shape `FILTER(ALL(T), T[c] <= MAX(T[c]))` keeps no rows, with ALL and ALLSELECTED alike, because FILTER binds no row context when its condition holds an aggregate.
+
 ## [0.9.120] - 2026-10-08
 
 Three fixes reported by OpenBI's port of the engine (OpenBI docs 48 and 49), plus one found while verifying them.

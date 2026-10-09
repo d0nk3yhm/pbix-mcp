@@ -6896,22 +6896,46 @@ def _load_theme_data_colors(work_dir: str) -> list[str]:
     return []
 
 
-def _resolve_theme_color(data_colors: list[str], color_id: int, percent: float) -> str:
-    """Resolve a ThemeDataColor reference to a hex color string."""
-    if color_id < len(data_colors):
-        base = data_colors[color_id]
-    else:
-        base = "#808080"
-    r, g, b = int(base[1:3], 16), int(base[3:5], 16), int(base[5:7], 16)
-    if percent > 0:
-        r = int(r + (255 - r) * percent)
-        g = int(g + (255 - g) * percent)
-        b = int(b + (255 - b) * percent)
-    elif percent < 0:
-        r = int(r * (1 + percent))
-        g = int(g * (1 + percent))
-        b = int(b * (1 + percent))
-    return f"#{max(0,min(255,r)):02X}{max(0,min(255,g)):02X}{max(0,min(255,b)):02X}"
+def _theme_picker_colors(data_colors: list[str]) -> list[str]:
+    """The colour picker's theme row, which a ThemeDataColor's ColorId indexes.
+
+    Power BI Desktop's own code (desktop.min.js, DataColorPalette):
+    ``basePickerColors = [{value: "#FFFFFF"}, {value: "#000000"}]`` followed by
+    ``_.take(this.colors, 8)``, and getThemeDataColor returns
+    ``basePickerColors[colorIdx]?.value``. So ColorId 0 is pure white and 1
+    pure black -- not the theme's background / foreground -- 2..9 are the
+    first eight data colours, and 10 and up resolve to nothing (issue #119).
+    """
+    return ["#FFFFFF", "#000000"] + [c.upper() for c in data_colors[:8]]
+
+
+def _js_round(x: float) -> int:
+    """JavaScript's Math.round: the nearest integer, halves toward +infinity."""
+    r = math.floor(x)
+    return r + 1 if x - r >= 0.5 else r
+
+
+def _shade_color(hex_color: str, percent: float) -> str:
+    """A ThemeDataColor's Percent, as Desktop shades (desktop.min.js): every
+    channel moves |Percent| of the way toward white (Percent > 0) or black
+    (Percent < 0), rounded as Math.round does -- white 10% darker is #E6E6E6."""
+    v = int(hex_color[1:7], 16)
+    target, amount = (0, -percent) if percent < 0 else (255, percent)
+    chans = [max(0, min(255, ch + _js_round((target - ch) * amount)))
+             for ch in ((v >> 16) & 255, (v >> 8) & 255, v & 255)]
+    return "#{:02X}{:02X}{:02X}".format(*chans)
+
+
+def _resolve_theme_color(data_colors: list[str], color_id: int, percent: float) -> str | None:
+    """A ThemeDataColor reference as the hex colour Desktop draws, or None when
+    its ColorId names no picker colour (10 and up, or a data colour the file's
+    theme does not define). ColorId N >= 2 is ``data_colors[N - 2]``: reading
+    it as ``data_colors[N]`` reported every "White" as the first data colour,
+    and pbix_recolor recoloured white backgrounds with the new primary."""
+    picker = _theme_picker_colors(data_colors)
+    if not 0 <= color_id < len(picker):
+        return None
+    return _shade_color(picker[color_id], percent)
 
 
 @mcp.tool()
@@ -6931,9 +6955,13 @@ def pbix_extract_colors(alias: str) -> str:
         info = _ensure_open(alias)
         work_dir = info["work_dir"]
         colors: dict[str, list[str]] = {}  # hex -> [locations]
+        unresolved: list[str] = []         # ThemeDataColor refs naming no colour
         data_colors = _load_theme_data_colors(work_dir)
 
-        def _add(hex_color: str, location: str):
+        def _add(hex_color: str | None, location: str):
+            if hex_color is None:
+                unresolved.append(location)
+                return
             h = hex_color.upper()
             colors.setdefault(h, []).append(location)
 
@@ -6994,6 +7022,10 @@ def pbix_extract_colors(alias: str) -> str:
         for hex_c in sorted(colors.keys()):
             locs = sorted(set(colors[hex_c]))
             lines.append(f"  {hex_c}  ({len(locs)} refs): {', '.join(locs[:8])}")
+        if unresolved:
+            locs = sorted(set(unresolved))
+            lines.append(f"  unresolved ThemeDataColor (no such theme colour; Desktop draws "
+                         f"the visual's default)  ({len(locs)} refs): {', '.join(locs[:8])}")
 
         return ToolResponse.ok(
             f"Found {len(colors)} unique colors:\n" + "\n".join(lines)
@@ -7062,33 +7094,29 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
                 count += n
             return text, count
 
+        def _theme_ref_target(m) -> str | None:
+            """The colour a ThemeDataColor ref is remapped to, if any: its
+            drawn colour, or failing that its unshaded picker colour (a
+            Percent shift gives a slightly different hex than the theme
+            colour itself). ColorId 0 / 1 are white / black (issue #119)."""
+            cid, pct = int(m.group(1)), float(m.group(2))
+            resolved = _resolve_theme_color(data_colors, cid, pct)
+            new_color = cmap.get(resolved) if resolved else None
+            if not new_color:
+                base = _resolve_theme_color(data_colors, cid, 0)
+                new_color = cmap.get(base) if base else None
+            return new_color
+
         def _replace_theme_ref(m) -> str:
             """Replace a ThemeDataColor ref with a Literal hex if it matches the color map."""
-            cid, pct = int(m.group(1)), float(m.group(2))
-            resolved = _resolve_theme_color(data_colors, cid, pct).upper()
-            # Check if this resolved color is in our replacement map
-            new_color = cmap.get(resolved)
-            if not new_color:
-                # Also check close matches (ThemeDataColor percent shifts
-                # produce slightly different hex than exact theme colors)
-                for old_c, new_c in cmap.items():
-                    if cid < len(data_colors) and data_colors[cid].upper() == old_c:
-                        new_color = new_c
-                        break
+            new_color = _theme_ref_target(m)
             if new_color:
                 return f'"Literal":{{"Value":"\'{new_color}\'"}}'
             return m.group(0)  # no match, keep original
 
         def _replace_theme_ref_escaped(m) -> str:
             """Same but for escaped JSON (config strings inside JSON)."""
-            cid, pct = int(m.group(1)), float(m.group(2))
-            resolved = _resolve_theme_color(data_colors, cid, pct).upper()
-            new_color = cmap.get(resolved)
-            if not new_color:
-                for old_c, new_c in cmap.items():
-                    if cid < len(data_colors) and data_colors[cid].upper() == old_c:
-                        new_color = new_c
-                        break
+            new_color = _theme_ref_target(m)
             if new_color:
                 return f'\\"Literal\\":{{\\"Value\\":\\"\'{new_color}\'\\"}}'
             return m.group(0)

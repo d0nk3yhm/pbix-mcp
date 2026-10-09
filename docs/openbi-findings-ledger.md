@@ -40,9 +40,19 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-08 (0.9.120): docs 1-49 and GitHub issues/PRs #1-#113 are
-closed; #114-#118 are open.** 0.9.120 closes docs 48 and 49, found by OpenBI's
-port of the engine:
+**Updated 2026-10-08 (0.9.121): docs 1-51 and GitHub issues/PRs #1-#113,
+#119-#120 are closed; #114-#118 are open.** 0.9.121 closes docs 50 and 51:
+
+- doc 50 = #119: a ThemeDataColor's ColorId indexes Desktop's picker row --
+  white, black, then the first 8 data colours (from desktop.min.js), so 0 and 1
+  are fixed white and black, not the theme's background / foreground (O47);
+- doc 51 = #120: ALLSELECTED(<table>) as a table is the table's rows under the
+  selection. Desktop keeps only the selection on its own columns for the
+  column form, so doc 51's expected 1 for COUNTROWS(ALLSELECTED(T[Region]))
+  under a D[Zone] slicer is 2 in Desktop.
+
+As of 0.9.120, docs 1-49 and #1-#113 were closed. 0.9.120 closes docs 48 and
+49, found by OpenBI's port of the engine:
 
 - doc 48 = #110: ROUND rounds half away from zero, on the decimal value;
 - doc 48 = #111: ISFILTERED(<table>) sees a direct filter on the table's
@@ -272,6 +282,17 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **doc 51 (GH #120)** -- CLOSED (0.9.121). ALLSELECTED(<table>) as a table
+  returned a CALCULATE marker, so iterators over it saw no rows (Matrix Bubble
+  Chart drew no bubbles). Now the table's rows under every selection reaching
+  it; the column form keeps only its own columns' selection (Desktop, 400-cell
+  matrix: 390 match, the other 10 are #118). Regression:
+  tests/test_issue120_allselected_table.py.
+- **doc 50 (GH #119)** -- CLOSED (0.9.121). ThemeDataColor read
+  dataColors[ColorId]; Desktop's picker row is [white, black] + 8 data
+  colours, so pbix_extract_colors called white blue and pbix_recolor painted
+  white fills the new primary. Shade = Desktop's own function (equal on 7,560
+  pairs under Node). Regression: tests/test_issue119_theme_data_color.py.
 - **doc 49 (GH #112)** -- CLOSED (0.9.120). The PBIR reader dropped
   `parentGroupName` and `visualGroup`, so grouped visuals read back as
   top-level at their group-relative positions. Now a child carries
