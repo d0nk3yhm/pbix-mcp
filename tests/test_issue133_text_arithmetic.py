@@ -7,8 +7,9 @@ numbers -- a calculation item adding 100 over Double of a text measure read
 100 (#121). Numeric and date text still converts, as in Desktop.
 
 Not covered here, and still different from Desktop: comparisons between text
-and a number or a Boolean ("x" = 1, TRUE() = 1 raise in Desktop), and
-functions given text (ABS, POWER, DIVIDE, SUMX over text).
+and a number or a Boolean ("x" = 1, TRUE() = 1 raise in Desktop), and SUMX
+over text. DIVIDE and the math functions convert text as arithmetic does
+since #139 (test_issue139_numeric_text_arguments.py).
 """
 from __future__ import annotations
 

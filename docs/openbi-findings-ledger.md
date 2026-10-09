@@ -40,8 +40,25 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-09 (0.9.123): docs 1-55 and GitHub issues/PRs #1-#113,
-#118-#135 and #140 are closed; #114-#117 and #136 are open.** 0.9.123 closes
+**Updated 2026-10-09 (0.9.124): docs 1-55 and GitHub issues/PRs #1-#113 and
+#118-#141 are closed; #114-#117 and #136 are open.** 0.9.124 closes four
+defects found verifying #118 on Awesome Chocolates, whose QOQ calculation item
+now matches Desktop end to end:
+
+- #137: a row transition on a date column (a DateTime relationship column, or
+  a marked date table's date column) clears the table's other filters, as a
+  CALCULATE filter on it does (#78) -- build_b137.py, 74 probes;
+- #138: DATEADD / SAMEPERIODLASTYEAR over a table expression shift the
+  table's own dates, whatever else filters the date table -- build_b138.py,
+  60 probes;
+- #139: DIVIDE and the math functions convert numeric text, TRUE / FALSE and
+  dates as arithmetic does, and raise for other text -- build_b139.py, 82
+  probes;
+- #141: DATEADD / SAMEPERIODLASTYEAR of a date column shift nothing when no
+  date is visible (the whole calendar before) -- build_b141.py, 24 probes.
+
+As of 0.9.123, docs 1-55 and #1-#113, #118-#135 and #140 were closed;
+#114-#117 and #136-#139 were open. 0.9.123 closes
 #118: ALLSELECTED keeps the measure's own CALCULATE filters and puts back what
 an iteration iterated (its shadow), measured on 420 cells (build_b118.py);
 the Financial Sample's Arrow Chart now matches Desktop on every measure and

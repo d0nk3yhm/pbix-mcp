@@ -4958,6 +4958,29 @@ class DAXEngine:
         parts.append(''.join(cur))
         return tuple(parts)
 
+    def _transitioned_ctx(self, ctx: 'DAXContext', written: dict) -> 'DAXContext':
+        """``ctx`` with a row transition's filters ``written``. A row value on
+        a DateTime column that joins a relationship, or on a marked date
+        table's date column, clears that table's other filters, as an explicit
+        CALCULATE filter on it does (#78). Power BI Desktop 2.152
+        (build_b137.py, issue #137): SUMX(VALUES(D[Month]), CALCULATE(
+        COUNTROWS(FILTER(ALL(D[Date]), CALCULATE(COUNTROWS(D)) > 0)))) is 273,
+        every date in every month, and MINX(D, CALCULATE(MAXX(FILTER(
+        ALLSELECTED(D[Date]), NOT ISBLANK([M])), D[Date]))) is the last sale
+        date for every row."""
+        new_ctx = ctx.with_filters(written)
+        clearing = self._clearing_date_columns(ctx)
+        if clearing:
+            drop = set()
+            for table, col in clearing:
+                if f"{table}.{col}" in written:
+                    drop |= {k for k in ctx.filter_context
+                             if k not in written and k.partition('.')[0] == table}
+            if drop:
+                new_ctx.filter_context = {k: v for k, v in new_ctx.filter_context.items()
+                                          if k not in drop}
+        return new_ctx
+
     def _make_row_context(self, row_item: dict, ctx: 'DAXContext',
                           shadow: Optional[list] = None) -> 'DAXContext':
         """Create a filter context from a row dict, filtering on ALL columns of the row.
@@ -4969,11 +4992,11 @@ class DAXEngine:
             filters_all: dict = {}
             for part in parts:
                 filters_all.update(self._row_filters(part, shadow))
-            new_ctx = ctx.with_filters(filters_all)
+            new_ctx = self._transitioned_ctx(ctx, filters_all)
             new_ctx._current_row = row_item
             new_ctx._outer_ctx = ctx
             return new_ctx
-        new_ctx = ctx.with_filters(self._row_filters(row_item, shadow))
+        new_ctx = self._transitioned_ctx(ctx, self._row_filters(row_item, shadow))
         # Bind the current row for ALL iteration shapes (full-row SUMX dicts,
         # single-column VALUES/ALL dicts, ADDCOLUMNS/SELECTCOLUMNS extension
         # columns) so column references resolve against the row even inside
@@ -5876,6 +5899,40 @@ class DAXEngine:
         return len([v for v in self._agg_ctx(ctx).get_column_data(*col)
                     if v is not None]) or None
 
+    def _num_operand(self, v, ctx: DAXContext):
+        """A numeric argument as Desktop's formula engine converts it: BLANK
+        stays None, TRUE / FALSE are 1 / 0, a date is its serial, and text is
+        read as arithmetic reads it (the culture's separators, a currency
+        symbol, a culture-ordered date; #133). Text that is no number raises,
+        as in arithmetic. A table is no number: None.
+
+        Power BI Desktop 2.152 (build_b139.py, issue #139): DIVIDE(3, "3") is
+        1, ABS("-3") 3, SIN("0") 0, COMBIN("4", 2) 6, ROUND(TRUE(), 0) 1,
+        ABS(DATE(2024, 1, 2)) 45293, DIVIDE("3,5", 1) 35 in an en-US model;
+        DIVIDE("abc", 3), DIVIDE("", 3) and SIN("x") raise. Every one of
+        these was BLANK, so Awesome Chocolates' QOQ item, which divides two
+        CONVERT(..., STRING) values, coloured a fall as a rise."""
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return int(v)
+        if isinstance(v, (int, float)):
+            return v
+        if not isinstance(v, (str, datetime, date)):
+            return None
+        n = _as_number(v)
+        if n is None and isinstance(v, str):
+            n = _arith_text_number(v, getattr(ctx, 'culture', None))
+            if n is None:
+                from pbix_mcp.errors import DAXEvaluationError
+                raise DAXEvaluationError(
+                    f"Cannot convert value '{v}' of type Text to type Number")
+        return n
+
+    def _num_arg(self, expr: str, ctx: DAXContext):
+        """``expr`` evaluated as a numeric argument (``_num_operand``)."""
+        return self._num_operand(self._eval_expr(expr.strip(), ctx), ctx)
+
     def _fn_divide(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
         if len(args) < 2:
@@ -5893,6 +5950,9 @@ class DAXEngine:
         # blank-driven ratios read as a real zero.
         if numerator is None:
             return None
+        # Text, TRUE / FALSE and dates are numbers here (issue #139).
+        numerator = self._num_operand(numerator, ctx)
+        denominator = self._num_operand(denominator, ctx)
         if isinstance(numerator, (int, float)) and isinstance(denominator, (int, float)):
             if denominator == 0:
                 return alt
@@ -5900,7 +5960,7 @@ class DAXEngine:
         return alt
 
     def _fn_abs(self, args_str: str, ctx: DAXContext) -> Any:
-        val = self._eval_expr(args_str.strip(), ctx)
+        val = self._num_arg(args_str, ctx)
         return abs(val) if isinstance(val, (int, float)) else None
 
     def _fn_round(self, args_str: str, ctx: DAXContext) -> Any:
@@ -5911,9 +5971,10 @@ class DAXEngine:
         digits round to tens, hundreds, ... The arithmetic is FORMAT's
         (_format_number, pinned off Desktop)."""
         args = self._split_args(args_str)
-        val = self._eval_expr(args[0].strip(), ctx)
-        digits = int(self._eval_expr(args[1].strip(), ctx)) if len(args) > 1 else 0
-        if isinstance(val, bool) or not isinstance(val, (int, float)):
+        val = self._num_arg(args[0], ctx)
+        d = self._num_arg(args[1], ctx) if len(args) > 1 else 0
+        digits = int(d) if d is not None else 0
+        if not isinstance(val, (int, float)):
             return None
         try:
             q = decimal.Decimal(repr(val)).quantize(
@@ -5938,12 +5999,12 @@ class DAXEngine:
 
     def _round_directed(self, args_str: str, ctx: DAXContext, up: bool) -> Any:
         args = self._split_args(args_str)
-        val = _as_number(self._eval_expr(args[0].strip(), ctx))
+        val = self._num_arg(args[0], ctx)
         if val is None:
             return None
         digits = 0
         if len(args) > 1:
-            n = _as_number(self._eval_expr(args[1].strip(), ctx))
+            n = self._num_arg(args[1], ctx)
             digits = int(n) if n is not None else 0
         scale = 10.0 ** digits
         scaled = val * scale
@@ -5989,8 +6050,8 @@ class DAXEngine:
         relative to today" column is negative for the whole past -- landed in
         the wrong bin.
         """
-        val = self._eval_expr(args_str.strip(), ctx)
-        if isinstance(val, bool) or not isinstance(val, (int, float)):
+        val = self._num_arg(args_str, ctx)
+        if not isinstance(val, (int, float)):
             return None
         return math.floor(val)
 
@@ -7076,10 +7137,11 @@ class DAXEngine:
         return datetime(year, month, day)
 
     def _dateadd_dates(self, date_table: str, date_col: str, offset: int,
-                       interval: str, ctx: DAXContext) -> list:
+                       interval: str, ctx: DAXContext, source: list | None = None) -> list:
         """The date values DATEADD yields: every VISIBLE date shifted by
         offset x interval, kept only where the shifted date exists in the date
-        table -- DAX drops shifts that fall outside it.
+        table -- DAX drops shifts that fall outside it. ``source``: the dates
+        of a table expression, shifted as they are (``_shift_date_table``).
 
         Shared by the table-expression form and CALCULATE's filter fast path so
         the two can never disagree.
@@ -7095,9 +7157,11 @@ class DAXEngine:
             dv = _as_date(row[idx])
             if dv is not None:
                 universe.setdefault(dv, row[idx])
-        visible = ctx.get_column_data(date_table, date_col)
-        if not visible:
-            visible = [row[idx] for row in tbl['rows']]
+        # No visible date shifts to no date (issue #141). This fell back to the
+        # whole calendar: Power BI Desktop 2.152 (build_b141.py) gives BLANK for
+        # CALCULATE(COUNTROWS(DATEADD(D[Date], 1, MONTH)), D[Month] = 199001),
+        # where the engine counted 516.
+        visible = source if source is not None else ctx.get_column_data(date_table, date_col)
         seen_src = [d for d in (_as_datetime(v) for v in visible) if d is not None]
         if not seen_src:
             return []
@@ -7225,9 +7289,15 @@ class DAXEngine:
         # match the cells (DATESBETWEEN hands back 'YYYY-MM-DD' text).
         wanted = {d for d in (_as_date(v) for v in values) if d is not None}
         cells = list(dict.fromkeys(row[idx] for row in tbl['rows'] if _as_date(row[idx]) in wanted))
-        sel = ctx.with_filters({f"{dt}.{dc}": cells})
+        # Exactly these dates, whatever else filters the date table (issue
+        # #138). They were read back under the context with only the date
+        # filter replaced, so an outer row's other columns cut the table down
+        # to its own quarter, and to every date when none were left. Awesome
+        # Chocolates' [Max Previous Quarter Not Blank] then answered the
+        # quarter before each quarter. Desktop answers 20234 for every quarter.
         return [{'__table__': dt, '__column__': dc, '__value__': v}
-                for v in self._dateadd_dates(dt, dc, int(offset), interval.rstrip('S'), sel)]
+                for v in self._dateadd_dates(dt, dc, int(offset), interval.rstrip('S'), ctx,
+                                             source=cells)]
 
     def _fn_sameperiodlastyear(self, args_str: str, ctx: DAXContext) -> Any:
         """SAMEPERIODLASTYEAR(<dates>) == DATEADD(<dates>, -1, YEAR)."""
@@ -7795,8 +7865,8 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return None
-        num = self._eval_expr(args[0].strip(), ctx)
-        mult = self._eval_expr(args[1].strip(), ctx)
+        num = self._num_arg(args[0], ctx)
+        mult = self._num_arg(args[1], ctx)
         if not isinstance(num, (int, float)) or not isinstance(mult, (int, float)):
             return None
         if mult == 0:
@@ -7979,7 +8049,7 @@ class DAXEngine:
                             # (issue #118). Plain lists read as explicit
                             # CALCULATE filters.
                             extra_filters[f"{table_name}.{col_name}"] = _row_value([val], table_ref)
-                        row_ctx = ctx.with_filters(extra_filters)
+                        row_ctx = self._transitioned_ctx(ctx, extra_filters)
                         if substitute_row_values:
                             row_cond = _substitute_row_refs(
                                 cond_expr, table_name, row_item)
@@ -8251,7 +8321,7 @@ class DAXEngine:
             # Wasting Patterns" counted 1 alert where Desktop counts 4.
             group_names = [c for c, _i in group_cols]
             for row_dict in result:
-                group_ctx = ctx.with_filters({
+                group_ctx = self._transitioned_ctx(ctx, {
                     f"{table_name}.{c}": _row_value([row_dict[c]], result)
                     for c in group_names})
                 for ext_name, ext_expr in extensions:
@@ -8319,8 +8389,8 @@ class DAXEngine:
                     shadows.setdefault(key, []).append(
                         {'__table__': t, '__column__': c, '__value__': val})
             for row_dict, combo in zip(result, combos):
-                group_ctx = ctx.with_filters({key: _row_value([val], shadows[key])
-                                              for key, _disp, val in combo})
+                group_ctx = self._transitioned_ctx(ctx, {key: _row_value([val], shadows[key])
+                                                         for key, _disp, val in combo})
                 for ext_name, ext_expr in extensions:
                     row_dict[ext_name] = self._eval_expr(ext_expr, group_ctx)
         return result
@@ -9026,8 +9096,8 @@ class DAXEngine:
     def _fn_ceiling(self, args_str: str, ctx: DAXContext) -> Any:
         """CEILING(number, significance) — round up to nearest multiple of significance."""
         args = self._split_args(args_str)
-        val = self._eval_expr(args[0].strip(), ctx)
-        sig = self._eval_expr(args[1].strip(), ctx) if len(args) > 1 else 1
+        val = self._num_arg(args[0], ctx)
+        sig = self._num_arg(args[1], ctx) if len(args) > 1 else 1
         if isinstance(val, (int, float)) and isinstance(sig, (int, float)) and sig != 0:
             return math.ceil(val / sig) * sig
         return val
@@ -9035,8 +9105,8 @@ class DAXEngine:
     def _fn_floor(self, args_str: str, ctx: DAXContext) -> Any:
         """FLOOR(number, significance) — round down to nearest multiple of significance."""
         args = self._split_args(args_str)
-        val = self._eval_expr(args[0].strip(), ctx)
-        sig = self._eval_expr(args[1].strip(), ctx) if len(args) > 1 else 1
+        val = self._num_arg(args[0], ctx)
+        sig = self._num_arg(args[1], ctx) if len(args) > 1 else 1
         if isinstance(val, (int, float)) and isinstance(sig, (int, float)) and sig != 0:
             return math.floor(val / sig) * sig
         return val
@@ -9046,8 +9116,8 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return None
-        val = self._eval_expr(args[0].strip(), ctx)
-        divisor = self._eval_expr(args[1].strip(), ctx)
+        val = self._num_arg(args[0], ctx)
+        divisor = self._num_arg(args[1], ctx)
         if isinstance(val, (int, float)) and isinstance(divisor, (int, float)) and divisor != 0:
             return val % divisor
         return None
@@ -9057,8 +9127,8 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return None
-        base = self._eval_expr(args[0].strip(), ctx)
-        exp = self._eval_expr(args[1].strip(), ctx)
+        base = self._num_arg(args[0], ctx)
+        exp = self._num_arg(args[1], ctx)
         if isinstance(base, (int, float)) and isinstance(exp, (int, float)):
             return math.pow(base, exp)
         return None
@@ -9075,8 +9145,9 @@ class DAXEngine:
     # ------------------------------------------------------------------
 
     def _num1(self, args_str: str, ctx: DAXContext):
-        v = self._eval_expr(args_str.strip(), ctx)
-        if isinstance(v, bool) or not isinstance(v, (int, float)):
+        # Text, TRUE / FALSE and dates convert (_num_operand, issue #139).
+        v = self._num_arg(args_str, ctx)
+        if not isinstance(v, (int, float)):
             return None
         return float(v)
 
@@ -9086,13 +9157,10 @@ class DAXEngine:
             return None
         out = []
         for prt in parts[:n]:
-            v = self._eval_expr(prt.strip(), ctx)
-            if isinstance(v, bool):
-                out.append(1.0 if v else 0.0)
-            elif isinstance(v, (int, float)):
-                out.append(float(v))
-            else:
+            v = self._num_arg(prt, ctx)
+            if not isinstance(v, (int, float)):
                 return None
+            out.append(float(v))
         return out
 
     def _fn_math1(self, name: str, args_str: str, ctx: DAXContext):
@@ -11147,7 +11215,7 @@ class DAXEngine:
         # them all (#118)
         shadow = [{'__table__': t, '__column__': c, '__value__': v} for v in vals]
         for v in seq:
-            sub = ctx.with_filters({f"{t}.{c}": _row_value([v], shadow)})
+            sub = self._transitioned_ctx(ctx, {f"{t}.{c}": _row_value([v], shadow)})
             res = self._eval_expr(parts[1].strip(), sub)
             if res is not None:
                 return res
@@ -11983,7 +12051,7 @@ class DAXEngine:
 
     def _fn_sqrt(self, args_str: str, ctx: DAXContext) -> Any:
         """SQRT(number) — square root."""
-        val = self._eval_expr(args_str.strip(), ctx)
+        val = self._num_arg(args_str, ctx)
         if isinstance(val, (int, float)) and val >= 0:
             return math.sqrt(val)
         return None
@@ -11991,36 +12059,36 @@ class DAXEngine:
     def _fn_log(self, args_str: str, ctx: DAXContext) -> Any:
         """LOG(number, base) — logarithm with specified base (default 10)."""
         args = self._split_args(args_str)
-        val = self._eval_expr(args[0].strip(), ctx)
-        base = self._eval_expr(args[1].strip(), ctx) if len(args) > 1 else 10
+        val = self._num_arg(args[0], ctx)
+        base = self._num_arg(args[1], ctx) if len(args) > 1 else 10
         if isinstance(val, (int, float)) and val > 0 and isinstance(base, (int, float)) and base > 0:
             return math.log(val, base)
         return None
 
     def _fn_log10(self, args_str: str, ctx: DAXContext) -> Any:
         """LOG10(number) — base-10 logarithm."""
-        val = self._eval_expr(args_str.strip(), ctx)
+        val = self._num_arg(args_str, ctx)
         if isinstance(val, (int, float)) and val > 0:
             return math.log10(val)
         return None
 
     def _fn_ln(self, args_str: str, ctx: DAXContext) -> Any:
         """LN(number) — natural logarithm."""
-        val = self._eval_expr(args_str.strip(), ctx)
+        val = self._num_arg(args_str, ctx)
         if isinstance(val, (int, float)) and val > 0:
             return math.log(val)
         return None
 
     def _fn_exp(self, args_str: str, ctx: DAXContext) -> Any:
         """EXP(number) — e^x."""
-        val = self._eval_expr(args_str.strip(), ctx)
+        val = self._num_arg(args_str, ctx)
         if isinstance(val, (int, float)):
             return math.exp(val)
         return None
 
     def _fn_sign(self, args_str: str, ctx: DAXContext) -> Any:
         """SIGN(number) — returns -1, 0, or 1."""
-        val = self._eval_expr(args_str.strip(), ctx)
+        val = self._num_arg(args_str, ctx)
         if isinstance(val, (int, float)):
             if val > 0:
                 return 1
@@ -12032,8 +12100,9 @@ class DAXEngine:
     def _fn_trunc(self, args_str: str, ctx: DAXContext) -> Any:
         """TRUNC(number, digits) — truncate to specified decimal places."""
         args = self._split_args(args_str)
-        val = self._eval_expr(args[0].strip(), ctx)
-        digits = int(self._eval_expr(args[1].strip(), ctx)) if len(args) > 1 else 0
+        val = self._num_arg(args[0], ctx)
+        d = self._num_arg(args[1], ctx) if len(args) > 1 else 0
+        digits = int(d) if d is not None else 0
         if isinstance(val, (int, float)):
             multiplier = 10 ** digits
             return int(val * multiplier) / multiplier
@@ -12041,7 +12110,7 @@ class DAXEngine:
 
     def _fn_even(self, args_str: str, ctx: DAXContext) -> Any:
         """EVEN(number) — round up to nearest even integer."""
-        val = self._eval_expr(args_str.strip(), ctx)
+        val = self._num_arg(args_str, ctx)
         if isinstance(val, (int, float)):
             result = math.ceil(abs(val))
             if result % 2 != 0:
@@ -12051,7 +12120,7 @@ class DAXEngine:
 
     def _fn_odd(self, args_str: str, ctx: DAXContext) -> Any:
         """ODD(number) — round up to nearest odd integer."""
-        val = self._eval_expr(args_str.strip(), ctx)
+        val = self._num_arg(args_str, ctx)
         if isinstance(val, (int, float)):
             result = math.ceil(abs(val))
             if result % 2 == 0:
@@ -12061,7 +12130,7 @@ class DAXEngine:
 
     def _fn_fact(self, args_str: str, ctx: DAXContext) -> Any:
         """FACT(number) — factorial."""
-        val = self._eval_expr(args_str.strip(), ctx)
+        val = self._num_arg(args_str, ctx)
         if isinstance(val, (int, float)) and val >= 0:
             return math.factorial(int(val))
         return None
@@ -12071,8 +12140,8 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return None
-        a = self._eval_expr(args[0].strip(), ctx)
-        b = self._eval_expr(args[1].strip(), ctx)
+        a = self._num_arg(args[0], ctx)
+        b = self._num_arg(args[1], ctx)
         if isinstance(a, (int, float)) and isinstance(b, (int, float)):
             return math.gcd(int(a), int(b))
         return None
@@ -12082,8 +12151,8 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return None
-        a = self._eval_expr(args[0].strip(), ctx)
-        b = self._eval_expr(args[1].strip(), ctx)
+        a = self._num_arg(args[0], ctx)
+        b = self._num_arg(args[1], ctx)
         if isinstance(a, (int, float)) and isinstance(b, (int, float)):
             a_int, b_int = int(a), int(b)
             if a_int == 0 or b_int == 0:

@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.124] - 2026-10-09
+
+Four defects found verifying #118 on Awesome Chocolates, whose QOQ calculation item now matches Power BI Desktop end to end. Checked against Power BI Desktop 2.152 over ADOMD:
+
+- under the QOQ item, `Sales Previous`, `Sales Change`, `Sales CF` and `Sales color` answer Desktop's 8,063,111.25, −0.335, `#ff383f` and `#D60007`. 0.9.123 gave BLANK, BLANK, `#15b2ad` and `#0F7572`;
+- four batteries match in full: date-table row transitions (`build_b137.py`, 74 probes; 0.9.123: 56), DATEADD over a table (`build_b138.py`, 60; 18), numeric arguments (`build_b139.py`, 82; 17) and DATEADD with no visible date (`build_b141.py`, 24; 8);
+- every Desktop probe from earlier releases still matches. #133's battery gains 3 cells: ABS, DIVIDE and POWER of non-numeric text raise.
+
+### Fixed — a row transition on a date column clears the date table's other filters (issue #137)
+
+- **What was wrong:** take `FILTER(ALLSELECTED(D[Date]), NOT ISBLANK([M]))` evaluated in an outer row's transition over D. Each date's `[M]` still saw the outer row's other columns. `MINX(D, CALCULATE(MAXX(FILTER(ALLSELECTED(D[Date]), NOT ISBLANK([M])), D[Date])))` answered 31 January, the last sale in the outer row's month. Desktop answers the last sale date, 31 March, for every row.
+- **Desktop's rule** (`build_b137.py`; a marked and an unmarked calendar answer alike): a filter on a DateTime column that joins a relationship, or on a marked date table's date column, clears the table's other filters (#78). The engine applied the rule only when CALCULATE wrote the filter. Desktop applies it to a row transition as well:
+  - `SUMX(VALUES(D[Month]), CALCULATE(COUNTROWS(FILTER(ALL(D[Date]), CALCULATE(COUNTROWS(D)) > 0))))` is 273, every date in each of the three months. The engine counted 91;
+  - `MINX(D, CALCULATE(COUNTROWS(FILTER(ALL(D[Date]), CALCULATE(COUNTROWS(D)) > 0)), D[Month] = 1))` is 91: an explicit Month filter is cleared the same way;
+  - the filters a transition writes itself stay: `SUMX(FILTER(D, D[Month] = 2), CALCULATE(COUNTROWS(D)))` is 29.
+- **The fix:** every row transition goes through one function, `_transitioned_ctx`, which applies the rule to the filters it writes. That covers the iterators, FILTER over whole rows, SUMMARIZE / SUMMARIZECOLUMNS groups and FIRSTNONBLANKVALUE.
+- **Pinned** by `tests/test_issue137_date_transition_clears.py`: 74 tests, every expected value generated from Desktop's output. **18 fail on 0.9.123.**
+
+### Fixed — DATEADD / SAMEPERIODLASTYEAR over a table expression shift the table's own dates (issue #138)
+
+- **What was wrong:** the engine read a table expression's dates back under the current context, with only the date column's filter replaced. So an outer row's month, quarter or weekday cut the table down before the shift, and when nothing was left it shifted every date of the calendar. `CALCULATE(COUNTROWS(DATEADD(<February 2024>, 1, MONTH)), D[Month] = 202305)` was 516; Desktop gives 31.
+- **What it decided:** Awesome Chocolates' `[Max Previous Quarter Not Blank]` is `CALCULATE([Max Quarter Not Blank], DATEADD(FILTER(ALLSELECTED('dim-Date'[Date]), NOT ISBLANK([Sales Actual])), -1, QUARTER))`. Under each quarter the engine answered the quarter before it. Desktop answers 20234 for every quarter and every date row, and the QOQ item filters its dates by it.
+- **The fix:** `_shift_date_table` shifts exactly the table's dates (`_dateadd_dates(..., source=)`). A column reference, `DATEADD(D[Date], 1, MONTH)`, still shifts the dates the context leaves, as in Desktop.
+- **Pinned** by `tests/test_issue138_dateadd_table_dates.py`: 60 tests from Desktop's output over a marked and an unmarked calendar. **42 fail on 0.9.123.** The 8 per-row probes take about 20 s each, so they are marked `slow`.
+
+### Fixed — DIVIDE and the math functions convert their arguments as arithmetic does (issue #139)
+
+- **What was wrong:** DIVIDE and every math function returned BLANK for numeric text, TRUE / FALSE and dates. CEILING and FLOOR returned the text unchanged. Desktop converts them as arithmetic does (#133):
+  - `DIVIDE(3, "3")` is 1, `ABS("-3")` 3, `SIN("0")` 0, `ROUND(TRUE(), 0)` 1 and `ABS(DATE(2024, 1, 2))` 45293;
+  - `DIVIDE("3,5", 1)` is 35 in an en-US model;
+  - text that is no number raises: `DIVIDE("abc", 3)`, `DIVIDE("", 3)`, `SIN("x")`;
+  - a text alternate result stays text: `DIVIDE(3, 0, "07") & ""` is "07".
+- **What it decided:** Awesome Chocolates' QOQ item divides `_CQ - _PQ` by `_PQ` over `SELECTEDMEASURE()`, and `[Sales CF]` is `CONVERT([Sales Actual], STRING)`. The engine's DIVIDE was BLANK, so `IF(_QOQ < 0, "#ff383f", "#15b2ad")` coloured a 33.5 % fall `#15b2ad`.
+- **The fix:** one conversion, `_num_operand`, now feeds:
+  - DIVIDE's numerator and denominator;
+  - ABS, ROUND / ROUNDUP / ROUNDDOWN, INT, TRUNC, CEILING, FLOOR, MOD, POWER, SQRT, EXP, LN, LOG, LOG10, SIGN, EVEN, ODD, FACT, GCD, LCM and MROUND;
+  - the helpers behind the trigonometric, combinatoric, bitwise and statistical functions.
+- **Pinned** by `tests/test_issue139_numeric_text_arguments.py`: 83 tests, 82 of them from Desktop's output (`build_b139.py`). **66 fail on 0.9.123.**
+
+### Fixed — DATEADD / SAMEPERIODLASTYEAR of a date column shift nothing when no date is visible (issue #141)
+
+- **What was wrong:** when the context left no date visible, the engine shifted the whole calendar. `CALCULATE(COUNTROWS(DATEADD(D[Date], 1, MONTH)), D[Month] = 199001)` counted 516, `SAMEPERIODLASTYEAR` 181, and `CALCULATE(CALCULATE([FS], DATEADD(D[Date], 1, MONTH)), D[Month] = 199001)` read a sales total of 13,962. Desktop answers BLANK for every one (`build_b141.py`, on the calendars of `build_b138.py`).
+- **The fix:** `_dateadd_dates` shifts the dates that are visible, and none shifts to none, as NEXTDAY / PREVIOUSDAY already did. A filter on the fact, which does not reach the calendar, still leaves every date visible (516 in Desktop and the engine).
+- **Pinned** by `tests/test_issue141_dateadd_no_visible_dates.py`: 24 tests from Desktop's output. **16 fail on 0.9.123.**
+
+### Still open
+
+- Under the QOQ item the four Chocolates measures take 70–110 s each, where Desktop answers at once.
+
 ## [0.9.123] - 2026-10-09
 
 ALLSELECTED keeps the measure's own CALCULATE filters, as OpenBI reported (#118), and puts back what an iteration iterated. Checked against Power BI Desktop 2.152 over ADOMD:
