@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.126] - 2026-10-09
+
+A row context filters nothing until CALCULATE or a measure reference turns it into a filter, as OpenBI reported (#116). Found verifying it: a VAR block inside a function argument (#144), and the one-date tables of time intelligence used as values (#145). Checked against Power BI Desktop 2.152 over ADOMD:
+
+- the row-context battery (`build_b116.py`) matches 39 of 40, against 14 on 0.9.125. The other is #115;
+- #118's ALLSELECTED battery (`build_b118.py`) matches in full, 420 of 420 (0.9.125: 405): its last 15 cells were this issue's;
+- `build_b115.py` gains 3 cells (42 of 55);
+- three new batteries match in full: CALCULATE's filter arguments in an iterator (`build_b143.py`, 24; 0.9.125: 16), row contexts and VAR blocks (`build_b144.py`, 31; 8), and dates as values (`build_b145.py`, the 18 probes that are this release's; 5);
+- every other Desktop probe answers as before.
+
+### Fixed — a row context filters nothing until a transition (issue #116)
+
+- **What was wrong:** the engine applied an iterator's row to the filter context at once, which CALCULATE and measure references need, so everything else inside the iterator saw only the current row:
+  - `SUMX(Orders, COUNTROWS(Orders))` was 3, Desktop 9, and `SUMX(Orders, MAXX(Orders, Orders[Revenue]))` 450, Desktop 750;
+  - `COUNTROWS(FILTER(Orders, COUNTROWS(Orders) = 3))` was BLANK, Desktop 3: an aggregate in FILTER's condition reads the context outside FILTER;
+  - `SUMX(VALUES(D[Month]), CALCULATE([S], VALUES(D[Date])))` gave each month its own dates. Desktop evaluates CALCULATE's filter arguments before the transition and sees every date in every month (1488, 3 × the total);
+  - `SUMX(Orders, COUNTROWS(FILTER(Orders, Orders[Revenue] < EARLIER(Orders[Revenue]))))` was BLANK, Desktop 3: EARLIER returned the column, so the row was compared with itself.
+- **The fix:**
+  - a row context's data reads (columns, rows, the blank row) come from the context the rows were opened in (`DAXContext._row_root`). CALCULATE and measure references still see the transition;
+  - time-intelligence functions over a date column, and RELATEDTABLE, see the transition too: Desktop reads their column as `CALCULATETABLE(DISTINCT(<dates>))`. `SUMX(VALUES(D[Month]), CALCULATE([S], DATESYTD(D[Date])))` gives each month its own year to date (772);
+  - EARLIER / EARLIEST walk the enclosing row contexts, and a column of another table reads the innermost row over that table: `SUMX(Dim, COUNTROWS(FILTER(Orders, Orders[Region] = Dim[Region])))` is 3;
+  - a function that takes a column (VALUES, DISTINCT, COUNT, DISTINCTCOUNT, SELECTEDVALUE, HASONEVALUE, RELATED, LOOKUPVALUE, …) takes the column, not the current row's value (`_column_arg`);
+  - FILTER binds its row instead of writing the row's values into the condition's text, which also rewrote the column a function takes (EARLIER, FIRSTDATE).
+- **Two tests now follow Desktop's rule:** `FILTER(Sales, SUM(Sales[Amount]) > 90)` keeps every row, since the SUM is the total (`test_issues14.py`), and `VALUES(P[S])` in a row context over P is the column's values (`test_calculate_predicates.py`).
+- **Pinned** by `tests/test_issue116_row_context.py`: 85 tests generated from Desktop's output (`build_b116.py`, `build_b143.py`, `build_b144.py`). **47 fail on 0.9.125.**
+
+### Fixed — a VAR block inside a function argument evaluates (issue #144)
+
+- **What was wrong:** the expression analyzer read any text holding the words VAR and RETURN as one VAR block. `SUMX(T, VAR x = … RETURN …)`, `IF(c, VAR … RETURN …, …)` and `CALCULATE(VAR … RETURN …, …)` were split at the wrong places: `SUMX(Orders, VAR t = 1 RETURN t)` was BLANK (Desktop 3), and `CALCULATE(VAR s = SUM(Orders[Revenue]) RETURN s, Orders[Region] = "N")` was 1 (Desktop 50).
+- **The fix:** a VAR block is an expression that starts with VAR. One in an argument is evaluated when the argument is.
+- **Pinned** by `tests/test_issue144_var_in_arguments.py`: 11 tests, 10 from Desktop's output (`build_b144.py`, `build_b116.py`). **10 fail on 0.9.125.**
+
+### Fixed — the one-date tables of time intelligence are dates as values (issue #145)
+
+- **What was wrong:** FIRSTDATE, LASTDATE, STARTOF… / ENDOF…, LASTNONBLANK and the other functions that return dates gave each date as 'YYYY-MM-DD' text. As a CALCULATE filter that worked; as a value it was no date. `MAXX(Dt, FIRSTDATE(Dt[Date]))` and `YEAR(LASTDATE(Dt[Date]))` were BLANK (Desktop 31 March 2024 and 2024), and `"d:" & FIRSTDATE(Dt[Date])` was "d:2024-01-01" (Desktop "d:1/1/2024").
+- **The fix:** the rows carry the column's own cell. Iterators, comparisons, arithmetic, date coercion, FORMAT and DIVIDE read a one-row, one-column table as its value.
+- **Pinned** by `tests/test_issue145_time_intelligence_dates.py`: 18 tests from Desktop's output (`build_b145.py`). **13 fail on 0.9.125.**
+
+### Still open
+
+- #115: a fact row's transition does not filter its dimensions. `SUMX(Orders, COUNTROWS(RELATEDTABLE(Dim)))` is 9, Desktop 3.
+- #146: date − date is a DateTime in Desktop and a number of days in the engine (`build_b146.py`).
+
 ## [0.9.125] - 2026-10-09
 
 Awesome Chocolates' calculation items answer at once (#142). Under QOQ, `Sales Previous`, `Sales Change`, `Sales CF` and `Sales color` took 70–110 s each in 0.9.124; each now takes under a second, with the same values. Checked against Power BI Desktop 2.152 over ADOMD:

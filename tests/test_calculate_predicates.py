@@ -165,12 +165,20 @@ class TestInMachinery:
         something truthy, and Agents_Performance's "Rank Filtering Employyees
         MTD" returned 1 where Desktop returns 0 -- its TOPN is legitimately empty
         and both IN tests should simply be FALSE.
+
+        The empty table here was VALUES(P[S]) inside a row context over P, which
+        yielded [] only because the column argument read as the row's value.
+        VALUES ignores a row context (issue #116), so the table is now empty for
+        a reason of its own.
         """
         eng = de.DAXEngine()
         ctx = self._ctx()
         ctx._current_row = {"__table__": "P", "S": "Lead", "V": 100}
-        assert eng._in_set_values('VALUES(P[S])', ctx) == []
-        assert eng._eval_in('"Lead"', 'VALUES(P[S])', ctx) is False
+        assert eng._in_set_values('FILTER(VALUES(P[S]), FALSE())', ctx) == []
+        assert eng._eval_in('"Lead"', 'FILTER(VALUES(P[S]), FALSE())', ctx) is False
+        # and VALUES in a row context is the column's values, not the row's
+        assert sorted(eng._in_set_values('VALUES(P[S])', ctx)) == [
+            "Closed Lost", "Closed Won", "Lead", "Proposal"]
 
     def test_single_column_table_expression(self):
         vals = de.DAXEngine()._in_set_values('VALUES(P[S])', self._ctx())

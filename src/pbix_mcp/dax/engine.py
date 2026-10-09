@@ -87,6 +87,22 @@ _MATH1 = {
     'SQRTPI': lambda x: math.sqrt(x * math.pi),
 }
 
+# Functions that see a row context's transition. A time-intelligence function
+# reads its <dates> column as CALCULATETABLE(DISTINCT(<dates>)), and
+# RELATEDTABLE(T) is CALCULATETABLE(T). Power BI Desktop 2.152 (build_b143.py):
+# in SUMX(VALUES(D[Month]), CALCULATE([S], DATESYTD(D[Date]))) each month gets
+# its own year to date, where CALCULATE([S], VALUES(D[Date])) sees every date
+# (issue #116, DAXEngine._row_transitioned).
+_ROW_TRANSITION_FNS = frozenset({
+    'DATEADD', 'SAMEPERIODLASTYEAR', 'PARALLELPERIOD', 'DATESYTD', 'DATESMTD', 'DATESQTD',
+    'TOTALYTD', 'TOTALMTD', 'TOTALQTD', 'PREVIOUSDAY', 'PREVIOUSMONTH', 'PREVIOUSQUARTER',
+    'PREVIOUSYEAR', 'NEXTDAY', 'NEXTMONTH', 'NEXTQUARTER', 'NEXTYEAR', 'STARTOFMONTH',
+    'ENDOFMONTH', 'STARTOFQUARTER', 'ENDOFQUARTER', 'STARTOFYEAR', 'ENDOFYEAR', 'FIRSTDATE',
+    'LASTDATE', 'DATESINPERIOD', 'DATESBETWEEN', 'OPENINGBALANCEMONTH', 'CLOSINGBALANCEMONTH',
+    'OPENINGBALANCEQUARTER', 'CLOSINGBALANCEQUARTER', 'OPENINGBALANCEYEAR', 'CLOSINGBALANCEYEAR',
+    'FIRSTNONBLANK', 'LASTNONBLANK', 'FIRSTNONBLANKVALUE', 'LASTNONBLANKVALUE', 'RELATEDTABLE',
+})
+
 # Calls that AGGREGATE over the context inside a FILTER predicate -- these keep
 # the filter-context path and must NOT be row-substituted. RELATED /
 # RELATEDTABLE are deliberately EXCLUDED: they are row-context NAVIGATIONS (the
@@ -645,6 +661,7 @@ _CALC_PRED_RE = re.compile(
 _CALC_PRED_REV_RE = re.compile(
     r"^([^\[\]]+?)\s*(<>|>=|<=|>|<|=)\s*'?([^'\[\]]+?)'?\s*\[([^\]]+)\]$", re.S)
 _VAR_KW_RE = re.compile(r'\bVAR\b', re.IGNORECASE)
+_VAR_START_RE = re.compile(r'VAR\b', re.IGNORECASE)   # .match: at the start
 _RETURN_KW_RE = re.compile(r'\bRETURN\b', re.IGNORECASE)
 
 
@@ -767,7 +784,12 @@ def _analyze_expr(raw):
     if "''[" in expr:
         expr = expr.replace("''[", "[")
 
-    if _VAR_KW_RE.search(expr) and _RETURN_KW_RE.search(expr):
+    # A VAR block only where the expression STARTS with VAR. Any text holding
+    # the two keywords was read as one, so SUMX(T, VAR x = 1 RETURN x), or a
+    # VAR block in any function argument, evaluated to BLANK (issue #144;
+    # Desktop 2.152, build_b116.py: SUMX(Orders, VAR t = FILTER(Orders,
+    # Orders[Revenue] > 100) RETURN COUNTROWS(t)) is 6).
+    if _VAR_START_RE.match(expr) and _RETURN_KW_RE.search(expr):
         return ((_P_VARRET, expr),)
 
     # A table constructor: { expr, expr, ... } -> a one-column table whose column
@@ -978,7 +1000,10 @@ def _as_date_strict(v):
 
 
 def _as_datetime(v):
-    """Best-effort datetime coercion from a value or ISO-ish string."""
+    """Best-effort datetime coercion from a value or ISO-ish string. A
+    one-row, one-column table is its value (#145: YEAR(LASTDATE(Dt[Date])))."""
+    if isinstance(v, list):
+        v = _scalarize(v)
     if isinstance(v, datetime):
         return v
     if isinstance(v, date):
@@ -1723,33 +1748,6 @@ def make_value_matcher(spec):
     return lambda cell: all(t(cell) for t in tests)
 
 
-def _substitute_row_refs(expr: str, table_name: str, row_item: dict) -> str:
-    """Replace ``Table[Col]`` references with the row's literal values.
-
-    Used by FILTER to evaluate a condition against the row being iterated: a
-    bare column reference otherwise evaluates to an unresolved
-    ('Table','Column') marker and every comparison against it returns None.
-    """
-    out = expr
-    for col_name, val in row_item.items():
-        if col_name.startswith("__"):
-            continue
-        if isinstance(val, str):
-            literal = '"' + val.replace('"', '""') + '"'
-        elif val is None:
-            literal = "BLANK()"
-        elif isinstance(val, bool):
-            literal = "TRUE()" if val else "FALSE()"
-        elif isinstance(val, (datetime, date)):
-            literal = '"' + val.isoformat() + '"'
-        else:
-            literal = str(val)
-        for pat in (f"'{table_name}'[{col_name}]", f"{table_name}[{col_name}]"):
-            if pat in out:
-                out = out.replace(pat, literal)
-    return out
-
-
 class _VarEvalError(_DAXEvaluationError):
     """A variable's expression failed. Desktop does not let IFERROR / ISERROR
     at the use site catch it: VAR x = ERROR("boom") RETURN IFERROR(x, 9) fails
@@ -2134,8 +2132,11 @@ class DAXContext:
 
         It is when the table has one, every direct filter on the table keeps a
         BLANK value, and every filter reaching the table through a relationship
-        admits it ('None' in the allowed keys -- see _hop_keys).
+        admits it ('None' in the allowed keys -- see _hop_keys). In a row
+        context, as the context the rows were opened in sees it (#116).
         """
+        if self._outer_ctx is not None:
+            return self._row_root().blank_row_visible(table_name)
         if table_name not in self.blank_row_tables():
             return False
         tbl = self.tables.get(table_name)
@@ -2722,12 +2723,32 @@ class DAXContext:
         if cache:
             cache.clear()
 
+    def _row_root(self) -> 'DAXContext':
+        """The context the enclosing row contexts were opened in: the filter
+        context as the last CALCULATE / measure reference left it. An
+        iterator's row sits in filter_context before any transition (the
+        engine applies it eagerly, for CALCULATE and measure references), but a
+        row context alone filters nothing (issue #116)."""
+        ctx = self
+        outer = ctx._outer_ctx
+        while outer is not None:
+            ctx, outer = outer, outer._outer_ctx
+        return ctx
+
     def get_column_data(self, table_name: str, column_name: str) -> list:
         """Get all values for a column, respecting current filter context.
 
         Memoized per (table, column) for the CURRENT filter set -- assigning
         :attr:`filter_context` invalidates it. Do NOT mutate the returned list.
+
+        In a row context (``_outer_ctx`` set) the values are those of the
+        context the rows were opened in (_row_root): Power BI Desktop 2.152,
+        SUMX(Orders, COUNTROWS(VALUES(Orders[Region]))) is 9 and
+        SUMX(VALUES(D[Month]), CALCULATE([S], VALUES(D[Date]))) sees every
+        date in every month (issue #116).
         """
+        if self._outer_ctx is not None:
+            return self._row_root().get_column_data(table_name, column_name)
         _ck = (table_name, column_name)
         _hit: list | None = self._column_data_cache.get(_ck)
         if _hit is not None:
@@ -3129,7 +3150,11 @@ class DAXContext:
         return [rows[i][col_idx] for i in sorted(keep)]
 
     def get_filtered_rows(self, table_name: str) -> list:
-        """Get rows of a table after applying filter context."""
+        """Get rows of a table after applying filter context. In a row
+        context, the rows of the context the rows were opened in (_row_root,
+        issue #116): SUMX(Orders, COUNTROWS(Orders)) is 9."""
+        if self._outer_ctx is not None:
+            return self._row_root().get_filtered_rows(table_name)
         tbl = self.tables.get(table_name)
         if not tbl:
             return []
@@ -4521,6 +4546,8 @@ class DAXEngine:
                 func_name, args_text = data
                 fn = self._func_map.get(func_name)
                 if fn:
+                    if ctx._outer_ctx is not None and func_name in _ROW_TRANSITION_FNS:
+                        ctx = self._row_transitioned(ctx)
                     return fn(args_text, ctx)
                 self._note_unsupported(func_name)
                 import logging
@@ -4587,6 +4614,16 @@ class DAXEngine:
                         _ci = ctx._find_col_idx(_tt['columns'], col_name)
                         if _ci >= 0 and _tt['columns'][_ci] in _cur:
                             return _cur[_tt['columns'][_ci]]
+                # Not the current row's: the innermost enclosing row context
+                # over that table (issue #116). Power BI Desktop 2.152:
+                # SUMX(Dim, COUNTROWS(FILTER(Orders, Orders[Region] =
+                # Dim[Region]))) is 3, one order per region.
+                _oc = ctx._outer_ctx
+                while _oc is not None:
+                    _found, _val = self._row_col(_oc._current_row, table_name, col_name, ctx)
+                    if _found:
+                        return _val
+                    _oc = _oc._outer_ctx
                 # A reference to a column that does NOT exist must be BLANK, not
                 # a (table, column) marker. Agents_Performance's TopN/BottomN
                 # measures read 'Top-Bottom-N'[Top-Bottom-N Value] while that
@@ -5140,7 +5177,11 @@ class DAXEngine:
 
     def _resolve_row_result(self, result, row_item, row_ctx):
         """Resolve a column reference result in a row iteration context.
-        If result is a (table, column) tuple, resolve it to a concrete value."""
+        If result is a (table, column) tuple, resolve it to a concrete value.
+        A one-row, one-column table is its value (#145: MAXX(Dt,
+        FIRSTDATE(Dt[Date])))."""
+        if isinstance(result, list):
+            return _scalarize(result)
         if isinstance(result, tuple) and len(result) == 2:
             if isinstance(row_item, dict) and '__parts__' in row_item:
                 # A CROSSJOIN row: the part from that table (#108).
@@ -5190,8 +5231,9 @@ class DAXEngine:
         return _NOT_APPLICABLE
 
     def _fold_arith(self, parts, op, ctx, var_scope):
-        """Fold `parts` left-to-right with `op`, DAX-style."""
-        acc = self._eval_expr(parts[0].strip(), ctx, var_scope)
+        """Fold `parts` left-to-right with `op`, DAX-style. A one-row,
+        one-column table is its value (#145: FIRSTDATE(Dt[Date]) + 1)."""
+        acc = _scalarize(self._eval_expr(parts[0].strip(), ctx, var_scope))
         # A blank folds to 0 for + and - ONLY IF SOMETHING ELSE HAS A VALUE.
         # When every operand is blank the whole expression is blank:
         #   BLANK()+BLANK() -> BLANK      BLANK()+BLANK()+5 -> 5
@@ -5208,7 +5250,7 @@ class DAXEngine:
         # the final serial back. `*`/`/` results are plain numbers.
         result_is_dt = isinstance(acc, (datetime, date)) and op in ('+', '-')
         for p in parts[1:]:
-            rhs = self._eval_expr(p.strip(), ctx, var_scope)
+            rhs = _scalarize(self._eval_expr(p.strip(), ctx, var_scope))
             any_value = any_value or rhs is not None
             if op == '+':
                 result_is_dt = result_is_dt or isinstance(rhs, (datetime, date))
@@ -5380,8 +5422,10 @@ class DAXEngine:
                               ('<', lambda a, b: a < b), ('=', lambda a, b: a == b)]:
             parts = self._split_operators(expr, op_str)
             if len(parts) == 2:
-                left = self._eval_expr(parts[0].strip(), ctx, var_scope)
-                right = self._eval_expr(parts[1].strip(), ctx, var_scope)
+                # A one-row, one-column table is its value (#145):
+                # FIRSTDATE(Dt[Date]) = Dt[Date].
+                left = _scalarize(self._eval_expr(parts[0].strip(), ctx, var_scope))
+                right = _scalarize(self._eval_expr(parts[1].strip(), ctx, var_scope))
                 if op_str == '==':
                     # Strict: a blank equals only a blank.
                     if left is None or right is None:
@@ -5818,7 +5862,7 @@ class DAXEngine:
             self._charge_eval(ctx)
             self._require_real_column(col, ctx)
         if col is None:
-            ref = self._eval_expr(args_str.strip(), ctx)
+            ref = self._column_arg(args_str, ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
                 return None
             col = ref
@@ -5833,7 +5877,7 @@ class DAXEngine:
             self._charge_eval(ctx)
             self._require_real_column(col, ctx)
         if col is None:
-            ref = self._eval_expr(args_str.strip(), ctx)
+            ref = self._column_arg(args_str, ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
                 return None
             col = ref
@@ -5853,7 +5897,7 @@ class DAXEngine:
             self._charge_eval(ctx)
             self._require_real_column(col, ctx)
         if col is None:
-            ref = self._eval_expr(args_str.strip(), ctx)
+            ref = self._column_arg(args_str, ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
                 return None
             col = ref
@@ -5897,7 +5941,7 @@ class DAXEngine:
             self._charge_eval(ctx)
             self._require_real_column(col, ctx)
         if col is None:
-            ref = self._eval_expr(args[0].strip(), ctx)
+            ref = self._column_arg(args[0], ctx)
             col = ref if isinstance(ref, tuple) and len(ref) == 2 else None
         if not col:
             return None
@@ -5947,7 +5991,7 @@ class DAXEngine:
             self._charge_eval(ctx)
             self._require_real_column(col, ctx)
         if col is None:
-            ref = self._eval_expr(args_str.strip(), ctx)
+            ref = self._column_arg(args_str, ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
                 return None
             col = ref
@@ -5968,7 +6012,7 @@ class DAXEngine:
             self._charge_eval(ctx)
             self._require_real_column(col, ctx)
         if col is None:
-            ref = self._eval_expr(args_str.strip(), ctx)
+            ref = self._column_arg(args_str, ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
                 return None
             col = ref
@@ -5986,7 +6030,7 @@ class DAXEngine:
             self._charge_eval(ctx)
             self._require_real_column(col, ctx)
         if col is None:
-            ref = self._eval_expr(args_str.strip(), ctx)
+            ref = self._column_arg(args_str, ctx)
             if not (isinstance(ref, tuple) and len(ref) == 2):
                 return None
             col = ref
@@ -6006,6 +6050,8 @@ class DAXEngine:
         DIVIDE("abc", 3), DIVIDE("", 3) and SIN("x") raise. Every one of
         these was BLANK, so Awesome Chocolates' QOQ item, which divides two
         CONVERT(..., STRING) values, coloured a fall as a rise."""
+        if isinstance(v, list):
+            v = _scalarize(v)      # a one-row, one-column table is its value (#145)
         if v is None:
             return None
         if isinstance(v, bool):
@@ -7415,7 +7461,7 @@ class DAXEngine:
             if ctx.blank_row_visible(tname):
                 rows = rows + [ctx.blank_row_dict(tname)]
             return rows
-        ref = self._eval_expr(arg, ctx)
+        ref = self._column_arg(arg, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             # Order-preserving dedup: Desktop iterates VALUES in data order, and
             # hash-set order made CONCATENATEX output nondeterministic.
@@ -7436,7 +7482,7 @@ class DAXEngine:
 
     def _fn_selectedvalue(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
-        ref = self._eval_expr(args[0].strip(), ctx)
+        ref = self._column_arg(args[0], ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             # IF(HASONEVALUE(c), VALUES(c), alt): the one value may be the
             # blank row's, and then the answer is BLANK, not alt (issue #82).
@@ -7712,7 +7758,8 @@ class DAXEngine:
 
     def _fn_format(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
-        val = self._eval_expr(args[0].strip(), ctx)
+        # a one-row, one-column table is its value (#145: FORMAT(LASTDATE(...)))
+        val = _scalarize(self._eval_expr(args[0].strip(), ctx))
         fmt = self._eval_expr(args[1].strip(), ctx) if len(args) > 1 else None
         # FORMAT(value, format, [locale]) -- DAX's third argument names the
         # culture to render in. It was ignored entirely, so there was no way
@@ -7894,7 +7941,7 @@ class DAXEngine:
 
     def _fn_countblank(self, args_str: str, ctx: DAXContext) -> Any:
         """COUNTBLANK(column) — count blank values in a column."""
-        ref = self._eval_expr(args_str.strip(), ctx)
+        ref = self._column_arg(args_str, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             values = ctx.get_column_data(ref[0], ref[1])
             return sum(1 for v in values if v is None or v == '') or None
@@ -7902,7 +7949,7 @@ class DAXEngine:
 
     def _fn_product(self, args_str: str, ctx: DAXContext) -> Any:
         """PRODUCT(column) — multiply all values in column."""
-        ref = self._eval_expr(args_str.strip(), ctx)
+        ref = self._column_arg(args_str, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             values = [v for v in ctx.get_column_data(ref[0], ref[1]) if isinstance(v, (int, float))]
             if not values:
@@ -7915,7 +7962,7 @@ class DAXEngine:
 
     def _fn_median(self, args_str: str, ctx: DAXContext) -> Any:
         """MEDIAN(column) — return median value."""
-        ref = self._eval_expr(args_str.strip(), ctx)
+        ref = self._column_arg(args_str, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             values = sorted(v for v in ctx.get_column_data(ref[0], ref[1]) if isinstance(v, (int, float)))
             if not values:
@@ -8055,7 +8102,7 @@ class DAXEngine:
 
     def _as_column_ref(self, text: str, ctx: DAXContext):
         """`text` as a (table, column) pair, however it is written."""
-        ref = self._eval_expr(text.strip(), ctx)
+        ref = self._column_arg(text, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             return ref
         return None
@@ -8119,14 +8166,6 @@ class DAXEngine:
         if isinstance(table_ref, list):
             filtered = []
             cond_expr = args[1].strip()
-            # A BARE column reference (`Sales[Amount] > 90`) evaluates to an
-            # unresolved ('Table','Column') marker, so the comparison yielded
-            # None and FILTER dropped every row. In a row context a bare
-            # reference IS that row's value, so substitute the row's values
-            # before evaluating. Conditions containing an aggregation
-            # (`SUM(Sales[Amount]) > 90`) must NOT be substituted — those
-            # aggregate over the context, so they keep the filter-context path.
-            substitute_row_values = not _AGG_CALL_RE.search(cond_expr)
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
                     if '__row__' in row_item:
@@ -8144,25 +8183,23 @@ class DAXEngine:
                             # CALCULATE filters.
                             extra_filters[f"{table_name}.{col_name}"] = _row_value([val], table_ref)
                         row_ctx = self._transitioned_ctx(ctx, extra_filters)
-                        if substitute_row_values:
-                            row_cond = _substitute_row_refs(
-                                cond_expr, table_name, row_item)
-                            # Text substitution only rewrites the QUALIFIED
-                            # form. Bind the row as well so an UNQUALIFIED
-                            # `[Col]` resolves to this row's value: Desktop
-                            # accepts both, and MS_Perf_Analyzer's
-                            # FILTER('Events', [component] = "Change Detection")
-                            # counted 0 rows against Desktop's 3 because the
-                            # bare reference read as a missing measure.
-                            # Only under the same no-aggregation guard --
-                            # binding a row while the condition contains
-                            # SUM(T[c]) would collapse the aggregate to the
-                            # row's own value.
-                            row_ctx._current_row = row_item
-                            row_ctx._outer_ctx = ctx
-                        else:
-                            row_cond = cond_expr
-                        cond = self._eval_expr(row_cond, row_ctx)
+                        # Bind the row: a column reference, qualified or not,
+                        # reads its value (MS_Perf_Analyzer's FILTER('Events',
+                        # [component] = "Change Detection") counted 0 rows
+                        # against Desktop's 3), and the row is a row context,
+                        # not a filter: an aggregate in the condition reads the
+                        # context outside FILTER (issue #116; Desktop 2.152,
+                        # COUNTROWS(FILTER(Orders, COUNTROWS(Orders) = 3)) is
+                        # 3). The row's values used to be substituted into the
+                        # condition's TEXT instead, which also rewrote the
+                        # column a function takes: EARLIER(Orders[Revenue])
+                        # compared the row with itself, and FIRSTDATE(Dt[Date])
+                        # got a date literal (#145). The row was bound only
+                        # without an aggregate, before aggregates took their
+                        # column as a column (_column_arg).
+                        row_ctx._current_row = row_item
+                        row_ctx._outer_ctx = ctx
+                        cond = self._eval_expr(cond_expr, row_ctx)
                         if cond:
                             filtered.append(row_item)
                     else:
@@ -8370,7 +8407,7 @@ class DAXEngine:
             arg = args[i].strip()
             if arg.startswith('"'):
                 break
-            ref = self._eval_expr(arg, ctx)
+            ref = self._column_arg(arg, ctx)
             if isinstance(ref, tuple) and len(ref) == 2:
                 ref_table, ref_col = ref
                 if ref_table == table_name or ref_table not in ctx.tables:
@@ -8562,7 +8599,7 @@ class DAXEngine:
         # Find group-by columns (column refs) vs name/expression pairs (string, expression)
         group_refs = []
         for arg in args:
-            ref = self._eval_expr(arg.strip(), ctx)
+            ref = self._column_arg(arg, ctx)
             if isinstance(ref, tuple) and len(ref) == 2:
                 group_refs.append(ref)
             else:
@@ -8660,9 +8697,27 @@ class DAXEngine:
             result.append(new_row)
         return result
 
+    def _column_arg(self, expr: str, ctx: DAXContext) -> Any:
+        """A function argument that may name a column: ``T[c]`` of a real
+        column is the column -- the (table, column) marker -- even in a row
+        context over T, where evaluating it gives the row's value (issue
+        #116: Desktop 2.152, SUMX(Orders, COUNTROWS(VALUES(Orders[Region]))) is
+        9). Anything else is evaluated."""
+        ref = self._parse_column_ref(expr)
+        if ref is not None:
+            tname = ctx.model_table(ref[0])
+            tbl = ctx.tables.get(tname)
+            if tbl is not None:
+                idx = ctx._find_col_idx(tbl['columns'], ref[1])
+                if idx >= 0:
+                    # the model's spelling: a parsed reference loses the space
+                    # of ' Sales' (issue #132)
+                    return tname, tbl['columns'][idx]
+        return self._eval_expr(expr.strip(), ctx)
+
     def _fn_distinct(self, args_str: str, ctx: DAXContext) -> Any:
         """DISTINCT(column_or_table) — distinct values, respecting filter context."""
-        ref = self._eval_expr(args_str.strip(), ctx)
+        ref = self._column_arg(args_str, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             values = ctx.get_column_data(ref[0], ref[1])
             seen = set()
@@ -8879,7 +8934,7 @@ class DAXEngine:
         # Extract target column references
         target_cols = []
         for i in range(1, len(args)):
-            ref = self._eval_expr(args[i].strip(), ctx)
+            ref = self._column_arg(args[i], ctx)
             if isinstance(ref, tuple) and len(ref) == 2:
                 target_cols.append(ref)
         if isinstance(table_ref, list) and len(target_cols) > 1:
@@ -9010,7 +9065,7 @@ class DAXEngine:
         # Columns to keep
         keep_cols = set()
         for i in range(1, len(args)):
-            ref = self._eval_expr(args[i].strip(), ctx)
+            ref = self._column_arg(args[i], ctx)
             if isinstance(ref, tuple) and len(ref) == 2:
                 keep_cols.add(f"{ref[0]}.{ref[1]}")
 
@@ -9094,14 +9149,14 @@ class DAXEngine:
 
     def _fn_hasonevalue(self, args_str: str, ctx: DAXContext) -> Any:
         """HASONEVALUE(column) — check if exactly one distinct value in filter context."""
-        ref = self._eval_expr(args_str.strip(), ctx)
+        ref = self._column_arg(args_str, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             return len(self._values_with_blank(ref[0], ref[1], ctx)) == 1
         return False
 
     def _fn_hasonefilter(self, args_str: str, ctx: DAXContext) -> Any:
         """HASONEFILTER(column) — check if exactly one direct filter on column."""
-        ref = self._eval_expr(args_str.strip(), ctx)
+        ref = self._column_arg(args_str, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             filter_key = f"{ref[0]}.{ref[1]}"
             if filter_key in ctx.filter_context:
@@ -9124,12 +9179,21 @@ class DAXEngine:
             return table, None
         ref = self._parse_column_ref(arg)
         if ref is None:
-            ref = self._eval_expr(arg, ctx)
+            ref = self._column_arg(arg, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             return ctx.model_table(str(ref[0])), str(ref[1])
         if isinstance(ref, str) and ref:
             return ctx.model_table(ref.strip("'\"")), None   # a table without loaded rows
         return None
+
+    @staticmethod
+    def _row_transitioned(ctx: DAXContext) -> DAXContext:
+        """``ctx`` with its row context's transition in force: the eager row
+        filters read as filters, the row itself still bound (the arguments
+        other than <dates> may read it). For the _ROW_TRANSITION_FNS."""
+        out = ctx.with_filters({})
+        out._current_row = ctx._current_row
+        return out
 
     @staticmethod
     def _transitioned(ctx: DAXContext) -> DAXContext:
@@ -9168,20 +9232,71 @@ class DAXEngine:
         # This returns a marker that CALCULATE can interpret.
         return ('__USERELATIONSHIP__', args_str.strip())
 
+    @staticmethod
+    def _row_col(row, table_name: str, col_name: str, ctx: DAXContext) -> tuple:
+        """``(True, value)`` when ``row``, an iterated row dict, holds column
+        ``col_name`` of ``table_name``; ``(False, None)`` otherwise."""
+        if not isinstance(row, dict):
+            return False, None
+        if '__parts__' in row:                    # a CROSSJOIN row (#108)
+            row = next((p for p in row['__parts__'] if p.get('__table__') == table_name), None)
+            if row is None:
+                return False, None
+        if row.get('__table__') != table_name:
+            return False, None
+        names = [col_name]
+        tbl = ctx.tables.get(table_name)
+        if tbl is not None:
+            ci = ctx._find_col_idx(tbl['columns'], col_name)
+            if ci >= 0 and tbl['columns'][ci] != col_name:
+                names.append(tbl['columns'][ci])  # the model's spelling (#132)
+        for name in names:
+            if row.get('__column__') == name:
+                return True, row.get('__value__')
+            if name in row and not name.startswith('__'):
+                return True, row[name]
+        return False, None
+
     def _fn_earlier(self, args_str: str, ctx: DAXContext) -> Any:
-        """EARLIER(column, n) — row context from n levels up.
-        Limitation: This engine does not maintain a row context stack.
-        Returns the current column value as an approximation."""
-        args = self._split_args(args_str)
-        ref = self._eval_expr(args[0].strip(), ctx)
-        # NOTE: EARLIER requires a row context stack which this engine doesn't maintain.
-        # We return the column reference so it can be used in comparisons.
-        return ref
+        """EARLIER(column[, n]) -- the column's value in the n-th row context
+        over its table outside the innermost one (n = 1 by default). The row
+        contexts are the iterated rows bound along _outer_ctx. Power BI Desktop
+        2.152 (build_b116.py, issue #116): SUMX(Orders, COUNTROWS(FILTER(Orders,
+        Orders[Revenue] < EARLIER(Orders[Revenue])))) is 3 and SUMX(Orders,
+        COUNTROWS(FILTER(ALL(Orders), Orders[Revenue] <= EARLIER(
+        Orders[Revenue])))) 6. It returned the column, which compared the row
+        with itself. Without such a row context it is an error, as in DAX."""
+        return self._earlier(args_str, ctx, earliest=False)
 
     def _fn_earliest(self, args_str: str, ctx: DAXContext) -> Any:
-        """EARLIEST(column) — outermost row context.
-        Limitation: Same as EARLIER — no row context stack."""
-        return self._fn_earlier(args_str, ctx)
+        """EARLIEST(column) -- the column's value in the outermost row context
+        over its table (_fn_earlier)."""
+        return self._earlier(args_str, ctx, earliest=True)
+
+    def _earlier(self, args_str: str, ctx: DAXContext, earliest: bool) -> Any:
+        args = self._split_args(args_str)
+        ref = self._parse_column_ref(args[0]) if args else None
+        if ref is None:
+            return None
+        table_name = ctx.model_table(ref[0])
+        n = 1
+        if not earliest and len(args) > 1:
+            v = self._num_arg(args[1], ctx)
+            n = int(v) if isinstance(v, (int, float)) else 1
+        hits = []
+        c: Optional[DAXContext] = ctx
+        while c is not None:
+            found, val = self._row_col(c._current_row, table_name, ref[1], ctx)
+            if found:
+                hits.append(val)
+            c = c._outer_ctx
+        if earliest and len(hits) > 1:
+            return hits[-1]
+        if not earliest and n >= 1 and len(hits) > n:
+            return hits[n]
+        from pbix_mcp.errors import DAXEvaluationError
+        raise DAXEvaluationError(
+            "EARLIER/EARLIEST refers to an earlier row context which doesn't exist")
 
     # =========================================================================
     # Math functions
@@ -9666,7 +9781,7 @@ class DAXEngine:
     # ------------------------------------------ column / iterator statistics
 
     def _column_numbers(self, args_str: str, ctx: DAXContext):
-        ref = self._eval_expr(args_str.strip(), ctx)
+        ref = self._column_arg(args_str, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             return [float(v) for v in ctx.get_column_data(ref[0], ref[1])
                     if isinstance(v, (int, float)) and not isinstance(v, bool)]
@@ -9777,7 +9892,7 @@ class DAXEngine:
         return None
 
     def _fn_averagea(self, args_str: str, ctx: DAXContext):
-        ref = self._eval_expr(args_str.strip(), ctx)
+        ref = self._column_arg(args_str, ctx)
         if not (isinstance(ref, tuple) and len(ref) == 2):
             return None
         vals = []
@@ -9944,7 +10059,7 @@ class DAXEngine:
     def _fn_filters(self, args_str: str, ctx: DAXContext):
         """FILTERS(column) -- the directly-filtered values of the column, or
         every value when the column carries no direct filter."""
-        ref = self._eval_expr(args_str.strip(), ctx)
+        ref = self._column_arg(args_str, ctx)
         if not (isinstance(ref, tuple) and len(ref) == 2):
             return None
         t, c = ref
@@ -10025,7 +10140,7 @@ class DAXEngine:
         group_cols = []
         i = 1
         while i < len(parts):
-            ref = self._eval_expr(parts[i].strip(), ctx)
+            ref = self._column_arg(parts[i], ctx)
             if isinstance(ref, tuple) and len(ref) == 2:
                 group_cols.append(ref[1])
                 i += 1
@@ -10095,7 +10210,7 @@ class DAXEngine:
         right = self._table_rows(parts[2], ctx)
         if left is None or right is None:
             return None
-        order_ref = self._eval_expr(parts[3].strip(), ctx)
+        order_ref = self._column_arg(parts[3], ctx)
         if not (isinstance(order_ref, tuple) and len(order_ref) == 2):
             return None
         ocol = order_ref[1]
@@ -10151,7 +10266,7 @@ class DAXEngine:
         """NEXTDAY / PREVIOUSDAY: the single day after the last (before the
         first) date in the current selection -- empty when the calendar does
         not contain it, and an empty set means BLANK downstream."""
-        ref = self._eval_expr(args_str.strip(), ctx)
+        ref = self._column_arg(args_str, ctx)
         if not (isinstance(ref, tuple) and len(ref) == 2):
             return None
         t, c = ref
@@ -11210,7 +11325,7 @@ class DAXEngine:
         return math.sqrt(var) if name.startswith("STDEV") else var
 
     def _fn_maxa_mina(self, name: str, args_str: str, ctx: DAXContext):
-        ref = self._eval_expr(args_str.strip(), ctx)
+        ref = self._column_arg(args_str, ctx)
         if not (isinstance(ref, tuple) and len(ref) == 2):
             return None
         vals = []
@@ -11298,7 +11413,7 @@ class DAXEngine:
         parts = self._split_args(args_str)
         if len(parts) != 2:
             return None
-        ref = self._eval_expr(parts[0].strip(), ctx)
+        ref = self._column_arg(parts[0], ctx)
         if not (isinstance(ref, tuple) and len(ref) == 2):
             return None
         t, c = ref
@@ -11532,8 +11647,8 @@ class DAXEngine:
         else:
             if len(parts) < 2:
                 return None
-            yref = self._eval_expr(parts[0].strip(), ctx)
-            xref = self._eval_expr(parts[1].strip(), ctx)
+            yref = self._column_arg(parts[0], ctx)
+            xref = self._column_arg(parts[1], ctx)
             if not (isinstance(yref, tuple) and isinstance(xref, tuple)):
                 return None
             yvals = ctx.get_column_data(yref[0], yref[1])
@@ -12119,7 +12234,7 @@ class DAXEngine:
             return None
         # AddMissingItems(showAll_col, table, groupBy_col): union the summary
         # rows with the group values the summary filtered away.
-        ref = self._eval_expr(parts[0].strip(), ctx)
+        ref = self._column_arg(parts[0], ctx)
         summary = self._eval_expr(parts[1].strip(), ctx)
         if not (isinstance(ref, tuple) and len(ref) == 2):
             return None
@@ -12797,7 +12912,7 @@ class DAXEngine:
         criteria = []
         i = 1
         while i + 1 < len(args):
-            ref = self._eval_expr(args[i].strip(), ctx)
+            ref = self._column_arg(args[i], ctx)
             value = self._eval_expr(args[i + 1].strip(), ctx)
             if isinstance(ref, tuple) and len(ref) == 2:
                 col_idx = ctx._find_col_idx(tbl['columns'], ref[1])
@@ -12861,7 +12976,7 @@ class DAXEngine:
         if len(args) < 3:
             return None
 
-        result_ref = self._eval_expr(args[0].strip(), ctx)
+        result_ref = self._column_arg(args[0], ctx)
         if not isinstance(result_ref, tuple) or len(result_ref) != 2:
             return None
 
@@ -12878,7 +12993,7 @@ class DAXEngine:
         criteria = []
         i = 1
         while i + 1 < len(args):
-            search_ref = self._eval_expr(args[i].strip(), ctx)
+            search_ref = self._column_arg(args[i], ctx)
             search_val = self._eval_expr(args[i + 1].strip(), ctx)
             if isinstance(search_ref, tuple) and len(search_ref) == 2:
                 col_idx = ctx._find_col_idx(tbl['columns'], search_ref[1])
@@ -12982,7 +13097,7 @@ class DAXEngine:
         row), NOT a filter-context lookup -- so it must use ctx._current_row,
         never 'the first visible row of the related table' (which returns the
         same value for every iterated row)."""
-        ref = self._eval_expr(args_str.strip(), ctx)
+        ref = self._column_arg(args_str, ctx)
         if not isinstance(ref, tuple) or len(ref) != 2:
             return None
         target_table, target_col = ref
@@ -13061,7 +13176,7 @@ class DAXEngine:
     def _get_date_column_dates(self, args_str: str, ctx: DAXContext) -> tuple:
         """Parse a date column reference and return (table_name, col_name, list_of_dates).
         Returns (table_name, col_name, dates) where dates are datetime objects."""
-        ref = self._eval_expr(args_str.strip(), ctx)
+        ref = self._column_arg(args_str, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             table_name, col_name = ref
             raw_values = ctx.get_column_data(table_name, col_name)
@@ -13073,14 +13188,33 @@ class DAXEngine:
             return table_name, col_name, dates
         return None, None, []
 
-    def _make_date_table_result(self, table_name: str, col_name: str, dates: list) -> list:
-        """Convert a list of datetime objects into the standard row-dict format."""
+    def _make_date_table_result(self, table_name: str, col_name: str, dates: list,
+                                ctx: Optional[DAXContext] = None) -> list:
+        """Convert a list of datetime objects into the standard row-dict
+        format, each value the column's own cell. It was the date as
+        'YYYY-MM-DD' text, which filtered fine but was no date as a value:
+        Power BI Desktop 2.152 (build_b145.py, issue #145), MAXX(Dt,
+        FIRSTDATE(Dt[Date])) is 31 March and YEAR(LASTDATE(Dt[Date])) 2024,
+        where the engine answered BLANK."""
+        cells: dict = {}
+        tbl = ctx.tables.get(table_name) if ctx is not None else None
+        if tbl is not None:
+            idx = ctx._find_col_idx(tbl['columns'], col_name) if ctx is not None else -1
+            if idx >= 0:
+                for row in tbl['rows']:
+                    dv = _as_date(row[idx])
+                    if dv is not None:
+                        cells.setdefault(dv, row[idx])
         result = []
         for d in dates:
+            day = d.date() if isinstance(d, datetime) else d
+            value = cells.get(day)
+            if value is None:
+                value = d if isinstance(d, datetime) else datetime(d.year, d.month, d.day)
             result.append({
                 '__table__': table_name,
                 '__column__': col_name,
-                '__value__': d.strftime('%Y-%m-%d')
+                '__value__': value
             })
         return result
 
@@ -13136,7 +13270,7 @@ class DAXEngine:
 
         all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
         ytd = [d for d in all_dates if year_start <= d <= max_date]
-        return self._make_date_table_result(table_name, col_name, ytd)
+        return self._make_date_table_result(table_name, col_name, ytd, ctx=ctx)
 
     def _fn_datesmtd(self, args_str: str, ctx: DAXContext) -> Any:
         """DATESMTD(dates) — month to date dates."""
@@ -13147,7 +13281,7 @@ class DAXEngine:
         month_start = datetime(max_date.year, max_date.month, 1)
         all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
         mtd = [d for d in all_dates if month_start <= d <= max_date]
-        return self._make_date_table_result(table_name, col_name, mtd)
+        return self._make_date_table_result(table_name, col_name, mtd, ctx=ctx)
 
     def _fn_datesqtd(self, args_str: str, ctx: DAXContext) -> Any:
         """DATESQTD(dates) — quarter to date dates."""
@@ -13159,7 +13293,7 @@ class DAXEngine:
         quarter_start = datetime(max_date.year, quarter_start_month, 1)
         all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
         qtd = [d for d in all_dates if quarter_start <= d <= max_date]
-        return self._make_date_table_result(table_name, col_name, qtd)
+        return self._make_date_table_result(table_name, col_name, qtd, ctx=ctx)
 
     def _total_over_dates(self, expr: str, dates: Any, ctx: DAXContext) -> Any:
         """Evaluate ``expr`` with ``dates`` (a DATESYTD/QTD/MTD result) as the
@@ -13239,7 +13373,7 @@ class DAXEngine:
             prev_year, prev_month = max_date.year, max_date.month - 1
         all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
         prev = [d for d in all_dates if d.year == prev_year and d.month == prev_month]
-        return self._make_date_table_result(table_name, col_name, prev)
+        return self._make_date_table_result(table_name, col_name, prev, ctx=ctx)
 
     def _fn_previousquarter(self, args_str: str, ctx: DAXContext) -> Any:
         """PREVIOUSQUARTER(dates) — dates from the previous quarter."""
@@ -13266,7 +13400,7 @@ class DAXEngine:
             prev_q_end = datetime(max_date.year, prev_q_end_month, last_day)
         all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
         prev = [d for d in all_dates if prev_q_start <= d <= prev_q_end]
-        return self._make_date_table_result(table_name, col_name, prev)
+        return self._make_date_table_result(table_name, col_name, prev, ctx=ctx)
 
     def _fn_previousyear(self, args_str: str, ctx: DAXContext) -> Any:
         """PREVIOUSYEAR(dates) — dates from the previous year."""
@@ -13284,7 +13418,7 @@ class DAXEngine:
         prev_year = max_date.year - 1
         all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
         prev = [d for d in all_dates if d.year == prev_year]
-        return self._make_date_table_result(table_name, col_name, prev)
+        return self._make_date_table_result(table_name, col_name, prev, ctx=ctx)
 
     def _fn_nextmonth(self, args_str: str, ctx: DAXContext) -> Any:
         """NEXTMONTH(dates) — dates from the next month."""
@@ -13298,7 +13432,7 @@ class DAXEngine:
             next_year, next_month = max_date.year, max_date.month + 1
         all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
         nxt = [d for d in all_dates if d.year == next_year and d.month == next_month]
-        return self._make_date_table_result(table_name, col_name, nxt)
+        return self._make_date_table_result(table_name, col_name, nxt, ctx=ctx)
 
     def _fn_nextquarter(self, args_str: str, ctx: DAXContext) -> Any:
         """NEXTQUARTER(dates) — dates from the next quarter."""
@@ -13318,7 +13452,7 @@ class DAXEngine:
             nq_end = datetime(max_date.year, nq_end_month, last_day)
         all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
         nxt = [d for d in all_dates if nq_start <= d <= nq_end]
-        return self._make_date_table_result(table_name, col_name, nxt)
+        return self._make_date_table_result(table_name, col_name, nxt, ctx=ctx)
 
     def _fn_nextyear(self, args_str: str, ctx: DAXContext) -> Any:
         """NEXTYEAR(dates) — dates from the next year."""
@@ -13329,7 +13463,7 @@ class DAXEngine:
         next_year = max_date.year + 1
         all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
         nxt = [d for d in all_dates if d.year == next_year]
-        return self._make_date_table_result(table_name, col_name, nxt)
+        return self._make_date_table_result(table_name, col_name, nxt, ctx=ctx)
 
     def _fn_parallelperiod(self, args_str: str, ctx: DAXContext) -> Any:
         """PARALLELPERIOD(dates, offset, interval) — shift dates by offset intervals."""
@@ -13397,7 +13531,7 @@ class DAXEngine:
         else:
             shifted = []
 
-        return self._make_date_table_result(table_name, col_name, shifted)
+        return self._make_date_table_result(table_name, col_name, shifted, ctx=ctx)
 
     # =========================================================================
     # Time Intelligence — Start/End of Period
@@ -13432,7 +13566,7 @@ class DAXEngine:
             return []
         lo, hi = self._period_bounds(min(dates), period)
         inside = [d for d in self._get_all_date_table_dates(table_name, col_name, ctx) if lo <= d <= hi]
-        return self._make_date_table_result(table_name, col_name, [min(inside)] if inside else [])
+        return self._make_date_table_result(table_name, col_name, [min(inside)] if inside else [], ctx=ctx)
 
     def _end_of(self, args_str: str, ctx: DAXContext, period: str) -> Any:
         """ENDOFMONTH/QUARTER/YEAR: the last date of the dates column in the
@@ -13442,7 +13576,7 @@ class DAXEngine:
             return []
         lo, hi = self._period_bounds(max(dates), period)
         inside = [d for d in self._get_all_date_table_dates(table_name, col_name, ctx) if lo <= d <= hi]
-        return self._make_date_table_result(table_name, col_name, [max(inside)] if inside else [])
+        return self._make_date_table_result(table_name, col_name, [max(inside)] if inside else [], ctx=ctx)
 
     def _fn_startofmonth(self, args_str: str, ctx: DAXContext) -> Any:
         """STARTOFMONTH(dates) — first date of the month."""
@@ -13490,7 +13624,7 @@ class DAXEngine:
             before = [d for d in self._get_all_date_table_dates(table_name, col_name, ctx) if d < lo]
             if not before:
                 return None
-            at = self._make_date_table_result(table_name, col_name, [max(before)])
+            at = self._make_date_table_result(table_name, col_name, [max(before)], ctx=ctx)
         else:
             at = self._end_of(args[1], ctx, period)
             if not at:
@@ -13531,7 +13665,7 @@ class DAXEngine:
         if not dates:
             return []
         earliest = min(dates)
-        return self._make_date_table_result(table_name, col_name, [earliest])
+        return self._make_date_table_result(table_name, col_name, [earliest], ctx=ctx)
 
     def _fn_lastdate(self, args_str: str, ctx: DAXContext) -> Any:
         """LASTDATE(dates) — latest date in filter context."""
@@ -13539,7 +13673,7 @@ class DAXEngine:
         if not dates:
             return []
         latest = max(dates)
-        return self._make_date_table_result(table_name, col_name, [latest])
+        return self._make_date_table_result(table_name, col_name, [latest], ctx=ctx)
 
     def _fn_datesbetween(self, args_str: str, ctx: DAXContext) -> Any:
         """DATESBETWEEN(dates, start, end) — dates between start and end."""
@@ -13557,7 +13691,7 @@ class DAXEngine:
             return []
         all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
         between = [d for d in all_dates if start_date <= d <= end_date]
-        return self._make_date_table_result(table_name, col_name, between)
+        return self._make_date_table_result(table_name, col_name, between, ctx=ctx)
 
     def _fn_datesinperiod(self, args_str: str, ctx: DAXContext) -> Any:
         """DATESINPERIOD(dates, start, offset, interval) — dates in a period from start."""
@@ -13617,7 +13751,7 @@ class DAXEngine:
 
         all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
         in_period = [d for d in all_dates if start_date <= d <= end_date]
-        return self._make_date_table_result(table_name, col_name, in_period)
+        return self._make_date_table_result(table_name, col_name, in_period, ctx=ctx)
 
     def _fn_calendar(self, args_str: str, ctx: DAXContext) -> Any:
         """CALENDAR(start, end) — generate a date table between start and end."""

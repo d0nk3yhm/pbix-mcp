@@ -40,8 +40,20 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-09 (0.9.125): docs 1-55 and GitHub issues/PRs #1-#113 and
-#118-#142 are closed; #114-#117 and #136 are open.** 0.9.125 closes #142:
+**Updated 2026-10-09 (0.9.126): docs 1-55 and GitHub issues/PRs #1-#113,
+#116, #118-#142, #144 and #145 are closed; #114, #115, #117, #136, #143 and
+#146 are open.** 0.9.126 closes #116: a row context filters nothing until
+CALCULATE or a measure reference turns it into a filter -- table expressions,
+nested iterators, VALUES, FILTER's aggregates and CALCULATE's filter arguments
+inside an iterator read the context the rows were opened in, while
+time-intelligence functions and RELATEDTABLE see the transition; EARLIER /
+EARLIEST walk the row contexts (build_b116.py 39 of 40, the other is #115;
+build_b118.py now 420 of 420). Found verifying it: #144 (a VAR block in a
+function argument) and #145 (the one-date tables of time intelligence as
+values).
+
+As of 0.9.125, docs 1-55 and #1-#113, #118-#142 were closed; #114-#117 and
+#136 were open. 0.9.125 closes #142:
 the #131 shield also proves a measure that re-filters a date table through a
 CALCULATE on its date column independent of the date row, so Awesome
 Chocolates' calculation items answer in under a second (70-110 s before),

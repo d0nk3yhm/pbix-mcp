@@ -73,12 +73,15 @@ class TestFilterFix:
             "CALCULATE(SUM(Sales[Amount]), FILTER(Sales, Sales[Amount] > 90))"
         ) == 300.0
 
-    def test_aggregation_condition_keeps_filter_context_path(self):
-        # A condition containing an aggregation is NOT row-substituted: it stays
-        # on the pre-existing filter-context route, where SUM() is evaluated
-        # within the iterated row's context (so it behaves like a per-row sum).
-        # Asserted to pin that this fix did not disturb that path.
+    def test_aggregation_condition_reads_the_context_outside_filter(self):
+        # An aggregate in FILTER's condition sees the filter context outside
+        # FILTER: the row is a row context, not a filter (issue #116; Power BI
+        # Desktop 2.152, COUNTROWS(FILTER(Orders, COUNTROWS(Orders) = 3)) is 3,
+        # build_b116.py). SUM is the 350 total on every row, so every row passes.
+        # This pinned a per-row sum before.
         rows = _ev("FILTER(Sales, SUM(Sales[Amount]) > 90)")
+        assert [r["Product"] for r in rows] == ["Widget", "Gadget", "Doo"]
+        rows = _ev("FILTER(Sales, CALCULATE(SUM(Sales[Amount])) > 90)")
         assert [r["Product"] for r in rows] == ["Widget", "Gadget"]
 
 
