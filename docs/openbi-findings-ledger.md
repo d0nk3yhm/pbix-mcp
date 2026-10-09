@@ -40,9 +40,34 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-09 (0.9.121): docs 1-51 and GitHub issues/PRs #1-#113,
-#119-#120 and #131 are closed; #114-#118 are open.** 0.9.121 closes docs 50
-and 51, and #131, found by its own corpus census:
+**Updated 2026-10-09 (0.9.122): docs 1-55 and GitHub issues/PRs #1-#113,
+#119-#135 are closed; #114-#118 are open.** 0.9.122 also solves PR #123 by
+@allanon2 on our side (#130, the modern visual header). It closes docs 52-55:
+
+- doc 52 = #121: calculation groups are applied -- the item a filter on the
+  group's item column selects replaces each outside measure reference,
+  higher precedence outer, SELECTEDMEASURE & co. inside items, and the
+  outermost item with a format string decides the format (format_string
+  in pbix_evaluate_dax; engine.evaluate_format_strings). The definitions
+  attach to the measures dict (engine.set_calculation_groups, or the
+  calculation_groups= argument of the evaluate functions);
+- doc 53 = #122: DATESINPERIOD around 29 February and month ends;
+- doc 54 = #124 (RANKX's order argument) and #125 (RANKX with BLANK, text
+  and dates);
+- doc 55 = #126: a DateTime with a time of day joins by date part only
+  across JoinOnDateBehavior = DatePartOnly (auto date/time), and exactly
+  otherwise -- per-value and per-dimension alike;
+- found verifying them: #127 (DATEADD / SAMEPERIODLASTYEAR over a table of
+  dates), #128 (the builder stores DatePartOnly as Desktop does), #129
+  (DATEADD keeps a single date's day number), #133 (text that is no number
+  is an error in arithmetic, not a BLANK), #134 (a VAR is evaluated when
+  first used, as in DAX), #135 (IFERROR / ISERROR react to errors, not to
+  BLANK);
+- found by the 0.9.121 census: #132 (a column named with a leading or
+  trailing space, Financial Sample's ' Sales', is found).
+
+As of 0.9.121, docs 1-51 and #1-#113, #119-#120 and #131 were closed.
+0.9.121 closes docs 50 and 51, and #131, found by its own corpus census:
 
 - doc 50 = #119: a ThemeDataColor's ColorId indexes Desktop's picker row --
   white, black, then the first 8 data colours (from desktop.min.js), so 0 and 1
@@ -287,6 +312,25 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **doc 52 (GH #121)** -- CLOSED (0.9.122). Calculation groups were read as
+  ordinary tables, so no item was ever applied. Now the item that the filter
+  on the group's item column selects is applied, with Desktop's rules,
+  measured over 549 query cells and 80 MDX format strings. Regression:
+  tests/test_issue121_calculation_groups.py,
+  tests/test_issue121_calc_group_rules.py.
+- **doc 55 (GH #126)** -- CLOSED (0.9.122). evaluate_per_dimension matched
+  join keys exactly and the per-value path by date part on every
+  relationship. Desktop: DatePartOnly (auto date/time) joins by date part,
+  DateAndTime exactly. The reader passes JoinOnDateBehavior and both paths
+  follow it. Regression: tests/test_issue126_date_part_joins.py.
+- **doc 54 (GH #124, #125)** -- CLOSED (0.9.122). RANKX read its order as
+  'DESC' in the text, returned BLANK for a BLANK value and ranked numbers
+  only. Now Desktop's order spellings, BLANK as 0 / "", text and dates.
+  Regression: tests/test_issue124_rankx_order.py,
+  tests/test_issue125_rankx_blank.py.
+- **doc 53 (GH #122)** -- CLOSED (0.9.122). DATESINPERIOD's YEAR branch
+  raised on 29 February; all intervals now shift as DATEADD's month-end rule.
+  Regression: tests/test_issue122_datesinperiod_month_ends.py.
 - **doc 51 (GH #120)** -- CLOSED (0.9.121). ALLSELECTED(<table>) as a table
   returned a CALCULATE marker, so iterators over it saw no rows (Matrix Bubble
   Chart drew no bubbles). Now the table's rows under every selection reaching

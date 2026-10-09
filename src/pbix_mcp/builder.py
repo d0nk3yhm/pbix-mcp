@@ -22,6 +22,7 @@ Usage:
     builder.save("output.pbix")
 """
 
+import datetime as _dt
 import io
 import json
 import os
@@ -1097,8 +1098,14 @@ class PBIXBuilder:
             "linguisticSchemaSyncVersion": 2,
             "defaultDrillFilterOtherVisuals": True,
             "objects": {},
+            # useStylableVisualContainerHeader: "Use the modern visual header
+            # with updated styling options" -- in all 26 Desktop-authored
+            # reports of the local corpus. Without it Desktop draws a built
+            # report's visuals in the legacy container, their content inset
+            # further (issue #130, reported by @allanon2 in PR #123).
             "settings": {"useNewFilterPaneExperience": True,
-                         "allowChangeFilterTypes": True},
+                         "allowChangeFilterTypes": True,
+                         "useStylableVisualContainerHeader": True},
         }
         layout = {
             "id": 0,
@@ -3220,14 +3227,19 @@ def _modify_metadata_and_encode(
             )
 
             if not is_m2m:
-                # RelationshipStorage
+                # RelationshipStorage. DefinitionType 2 is a DATE-PART join
+                # (JoinOnDateBehavior = DatePartOnly): Desktop writes it on
+                # every auto date/time relationship and rebuilds the index by
+                # it. Written as 0, Desktop kept an exact join through a full
+                # refresh even under DatePartOnly (issue #128).
                 rs_name = f"{rel_name.replace('-', ' ')} ({rel_id})"
+                def_type = 2 if join_on_date == 2 else 0
                 c.execute(
                     """INSERT INTO RelationshipStorage (
                         ID, RelationshipID, Name, DefinitionType,
                         Cardinality, Flags, RelationshipIndexStorageID
-                    ) VALUES (?, ?, ?, 0, 0, 0, ?)""",
-                    (rs_id, rel_id, rs_name, ris_id),
+                    ) VALUES (?, ?, ?, ?, 0, 0, ?)""",
+                    (rs_id, rel_id, rs_name, def_type, ris_id),
                 )
 
                 # RelationshipIndexStorage (SystemTableID and RecordCount updated
@@ -3250,8 +3262,8 @@ def _modify_metadata_and_encode(
                         """INSERT INTO RelationshipStorage (
                             ID, RelationshipID, Name, DefinitionType,
                             Cardinality, Flags, RelationshipIndexStorageID
-                        ) VALUES (?, ?, ?, 0, 0, 0, ?)""",
-                        (rs2_id, rel_id, rs_name, ris2_id),
+                        ) VALUES (?, ?, ?, ?, 0, 0, ?)""",
+                        (rs2_id, rel_id, rs_name, def_type, ris2_id),
                     )
                     c.execute(
                         """INSERT INTO RelationshipIndexStorage (
@@ -3928,7 +3940,7 @@ def _modify_metadata_and_encode(
         # table_id_map / tables / vertipaq_files. `many_*` is the INDEXED table
         # and `one_*` the target; for the reverse index the caller swaps them.
         def _build_r_index(many_tname, one_tname, many_col_name, one_col_name,
-                           rel_id, rel_name, rs_id, ris_id):
+                           rel_id, rel_name, rs_id, ris_id, date_part=False):
             from_tid = table_id_map[many_tname]   # PBI From = Many (indexed side)
             to_tid = table_id_map[one_tname]      # PBI To = One (target side)
 
@@ -3962,12 +3974,25 @@ def _modify_metadata_and_encode(
                     return s if s != "" else None
                 return v
 
+            # A DatePartOnly join (issue #128) matches a key by its DATE: every
+            # time of a day reaches that day's row, as Desktop builds the index
+            # of an auto date/time relationship.
+            def _join_key(v):
+                if date_part:
+                    if isinstance(v, _dt.datetime):
+                        return _dt.datetime(v.year, v.month, v.day)
+                    if isinstance(v, _dt.date):
+                        return _dt.datetime(v.year, v.month, v.day)
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        return float(int(v // 1))      # a serial's day
+                return v
+
             # Map TO table key values to row indices
             to_key_index: dict[object, int] = {}
             for idx, row in enumerate(to_rows):
                 key_val = _canon_key(row.get(one_col_name), fk_is_string)
-                if key_val is not None and key_val not in to_key_index:
-                    to_key_index[key_val] = idx
+                if key_val is not None and _join_key(key_val) not in to_key_index:
+                    to_key_index[_join_key(key_val)] = idx
 
             # Get DISTINCT FK values in DICTIONARY (data_id) order: insertion
             # order for strings, sorted for numerics — R$ is indexed by the
@@ -4006,7 +4031,7 @@ def _modify_metadata_and_encode(
             index_values: list[int] = [0] * DATA_ID_OFFSET
             unmatched = 0
             for fk_val in fk_dict_order:
-                matched_idx = to_key_index.get(fk_val)
+                matched_idx = to_key_index.get(_join_key(fk_val))
                 if matched_idx is None:
                     unmatched += 1
                     index_values.append(0)
@@ -4016,6 +4041,8 @@ def _modify_metadata_and_encode(
             # blank member: an unmatched key, or a blank key (data_id 2, a
             # padding slot). Desktop sets it on refresh in both cases.
             ris_flags = 1 if unmatched or any(v is None for v in fk_values) else 0
+            if date_part:
+                ris_flags |= 8      # Desktop's flag on a date-part join index
 
             # R$ table naming: table name does NOT include .tbl suffix
             rel_name_spaced = rel_name.replace("-", " ")
@@ -4303,17 +4330,18 @@ def _modify_metadata_and_encode(
         for rdef in relationships:
             if "_rel_id" not in rdef or rdef.get("_is_m2m"):
                 continue
+            _dp = rdef.get("join_on_date_behavior", 1) == 2
             _build_r_index(
                 rdef["_many_table"], rdef["_one_table"],
                 rdef["_many_column"], rdef["_one_column"],
                 rdef["_rel_id"], rdef["_rel_name"],
-                rdef["_rs_id"], rdef["_ris_id"])
+                rdef["_rs_id"], rdef["_ris_id"], date_part=_dp)
             if rdef.get("_rs2_id"):
                 _build_r_index(
                     rdef["_one_table"], rdef["_many_table"],
                     rdef["_one_column"], rdef["_many_column"],
                     rdef["_rel_id"], rdef["_rel_name"],
-                    rdef["_rs2_id"], rdef["_ris2_id"])
+                    rdef["_rs2_id"], rdef["_ris2_id"], date_part=_dp)
 
         # Clean up any pre-existing system tables — make them inert
         # so they don't interfere with Refresh.

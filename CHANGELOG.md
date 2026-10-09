@@ -5,6 +5,147 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.122] - 2026-10-09
+
+Calculation groups are applied (OpenBI doc 52). Also three fixes reported by OpenBI (docs 53, 54 and 55), six found while verifying them, one found by the 0.9.121 corpus census (#132), and one reported by @allanon2 (PR #123). All were checked against Power BI Desktop 2.152 over ADOMD:
+
+- all 133 date probes (DATESINPERIOD, DATEADD, SAMEPERIODLASTYEAR) match; 0.9.121 matched 41;
+- all 549 calculation-group cells of three batteries match, errors included, and all 80 item format strings read over MDX;
+- VARs are lazy and IFERROR / ISERROR react to errors only: 24 of 25 probes match, against 15;
+- all 126 RANKX cells match;
+- the date-part join matches Desktop on its own auto date/time file and on Desktop-switched relationships;
+- on the two community reports built on Microsoft's Financial Sample, 45 of 49 and 8 of 11 measures match, against 3 and 2;
+- every Desktop probe from earlier releases still matches.
+
+### Added — calculation groups are applied (issue #121)
+
+- **What was wrong:** a filter on a calculation group's column did not apply the selected item, and the SELECTEDMEASURE family was not implemented. Every measure evaluated as if the group did not exist. On Awesome Chocolates' QOQ page, `Sales Change` read 34,042,511.25, the plain Sales, where Desktop shows the quarter-over-quarter change.
+- **The definitions:**
+  - `ModelReader.calculation_groups` reads each group: its table, its item column (SourceColumn "Name", e.g. `'Time Intelligence'[Time]`), its precedence, and its items with their expressions and format-string expressions.
+  - `ModelReader.measure_format_strings` reads the measures' static and dynamic format strings.
+  - The server attaches both to the model's measures dict (`engine.set_calculation_groups`), so every evaluation over the model applies them.
+  - `evaluate_measures_batch`, `evaluate_measures_smart` and `evaluate_measure` also take `calculation_groups=` and `measure_formats=`, for a caller that builds its own model, as OpenBI does.
+- **Desktop 2.152's rules,** measured one cell per query (`build_b121.py`, `build_b121b.py`):
+  - an item applies when the filter on its group's item column lets exactly one item through, whether from a grouping, a TREATAS slicer or a CALCULATE filter. Several items, none, or a filter on another column (`CG[Ordinal] = 2`) apply nothing, and a one-item group needs the filter too;
+  - it applies once per measure reference made outside it: `S2 = [S]` under Double is 120, not 240, and Plus1 of `[S] + [S]` is 121;
+  - the item's own measure references are plain: `RefS = [S] * 10` is 600 for every measure;
+  - the group of higher precedence is the outer one: Double (0) with Add100 (10) is Add100(Double(S)) = 220. A lower group still applies to the measure references in the expression of a higher group's item: `Ref10 = [S] * 10` with Double is 1200;
+  - a CALCULATE that selects another item applies it inside. `CALCULATE([S], CG[Name] = "Plus1")` under Double is 122, while re-selecting the same item does nothing: `CALCULATE([S], CG[Name] = "Double")` under Double is 120. Sideways recursion works the same way: an item `CALCULATE(SELECTEDMEASURE(), CG[Name] = "Double")` is Double.
+- **SELECTEDMEASURE, SELECTEDMEASURENAME, ISSELECTEDMEASURE and SELECTEDMEASUREFORMATSTRING** are evaluated inside items. Outside one they raise Desktop's error ("no measure reference in the current context"). An error inside SELECTEDMEASURE() is the item's error.
+- **Format strings:** `engine.evaluate_format_strings` returns the format a selected item gives a measure, and `pbix_evaluate_dax` reports it as `format_string`. Desktop over MDX (`build_b121c.py`, cell FORMAT_STRING, the item format strings set through Desktop's own TOM):
+  - the outermost item that has a format-string expression decides; an item without one passes to the next, and then to the measure's own format;
+  - in that expression SELECTEDMEASURE() is the value being formatted, the item included: `IF(SELECTEDMEASURE() > 100, "#,0", "0.00")` on Triple of 60 is "#,0".
+- **Measured:** all 189 + 280 + 80 cells of the three batteries match Desktop, errors included, and so do all 80 format strings. On Awesome Chocolates under QOQ, `Sales Actual` (5,361,207.75), `Sales` and `Max Quarter Not Blank` match Desktop. The previous-quarter values do not yet: `Sales Previous`, and with it `Sales Change` and the CF and colour measures. Their `[Max Previous Quarter Not Blank]` needs #118, because Desktop keeps the DATEADD filter inside ALLSELECTED. They also take 95–160 s each here: a per-date FILTER of a date measure.
+- **Pinned** by `tests/test_issue121_calculation_groups.py` (200 tests) and `tests/test_issue121_calc_group_rules.py` (360). Every expected value was generated from Desktop's output. **559 fail on 0.9.121.**
+
+### Fixed — text that is no number is an error in arithmetic (issue #133)
+
+- **What was wrong:** text that is no number gave BLANK in arithmetic, where Desktop raises *Cannot convert value 'x' of type Text to type Number*. The BLANK then folded into confident numbers: Add100 over Double of a text measure answered 100, and IFERROR / ISERROR never saw an error.
+- **The fix:**
+  - `+ - * /` with such text raises Desktop's error. Numeric and date text still converts, now also with the model culture's group separator, a currency symbol, and a culture-ordered date (`"3,5" + 0` is 35 and `"$3" + 0` is 3 in en-US);
+  - unary minus converts as binary arithmetic does: `-"3"` is −3, `-TRUE()` is −1, `-DATE(2024, 1, 1)` is −45292. It raises on other text.
+- **Measured:** 30 of Desktop's 40 probes (`build_b133.py`) match; 0.9.121 matched 14. **Unchanged, and different from Desktop:**
+  - comparisons between text and a number or a Boolean (`"3" = 3` and `TRUE() = 1` raise in Desktop), because the engine compares ISO date strings internally;
+  - ABS, POWER, DIVIDE and SUMX given text.
+- **Pinned** by `tests/test_issue133_text_arithmetic.py`: 31 tests. **17 fail on 0.9.121.**
+
+### Fixed — a VAR is evaluated when it is first used (issue #134)
+
+- **What was wrong:** every VAR was evaluated up front. DAX evaluates a variable the first time it is used, in the filter context where it is defined, and never if it is not. So an unused variable that failed failed the measure: `VAR x = ERROR("boom") RETURN 5` was an error where Desktop gives 5. With #133 `"a" * 1` is such a failure. And a calculation item like Awesome Chocolates' QOQ computed all five of its period VARs for every measure, though its SWITCH uses one.
+- **The fix:** a VAR is a thunk (`_LazyVar`), forced at its first use and remembered, in the context and with the variables it was defined with. A variable's error is not caught where the variable is used: Desktop fails `VAR x = ERROR("boom") RETURN IFERROR(x, 9)`, and so does the engine.
+- **Pinned** in `tests/test_issue134_135_lazy_vars_iferror.py`: the lazy-VAR probes plus a test that a used variable is evaluated once. **4 fail on 0.9.121.**
+
+### Fixed — IFERROR / ISERROR react to errors, not to BLANK (issue #135)
+
+- **What was wrong:** IFERROR returned the fallback when its argument was BLANK, and ISERROR answered `val is None`, a rule from when the engine reported errors as BLANK. Desktop: `IFERROR(BLANK(), 5)` is BLANK, `ISERROR(BLANK())` FALSE, and `IFERROR(DIVIDE(1, BLANK()), 5)` BLANK. So a measure like `IFERROR(DIVIDE([a], [b]), 0)` read 0 where Desktop shows nothing. A division by zero, on the other hand, *is* an error there: `IFERROR(1 / 0, 5)` is 5.
+- **The fix:** both catch a raised error, an infinite or NaN result, and a referenced measure that failed. The engine still degrades such a measure to BLANK, so they count the degradations around their argument (Desktop: `IFERROR([Bad], 13)` is 13).
+- **Measured:** 24 of the 25 probes of `build_b134.py` match, lazy VARs included, against 15 on 0.9.121. The 25th, `VAR x = [Bad] RETURN x`, fails in Desktop; the engine still degrades a referenced measure's error to BLANK outside IFERROR / ISERROR.
+- **Pinned** in `tests/test_issue134_135_lazy_vars_iferror.py`: 25 tests in all. **5 fail on 0.9.121** for this issue.
+
+### Fixed — DATESINPERIOD around 29 February and month ends (issue #122)
+
+- **What was wrong:** the YEAR branch built `datetime(year + offset, month, day)`, which raised on 29 February, so a moving-annual total was BLANK that day. MONTH and QUARTER clamped the day number but did not map a month end to a month end.
+- **Desktop 2.152:** the far end shifts as DATEADD's month-end rule does, and it is exclusive:
+  - one YEAR back from 2024-02-29 is 2023-03-01..2024-02-29, 366 days;
+  - from 2025-02-28 it is 2024-03-01..2025-02-28, 365 days, because a month end maps to a month end;
+  - one YEAR forward from 2024-02-29 ends 2025-02-27;
+  - one MONTH back from 30 April is 1..30 April;
+  - one QUARTER back from 30 November starts 1 September.
+- **The fix:** MONTH, QUARTER and YEAR all shift through `_shift_date`.
+- **Pinned** by `tests/test_issue122_datesinperiod_month_ends.py`: 13 tests, 5 fail on 0.9.121.
+
+### Fixed — RANKX's order argument (issue #124)
+
+- **What was wrong:** the order was read as "DESC appears in the text", so an omitted or empty order, `0`, `FALSE` and `FALSE()` all ranked low to high.
+- **The fix:** those rank high to low, and `1`, `TRUE` and `ASC` rank low to high, as in Desktop. Any other expression is evaluated.
+- **Pinned** by `tests/test_issue124_rankx_order.py`: 60 cells, 15 fail on 0.9.121.
+
+### Fixed — RANKX with BLANK, text and dates (issue #125)
+
+- **What was wrong:** a BLANK value returned BLANK, rows whose expression was BLANK were left out, and only numbers were ranked.
+- **The fix:**
+  - BLANK counts as 0 for numbers and as `""` for text, in the value and in every row. Desktop ranks a member with no deals 5th of 6, above a −5;
+  - text ranks case-insensitively, as the formula engine compares;
+  - dates rank as their serials;
+  - a member wrapped in `IF(ISBLANK(...), BLANK(), RANKX(...))` stays BLANK.
+- **Pinned** by `tests/test_issue125_rankx_blank.py`: 54 cells, 39 fail on 0.9.121.
+
+### Fixed — a DateTime with a time of day joins by date part only across DatePartOnly (issue #126)
+
+- **What was wrong:** the two engine paths disagreed:
+  - `evaluate_per_dimension` matched exact values, so a 12:30 departure found no row of an auto date/time calendar. Briqlab's "Monthly Flight Trends" was BLANK in all 12 months;
+  - the per-value path matched date parts on every relationship.
+- **Desktop 2.152:**
+  - a relationship with `JoinOnDateBehavior` = DatePartOnly, which auto date/time writes, joins on the date. Briqlab's 300 departures all land on their months;
+  - DateAndTime, the default, joins exact values only. On a date-only calendar the times go to the blank member.
+
+  This was confirmed by switching one relationship to DatePartOnly through Desktop's own TOM and recalculating.
+- **The fix:**
+  - the reader passes `JoinOnDateBehavior` to the engine. When a `LocalDateTable_*` relationship arrives without it, DatePartOnly is assumed, since Desktop writes that on every one;
+  - a DatePartOnly hop compares date parts in its keys, its fact lookup, its blank row, multi-hop paths and the per-dimension buckets;
+  - every other join aliases a date-time to its bare date only at midnight.
+- **Pinned** by `tests/test_issue126_date_part_joins.py`: 7 tests, 6 fail on 0.9.121.
+
+### Fixed — DATEADD / SAMEPERIODLASTYEAR over a table of dates (issue #127)
+
+- **What was wrong:** only a column reference was parsed. A table expression such as `DATESBETWEEN(...)` or `FILTER(ALL('Date'[Date]), ...)` returned a marker, so COUNTROWS and MINX saw nothing, and as a CALCULATE filter the shift was dropped without a trace. `CALCULATE(COUNTROWS('Date'), DATEADD(DATESBETWEEN(… March …), -1, MONTH))` counted the whole calendar (1,096) where Desktop counts February's 29.
+- **The fix:** the table's dates are shifted as a column's visible dates are, and applied as the filter on that column.
+- **Pinned** by `tests/test_issue127_dateadd_table_arg.py`: 8 tests, all failing on 0.9.121.
+
+### Fixed — PBIXBuilder stores a DatePartOnly relationship as Desktop does (issue #128)
+
+- **What was wrong:** `add_relationship(..., join_on_date_behavior=2)` wrote the flag but stored an exact join: `RelationshipStorage.DefinitionType` 0 and an exact R$ index. Desktop reads the join from that storage, so the date part was never used, even after a full refresh.
+- **The fix:** `DefinitionType` 2, index flag 8, and an R$ index built by each key's date part. These are what Desktop's own auto date/time relationships carry.
+- **Measured:** Desktop 2.152 answers January 3, February 2 and blank 1 on the built file, and the same after a full refresh.
+- **Pinned** by `tests/test_issue128_builder_date_part_join.py`: 2 tests, both failing on 0.9.121.
+
+### Fixed — DATEADD keeps a single date's day number (issue #129)
+
+- **What was wrong:** both ends of each shifted run went through the month-end rule, so 30 April alone one MONTH back was 31 March.
+- **Desktop 2.152:**
+  - a run's start, and a single date, keep their day number, clamped: 30 Apr → 30 Mar, 29 Feb + 1 MONTH → 29 Mar, 30 Nov − 1 QUARTER → 30 Aug;
+  - only the end of a run of two or more days that closes its month moves to the target month's end: 29–30 Apr → 29–31 Mar, 30 Apr–2 May → 30 Mar–2 Apr.
+- **Pinned** by `tests/test_issue129_dateadd_month_end.py`: 22 cases. All fail on 0.9.121, whose table form returned nothing (#127); 12 cells are #129's own.
+
+### Fixed — built reports use the modern visual header (issue #130, PR #123 by @allanon2)
+
+- **What was wrong:** `PBIXBuilder` wrote report settings without `useStylableVisualContainerHeader: true` ("Use the modern visual header with updated styling options"). Desktop drew a built report's visuals in the legacy container: rendered side by side in Desktop 2.152, their content sat about 13–18 px lower than in the same report with the setting.
+- **The fix:** the builder writes the setting. All 26 Desktop-authored reports in the local corpus carry it.
+- **Credit:** reported by @allanon2 in PR #123, which made the same one-line change. Solved and verified on our side.
+- **Pinned** by `tests/test_issue130_builder_modern_header.py`, which fails on 0.9.121.
+
+### Fixed — a column whose name begins or ends with a space is found (issue #132)
+
+- **What was wrong:** Microsoft's Financial Sample names its sales column `' Sales'`, with a leading space, and its reports read it as `financials[ Sales]`. Every parse of a reference strips the bracketed name, and the column lookup then compared `'Sales'` with `' Sales'` exactly. So `SUM(financials[ Sales])` found no column. Every measure built on it was BLANK: PY Sales, MTD / QTD / YTD, MOM / QOQ / YOY and their percentages, Current Year, Current Month. Desktop gives 118,726,350.26 for Sales.
+- **The fix:**
+  - the column lookup falls back to names compared without leading or trailing spaces;
+  - a row reads its value by the model's spelling of the name;
+  - the unresolvable-reference check compares stripped names too.
+- **Measured:** Arrow Chart - Microsoft Financial Dataset matches 45 of 49 measures, against 3 on 0.9.121, and Target Line Bar Charts 8 of 11, against 2. Of the rest:
+  - `Sales PM` and `Sales MOM` are #118: Desktop keeps the DATEADD filter inside ALLSELECTED;
+  - `Max x-axis Adj` runs out of time.
+- **Pinned** by `tests/test_issue132_column_name_spaces.py`: 14 tests (aggregates, an iterator, a CALCULATE filter, FILTER, VALUES, a slicer key, and the Arrow Chart report against Desktop). **13 fail on 0.9.121.**
+
 ## [0.9.121] - 2026-10-09
 
 Two fixes reported by OpenBI (docs 50 and 51), and one found by the release's own corpus census (#131).

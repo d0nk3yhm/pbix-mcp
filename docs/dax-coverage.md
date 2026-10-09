@@ -49,7 +49,10 @@ in a query/measure context.
   `RUNNINGSUM`, `ISATLEVEL`, `LOOKUP`
 - **Calculation-group context only (4)** — evaluable only inside a
   calculation item: `SELECTEDMEASURE`, `SELECTEDMEASURENAME`,
-  `SELECTEDMEASUREFORMATSTRING`, `ISSELECTEDMEASURE`
+  `SELECTEDMEASUREFORMATSTRING`, `ISSELECTEDMEASURE`. Since 0.9.122
+  (issue #121) the engine applies calculation items and evaluates these
+  inside them, checked against Desktop cell by cell; outside an item they
+  raise Desktop's error, so the query-context probes stay classified.
 - **Engine-internal (3)** — no user-authorable argument shape exists:
   `NATURALJOINUSAGE` (*"can only be used as a value filter for
   SUMMARIZECOLUMNS"*, yet refused in that position too),

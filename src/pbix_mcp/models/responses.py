@@ -135,6 +135,11 @@ class DAXResult(BaseModel):
     # present: the engine reads an unsupported call as BLANK and carries on,
     # so a number computed past one is not to be trusted.
     unsupported_functions: list[str] | None = None
+    # The format string Power BI shows the value with when an applied
+    # calculation item's format-string expression decides it (issue #121),
+    # e.g. a "% change" item over a currency measure. None otherwise: the
+    # measure's own format string is in the model.
+    format_string: str | None = None
 
     @field_validator("value")
     @classmethod

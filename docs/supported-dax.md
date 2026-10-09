@@ -91,7 +91,8 @@ Classified out of authorable scope this batch, each from Desktop's own error:
 visual-calculation-only `LOOKUP`, `COLLAPSE`, `EXPAND`, `ISATLEVEL` (and by
 the same family `COLLAPSEALL`/`EXPANDALL`); calculation-group-context-only
 `SELECTEDMEASURE`, `ISSELECTEDMEASURE`, `SELECTEDMEASURENAME`,
-`SELECTEDMEASUREFORMATSTRING`; unresolvable `EXTERNALMEASURE`;
+`SELECTEDMEASUREFORMATSTRING` (evaluated inside calculation items since
+0.9.122, issue #121); unresolvable `EXTERNALMEASURE`;
 import-storage-unsupported `APPROXIMATEDISTINCTCOUNT`; calendar-reference
 `TOTALWTD`; auto-date-table-dependent `COLUMNSTATISTICS` (reversed in
 batch 5 — see below).

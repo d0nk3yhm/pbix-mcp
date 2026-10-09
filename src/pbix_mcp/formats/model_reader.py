@@ -196,7 +196,8 @@ class ModelReader:
 
         Returns list of dicts with keys: FromTableName, FromColumnName,
         ToTableName, ToColumnName, IsActive, CrossFilteringBehavior,
-        FromCardinality, ToCardinality.
+        FromCardinality, ToCardinality, JoinOnDateBehavior (2 = DatePartOnly,
+        what auto date/time writes: a join on the date part, issue #126).
         """
         if "relationships" in self._metadata_cache:
             return self._metadata_cache["relationships"]
@@ -217,7 +218,8 @@ class ModelReader:
                    r.IsActive,
                    r.CrossFilteringBehavior,
                    r.FromCardinality,
-                   r.ToCardinality
+                   r.ToCardinality,
+                   r.JoinOnDateBehavior
             FROM [Relationship] r
             JOIN [Column] fc ON r.FromColumnID = fc.ID
             JOIN [Table] ft ON fc.TableID = ft.ID
@@ -262,6 +264,85 @@ class ModelReader:
             dates = [c["ColumnName"] for c in cols if c["DataType"] == 9]   # AMO DataType.DateTime
             out[table] = keys[0] if len(keys) == 1 else (dates[0] if len(dates) == 1 else None)
         self._metadata_cache["date_tables"] = out
+        return dict(out)
+
+    @property
+    def calculation_groups(self) -> list[dict]:
+        """The model's calculation groups (issue #121), highest precedence
+        first: ``{"table", "column", "precedence", "items": [{"name",
+        "expression", "ordinal", "format_string"}]}``.
+
+        ``column`` is the group's item column, the one whose SourceColumn is
+        "Name" (Desktop names it after the group, e.g. 'Time Intelligence'
+        [Time]). ``format_string`` is the item's dynamic format-string
+        expression, or None.
+        """
+        if "calculation_groups" in self._metadata_cache:
+            return [dict(g) for g in self._metadata_cache["calculation_groups"]]
+        out: list[dict] = []
+        try:
+            groups = self._query_metadata("""
+                SELECT cg.ID, cg.Precedence, t.Name AS TableName, t.ID AS TableID
+                FROM [CalculationGroup] cg JOIN [Table] t ON t.ID = cg.TableID
+            """)
+            for g in groups:
+                cols = self._query_metadata(
+                    "SELECT COALESCE(c.ExplicitName, c.InferredName) AS ColumnName, c.SourceColumn "
+                    f"FROM [Column] c WHERE c.TableID = {int(g['TableID'])} AND c.Type = 1")
+                name_col = next((c["ColumnName"] for c in cols
+                                 if str(c.get("SourceColumn") or "").lower() == "name"), None)
+                if name_col is None:
+                    continue
+                try:
+                    items = self._query_metadata(
+                        "SELECT ci.Name, ci.Expression, ci.Ordinal, f.Expression AS FormatString "
+                        "FROM [CalculationItem] ci LEFT JOIN [FormatStringDefinition] f "
+                        "ON f.ID = ci.FormatStringDefinitionID AND ci.FormatStringDefinitionID != 0 "
+                        f"WHERE ci.CalculationGroupID = {int(g['ID'])} ORDER BY ci.Ordinal, ci.ID")
+                except Exception:
+                    items = self._query_metadata(
+                        "SELECT ci.Name, ci.Expression, ci.Ordinal, NULL AS FormatString "
+                        "FROM [CalculationItem] ci "
+                        f"WHERE ci.CalculationGroupID = {int(g['ID'])} ORDER BY ci.Ordinal, ci.ID")
+                out.append({
+                    "table": g["TableName"],
+                    "column": name_col,
+                    "precedence": int(g.get("Precedence") or 0),
+                    "items": [{"name": i["Name"], "expression": i["Expression"] or "",
+                               "ordinal": i.get("Ordinal"),
+                               "format_string": i.get("FormatString") or None}
+                              for i in items if i.get("Name") is not None],
+                })
+        except Exception:
+            out = []          # no calculation-group tables in this model's schema
+        out.sort(key=lambda g: -g["precedence"])
+        self._metadata_cache["calculation_groups"] = out
+        return [dict(g) for g in out]
+
+    @property
+    def measure_format_strings(self) -> dict:
+        """``{measure: {"format_string": static or None, "expression": the
+        dynamic format-string expression or None}}``: what
+        SELECTEDMEASUREFORMATSTRING() returns for a measure (issue #121)."""
+        if "measure_format_strings" in self._metadata_cache:
+            return dict(self._metadata_cache["measure_format_strings"])
+        out: dict = {}
+        try:
+            try:
+                rows = self._query_metadata(
+                    "SELECT m.Name, m.FormatString, f.Expression AS Dynamic FROM [Measure] m "
+                    "LEFT JOIN [FormatStringDefinition] f ON f.ID = m.FormatStringDefinitionID "
+                    "AND m.FormatStringDefinitionID != 0")
+            except Exception:
+                rows = self._query_metadata(
+                    "SELECT m.Name, m.FormatString, NULL AS Dynamic FROM [Measure] m")
+            for r in rows:
+                if r.get("FormatString") or r.get("Dynamic"):
+                    out[r["Name"]] = {"format_string": r.get("FormatString") or None,
+                                      "expression": r.get("Dynamic") or None}
+        except Exception:
+            out = {}
+        self._metadata_cache["measure_format_strings"] = out
         return dict(out)
 
     @property

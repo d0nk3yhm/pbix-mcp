@@ -767,7 +767,11 @@ class TestDatesAreNumbers:
         assert abs(got - 3796149882403.333) < 1e-3
 
     def test_a_plain_word_is_still_not_a_number(self):
-        assert self._ev('"hello" * 2') is None
+        # Not a number, and not a BLANK either: Desktop raises "Cannot
+        # convert value 'hello' of type Text to type Number" (issue #133).
+        from pbix_mcp.errors import DAXEvaluationError
+        with pytest.raises(DAXEvaluationError, match="Cannot convert value 'hello'"):
+            self._ev('"hello" * 2')
 
 
 class TestFormatPictures:

@@ -13267,7 +13267,7 @@ def _relationships_from_metadata(conn) -> list:
         "       tt.Name AS tt, "
         "       COALESCE(tc.ExplicitName, tc.InferredName) AS tc, "
         "       r.IsActive, r.CrossFilteringBehavior, "
-        "       r.FromCardinality, r.ToCardinality "
+        "       r.FromCardinality, r.ToCardinality, r.JoinOnDateBehavior "
         "FROM Relationship r "
         "JOIN [Table] ft ON r.FromTableID = ft.ID "
         "JOIN [Column] fc ON r.FromColumnID = fc.ID "
@@ -13280,6 +13280,7 @@ def _relationships_from_metadata(conn) -> list:
         "CrossFilteringBehavior": r["CrossFilteringBehavior"] or 1,
         "FromCardinality": r["FromCardinality"] or 2,
         "ToCardinality": r["ToCardinality"] or 1,
+        "JoinOnDateBehavior": r["JoinOnDateBehavior"] or 1,
     } for r in rows]
 
 
@@ -13792,6 +13793,9 @@ def _get_dax_context(alias: str) -> dict:
             # (none for many-to-many, both sides of a 1:1 -- issue #82).
             'FromCardinality': r.get('FromCardinality') or 2,
             'ToCardinality': r.get('ToCardinality') or 1,
+            # 2 = DatePartOnly (auto date/time): the join compares date parts,
+            # so a 12:30 departure lands on its day (issue #126).
+            'JoinOnDateBehavior': r.get('JoinOnDateBehavior') or 1,
         })
 
     # Load all user-facing tables
@@ -13870,9 +13874,22 @@ def _get_dax_context(alias: str) -> dict:
     except Exception:
         pass
 
+    # Calculation groups (issue #121) travel with the measures dict, so every
+    # evaluation over this model applies the selected calculation items.
+    calculation_groups: list = []
+    try:
+        from pbix_mcp.dax import engine as _dax_engine
+        calculation_groups = model.calculation_groups
+        _dax_engine.set_calculation_groups(measure_defs, calculation_groups,
+                                           model.measure_format_strings)
+    except Exception:
+        logger.debug("calculation groups not read", exc_info=True)
+
     ctx = {
         'tables': tables,
         'measure_defs': measure_defs,
+        # ModelReader.calculation_groups, highest precedence first (#121)
+        'calculation_groups': calculation_groups,
         'measure_tables': measure_tables,
         # name -> declared Measure.DataType AMO code (issue #40)
         'measure_types': measure_types,
@@ -14258,6 +14275,19 @@ def pbix_evaluate_dax(
             selected_filters=selected,
             date_tables=ctx.get('date_tables'),
         )
+        # A selected calculation item's format-string expression decides the
+        # format its values are shown with (issue #121).
+        item_formats: dict = {}
+        if ctx.get('calculation_groups'):
+            item_formats = dax_engine.evaluate_format_strings(
+                measure_names, ctx['tables'], ctx['measure_defs'], fc,
+                ctx['date_table'], ctx['date_column'], ctx.get('relationships'),
+                group_keys=group_keys or None,
+                selected_filters=(selected if selected is not None or not group_keys else
+                                  {k: v for k, v in (fc or {}).items() if k not in group_keys}),
+                culture=ctx.get('culture'), date_tables=ctx.get('date_tables'),
+                measure_tables=ctx.get('measure_tables'),
+                model_columns=ctx.get('model_columns'))
 
         # Build structured response with DAXResult objects
         unsupported = set(dax_engine._engine.unsupported_functions)
@@ -14286,7 +14316,8 @@ def pbix_evaluate_dax(
                         and isinstance(val, float) and val.is_integer()):
                     val = int(val)
                 dax_results.append(DAXResult(name=name, value=val, status="ok",
-                                             unsupported_functions=_unsupported_of(name)))
+                                             unsupported_functions=_unsupported_of(name),
+                                             format_string=item_formats.get(name)))
             elif name in timed_out:
                 # NOT a blank: the evaluation was abandoned on the wall-clock
                 # budget. Reporting it as blank made "no value" and "we ran out

@@ -45,7 +45,9 @@ import time
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
-from typing import Any, Optional
+from typing import AbstractSet, Any, Optional
+
+from pbix_mcp.errors import DAXEvaluationError as _DAXEvaluationError
 
 # Sentinel returned by _eval_binary to mean "this expression is NOT a binary
 # expression" — distinct from a genuine BLANK (None) result of an operation such
@@ -348,6 +350,44 @@ def _culture_seps(culture):
     if key in _CULTURE_SEPS_BY_REGION:
         return _CULTURE_SEPS_BY_REGION[key]
     return _CULTURE_SEPS_BY_LANG.get(key.split("-")[0], (",", "."))
+
+
+_CURRENCY_CHARS = "$€£¥"
+
+
+def _arith_text_number(s: str, culture=None):
+    """Text in arithmetic as Desktop's formula engine converts it, where
+    _as_number gives up: the culture's group separator and a currency symbol
+    are accepted, and a non-ISO date follows the culture's day/month order.
+    Desktop 2.152 (en-US model): "3,5" + 0 is 35, "$3" + 0 is 3, and
+    "01/02/2024" + 1 is 45294 (2 January). None for text that is no number
+    (issue #133)."""
+    t = s.strip()
+    if not t:
+        return None
+    group, dec = _culture_seps(culture)
+    u = t
+    if u[:1] in _CURRENCY_CHARS:
+        u = u[1:].strip()
+    elif u[-1:] in _CURRENCY_CHARS:
+        u = u[:-1].strip()
+    u = u.replace(group, '').replace(' ', '') if group else u
+    if dec != '.':
+        u = u.replace(dec, '.')
+    try:
+        return float(u)
+    except ValueError:
+        pass
+    m = re.fullmatch(r'(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})', t)
+    if m:
+        a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        key = str(culture or 'en-US').lower().replace('_', '-')
+        month, day = (a, b) if key in ('en-us', 'en') else (b, a)
+        try:
+            return float((date(y, month, day) - date(1899, 12, 30)).days)
+        except ValueError:
+            return None
+    return None
 
 
 def _fmt_split_sections(fmt: str) -> list:
@@ -978,6 +1018,53 @@ def _as_datetime(v):
     return None
 
 
+def _midnight_date(v):
+    """v's date when v is a date, or a date-time AT MIDNIGHT (a string
+    included), else None. An exact join may equate a midnight date-time with
+    its bare date -- the same moment -- but never another time of that day:
+    Power BI Desktop 2.152 joins a 12:30 departure to no row of a date-only
+    calendar through a DateAndTime relationship (issue #126)."""
+    if isinstance(v, datetime):
+        return None if (v.hour or v.minute or v.second or v.microsecond) else v.date()
+    if isinstance(v, date):
+        return v
+    if isinstance(v, str):
+        m = _as_moment_str(v.strip())
+        if m is None or m.hour or m.minute or m.second or m.microsecond:
+            return None
+        return m.date()
+    return None
+
+
+_DP_PREFIX = 'dp:'
+
+
+class _DatePartKeys(frozenset):
+    """A cross filter's keys across a DatePartOnly relationship: date parts
+    ('dp:YYYY-MM-DD', plus 'None' for the blank row). See _date_part_key."""
+
+
+def _date_part_key(v):
+    """A join value's DATE PART, as a JoinOnDateBehavior = DatePartOnly
+    relationship compares it -- the one Power BI writes for auto date/time --
+    or None when v is no date. Desktop 2.152 joins every time of a day to that
+    day's row through it (issue #126)."""
+    d = _as_date(v)
+    if d is None and isinstance(v, (int, float)) and not isinstance(v, bool):
+        dt = _as_datetime(v)
+        d = dt.date() if dt is not None else None
+    return _DP_PREFIX + d.isoformat() if d is not None else None
+
+
+def _key_in(v, allowed) -> bool:
+    """Does a join cell match a cross filter's key set? By date part across a
+    DatePartOnly relationship, by its str() spelling otherwise."""
+    if isinstance(allowed, _DatePartKeys):
+        k = _date_part_key(v) if v is not None else 'None'
+        return (k or str(v)) in allowed
+    return str(v) in allowed
+
+
 def _join_key_aliases(v) -> set:
     """Every spelling a relationship join key can legitimately arrive in.
 
@@ -995,7 +1082,8 @@ def _join_key_aliases(v) -> set:
     if isinstance(v, (datetime, date)) and not isinstance(v, bool):
         dt = v if isinstance(v, datetime) else datetime(v.year, v.month, v.day)
         out.add(dt.isoformat())
-        out.add(dt.date().isoformat())
+        if _midnight_date(dt) is not None:      # never another time of the day (#126)
+            out.add(dt.date().isoformat())
         serial = _dax_serial(dt)
         if serial == int(serial):
             out.add(str(int(serial)))
@@ -1005,7 +1093,8 @@ def _join_key_aliases(v) -> set:
         if dt is not None:
             out.add(str(dt))
             out.add(dt.isoformat())
-            out.add(dt.date().isoformat())
+            if _midnight_date(dt) is not None:
+                out.add(dt.date().isoformat())
         if isinstance(v, float) and v == int(v):
             out.add(str(int(v)))
         elif isinstance(v, int):
@@ -1303,6 +1392,54 @@ _SHARED_FILTER_CACHE_MAX = 4
 _CACHE_LOCK = threading.Lock()
 
 
+# ---------------------------------------------------------------------------
+# Calculation groups (issue #121)
+# ---------------------------------------------------------------------------
+# A model's calculation groups travel with its MEASURES dict: every context
+# over the model -- including the ones a dozen construction sites derive
+# without copying attributes -- carries that same dict, so registering the
+# groups against its identity reaches all of them (as _shared_filter_cache
+# does for the filter caches).
+class _CalcGroup:
+    """One calculation group as the engine applies it."""
+    __slots__ = ('table', 'column', 'precedence', 'items', 'by_name', 'key')
+
+    def __init__(self, spec: dict):
+        self.table = str(spec['table'])
+        self.column = str(spec.get('column') or 'Name')
+        self.precedence = int(spec.get('precedence') or 0)
+        self.items = [dict(i) for i in (spec.get('items') or [])
+                      if i.get('name') is not None]
+        self.by_name = {str(i['name']).lower(): i for i in self.items}
+        self.key = self.table.lower()
+
+
+_CALC_GROUPS: dict = {}       # id(measures) -> (measures, groups, measure formats)
+_CALC_GROUPS_MAX = 64
+
+
+def set_calculation_groups(measures: dict, groups, measure_formats: dict | None = None) -> None:
+    """Attach a model's calculation groups (ModelReader.calculation_groups)
+    and its measures' format strings (ModelReader.measure_format_strings) to
+    its measures dict. Evaluations over that dict then apply the selected
+    calculation items; ``groups`` empty or None detaches them."""
+    with _CACHE_LOCK:
+        _CALC_GROUPS.pop(id(measures), None)
+        if groups or measure_formats:
+            if len(_CALC_GROUPS) >= _CALC_GROUPS_MAX:
+                _CALC_GROUPS.pop(next(iter(_CALC_GROUPS)), None)
+            gs = sorted((g if isinstance(g, _CalcGroup) else _CalcGroup(g)
+                         for g in (groups or [])), key=lambda g: -g.precedence)
+            _CALC_GROUPS[id(measures)] = (measures, tuple(gs), dict(measure_formats or {}))
+
+
+def _calc_registry(measures) -> tuple:
+    hit = _CALC_GROUPS.get(id(measures))
+    if hit is not None and hit[0] is measures:
+        return hit[1], hit[2]
+    return (), {}
+
+
 # Relationship sets seen so far -> a small id (see DAXContext._rels_sig).
 _RELS_SIG_IDS: dict = {}
 
@@ -1322,7 +1459,8 @@ def _relationship_indexes(relationships: list) -> tuple:
     reused. USERELATIONSHIP / CROSSFILTER build a NEW list, so they get their
     own entry.
 
-    Returns (rel_index, rel_dir, rel_adj, one_side_of, rels_sig, expand_adj).
+    Returns (rel_index, rel_dir, rel_adj, one_side_of, rels_sig, expand_adj,
+    date_part_joins).
     """
     hit = _REL_INDEX_CACHE.get(id(relationships))
     if hit is not None and hit[0] is relationships:
@@ -1411,14 +1549,28 @@ def _relationship_indexes(relationships: list) -> tuple:
             (r.get('FromTable'), r.get('FromColumn'), r.get('ToTable'),
              r.get('ToColumn'), r.get('IsActive'),
              r.get('CrossFilteringBehavior'), r.get('FromCardinality'),
-             r.get('ToCardinality'))
+             r.get('ToCardinality'), r.get('JoinOnDateBehavior'))
             for r in relationships)
         with _CACHE_LOCK:
             rels_sig = _RELS_SIG_IDS.setdefault(sig, len(_RELS_SIG_IDS))
     except (AttributeError, TypeError):
         rels_sig = None
+    # The joins that compare DATE PARTS (JoinOnDateBehavior = 2, DatePartOnly),
+    # both orientations, as (table, column, other table, other column) --
+    # Power BI writes it for auto date/time (issue #126).
+    date_part: set = set()
+    for rel in relationships:
+        jod = rel.get('JoinOnDateBehavior')
+        if jod is None and any(str(rel.get(k) or '').startswith('LocalDateTable_')
+                               for k in ('ToTable', 'FromTable')):
+            jod = 2     # not given: Desktop writes DatePartOnly on every auto date/time join
+        if rel.get('IsActive') and jod == 2:
+            ft, fc = rel.get('FromTable', ''), rel.get('FromColumn', '')
+            tt, tc = rel.get('ToTable', ''), rel.get('ToColumn', '')
+            date_part.add((ft, fc, tt, tc))
+            date_part.add((tt, tc, ft, fc))
     out = (rel_index, rel_dir, rel_adj, one_side_of, rels_sig,
-           {t: frozenset(v) for t, v in expand_adj.items()})
+           {t: frozenset(v) for t, v in expand_adj.items()}, frozenset(date_part))
     with _CACHE_LOCK:
         if len(_REL_INDEX_CACHE) >= _REL_INDEX_CACHE_MAX:
             _REL_INDEX_CACHE.pop(next(iter(_REL_INDEX_CACHE)), None)
@@ -1598,6 +1750,54 @@ def _substitute_row_refs(expr: str, table_name: str, row_item: dict) -> str:
     return out
 
 
+class _VarEvalError(_DAXEvaluationError):
+    """A variable's expression failed. Desktop does not let IFERROR / ISERROR
+    at the use site catch it: VAR x = ERROR("boom") RETURN IFERROR(x, 9) fails
+    (build_b134.py, issue #134). Carries the original error."""
+
+    def __init__(self, original: BaseException):
+        super().__init__(getattr(original, 'message', None) or str(original))
+        self.original = original
+
+
+class _LazyVar:
+    """A VAR, evaluated the first time it is used, in the filter context and
+    with the variables it was defined with. Desktop 2.152 (build_b134.py,
+    issue #134): VAR x = ERROR("boom") RETURN 5 is 5, IF(FALSE(), x, 6) is 6,
+    and VAR x = SUM(T[v]) RETURN CALCULATE(x, T[c] = "a") is the whole 60."""
+    __slots__ = ('expr', 'ctx', 'scope', 'state', 'value')
+
+    def __init__(self, expr: str, ctx, scope: dict):
+        self.expr, self.ctx, self.scope = expr, ctx, scope
+        self.state = 0           # 0 pending, 1 running, 2 done, 3 failed
+        self.value: Any = None
+
+    def force(self, engine) -> Any:
+        if self.state == 2:
+            return self.value
+        if self.state == 3:
+            raise self.value
+        if self.state == 1:
+            from pbix_mcp.errors import DAXEvaluationError
+            raise DAXEvaluationError(f"Variable expression '{self.expr[:60]}' refers to itself")
+        self.state = 1
+        prev = engine._current_var_scope
+        engine._current_var_scope = self.scope
+        try:
+            self.value = engine._eval_expr(self.expr, self.ctx, self.scope)
+            self.state = 2
+            return self.value
+        except Exception as exc:
+            if getattr(exc, "_pbix_deadline", False):
+                self.state = 0
+                raise
+            err = exc if isinstance(exc, _VarEvalError) else _VarEvalError(exc)
+            self.state, self.value = 3, err
+            raise err from exc
+        finally:
+            engine._current_var_scope = prev
+
+
 class GroupByValues(list):
     """A filter_context In-set that came from the QUERY'S GROUPING (a row of a
     SUMMARIZECOLUMNS / visual axis), not from a slicer or a CALCULATE filter.
@@ -1767,7 +1967,8 @@ class DAXContext:
         # Relationship lookups (see _relationship_indexes), shared by every
         # context over the same relationship list.
         (self._rel_index, self._rel_dir, self._rel_adj, self._one_side_of,
-         self._rels_sig, self._expand_adj) = _relationship_indexes(self.relationships)
+         self._rels_sig, self._expand_adj,
+         self._date_part_joins) = _relationship_indexes(self.relationships)
 
     # ---- DAX's blank (unknown) row -------------------------------------------
     # When a relationship joins a row whose key matches no row of the one side
@@ -1844,6 +2045,23 @@ class DAXContext:
             hit = self._filter_idx_cache[key] = frozenset(acc)
         return hit
 
+    def _date_part_key_set(self, table_name: str, col_name: str) -> frozenset:
+        """Every DATE PART in table_name[col_name] ('dp:...', 'None' for a
+        blank), memoized: the keys a DatePartOnly join matches (issue #126)."""
+        tbl = self.tables.get(table_name)
+        if not tbl:
+            return frozenset()
+        idx = self._find_col_idx(tbl['columns'], col_name)
+        if idx < 0:
+            return frozenset()
+        key = (id(tbl), 'dp-keys', idx)
+        hit = self._filter_idx_cache.get(key)
+        if hit is None:
+            hit = self._filter_idx_cache[key] = frozenset(
+                (_date_part_key(r[idx]) or str(r[idx])) if r[idx] is not None else 'None'
+                for r in tbl['rows'])
+        return hit
+
     def _has_unmatched_keys(self, many_table, many_col, one_table, one_col) -> bool:
         mtbl = self.tables.get(many_table)
         if not mtbl or not self.tables.get(one_table):
@@ -1851,21 +2069,31 @@ class DAXContext:
         mi = self._find_col_idx(mtbl['columns'], many_col)
         if mi < 0:
             return False
+        if (many_table, many_col, one_table, one_col) in self._date_part_joins:
+            dp_keys = self._date_part_key_set(one_table, one_col)
+            return any(not _key_in(r[mi], _DatePartKeys(dp_keys)) for r in mtbl['rows'])
         keys = self._key_aliases(one_table, one_col)
         return any(str(r[mi]) not in keys for r in mtbl['rows'])
 
     def _unmatched_key_strs(self, many_table: str, many_idx: int,
                             one_table: str, one_col: str) -> frozenset:
         """The many side's keys that reach one_table's blank row, plus 'None'
-        (a blank key), as the str() spellings a cross filter holds."""
+        (a blank key), as the str() spellings a cross filter holds -- date
+        parts across a DatePartOnly join."""
         mtbl = self.tables.get(many_table)
         if not mtbl:
             return frozenset({'None'})
         key = (id(mtbl), 'unmatched', many_idx, one_table, one_col)
         hit = self._filter_idx_cache.get(key)
         if hit is None:
-            keys = self._key_aliases(one_table, one_col)
-            out = {str(r[many_idx]) for r in mtbl['rows']}
+            many_col = mtbl['columns'][many_idx] if many_idx < len(mtbl['columns']) else None
+            if (many_table, many_col, one_table, one_col) in self._date_part_joins:
+                keys = self._date_part_key_set(one_table, one_col)
+                out = {(_date_part_key(r[many_idx]) or str(r[many_idx]))
+                       if r[many_idx] is not None else 'None' for r in mtbl['rows']}
+            else:
+                keys = self._key_aliases(one_table, one_col)
+                out = {str(r[many_idx]) for r in mtbl['rows']}
             hit = self._filter_idx_cache[key] = frozenset(
                 {k for k in out if k not in keys} | {'None'})
         return hit
@@ -1920,7 +2148,7 @@ class DAXContext:
         return row
 
     def _hop_keys(self, cur_name: str, cur_rows: list, cur_blank: bool,
-                  cur_idx: int, nxt_name: str, nxt_idx: int) -> set:
+                  cur_idx: int, nxt_name: str, nxt_idx: int) -> AbstractSet[str]:
         """The keys of nxt_name[nxt_idx] that the filtered rows of cur_name
         select across one relationship, blank row included.
 
@@ -1930,21 +2158,33 @@ class DAXContext:
         side's blank row is selected when a surviving row's key matches
         nothing. Either way the blank row travels as 'None'.
         """
-        allowed: set = set()
-        for r in cur_rows:
-            allowed |= _join_key_aliases(r[cur_idx])
         cur_tbl = self.tables.get(cur_name) or {}
         nxt_tbl = self.tables.get(nxt_name) or {}
         cur_col = (cur_tbl.get('columns') or [None])[cur_idx] if cur_tbl else None
         nxt_col = (nxt_tbl.get('columns') or [None])[nxt_idx] if nxt_tbl else None
+        date_part = (cur_name, cur_col, nxt_name, nxt_col) in self._date_part_joins
+        allowed: set = set()
+        for r in cur_rows:
+            if date_part:
+                # A DatePartOnly join (auto date/time): the next table's rows
+                # of the same DAY, whatever their time (issue #126).
+                v = r[cur_idx]
+                allowed.add((_date_part_key(v) or str(v)) if v is not None else 'None')
+            else:
+                allowed |= _join_key_aliases(r[cur_idx])
         if (nxt_name, cur_name) in self._one_side_of:
             if cur_blank and cur_col is not None:
                 allowed |= self._unmatched_key_strs(nxt_name, nxt_idx, cur_name, cur_col)
         elif nxt_col is not None and nxt_name in self.blank_row_tables():
-            keys = self._key_aliases(nxt_name, nxt_col)
-            if cur_blank or any(str(r[cur_idx]) not in keys for r in cur_rows):
+            if date_part:
+                dp_keys = _DatePartKeys(self._date_part_key_set(nxt_name, nxt_col))
+                missing = any(not _key_in(r[cur_idx], dp_keys) for r in cur_rows)
+            else:
+                keys = self._key_aliases(nxt_name, nxt_col)
+                missing = any(str(r[cur_idx]) not in keys for r in cur_rows)
+            if cur_blank or missing:
                 allowed.add('None')
-        return allowed
+        return _DatePartKeys(allowed) if date_part else allowed
 
     @staticmethod
     def _auto_detect_date_table(tables: dict, relationships: list | None = None) -> str:
@@ -2005,6 +2245,15 @@ class DAXContext:
         norm = col_name.lower().replace('-', '_').replace(' ', '_')
         for i, c in enumerate(cols):
             if c.lower().replace('-', '_').replace(' ', '_') == norm:
+                return i
+        # A model column may begin or end with a space -- Microsoft's Financial
+        # Sample has ' Sales', read as financials[ Sales] -- while every parse
+        # of a reference strips the bracketed name. Matching exactly found no
+        # column, so SUM(financials[ Sales]) and all 47 measures built on it
+        # were BLANK where Desktop answers 118,726,350.26 (issue #132).
+        bare = col_name.strip().lower()
+        for i, c in enumerate(cols):
+            if c.strip().lower() == bare:
                 return i
         return -1
 
@@ -2381,7 +2630,7 @@ class DAXContext:
                 # Final hop: emit the filter for the fact table (empty set is OK).
                 return (allowed_keys, nxt_idx)
             # Intermediate hop: restrict the next table's rows and continue.
-            frontier_rows = [r for r in nxt_tbl['rows'] if str(r[nxt_idx]) in allowed_keys]
+            frontier_rows = [r for r in nxt_tbl['rows'] if _key_in(r[nxt_idx], allowed_keys)]
             cur_blank = (nxt_name in self.blank_row_tables()
                          and 'None' in allowed_keys)
             frontier_tbl = nxt_tbl
@@ -2519,8 +2768,11 @@ class DAXContext:
                     acc.setdefault(sv, []).append(i)
                     # STRICT parse (issue #42): a compound key with a date
                     # PREFIX must not alias to the bare date, or every key
-                    # sharing that prefix merges into one bucket.
-                    dv = _as_date_strict(v)
+                    # sharing that prefix merges into one bucket. And only a
+                    # MIDNIGHT value is its bare date: a 12:30 departure is not
+                    # that day's key through an exact join (issue #126; a
+                    # DatePartOnly join uses _date_part_index_map instead).
+                    dv = _midnight_date(v)
                     if dv is not None:
                         iso = dv.isoformat()
                         if iso != sv:
@@ -2531,6 +2783,22 @@ class DAXContext:
             vmap = {k: frozenset(v) for k, v in acc.items()}
             self._filter_idx_cache[key] = vmap
         return vmap
+
+    def _date_part_index_map(self, tbl: dict, col_idx: int) -> dict:
+        """``{date part key: frozenset(row indices)}`` for one column -- the
+        lookup across a DatePartOnly join, where every time of a day is that
+        day ('dp:YYYY-MM-DD'; a blank cell is 'None'). Issue #126."""
+        key = (id(tbl), 'dpmap', col_idx)
+        dmap = self._filter_idx_cache.get(key)
+        if dmap is None:
+            acc: dict = {}
+            for i, row in enumerate(tbl['rows']):
+                v = row[col_idx]
+                k = (_date_part_key(v) or str(v)) if v is not None else 'None'
+                acc.setdefault(k, []).append(i)
+            dmap = {k: frozenset(v) for k, v in acc.items()}
+            self._filter_idx_cache[key] = dmap
+        return dmap
 
     def _indices_for_values(self, tbl: dict, col_idx: int, allowed):
         """Row indices matching an In-SET filter, via the column's value map --
@@ -2544,13 +2812,21 @@ class DAXContext:
         """
         if isinstance(allowed, dict):
             return None
+        if isinstance(allowed, _DatePartKeys):
+            # Across a DatePartOnly join the keys ARE date parts (issue #126).
+            dmap = self._date_part_index_map(tbl, col_idx)
+            found = [dmap[k] for k in allowed if k in dmap]
+            if not found:
+                return frozenset()
+            return found[0] if len(found) == 1 else frozenset().union(*found)
         values = allowed if isinstance(allowed, (list, tuple, set, frozenset)) \
             else [allowed]
         vmap = self._value_index_map(tbl, col_idx)
         keys = set()
         for v in values:
             keys.add(str(v))
-            dv = _as_date_strict(v)  # strict: no date-prefix aliasing (#42)
+            # strict: no date-prefix aliasing (#42); midnight only (#126)
+            dv = _midnight_date(v)
             if dv is not None:
                 keys.add(dv.isoformat())
             # Numeric alternates (issue #39): the map is keyed str(cell), and
@@ -2955,6 +3231,14 @@ class DAXEngine:
         self._deadline = None
         self._eval_depth = 0
         self._time_counter = 0
+        # Calculation groups (issue #121): group -> the selection whose item
+        # was applied on the current evaluation path, and the measures the
+        # items being evaluated apply to (SELECTEDMEASURE's measure).
+        self._cg_applied: dict = {}
+        self._cg_frames: list[str] = []
+        # Measure errors degraded to BLANK so far: IFERROR / ISERROR compare it
+        # before and after their argument (issue #135).
+        self._nested_errors = 0
         # Bare `[Column]` -> owning table, memoized per model (see
         # _resolve_bare_column): the lookup scans every table's column list and
         # runs inside per-row iteration.
@@ -3399,10 +3683,17 @@ class DAXEngine:
             'RELATED': self._fn_related,
             'RELATEDTABLE': self._fn_relatedtable,
             'CROSSFILTER': self._fn_crossfilter,
+            # --- Calculation groups (issue #121) ---
+            'SELECTEDMEASURE': self._fn_selectedmeasure,
+            'SELECTEDMEASURENAME': self._fn_selectedmeasurename,
+            'ISSELECTEDMEASURE': self._fn_isselectedmeasure,
+            'SELECTEDMEASUREFORMATSTRING': self._fn_selectedmeasureformatstring,
         }
 
-    def evaluate_measure(self, measure_name: str, ctx: DAXContext) -> Any:
-        """Evaluate a named measure in the given context."""
+    def evaluate_measure(self, measure_name: str, ctx: DAXContext,
+                         propagate: bool = False) -> Any:
+        """Evaluate a named measure in the given context. An error inside a
+        nested measure degrades it to BLANK, unless ``propagate``."""
         # DAX identifiers are CASE-INSENSITIVE. Canonicalize to the model's own
         # spelling before anything else, so the cache key, the circular-reference
         # stack and the definition lookup all agree.
@@ -3421,6 +3712,17 @@ class DAXEngine:
                 if _name.lower() == lowered:
                     measure_name = _name
                     break
+        # Calculation groups (issue #121): the selected item of highest
+        # precedence that this evaluation path has not applied yet replaces
+        # the reference with its own expression (see _cg_chain).
+        _cg = None
+        _cg_sig: tuple = ()
+        _groups = _calc_registry(ctx.measures)[0]
+        if _groups and measure_name in ctx.measures:
+            _chain = self._cg_chain(_groups, ctx)
+            if _chain:
+                _cg = _chain[0]
+                _cg_sig = tuple((g.key, str(i['name']).lower()) for g, i, _s in _chain)
         # Check cache
         try:
             # A filter value is a list (In-set) or a dict (structured
@@ -3442,12 +3744,16 @@ class DAXEngine:
             # Filters the measure provably cannot see are not part of the key
             # (_shielded_keys): "the last week with sales" called once per
             # date row is then evaluated once.
-            _skip = self._shielded_keys(measure_name, ctx) if ctx.filter_context else ()
+            _skip = (self._shielded_keys(measure_name, ctx)
+                     if ctx.filter_context and not _cg_sig else ())
             fc_key = tuple(sorted(
                 (k, _fc_part(v)) for k, v in ctx.filter_context.items()
                 if k not in _skip
             )) if ctx.filter_context else ()
-            cache_key = (measure_name, fc_key)
+            # Under the same filters, a reference whose item applies and one
+            # whose item is already applied (inside the item, or nested in the
+            # measure) have different values: the items are part of the key.
+            cache_key = (measure_name, fc_key) + ((_cg_sig,) if _cg_sig else ())
         except Exception:
             cache_key = None
         if cache_key and cache_key in ctx._measure_cache:
@@ -3459,18 +3765,24 @@ class DAXEngine:
                 self._note_unsupported(*_fns, measure=measure_name)
             return ctx._measure_cache[cache_key]
 
-        # Prevent circular references
-        if measure_name in ctx._eval_stack:
+        # Prevent circular references. An applied item evaluates the same
+        # measure again through SELECTEDMEASURE(), so it has a token of its own.
+        _token: Any = measure_name if _cg is None else (measure_name, _cg[0].key)
+        if _token in ctx._eval_stack:
             from pbix_mcp.errors import DAXEvaluationError
             raise DAXEvaluationError(f"Circular reference detected: '{measure_name}' references itself")
         if not ctx._eval_stack:
             ctx._eval_calls = 0   # reset budget for each outermost measure
-        ctx._eval_stack.add(measure_name)
+        ctx._eval_stack.add(_token)
 
         expr = ctx.measures.get(measure_name)
         if expr is None:
-            ctx._eval_stack.discard(measure_name)
+            ctx._eval_stack.discard(_token)
             return None
+        if _cg is not None:
+            # The item's expression stands in for the measure; its
+            # SELECTEDMEASURE() is this measure with the remaining items.
+            expr = _cg[1].get('expression') or 'SELECTEDMEASURE()'
         # Resolve auto date/time hierarchy accessors once, here, so every
         # downstream consumer -- including the ones that regex the raw argument
         # text (_fn_dateadd, _fn_all) rather than evaluating it -- sees a plain
@@ -3502,6 +3814,11 @@ class DAXEngine:
         self._home_tables.append(ctx.measure_tables.get(measure_name))
         _hit: set = set()
         self._measure_path.append((measure_name, _hit))
+        _cg_prev = None
+        if _cg is not None:
+            _cg_prev = self._cg_applied.get(_cg[0].key)
+            self._cg_applied[_cg[0].key] = _cg[2]
+            self._cg_frames.append(measure_name)
         try:
             result = _scalarize(self._eval_expr(expr.strip(), ctx))
             if cache_key:
@@ -3519,18 +3836,30 @@ class DAXEngine:
                 if self._eval_depth > 1:
                     raise
                 self.timed_out.add(measure_name)
+            elif propagate and self._eval_depth > 1:
+                # SELECTEDMEASURE(): the item's own measure reference, so its
+                # error is the item's error (Desktop: Add100 over Double of
+                # "x" fails; as a BLANK it read 100).
+                raise
             else:
                 # Record WHY before degrading, so the tool layer can report
                 # status "error" instead of a blank indistinguishable from a
                 # legitimate BLANK (ledger issues-7).
                 self.eval_errors.setdefault(measure_name, str(_exc))
+                self._nested_errors += 1
             # Graceful degradation
             return None
         finally:
             ctx._outer_ctx = _prev_outer
             self._home_tables.pop()
             self._measure_path.pop()
-            ctx._eval_stack.discard(measure_name)
+            if _cg is not None:
+                self._cg_frames.pop()
+                if _cg_prev is None:
+                    self._cg_applied.pop(_cg[0].key, None)
+                else:
+                    self._cg_applied[_cg[0].key] = _cg_prev
+            ctx._eval_stack.discard(_token)
             self._eval_depth -= 1
             if self._eval_depth == 0:
                 self._deadline = None
@@ -3544,6 +3873,140 @@ class DAXEngine:
             self.unsupported_by_measure.setdefault(m, set()).update(funcs)
         if measure is not None:
             self.unsupported_by_measure.setdefault(measure, set()).update(funcs)
+
+    # ---- calculation groups (issue #121) ------------------------------------
+    # Power BI Desktop 2.152 over ADOMD, one cell per query (build_b121.py,
+    # build_b121b.py; T(c, v) = a 10, b 20, c 30, S = SUM(T[v])):
+    #   * an item applies when the filter context selects exactly ONE item of
+    #     its group: by grouping, a TREATAS slicer or a CALCULATE filter.
+    #     Several items, or none, apply nothing;
+    #   * it applies once per measure reference made outside it. S2 = [S] is
+    #     Double(S2) = 120, not 240, and Plus1 of SS = [S] + [S] is 121;
+    #   * the item's own measure references are plain: RefS = [S] * 10 is 600
+    #     for every measure;
+    #   * an inline aggregation is no measure reference: SUM(T[v]) in the query
+    #     stays 60, while CALCULATE([S]) and SUMX(VALUES(T[c]), [S]) are
+    #     affected (Plus1: 61, and 63 = 11 + 21 + 31);
+    #   * the group of higher precedence is the outer one: Double (0) with
+    #     Add100 (10) is Add100(Double(S)) = 220, and Plus1 with Neg is -61.
+    # build_b121b.py adds:
+    #   * only a filter on the ITEM column selects: CG[Ordinal] = 2 leaves
+    #     every measure plain, although SELECTEDVALUE(CG[Name]) is "Plus1";
+    #   * an item stays applied while the same item is selected: a measure
+    #     whose body is CALCULATE([S], CG[Name] = "Double") is 120 under
+    #     Double, while CALCULATE([S], CG[Name] = "Plus1") is 122 -- a
+    #     CALCULATE that selects ANOTHER item applies it to the references
+    #     inside, and so does sideways recursion (CALCULATE(SELECTEDMEASURE(),
+    #     CG[Name] = "Double") as an item is Double);
+    #   * a group's item applies to the measure references in the expression
+    #     of a higher-precedence group's item: Ref10 = [S] * 10 (precedence
+    #     10) with Double (0) is 1200;
+    #   * a one-item group applies nothing without a filter.
+
+    def _cg_selection(self, g: '_CalcGroup', ctx: DAXContext):
+        """The item of group ``g`` that ``ctx`` selects: the filter on its
+        item column lets exactly one item through. A filter on another column
+        of the group's table plays no part (Desktop: CALCULATE([S], CG[Name]
+        = "Double") under CG[Ordinal] = 2 is Double's 120, and CG[Ordinal] =
+        1 under CG[Name] IN {"Double", "Plus1"} applies nothing). None
+        otherwise."""
+        col_key = f"{g.key}.{g.column.lower()}"
+        specs = [v for k, v in ctx.filter_context.items() if k.lower() == col_key]
+        if not specs:
+            return None
+        names = [str(i['name']) for i in g.items]
+        for spec in specs:
+            try:
+                match = make_value_matcher(spec)
+            except ValueError:
+                return None
+            names = [n for n in names if match(n)]
+        if len(names) != 1:
+            return None
+        return g.by_name.get(names[0].lower())
+
+    def _cg_chain(self, groups: tuple, ctx: DAXContext) -> list:
+        """The selected items not yet applied on this path, outermost (highest
+        precedence) first: [(group, item, item's lower-cased name)]."""
+        out = []
+        for g in groups:
+            item = self._cg_selection(g, ctx)
+            if item is None:
+                continue
+            name = str(item['name']).lower()
+            if self._cg_applied.get(g.key) == name:
+                continue
+            out.append((g, item, name))
+        return out
+
+    def _cg_measure(self, fn: str) -> str:
+        if not self._cg_frames:
+            from pbix_mcp.errors import DAXEvaluationError
+            raise DAXEvaluationError(
+                f"There is no measure reference in the current context that {fn} can use")
+        return self._cg_frames[-1]
+
+    def _fn_selectedmeasure(self, args_str: str, ctx: DAXContext) -> Any:
+        """SELECTEDMEASURE(): the measure the item applies to, with the items
+        of lower precedence still to apply."""
+        return self.evaluate_measure(self._cg_measure('SELECTEDMEASURE'), ctx, propagate=True)
+
+    def _fn_selectedmeasurename(self, args_str: str, ctx: DAXContext) -> Any:
+        return self._cg_measure('SELECTEDMEASURENAME')
+
+    def _fn_isselectedmeasure(self, args_str: str, ctx: DAXContext) -> Any:
+        """ISSELECTEDMEASURE(<measure>, ...): is the item applied to one of them."""
+        cur = self._cg_measure('ISSELECTEDMEASURE').lower()
+        for a in self._split_args(args_str):
+            a = a.strip()
+            name = a[a.rfind('[') + 1:-1] if a.endswith(']') and '[' in a else a
+            if name.strip().lower() == cur:
+                return True
+        return False
+
+    def _fn_selectedmeasureformatstring(self, args_str: str, ctx: DAXContext) -> Any:
+        """SELECTEDMEASUREFORMATSTRING(): the format string of the measure the
+        item applies to -- its dynamic format string evaluated, else its static
+        one, else BLANK (Desktop: BLANK for a measure without one)."""
+        name = self._cg_measure('SELECTEDMEASUREFORMATSTRING')
+        return self._measure_own_format(name, ctx)
+
+    def _measure_own_format(self, name: str, ctx: DAXContext) -> Any:
+        fmt = _calc_registry(ctx.measures)[1].get(name) or {}
+        if fmt.get('expression'):
+            self._cg_frames.append(name)
+            try:
+                return _scalarize(self._eval_expr(str(fmt['expression']).strip(), ctx))
+            finally:
+                self._cg_frames.pop()
+        return fmt.get('format_string') or None
+
+    _NO_ITEM_FORMAT = object()
+
+    def item_format_string(self, measure_name: str, ctx: DAXContext) -> Any:
+        """The format string an applied calculation item gives measure
+        ``measure_name`` in ``ctx``: the format-string expression of the
+        outermost selected item that has one, evaluated with the measure as
+        SELECTEDMEASURE. _NO_ITEM_FORMAT when no such item applies -- the
+        measure keeps its own format string."""
+        if measure_name not in ctx.measures:
+            low = measure_name.lower()
+            measure_name = next((m for m in ctx.measures if m.lower() == low), measure_name)
+        # Desktop 2.152 over MDX (build_b121c.py, cell FORMAT_STRING): the
+        # outermost item WITH a format string decides it -- Add100's over
+        # Double's, Double's when the outer item has none -- and in that
+        # expression SELECTEDMEASURE() is the value being formatted, the item
+        # applied: IF(SELECTEDMEASURE() > 100, "#,0", "0.00") on Triple of 60
+        # is "#,0".
+        groups = _calc_registry(ctx.measures)[0]
+        for g, item, _name in (self._cg_chain(groups, ctx) if groups else []):
+            if item.get('format_string'):
+                self._cg_frames.append(measure_name)
+                try:
+                    return _scalarize(self._eval_expr(str(item['format_string']).strip(), ctx))
+                finally:
+                    self._cg_frames.pop()
+        return self._NO_ITEM_FORMAT
 
     # ---- measure memo: filters a measure provably cannot see ----------------
     # "The last week with sales" is MAXX(FILTER(ALLSELECTED('Date'),
@@ -3905,6 +4368,13 @@ class DAXEngine:
                         return _cur[col_name]
                     if _cur.get('__column__') == col_name:
                         return _cur.get('__value__')
+                    # The row is keyed by the model's spelling, which may keep a
+                    # space the parsed reference lost (' Sales', issue #132).
+                    _tt = ctx.tables.get(table_name)
+                    if _tt is not None:
+                        _ci = ctx._find_col_idx(_tt['columns'], col_name)
+                        if _ci >= 0 and _tt['columns'][_ci] in _cur:
+                            return _cur[_tt['columns'][_ci]]
                 # A reference to a column that does NOT exist must be BLANK, not
                 # a (table, column) marker. Agents_Performance's TopN/BottomN
                 # measures read 'Top-Bottom-N'[Top-Bottom-N Value] while that
@@ -3967,10 +4437,11 @@ class DAXEngine:
             if kind == _P_MAYBEVAR:
                 if var_scope:
                     if data in var_scope:
-                        return var_scope[data]
+                        v = var_scope[data]
+                        return v.force(self) if isinstance(v, _LazyVar) else v
                     for k, v in var_scope.items():
                         if k.lower() == data.lower():
-                            return v
+                            return v.force(self) if isinstance(v, _LazyVar) else v
                 continue  # not a var in this scope: fall through to the tail
             if kind == _P_PAREN:
                 return self._eval_expr(data, ctx, var_scope)
@@ -3991,7 +4462,21 @@ class DAXEngine:
                 inner_val = self._eval_expr(data, ctx, var_scope)
                 if isinstance(inner_val, (int, float)) and not isinstance(inner_val, bool):
                     return -inner_val
-                return None
+                if inner_val is None or isinstance(inner_val, (list, tuple)):
+                    return None
+                # Unary minus converts as arithmetic does (Desktop 2.152:
+                # -"3" is -3, -TRUE() is -1, -DATE(2024, 1, 1) is -45292) and
+                # refuses other text (-"x" raises; issue #133).
+                _n = float(inner_val) if isinstance(inner_val, bool) else _as_number(inner_val)
+                if _n is None and isinstance(inner_val, str):
+                    _n = _arith_text_number(inner_val, getattr(ctx, 'culture', None))
+                if _n is None:
+                    if isinstance(inner_val, str):
+                        from pbix_mcp.errors import DAXEvaluationError
+                        raise DAXEvaluationError(
+                            f"Cannot convert value '{inner_val}' of type Text to type Number")
+                    return None
+                return -int(_n) if _n.is_integer() else -_n
             if kind == _P_NOT:
                 inner_val = self._eval_expr(data, ctx, var_scope)
                 if inner_val is None or inner_val == 0 or inner_val == '' or inner_val is False:
@@ -4095,9 +4580,13 @@ class DAXEngine:
         prev_scope = self._current_var_scope
         try:
             for var_name, var_expr in var_decls:
-                self._current_var_scope = scope
-                val = self._eval_expr(var_expr, ctx, scope)
-                scope[var_name] = val
+                # LAZY, as in DAX (issue #134): a variable is evaluated the
+                # first time it is used -- in this filter context, with the
+                # variables declared before it -- and never if it is not.
+                # Evaluated eagerly, an unused VAR x = "a" * 1 failed a measure
+                # Desktop answers, and a calculation item computed every
+                # period's VAR for each measure it applied to.
+                scope[var_name] = _LazyVar(var_expr, ctx, dict(scope))
 
             # Evaluate RETURN expression
             self._current_var_scope = scope
@@ -4514,9 +5003,25 @@ class DAXEngine:
                 # hands dates over as ISO strings, so coerce before giving up.
                 # Returning None here made `[end] - [start]` blank on every row
                 # of a datetime column.
-                left, right = _as_number(left), _as_number(right)
-                if left is None or right is None:
+                ln, rn = _as_number(left), _as_number(right)
+                _cul = getattr(ctx, 'culture', None)
+                if ln is None and isinstance(left, str):
+                    ln = _arith_text_number(left, _cul)
+                if rn is None and isinstance(right, str):
+                    rn = _arith_text_number(right, _cul)
+                if ln is None or rn is None:
+                    # Text that is no number is an ERROR, not a blank (Desktop
+                    # 2.152: "x" + 1, "x" * 2, BLANK() + "x" and "" + 1 all
+                    # raise; IFERROR("x" * 2, 5) is 5). As a blank, a
+                    # calculation item over a text measure -- Double of "x" --
+                    # turned into a confident number further up (issue #133).
+                    _txt = left if ln is None else right
+                    if isinstance(_txt, str):
+                        from pbix_mcp.errors import DAXEvaluationError
+                        raise DAXEvaluationError(
+                            f"Cannot convert value '{_txt}' of type Text to type Number")
                     return None
+                left, right = ln, rn
             if op == '+':
                 acc = left + right
             elif op == '-':
@@ -4941,8 +5446,8 @@ class DAXEngine:
         known = (ctx.model_columns or {}).get(col[0])
         if not known:
             return
-        lowered = col[1].lower()
-        if any(c.lower() == lowered for c in known):
+        lowered = col[1].strip().lower()
+        if any(c.strip().lower() == lowered for c in known):   # ' Sales' (#132)
             return
         from pbix_mcp.errors import DAXEvaluationError
         raise DAXEvaluationError(
@@ -6144,7 +6649,23 @@ class DAXEngine:
         # Parse DATEADD(column, offset, interval)
         match = re.search(r"DATEADD\s*\(\s*'?([^'\[]+)'?\s*\[([^\]]+)\]\s*,\s*(-?\d+)\s*,\s*(\w+)\s*\)", expr, re.IGNORECASE)
         if not match:
-            return ctx
+            # DATEADD over a TABLE of dates (DATESBETWEEN(...), FILTER(...)):
+            # its shifted dates are the filter (issue #127). This returned the
+            # context unchanged, so the filter argument was silently dropped.
+            rows = self._eval_expr(expr.strip(), ctx)
+            if not (isinstance(rows, list)
+                    and all(isinstance(r, dict) and '__column__' in r for r in rows)):
+                return ctx
+            if not rows:
+                return None
+            date_table, date_col = rows[0]['__table__'], rows[0]['__column__']
+            new_filters = {k: v for k, v in ctx.filter_context.items()
+                           if not k.startswith(f"{date_table}.")}
+            new_filters[f"{date_table}.{date_col}"] = [r['__value__'] for r in rows]
+            _tc = DAXContext(ctx.tables, ctx.measures, ctx.date_table,
+                             ctx.date_column, new_filters, ctx.relationships)
+            _tc._filter_idx_cache = ctx._filter_idx_cache
+            return _tc
 
         date_table = match.group(1).strip()
         date_col = match.group(2).strip()
@@ -6304,10 +6825,13 @@ class DAXEngine:
         return ('__ALL__', ref)
 
     @staticmethod
-    def _shift_date(d, offset: int, interval: str):
+    def _shift_date(d, offset: int, interval: str, month_end: bool = True):
         """One DATEADD step. Month-family arithmetic is calendar-correct and
         clamps to the last day of the target month, as DAX does when the source
-        day does not exist there (31 Mar -1 MONTH -> 28/29 Feb)."""
+        day does not exist there (31 Mar -1 MONTH -> 28/29 Feb). With
+        ``month_end`` a month's last day lands on the target month's last day
+        (DATESINPERIOD's far end, the END of a DATEADD run); without it the day
+        number is kept and clamped (a DATEADD run's start, a single date)."""
         if interval == 'DAY':
             return d + timedelta(days=offset)
         if interval == 'WEEK':
@@ -6324,7 +6848,7 @@ class DAXEngine:
         # per-employee PMTD came up short (employee 84: 19,839.8 vs Desktop's
         # 35,439.8 -- exactly the 15,600 booked on 31-Oct). This is also what
         # EDATE and Desktop's own DATEADD do.
-        if d.day == calendar.monthrange(d.year, d.month)[1]:
+        if month_end and d.day == calendar.monthrange(d.year, d.month)[1]:
             day = last_target
         else:
             day = min(d.day, last_target)
@@ -6388,13 +6912,18 @@ class DAXEngine:
                 runs[-1][1] = i
             else:
                 runs.append([i, i])
+        # A run's START keeps its day number (clamped); only the END of a run
+        # of two or more days that closes its month lands on the target
+        # month's end (issue #129). Power BI Desktop 2.152: 30 Apr alone -1
+        # MONTH is 30 Mar, 29..30 Apr is 29..31 Mar, 30 Apr..2 May is 30 Mar..
+        # 2 Apr, 30 Nov..31 Dec -1 QUARTER is 30 Aug..30 Sep (32 days).
         out: dict = {}
         for a, b in runs:
             ka, kb = uni_sorted[a], uni_sorted[b]
             lo = self._shift_date(datetime(ka.year, ka.month, ka.day),
-                                  offset, interval)
+                                  offset, interval, month_end=False)
             hi = self._shift_date(datetime(kb.year, kb.month, kb.day),
-                                  offset, interval)
+                                  offset, interval, month_end=a != b)
             if lo is None or hi is None:
                 continue
             lo_d = lo.date() if isinstance(lo, datetime) else lo
@@ -6422,6 +6951,11 @@ class DAXEngine:
         """
         m = self._DATEADD_ARGS_RE.match(args_str.strip())
         if not m:
+            args = self._split_args(args_str)
+            if len(args) == 3:
+                shifted = self._shift_date_table(args[0], args[1], args[2].strip().upper(), ctx)
+                if shifted is not None:
+                    return shifted
             return ('__DATEADD__', args_str.strip())
         dt, dc = m.group(1).strip(), m.group(2).strip()
         dates = self._dateadd_dates(dt, dc, int(m.group(3)),
@@ -6429,12 +6963,58 @@ class DAXEngine:
         return [{'__table__': dt, '__column__': dc, '__value__': v}
                 for v in dates]
 
+    def _shift_date_table(self, table_arg: str, offset_arg, interval: str,
+                          ctx: DAXContext):
+        """DATEADD / SAMEPERIODLASTYEAR over a TABLE expression of dates
+        (DATESBETWEEN(...), FILTER(ALL('Date'[Date]), ...)): its dates are the
+        ones shifted, as a column reference's visible dates are. Only a
+        column reference was parsed, so these returned a marker and
+        COUNTROWS / MINX over them saw nothing (issue #127). Power BI Desktop
+        2.152: DATEADD(DATESBETWEEN('Date'[Date], DATE(2024,2,29),
+        DATE(2024,2,29)), -1, YEAR) is 2023-02-28, and SAMEPERIODLASTYEAR of
+        February 2024 is February 2023's 28 days. None when the table is not
+        one column of dates."""
+        rows = self._eval_expr(table_arg.strip(), ctx)
+        if not isinstance(rows, list):
+            return None
+        lineage: tuple[str, str] | None = None
+        values: list = []
+        for r in rows:
+            if not (isinstance(r, dict) and '__column__' in r and '__row__' not in r):
+                return None
+            key = (str(r.get('__table__')), str(r.get('__column__')))
+            if lineage is None:
+                lineage = key
+            elif key != lineage:
+                return None
+            values.append(r.get('__value__'))
+        if lineage is None:
+            return []
+        offset = offset_arg if isinstance(offset_arg, int) else self._eval_expr(str(offset_arg).strip(), ctx)
+        if not isinstance(offset, (int, float)) or isinstance(offset, bool):
+            return None
+        dt, dc = lineage
+        tbl = ctx.tables.get(dt)
+        if not tbl:
+            return None
+        idx = ctx._find_col_idx(tbl['columns'], dc)
+        if idx < 0:
+            return None
+        # The table's dates in the column's own spelling, so the filter keys
+        # match the cells (DATESBETWEEN hands back 'YYYY-MM-DD' text).
+        wanted = {d for d in (_as_date(v) for v in values) if d is not None}
+        cells = list(dict.fromkeys(row[idx] for row in tbl['rows'] if _as_date(row[idx]) in wanted))
+        sel = ctx.with_filters({f"{dt}.{dc}": cells})
+        return [{'__table__': dt, '__column__': dc, '__value__': v}
+                for v in self._dateadd_dates(dt, dc, int(offset), interval.rstrip('S'), sel)]
+
     def _fn_sameperiodlastyear(self, args_str: str, ctx: DAXContext) -> Any:
         """SAMEPERIODLASTYEAR(<dates>) == DATEADD(<dates>, -1, YEAR)."""
         ref = args_str.strip()
-        m = re.match(r"'?([^'\[]+)'?\s*\[([^\]]+)\]", ref)
+        m = re.match(r"^'?([^'\[]+)'?\s*\[([^\]]+)\]$", ref)
         if not m:
-            return ('__DATEADD__', ref)
+            shifted = self._shift_date_table(ref, -1, 'YEAR', ctx)
+            return shifted if shifted is not None else ('__DATEADD__', ref)
         dt, dc = m.group(1).strip(), m.group(2).strip()
         return [{'__table__': dt, '__column__': dc, '__value__': v}
                 for v in self._dateadd_dates(dt, dc, -1, 'YEAR', ctx)]
@@ -11543,6 +12123,44 @@ class DAXEngine:
             return delimiter.join(text for _, text in parts)
         return delimiter.join(parts)
 
+    def _rankx_order_desc(self, order: str, ctx: DAXContext) -> bool:
+        """RANKX's order argument: 0 / FALSE / DESC -- and an omitted or empty
+        argument -- rank high to low; 1 / TRUE / ASC low to high (issue #124:
+        'DESC' in the text was tested, so 0, FALSE and an omitted order all
+        ranked ascending). Desktop 2.152 answers every spelling that way."""
+        ou = order.strip().upper()
+        if ou in ('', 'DESC', '0', 'FALSE', 'FALSE()'):
+            return True
+        if ou in ('ASC', '1', 'TRUE', 'TRUE()'):
+            return False
+        return not bool(self._eval_expr(order.strip(), ctx))
+
+    @staticmethod
+    def _rankx_keys(values: list):
+        """RANKX's values as one comparable kind, BLANK included (issue #125).
+
+        "If expression or value evaluates to BLANK it is treated as a 0 (zero)
+        for all expressions that result in a number, or as an empty text for
+        all text expressions" (Microsoft's RANKX reference); Desktop 2.152
+        ranks a member with no data 5th of 6, above a -5. Dates are numbers.
+        Text compares as the formula engine does (case-insensitively). A value
+        of any other kind maps to None and is left out."""
+        text = any(isinstance(v, str) for v in values)
+        out: list[str | float | None] = []
+        for v in values:
+            if text:
+                out.append('' if v is None else (_text_key(v) if isinstance(v, str) else None))
+            elif v is None:
+                out.append(0.0)
+            elif isinstance(v, (int, float)):
+                out.append(float(v))
+            elif isinstance(v, (datetime, date)):
+                out.append(_dax_serial(v if isinstance(v, datetime)
+                                       else datetime(v.year, v.month, v.day)))
+            else:
+                out.append(None)
+        return out
+
     def _fn_rankx(self, args_str: str, ctx: DAXContext) -> Any:
         """RANKX(table, expression, value, order, ties) — rank a value within a table's evaluated expression."""
         args = self._split_args(args_str)
@@ -11552,30 +12170,29 @@ class DAXEngine:
         rank_expr = args[1].strip()
         # Value to rank (optional — defaults to the expression evaluated in current context)
         value_expr = args[2].strip() if len(args) > 2 else None
-        order_str = args[3].strip().upper() if len(args) > 3 else 'DESC'
-        is_desc = 'DESC' in order_str
+        is_desc = self._rankx_order_desc(args[3] if len(args) > 3 else '', ctx)
 
         # Get the value to rank
         if value_expr:
-            current_val = self._eval_expr(value_expr, ctx)
+            current_raw = self._eval_expr(value_expr, ctx)
         else:
-            current_val = self._eval_expr(rank_expr, ctx)
-
-        if not isinstance(current_val, (int, float)):
-            return None
+            current_raw = self._eval_expr(rank_expr, ctx)
 
         # Evaluate expression for all rows in the table
-        all_vals = []
+        row_raw = []
         if isinstance(table_ref, list):
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
                     # _make_row_context handles bare-table (__row__) iterators
                     # too; the old direct __column__ lookup KeyError'd on them.
                     row_ctx = self._make_row_context(row_item, ctx)
-                    result = self._eval_expr(rank_expr, row_ctx)
-                    if isinstance(result, (int, float)):
-                        all_vals.append(result)
+                    row_raw.append(self._eval_expr(rank_expr, row_ctx))
 
+        keys = self._rankx_keys([current_raw] + row_raw)
+        current_val = keys[0]
+        if current_val is None:
+            return None
+        all_vals = [k for k in keys[1:] if k is not None]
         if not all_vals:
             return 1
 
@@ -11596,7 +12213,7 @@ class DAXEngine:
         # [2- Ranking Subjects] came out 6578 (10,808 subjects, 6,577 of them
         # above the ranked value) where Desktop answers 6 -- there are only 10
         # DISTINCT values and 5 of them beat it.
-        ties = args[4].strip().strip('"\'').upper() if len(args) > 4 else 'SKIP'
+        ties = (args[4].strip().strip('"\'').upper() if len(args) > 4 else '') or 'SKIP'
         if ties == 'DENSE':
             beat = len({v for v in all_vals
                         if (v > current_val if is_desc else v < current_val)})
@@ -11708,18 +12325,40 @@ class DAXEngine:
         """FALSE() — boolean false."""
         return False
 
+    def _eval_catching(self, expr: str, ctx: DAXContext):
+        """(failed, value) of ``expr`` for IFERROR / ISERROR. Power BI Desktop
+        2.152 (build_b134.py, issue #135):
+          * a BLANK is no error: IFERROR(BLANK(), 5) is BLANK, ISERROR(BLANK())
+            FALSE -- the engine read every BLANK as an error;
+          * a division by zero is one here: IFERROR(1 / 0, 5) is 5;
+          * so is a referenced measure that fails: IFERROR([Bad], 13) is 13
+            (the engine degrades a nested measure's error to BLANK, so this
+            counts the degradations instead);
+          * a VARIABLE's error is not caught where the variable is used:
+            VAR x = ERROR("boom") RETURN IFERROR(x, 9) fails (_VarEvalError)."""
+        before = self._nested_errors
+        try:
+            value = self._eval_expr(expr.strip(), ctx)
+        except _VarEvalError:
+            raise
+        except Exception as exc:
+            if getattr(exc, "_pbix_deadline", False):
+                raise
+            return True, None
+        if self._nested_errors != before:
+            return True, None
+        if isinstance(value, float) and (math.isinf(value) or math.isnan(value)):
+            return True, None
+        return False, value
+
     def _fn_iferror(self, args_str: str, ctx: DAXContext) -> Any:
-        """IFERROR(expression, fallback) — return fallback if expression errors."""
+        """IFERROR(expression, fallback) — fallback when expression is an ERROR
+        (not when it is BLANK; see _eval_catching)."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return None
-        try:
-            result = self._eval_expr(args[0].strip(), ctx)
-            if result is None:
-                return self._eval_expr(args[1].strip(), ctx)
-            return result
-        except Exception:
-            return self._eval_expr(args[1].strip(), ctx)
+        failed, result = self._eval_catching(args[0], ctx)
+        return self._eval_expr(args[1].strip(), ctx) if failed else result
 
     def _fn_coalesce(self, args_str: str, ctx: DAXContext) -> Any:
         """COALESCE(value1, value2, ...) — return first non-blank value."""
@@ -11790,12 +12429,9 @@ class DAXEngine:
         return isinstance(val, bool)
 
     def _fn_iserror(self, args_str: str, ctx: DAXContext) -> Any:
-        """ISERROR(value) — check if expression results in error."""
-        try:
-            val = self._eval_expr(args_str.strip(), ctx)
-            return val is None
-        except Exception:
-            return True
+        """ISERROR(value) — is the expression an ERROR (a BLANK is not; see
+        _eval_catching)."""
+        return self._eval_catching(args_str, ctx)[0]
 
     def _fn_username(self, args_str: str, ctx: DAXContext) -> Any:
         """USERNAME() — returns empty string (server-side function)."""
@@ -12531,34 +13167,21 @@ class DAXEngine:
             else:
                 end_date = start_date
                 start_date = start_date + timedelta(days=offset + 1)
-        elif interval in ('MONTH', 'MONTHS'):
-            new_month = start_date.month + offset
-            new_year = start_date.year + (new_month - 1) // 12
-            new_month = ((new_month - 1) % 12) + 1
+        elif interval in ('MONTH', 'MONTHS', 'QUARTER', 'QUARTERS', 'YEAR', 'YEARS'):
+            # The far end is the start shifted as DATEADD shifts it: clamped to
+            # the target month, and a month END to a month END (issue #122).
+            # The YEAR branch built datetime(year + offset, month, day), which
+            # raised on 29 February and blanked the measure; MONTH and QUARTER
+            # clamped but sent 30 April to 30 March. Power BI Desktop 2.152:
+            # one YEAR back from 2024-02-29 is 2023-03-01..2024-02-29 (366
+            # days), from 2025-02-28 it is 2024-03-01..2025-02-28 (365), and
+            # one YEAR forward from 2024-02-29 ends 2025-02-27.
+            other = self._shift_date(start_date, offset, interval.rstrip('S'))
             if offset >= 0:
-                _, last_day = monthrange(new_year, new_month)
-                end_date = datetime(new_year, new_month, min(start_date.day, last_day))
+                end_date = other
             else:
                 end_date = start_date
-                _, last_day = monthrange(new_year, new_month)
-                start_date = datetime(new_year, new_month, min(start_date.day, last_day))
-        elif interval in ('QUARTER', 'QUARTERS'):
-            new_month = start_date.month + offset * 3
-            new_year = start_date.year + (new_month - 1) // 12
-            new_month = ((new_month - 1) % 12) + 1
-            if offset >= 0:
-                _, last_day = monthrange(new_year, new_month)
-                end_date = datetime(new_year, new_month, min(start_date.day, last_day))
-            else:
-                end_date = start_date
-                _, last_day = monthrange(new_year, new_month)
-                start_date = datetime(new_year, new_month, min(start_date.day, last_day))
-        elif interval in ('YEAR', 'YEARS'):
-            if offset >= 0:
-                end_date = datetime(start_date.year + offset, start_date.month, start_date.day)
-            else:
-                end_date = start_date
-                start_date = datetime(start_date.year + offset, start_date.month, start_date.day)
+                start_date = other
         else:
             return []
 
@@ -12676,8 +13299,14 @@ _engine: DAXEngine = _PerThreadEngine()  # type: ignore[assignment]
 def evaluate_measure(measure_name: str, tables: dict, measures: dict,
                      filter_context: dict | None = None,
                      date_table: str | None = None, date_column: str | None = None,
-                     relationships: list | None = None) -> Any:
-    """Evaluate a single DAX measure."""
+                     relationships: list | None = None,
+                     calculation_groups: list | None = None,
+                     measure_formats: dict | None = None) -> Any:
+    """Evaluate a single DAX measure. ``calculation_groups`` (and
+    ``measure_formats``), when given, are attached to ``measures`` as
+    set_calculation_groups does."""
+    if calculation_groups is not None or measure_formats is not None:
+        set_calculation_groups(measures, calculation_groups, measure_formats)
     ctx = DAXContext(tables, measures, date_table, date_column, filter_context, relationships)
     return _engine.evaluate_measure(measure_name, ctx)
 
@@ -12691,8 +13320,16 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
                             culture: str | None = None,
                             date_tables: dict | None = None,
                             measure_tables: dict | None = None,
-                            model_columns: dict | None = None) -> dict:
+                            model_columns: dict | None = None,
+                            calculation_groups: list | None = None,
+                            measure_formats: dict | None = None) -> dict:
     """Evaluate multiple measures, returning { name: value }.
+
+    ``calculation_groups`` is ModelReader.calculation_groups and
+    ``measure_formats`` ModelReader.measure_format_strings (issue #121). When
+    given they are attached to ``measures`` (set_calculation_groups), so this
+    and every later evaluation over that dict applies the selected
+    calculation items; omitted, whatever is attached already stays.
 
     ``measure_tables`` (each measure's home table) and ``model_columns`` are what
     resolve a bare ``[Column]`` in a measure, as in evaluate_measures_smart;
@@ -12704,6 +13341,8 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
     base filter_context BEFORE the group key was merged in) — together they
     are what ALLSELECTED restores (see DAXContext.group_keys).
     """
+    if calculation_groups is not None or measure_formats is not None:
+        set_calculation_groups(measures, calculation_groups, measure_formats)
     if group_keys:
         # The grouping values carry the ISINSCOPE tag, as in
         # evaluate_measures_smart's group_by (issue #79).
@@ -12724,6 +13363,45 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
     for name in measure_names:
         results[name] = _engine.evaluate_measure(name, ctx)
     return results
+
+
+def evaluate_format_strings(measure_names: list, tables: dict, measures: dict,
+                            filter_context: dict | None = None,
+                            date_table: str | None = None, date_column: str | None = None,
+                            relationships: list | None = None,
+                            group_keys: set | None = None,
+                            selected_filters: dict | None = None,
+                            culture: str | None = None,
+                            date_tables: dict | None = None,
+                            measure_tables: dict | None = None,
+                            model_columns: dict | None = None) -> dict:
+    """``{name: format string}`` for the measures whose format a selected
+    calculation item decides, through its format-string expression (issue
+    #121). A measure no such item applies to is left out: it keeps its own
+    format string. Arguments as in evaluate_measures_batch."""
+    if not _calc_registry(measures)[0]:
+        return {}
+    if group_keys:
+        filter_context = {k: (_tag_group_by(v) if k in group_keys else v)
+                          for k, v in (filter_context or {}).items()}
+    ctx = DAXContext(tables, measures, date_table, date_column, filter_context, relationships)
+    ctx.date_tables = date_tables or {}
+    if group_keys:
+        ctx.group_keys = set(group_keys)
+    if selected_filters is not None:
+        ctx.selected_filters = dict(selected_filters)
+    ctx.culture = culture
+    ctx.measure_tables = measure_tables or {}
+    ctx.model_columns = model_columns or {}
+    out = {}
+    for name in measure_names:
+        try:
+            fmt = _engine.item_format_string(name, ctx)
+        except Exception:      # noqa: BLE001 -- a broken expression formats nothing
+            continue
+        if fmt is not DAXEngine._NO_ITEM_FORMAT:
+            out[name] = None if fmt is None else str(fmt)
+    return out
 
 
 # Simple single-column aggregations that can be bucketed once per fact table
@@ -12782,6 +13460,15 @@ def evaluate_per_dimension(measure_names: list, tables: dict, measures: dict,
     join key maps a fact row to more than one dimension value (ambiguous), are
     omitted so the caller can evaluate them the slow-but-exact way.
     """
+    # A selected calculation item applies to the measure in its own filter
+    # context, which the bucketed evaluation below (an empty context over
+    # pre-filtered rows) does not carry: leave such evaluations to the
+    # per-value path (issue #121).
+    _cg_tables = {g.key for g in _calc_registry(measures)[0]}
+    if _cg_tables and (dim_table.lower() in _cg_tables or any(
+            k.split('.', 1)[0].lower() in _cg_tables for k in (base_fc or {}))):
+        return {}
+
     # Which requested measures are eligible? name -> (func, table, col)
     specs = {}
     for name in measure_names:
@@ -12863,6 +13550,7 @@ def evaluate_per_dimension(measure_names: list, tables: dict, measures: dict,
             # key to a single dimension value (fall back on ambiguity).
             fact_col_idx = None
             key_to_value: dict = {}
+            date_part = False
             ok = True
             for val in unique_vals:
                 probe = DAXContext(tables, measures, date_table, date_column,
@@ -12872,6 +13560,9 @@ def evaluate_per_dimension(measure_names: list, tables: dict, measures: dict,
                     ok = False
                     break
                 allowed, idx = cross[0]
+                # Across a DatePartOnly join (auto date/time) the keys are
+                # date parts, and the fact rows bucket by theirs (issue #126).
+                date_part = date_part or isinstance(allowed, _DatePartKeys)
                 if fact_col_idx is None:
                     fact_col_idx = idx
                 elif fact_col_idx != idx:
@@ -12887,7 +13578,11 @@ def evaluate_per_dimension(measure_names: list, tables: dict, measures: dict,
             if not ok or fact_col_idx is None:
                 continue
             for row in base_rows:
-                k = str(row[fact_col_idx])
+                cell = row[fact_col_idx]
+                if date_part:
+                    k = (_date_part_key(cell) or str(cell)) if cell is not None else 'None'
+                else:
+                    k = str(cell)
                 if k in key_to_value:
                     # BLANK is a group of its own: the rows that reach the
                     # dimension's blank row (issue #82)
@@ -12939,8 +13634,13 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
                             culture: str | None = None,
                             group_by: set | None = None,
                             selected_filters: dict | None = None,
-                            date_tables: dict | None = None) -> dict:
+                            date_tables: dict | None = None,
+                            calculation_groups: list | None = None,
+                            measure_formats: dict | None = None) -> dict:
     """Evaluate measures with smart fallback for SELECTEDVALUE-dependent measures.
+
+    ``calculation_groups`` / ``measure_formats``: as in evaluate_measures_batch
+    (issue #121).
 
     ``group_by`` names the filter_context keys that are the query's GROUPING
     (one SUMMARIZECOLUMNS / visual row), as opposed to slicer filters: their
@@ -12968,6 +13668,8 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
     simulate_row_context=False for Desktop-identical evaluation; pbix_evaluate_dax
     does so unless the caller opts in.
     """
+    if calculation_groups is not None or measure_formats is not None:
+        set_calculation_groups(measures, calculation_groups, measure_formats)
     if group_by:
         filter_context = {key: (_tag_group_by(v) if key in group_by else v)
                           for key, v in (filter_context or {}).items()}

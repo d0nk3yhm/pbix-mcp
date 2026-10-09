@@ -432,8 +432,10 @@ class TestInfoFunctions:
     def test_iferror(self, engine, tables, rels):
         c = ctx(tables, rels, {'M': 'IFERROR(DIVIDE(1, 0), -1)'})
         result = engine.evaluate_measure('M', c)
-        # DIVIDE(1,0) returns 0 (alt value), IFERROR wraps it
-        assert result == 0 or result == -1  # Either DIVIDE's alt or IFERROR's alt
+        # DIVIDE(1, 0) is BLANK (its alternate result defaults to BLANK), and a
+        # BLANK is no error: Desktop 2.152 gives BLANK for
+        # IFERROR(DIVIDE(1, BLANK()), 5) (issue #135).
+        assert result is None
 
 
 # ===========================================================================
