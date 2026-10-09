@@ -177,14 +177,12 @@ def _convert_value_for_dict(value, data_type: str):
         return None
 
     if data_type == "String":
-        # Canonicalize empty string to NULL (blank). PBI Desktop never writes
-        # "" into a string dictionary (0 occurrences across every string
-        # column of 4 real Desktop-built dashboards in the public corpus) —
-        # its importer canonicalizes empty text to blank, and AS rejects
-        # dictionaries containing a zero-length record at load
-        # (PFE_XM_DBCC_STRINGSTORE_CORRUPT).
-        s = str(value)
-        return s if s != "" else None
+        # "" is a value of its own, apart from BLANK, as Desktop's import
+        # keeps it (issue #161): ISBLANK("") is FALSE, TREATAS({""}) selects
+        # it alone. Desktop stores it as a zero-length record on a page
+        # flagged page_contains_nulls (_encode_string_dictionary); 0.9.3 to
+        # 0.9.131 stored it as BLANK.
+        return str(value)
     elif data_type == "Int64":
         return int(value)
     elif data_type == "Boolean":
@@ -495,7 +493,12 @@ def _encode_string_dictionary(unique_strings: list[str]) -> bytes:
         buf += _u4(8)   # element_size
         return bytes(buf)
 
-    compress = total_chars > _COMPRESS_CHAR_THRESHOLD
+    # A store holding the empty text "" stays on one uncompressed page (issue
+    # #161): Desktop wrote such a column of 13,313 characters uncompressed,
+    # and the same column without "" Huffman-compressed (build_b161c.py); a
+    # compressed page holding "" makes it refuse the model ("DBCC failed while
+    # checking the string store").
+    compress = total_chars > _COMPRESS_CHAR_THRESHOLD and "" not in unique_strings
 
     if not compress:
         # --- Uncompressed single page (byte-identical to PBI Desktop) ---
@@ -512,7 +515,12 @@ def _encode_string_dictionary(unique_strings: list[str]) -> bytes:
         buf += _s8(1)              # store_page_count
 
         buf += _u8(0)              # page_mask
-        buf += _u1(0)              # page_contains_nulls
+        # page_contains_nulls: 1 exactly when the page holds a zero-length
+        # string "" (issue #161) -- all 10 such pages Desktop wrote in the
+        # corpus, and 0 on all 714 without one. Under 0, Desktop 2.152 refuses
+        # the model ("DBCC failed while checking the string store",
+        # build_b161.py): the rejection that made 0.9.3 store "" as BLANK.
+        buf += _u1(1 if "" in unique_strings else 0)
         buf += _u8(0)              # page_start_index
         buf += _u8(count)          # page_string_count
         buf += _u1(0)              # page_compressed
@@ -555,7 +563,7 @@ def _encode_string_dictionary(unique_strings: list[str]) -> bytes:
     for page_id, page_strings in enumerate(pages):
         body, bit_offsets = _encode_compressed_page(page_strings)
         buf += _u8(1)              # page_mask (compressed pages use 0x1)
-        buf += _u1(0)              # page_contains_nulls
+        buf += _u1(1 if "" in page_strings else 0)   # page_contains_nulls (#161)
         buf += _u8(start_index)    # page_start_index
         buf += _u8(len(page_strings))  # page_string_count
         buf += _u1(1)              # page_compressed
@@ -1193,7 +1201,7 @@ def _encode_h_dollar_data(
         )
 
     # POS_TO_ID: sorted_pos -> data_id (dict_index + 3). When the column has
-    # NULLs (conversion also canonicalizes String "" to None), the BLANK
+    # NULLs (None; "" is a value of its own, #161), the BLANK
     # member (reserved data id 2) occupies sorted position 0 — PBI Desktop
     # ground truth (IT_Support Body/Answer): POS_TO_ID[0]=2, ID_TO_POS[2]=0,
     # RecordsPerSegment=distinct+1, AHS DistinctDataCount=distinct+1.
@@ -1258,19 +1266,19 @@ def _encode_column(
     """
     row_count = len(values)
 
-    # Convert values to storage format first — conversion canonicalizes
-    # String "" to None, so null detection must run on CONVERTED values.
+    # Convert values to storage format first, so null detection runs on
+    # CONVERTED values.
     converted = []
     for v in values:
         converted.append(_convert_value_for_dict(v, data_type))
 
     # --- Build dictionary ---
     # Null presence is derived from CONVERTED values regardless of the declared
-    # nullable flag: conversion canonicalizes String "" to None, and gating on
-    # `nullable` would leave those rows without a null slot — they would alias
-    # to the first dictionary entry (index 0) and silently decode as the wrong
-    # value. Encoding the null state is always consistent; the declared flag
-    # only expresses caller intent.
+    # nullable flag: gating on `nullable` would leave a None in a
+    # nullable=False column without a null slot — it would alias to the first
+    # dictionary entry (index 0) and silently decode as the wrong value.
+    # Encoding the null state is always consistent; the declared flag only
+    # expresses caller intent.
     has_nulls = any(v is None for v in converted)
 
     # Build unique values list.
@@ -1446,6 +1454,27 @@ def column_text_key(s: str) -> str:
     return s.translate(_ASCII_LOWER)
 
 
+# What Desktop's import strips from the END of a text value: U+0001 to U+0020,
+# every C0 control and the space (issue #159).
+IMPORT_STRIPPED = "".join(chr(c) for c in range(0x01, 0x21))
+
+
+def import_text(s: str) -> str:
+    """A text as Desktop's import stores it: without its trailing U+0001 to
+    U+0020, any number and mix of them (issue #159). A text of nothing else
+    becomes "", a value of its own (#161).
+
+    Power BI Desktop 2.152, every C0 / C1 control and Unicode space as the
+    last character (build_b159.py, build_b159b.py): "ab " / "ab\\t" / "ab\\n"
+    / "ab\\r" / "ab \\t" are stored as "ab", and a filter on "ab " then finds
+    nothing. Kept: DEL, U+0080 to U+009F, the no-break and every other
+    Unicode space, leading and inner whitespace. DAX does not strip: a
+    calculated column or table keeps its text as computed (a corpus file's
+    DATATABLE(..., {{" "}}) is stored as " "), so only imported values go
+    through this."""
+    return s.rstrip(IMPORT_STRIPPED)
+
+
 def _val_key(v):
     """Hashable IDENTITY key for a dictionary value.
 
@@ -1546,9 +1575,8 @@ def encode_table_data(
             # IT_Support Body/Answer columns). Without this, a column with
             # e.g. 2 distinct values + NULL overflows a 1-bit encoding and
             # AS rejects the table at load (DBCC string-store corruption).
-            # Conversion also canonicalizes String "" to None, so null
-            # detection must use converted values — and must NOT be gated on
-            # the declared nullable flag (a "" in a nullable=False column
+            # Null detection uses converted values and must NOT be gated on
+            # the declared nullable flag (a None in a nullable=False column
             # would otherwise alias to the first dictionary entry).
             col_has_nulls = any(v is None for v in converted_vals)
             states = unique_count + (1 if col_has_nulls else 0)

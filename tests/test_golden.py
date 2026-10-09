@@ -741,11 +741,12 @@ class TestVertiPaqStringStoreRegression:
         assert records == [4, 3, 5, 0, 0, 0]
         assert 2 not in records  # reserved id 2 must never be a record
 
-    def test_empty_string_canonicalizes_to_null(self):
-        """PBI Desktop never writes "" into a string dictionary (0 occurrences
-        across all string columns of 4 real Desktop-built dashboards); AS
-        rejects dictionaries containing a zero-length record at load. Empty
-        strings must canonicalize to NULL/blank."""
+    def test_empty_string_is_a_value_of_its_own(self):
+        """Issue #161: Desktop's import keeps "" apart from BLANK and writes it
+        as an ordinary zero-length record on a page flagged
+        page_contains_nulls: all 10 such pages in the corpus Desktop saved,
+        and 0 on the 714 pages without one. (0.9.3 to 0.9.131 stored "" as
+        BLANK, believing Desktop never writes it.)"""
         from pbix_mcp.formats.vertipaq_decoder import (
             decode_dictionary,
             decode_idf,
@@ -753,16 +754,21 @@ class TestVertiPaqStringStoreRegression:
         )
         from pbix_mcp.formats.vertipaq_encoder import encode_table_data
 
-        rows = [{"S": ""}, {"S": "a"}, {"S": "target_0"}]
-        files = encode_table_data(
-            "T", 1, [{"name": "S", "data_type": "String", "nullable": True}],
-            rows, u32_a=0xABA5A, u32_b_start=0)
-        _, vals = decode_dictionary(files["T.tbl\\1.prt\\column.S.dict"])
-        assert vals == ["a", "target_0"]  # no "" entry
-        meta = decode_idfmeta(files["T.tbl\\1.prt\\column.Smeta"])
-        assert meta["has_nulls"] is True
-        idx = decode_idf(files["T.tbl\\1.prt\\column.S"], meta["bit_width"], 3)
-        assert idx == [0, 1, 2]  # "" row -> null slot 0
+        def encode(values):
+            files = encode_table_data(
+                "T", 1, [{"name": "S", "data_type": "String", "nullable": True}],
+                [{"S": v} for v in values], u32_a=0xABA5A, u32_b_start=0)
+            raw = files["T.tbl\\1.prt\\column.S.dict"]
+            meta = decode_idfmeta(files["T.tbl\\1.prt\\column.Smeta"])
+            idx = decode_idf(files["T.tbl\\1.prt\\column.S"], meta["bit_width"], len(values))
+            # page_contains_nulls of the first page: type 4 + hash 24 + count 8
+            # + compressed 1 + longest 8 + page count 8 + page mask 8 = byte 61
+            return decode_dictionary(raw)[1], raw[61], meta["has_nulls"], idx
+
+        assert encode(["", "a", "target_0"]) == (["", "a", "target_0"], 1, False, [0, 1, 2])
+        # with a BLANK as well: the null slot 0, "" its own value 1
+        assert encode(["", None, "a"]) == (["", "a"], 1, True, [1, 0, 2])
+        assert encode(["b", "a"]) == (["b", "a"], 0, False, [0, 1])
 
     def test_nullable_column_hierarchy_has_blank_member(self):
         """PBI Desktop ground truth (IT_Support Body/Answer): a nullable

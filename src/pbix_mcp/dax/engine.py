@@ -6420,7 +6420,9 @@ class DAXEngine:
         dts = [v for v in data if isinstance(v, (datetime, date))]
         if dts:
             return dts
-        return [v for v in data if isinstance(v, str) and v != ""]
+        # the empty text "" is a value and the least of them (Desktop: MIN of
+        # "", "b", BLANK, "a" is "", LEN 0; issue #164)
+        return [v for v in data if isinstance(v, str)]
 
     def _minmax_column(self, args, ctx, pick):
         col = self._parse_column_ref(args[0])
@@ -6743,8 +6745,10 @@ class DAXEngine:
         return not self._eval_expr(args_str.strip(), ctx)
 
     def _fn_isblank(self, args_str: str, ctx: DAXContext) -> Any:
-        val = self._eval_expr(args_str.strip(), ctx)
-        return val is None or val == ''
+        """ISBLANK(value): BLANK only -- the empty text "" is a value
+        (Desktop 2.152: ISBLANK("") and ISBLANK("" & BLANK()) are FALSE, and a
+        column's "" rows are not blank; build_b163.py, issue #164)."""
+        return _scalarize(self._eval_expr(args_str.strip(), ctx)) is None
 
     def _fn_blank(self, args_str: str, ctx: DAXContext) -> Any:
         return None
@@ -8626,7 +8630,7 @@ class DAXEngine:
         return sum(values) / len(values) if values else None
 
     def _fn_countx(self, args_str: str, ctx: DAXContext) -> Any:
-        """COUNTX(table_expression, expression) — count non-blank numeric results per row."""
+        """COUNTX(table_expression, expression) — count non-blank results per row."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return None
@@ -8641,7 +8645,10 @@ class DAXEngine:
                     result = self._resolve_row_result(result, row_item, row_ctx)
                 else:
                     result = self._eval_expr(row_expr, ctx)
-                if result is not None and result != '':
+                # every non-BLANK result counts, the empty text "" too
+                # (Desktop: COUNTX(T, T[c]) over "", "", "a", "b", BLANK is 4;
+                # issue #164)
+                if _scalarize(result) is not None:
                     count += 1
         return count or None
 
@@ -8800,7 +8807,9 @@ class DAXEngine:
             row_ctx = self._make_row_context(row_item, ctx)
             probe = self._eval_expr(expr, row_ctx)
             probe = self._resolve_row_result(probe, row_item, row_ctx)
-            if probe is not None and probe != '':
+            # the empty text "" is not blank: Desktop's FIRSTNONBLANK(T[c],
+            # T[c]) is a column's "" (issue #164)
+            if _scalarize(probe) is not None:
                 return self._one_row_table(table_name, col_name, v)
         return []
 
@@ -13368,73 +13377,68 @@ class DAXEngine:
     # Text functions
     # =========================================================================
 
+    def _eval_text(self, expr: str, ctx: DAXContext) -> str:
+        """A text argument as DAX converts it (issue #165): a one-row table is
+        its value -- LEN(FIRSTNONBLANK(T[c], 1)), UPPER(TOPN(1, VALUES(T[c]),
+        T[c])), LEN(LASTDATE(D[Date])) is 8 -- BLANK is "", and numbers, dates
+        and TRUE / FALSE are their DAX text, as for `&` (_concat_str). str()
+        made a table's Python repr the text (LEN 56) and `str(x or '')`
+        dropped a 0."""
+        text: str = _concat_str(self._eval_expr(expr.strip(), ctx))
+        return text
+
     def _fn_left(self, args_str: str, ctx: DAXContext) -> Any:
         """LEFT(text, n) — leftmost n characters."""
         args = self._split_args(args_str)
-        text = self._eval_expr(args[0].strip(), ctx)
+        text = self._eval_text(args[0], ctx)
         n = int(self._eval_expr(args[1].strip(), ctx)) if len(args) > 1 else 1
-        if text is not None:
-            return str(text)[:n]
-        return ''
+        return text[:n]
 
     def _fn_right(self, args_str: str, ctx: DAXContext) -> Any:
         """RIGHT(text, n) — rightmost n characters."""
         args = self._split_args(args_str)
-        text = self._eval_expr(args[0].strip(), ctx)
+        s = self._eval_text(args[0], ctx)
         n = int(self._eval_expr(args[1].strip(), ctx)) if len(args) > 1 else 1
-        if text is not None:
-            s = str(text)
-            return s[-n:] if n <= len(s) else s
-        return ''
+        return s[-n:] if n <= len(s) else s
 
     def _fn_mid(self, args_str: str, ctx: DAXContext) -> Any:
         """MID(text, start, n) — substring from start position (1-based) for n characters."""
         args = self._split_args(args_str)
         if len(args) < 3:
             return ''
-        text = self._eval_expr(args[0].strip(), ctx)
+        s = self._eval_text(args[0], ctx)
         start = int(self._eval_expr(args[1].strip(), ctx))
         n = int(self._eval_expr(args[2].strip(), ctx))
-        if text is not None:
-            s = str(text)
-            return s[start - 1:start - 1 + n]  # DAX uses 1-based indexing
-        return ''
+        return s[start - 1:start - 1 + n]  # DAX uses 1-based indexing
 
     def _fn_len(self, args_str: str, ctx: DAXContext) -> Any:
         """LEN(text) — length of text."""
-        val = self._eval_expr(args_str.strip(), ctx)
-        if val is not None:
-            return len(str(val))
-        return 0
+        return len(self._eval_text(args_str, ctx))
 
     def _fn_upper(self, args_str: str, ctx: DAXContext) -> Any:
         """UPPER(text) — convert to uppercase."""
-        val = self._eval_expr(args_str.strip(), ctx)
-        return str(val).upper() if val is not None else ''
+        return self._eval_text(args_str, ctx).upper()
 
     def _fn_lower(self, args_str: str, ctx: DAXContext) -> Any:
         """LOWER(text) — convert to lowercase."""
-        val = self._eval_expr(args_str.strip(), ctx)
-        return str(val).lower() if val is not None else ''
+        return self._eval_text(args_str, ctx).lower()
 
     def _fn_proper(self, args_str: str, ctx: DAXContext) -> Any:
         """PROPER(text) — capitalize first letter of each word."""
-        val = self._eval_expr(args_str.strip(), ctx)
-        return str(val).title() if val is not None else ''
+        return self._eval_text(args_str, ctx).title()
 
     def _fn_trim(self, args_str: str, ctx: DAXContext) -> Any:
         """TRIM(text) — remove leading/trailing spaces."""
-        val = self._eval_expr(args_str.strip(), ctx)
-        return str(val).strip() if val is not None else ''
+        return self._eval_text(args_str, ctx).strip()
 
     def _fn_substitute(self, args_str: str, ctx: DAXContext) -> Any:
         """SUBSTITUTE(text, old, new, instance) — replace text occurrences."""
         args = self._split_args(args_str)
         if len(args) < 3:
             return ''
-        text = str(self._eval_expr(args[0].strip(), ctx) or '')
-        old = str(self._eval_expr(args[1].strip(), ctx) or '')
-        new = str(self._eval_expr(args[2].strip(), ctx) or '')
+        text = self._eval_text(args[0], ctx)
+        old = self._eval_text(args[1], ctx)
+        new = self._eval_text(args[2], ctx)
         if len(args) > 3:
             instance = int(self._eval_expr(args[3].strip(), ctx) or 1)
             # Replace only the nth occurrence
@@ -13458,10 +13462,10 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 4:
             return ''
-        text = str(self._eval_expr(args[0].strip(), ctx) or '')
+        text = self._eval_text(args[0], ctx)
         start = int(self._eval_expr(args[1].strip(), ctx)) - 1  # DAX is 1-based
         n = int(self._eval_expr(args[2].strip(), ctx))
-        new = str(self._eval_expr(args[3].strip(), ctx) or '')
+        new = self._eval_text(args[3], ctx)
         return text[:start] + new + text[start + n:]
 
     def _fn_rept(self, args_str: str, ctx: DAXContext) -> Any:
@@ -13469,7 +13473,7 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return ''
-        text = str(self._eval_expr(args[0].strip(), ctx) or '')
+        text = self._eval_text(args[0], ctx)
         n = int(self._eval_expr(args[1].strip(), ctx) or 0)
         return text * max(0, n)
 
@@ -13478,8 +13482,8 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return -1
-        find_text = str(self._eval_expr(args[0].strip(), ctx) or '').lower()
-        within_text = str(self._eval_expr(args[1].strip(), ctx) or '').lower()
+        find_text = self._eval_text(args[0], ctx).lower()
+        within_text = self._eval_text(args[1], ctx).lower()
         start = int(self._eval_expr(args[2].strip(), ctx)) - 1 if len(args) > 2 else 0
         pos = within_text.find(find_text, start)
         return pos + 1 if pos >= 0 else -1  # DAX returns 1-based
@@ -13489,8 +13493,8 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return -1
-        find_text = str(self._eval_expr(args[0].strip(), ctx) or '')
-        within_text = str(self._eval_expr(args[1].strip(), ctx) or '')
+        find_text = self._eval_text(args[0], ctx)
+        within_text = self._eval_text(args[1], ctx)
         start = int(self._eval_expr(args[2].strip(), ctx)) - 1 if len(args) > 2 else 0
         pos = within_text.find(find_text, start)
         return pos + 1 if pos >= 0 else -1
@@ -13500,8 +13504,8 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return False
-        within = str(self._eval_expr(args[0].strip(), ctx) or '').lower()
-        find = str(self._eval_expr(args[1].strip(), ctx) or '').lower()
+        within = self._eval_text(args[0], ctx).lower()
+        find = self._eval_text(args[1], ctx).lower()
         return find in within
 
     def _fn_containsstringexact(self, args_str: str, ctx: DAXContext) -> Any:
@@ -13509,8 +13513,8 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return False
-        within = str(self._eval_expr(args[0].strip(), ctx) or '')
-        find = str(self._eval_expr(args[1].strip(), ctx) or '')
+        within = self._eval_text(args[0], ctx)
+        find = self._eval_text(args[1], ctx)
         return find in within
 
     def _fn_exact(self, args_str: str, ctx: DAXContext) -> Any:
@@ -13518,8 +13522,8 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return False
-        t1 = str(self._eval_expr(args[0].strip(), ctx) or '')
-        t2 = str(self._eval_expr(args[1].strip(), ctx) or '')
+        t1 = self._eval_text(args[0], ctx)
+        t2 = self._eval_text(args[1], ctx)
         return t1 == t2
 
     def _fn_unichar(self, args_str: str, ctx: DAXContext) -> Any:
@@ -13534,20 +13538,18 @@ class DAXEngine:
 
     def _fn_unicode(self, args_str: str, ctx: DAXContext) -> Any:
         """UNICODE(text) — return unicode code point of first character."""
-        val = self._eval_expr(args_str.strip(), ctx)
-        if val is not None:
-            s = str(val)
-            if s:
-                return ord(s[0])
+        s = self._eval_text(args_str, ctx)
+        if s:
+            return ord(s[0])
         return 0
 
     def _fn_value(self, args_str: str, ctx: DAXContext) -> Any:
         """VALUE(text) — convert text to number."""
-        val = self._eval_expr(args_str.strip(), ctx)
+        val = _scalarize(self._eval_expr(args_str.strip(), ctx))
         if val is None:
             return 0
         try:
-            s = str(val).replace(',', '').replace('$', '').replace('%', '').strip()
+            s = _concat_str(val).replace(',', '').replace('$', '').replace('%', '').strip()
             if '.' in s:
                 return float(s)
             return int(s)
@@ -13559,8 +13561,8 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return ''
-        delimiter = str(self._eval_expr(args[0].strip(), ctx) or '')
-        parts = [str(self._eval_expr(a.strip(), ctx) or '') for a in args[1:]]
+        delimiter = self._eval_text(args[0], ctx)
+        parts = [self._eval_text(a, ctx) for a in args[1:]]
         return delimiter.join(parts)
 
     def _fn_concatenatex(self, args_str: str, ctx: DAXContext) -> Any:
@@ -13839,11 +13841,13 @@ class DAXEngine:
         return self._eval_expr(args[1].strip(), ctx) if failed else result
 
     def _fn_coalesce(self, args_str: str, ctx: DAXContext) -> Any:
-        """COALESCE(value1, value2, ...) — return first non-blank value."""
+        """COALESCE(value1, value2, ...) — return first non-blank value. The
+        empty text "" is not blank: Desktop's COALESCE("", "x") is "", and
+        COALESCE(T[c], "x") keeps a row's "" (build_b163.py, issue #164)."""
         args = self._split_args(args_str)
         for arg in args:
-            val = self._eval_expr(arg.strip(), ctx)
-            if val is not None and val != '':
+            val = _scalarize(self._eval_expr(arg.strip(), ctx))
+            if val is not None:
                 return val
         return None
 

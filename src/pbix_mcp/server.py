@@ -10354,8 +10354,13 @@ def _rebuild_datamodel(
             continue
         if tname in table_updates:
             upd = table_updates[tname]
+            calc_cols = upd.get("calc_columns")
+            if tname in restamp_calc_tables:
+                # a calculated table: every column is DAX's, its text stored as
+                # computed -- only an import strips trailing whitespace (#159)
+                calc_cols = [c["name"] for c in upd["columns"]]
             builder.add_table(tname, upd["columns"], rows=upd["rows"],
-                              calc_columns=upd.get("calc_columns"))
+                              calc_columns=calc_cols)
         else:
             # Read existing row data from VertiPaq. If a column cannot be
             # decoded we must NOT fall back to rebuilding the table with no
@@ -10379,7 +10384,8 @@ def _rebuild_datamodel(
 
     # Add new tables
     for et in extra_tables:
-        builder.add_table(et["name"], et["columns"], rows=et.get("rows", []))
+        builder.add_table(et["name"], et["columns"], rows=et.get("rows", []),
+                          calc_columns=et.get("calc_columns"))
 
     # Add all measures (existing + new), skip measures on removed tables
     for m in measures:
@@ -13478,7 +13484,9 @@ def pbix_datamodel_add_calculated_table(
                      "data_type": _infer_calc_type_name([r[i] for r in rows])}
                     for i, c in enumerate(cols)]
         new_table = {"name": table_name, "columns": new_cols,
-                     "rows": [dict(zip(cols, r)) for r in rows]}
+                     "rows": [dict(zip(cols, r)) for r in rows],
+                     # DAX's values, stored as computed (#159)
+                     "calc_columns": list(cols)}
 
         old_size, _ = _rebuild_datamodel(
             info, table_updates=table_updates, extra_tables=[new_table],

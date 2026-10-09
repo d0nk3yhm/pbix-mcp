@@ -817,6 +817,9 @@ class PBIXBuilder:
                   Power BI recomputes a calculated column from its DAX on
                   refresh — embedding it would ship stale values the engine
                   ignores (Desktop's Enter-data query carries source columns only).
+                  Their text is stored exactly as given; every other text
+                  loses the trailing U+0001 to U+0020 Desktop's import strips
+                  (issue #159).
         """
         if mode not in ("import", "directquery"):
             raise ValueError(f"mode must be 'import' or 'directquery', got {mode!r}")
@@ -1444,17 +1447,30 @@ class PBIXBuilder:
             # Silently altering supplied values is the one thing this project
             # does not do, so say so here rather than let the caller discover it
             # in a readback.
-            from pbix_mcp.formats.vertipaq_encoder import column_text_key
+            # The same goes for an imported text's trailing U+0001 to U+0020,
+            # which Desktop's import strips (issue #159): the model stores the
+            # text without them, so say that too. The case check then sees
+            # the stored text ("UV " and "uv" fold onto "UV").
+            from pbix_mcp.formats.vertipaq_encoder import (
+                IMPORT_STRIPPED,
+                column_text_key,
+                import_text,
+            )
+            imported = set(_import_text_columns(t))
             for c in t["columns"]:
                 if str(c.get("data_type", "String")) != "String":
                     continue
                 cname = c["name"]
                 first_by_key: dict[str, str] = {}
                 collisions: dict[str, set] = {}
+                stripped: list[str] = []
                 for row in t.get("rows", []):
                     v = row.get(cname)
                     if not isinstance(v, str):
                         continue
+                    if cname in imported and v and v[-1] in IMPORT_STRIPPED:
+                        stripped.append(v)
+                        v = import_text(v)
                     key = column_text_key(v)
                     prev = first_by_key.get(key)
                     if prev is None:
@@ -1475,6 +1491,19 @@ class PBIXBuilder:
                         f"using the first spelling seen (as Power BI does on "
                         f"import) — distinct counts and grouping will reflect "
                         f"the folded value."
+                    )
+                if stripped:
+                    examples = ", ".join(repr(s) for s in stripped[:3])
+                    warn(
+                        "trailing_whitespace", [t["name"]],
+                        f"WARNING: Table '{t['name']}' column '{cname}' has "
+                        f"{len(stripped)} value(s) ending in whitespace or "
+                        f"control characters ({examples}). Power BI's import "
+                        f"strips U+0001 to U+0020 (space, tab, line feed, "
+                        f"carriage return, ...) from the end of a text, so "
+                        f"the model stores them stripped, as a refresh in "
+                        f"Power BI would; a filter on the unstripped text "
+                        f"finds nothing. The partition's source keeps them."
                     )
 
             # Check row data matches column definitions. A field that is not
@@ -1749,7 +1778,8 @@ class PBIXBuilder:
                     "message": f"PBIX pre-build: {issue}"})
                 warnings.warn(f"PBIX pre-build: {issue}", stacklevel=2)
 
-        tables = self._tables
+        # the rows as stored: imported text as Desktop's import stores it (#159)
+        tables = _stored_tables(self._tables)
         measures = self._measures
         relationships = self._relationships
 
@@ -1925,6 +1955,43 @@ _M_TRANSFORM_TYPES = {
 # rather than emit a multi-hundred-MB literal — such a table should carry a real
 # source instead. Realistic inline/config tables are a few KB; this is generous.
 _ENTER_DATA_MAX_B64 = 12 * 1024 * 1024
+
+
+def _import_text_columns(tdef: dict) -> list[str]:
+    """The text columns whose values come through Desktop's import: every
+    String column but the calculated ones (DAX keeps its text as computed)."""
+    calc = {c.lower() for c in tdef.get("calc_columns") or []}
+    return [c["name"] for c in tdef.get("columns", [])
+            if str(c.get("data_type", "String")) == "String" and c["name"].lower() not in calc]
+
+
+def _stored_tables(tables: list[dict]) -> list[dict]:
+    """The tables as the model stores their rows: an imported text without
+    the trailing U+0001 to U+0020 Desktop's import strips (issue #159).
+    ``source_rows`` keeps the rows as supplied, for the partition's M, so a
+    refresh in Desktop strips them the same way."""
+    from pbix_mcp.formats.vertipaq_encoder import IMPORT_STRIPPED, import_text
+
+    def stripped(v) -> bool:
+        return isinstance(v, str) and v != "" and v[-1] in IMPORT_STRIPPED
+
+    out = []
+    for t in tables:
+        names = _import_text_columns(t)
+        rows = t.get("rows") or []
+        if not names or not any(stripped(r.get(n)) for r in rows for n in names):
+            out.append(t)
+            continue
+        new_rows = []
+        for r in rows:
+            hit = [n for n in names if stripped(r.get(n))]
+            if hit:
+                r = dict(r)
+                for n in hit:
+                    r[n] = import_text(r[n])
+            new_rows.append(r)
+        out.append(dict(t, rows=new_rows, source_rows=rows))
+    return out
 
 
 def _m_escape_field_name(name: str) -> str:
@@ -2448,6 +2515,8 @@ def _modify_metadata_and_encode(
 
     from pbix_mcp.formats.vertipaq_encoder import (
         _align_bit_width,
+        _convert_value_for_dict,
+        _val_key,
         encode_nosplit_idf,
         encode_nosplit_idfmeta,
         encode_table_data,
@@ -2610,7 +2679,8 @@ def _modify_metadata_and_encode(
                  _build_m_expression(tname, tdef.get("columns", []),
                                      tdef.get("source_csv"), tdef.get("source_db"),
                                      is_directquery=is_directquery,
-                                     rows=tdef.get("rows", []),
+                                     # the rows as supplied: a refresh strips them as stored (#159)
+                                     rows=tdef.get("source_rows", tdef.get("rows", [])),
                                      exclude_columns=tdef.get("calc_columns")),
                  partition_type, ps_id,
                  partition_mode,
@@ -3189,8 +3259,12 @@ def _modify_metadata_and_encode(
                 from_tdef = next((t for t in tables if t["name"] == ft), None)
                 to_tdef = next((t for t in tables if t["name"] == tt), None)
                 if from_tdef and to_tdef:
-                    from_vals = [r.get(fc) for r in from_tdef.get("rows", [])]
-                    to_vals = [r.get(tc) for r in to_tdef.get("rows", [])]
+                    # a text key as the column stores it: "k1" / "K1" are one
+                    # value (#43, #160), as are "k1" / "k1 " once stored (#159)
+                    from_vals = [_val_key(v) if isinstance(v, str) else v
+                                 for v in (r.get(fc) for r in from_tdef.get("rows", []))]
+                    to_vals = [_val_key(v) if isinstance(v, str) else v
+                               for v in (r.get(tc) for r in to_tdef.get("rows", []))]
                     from_is_unique = len(set(from_vals)) == len(from_vals)
                     to_is_unique = len(set(to_vals)) == len(to_vals)
                     # If from has unique values and to doesn't (or has more rows), swap
@@ -3482,19 +3556,24 @@ def _modify_metadata_and_encode(
                 # CRITICAL: String=insertion order, Numeric=sorted (matching GT v2)
                 raw_vals = [row.get(col_name) for row in rows]
                 if data_type == "String":
-                    # Insertion order for strings. Empty string canonicalizes
-                    # to NULL (matching _convert_value_for_dict), so it never
-                    # becomes a dictionary entry here either.
+                    # Insertion order for strings: one entry per DICTIONARY
+                    # value, numbered as the encoder numbers them -- its
+                    # conversion ("" a value of its own, #161) and its identity
+                    # (_val_key folds ASCII case, #43), the first spelling
+                    # stored. Deduplicating the text exactly numbered every
+                    # case spelling, so the hierarchy pointed past the
+                    # dictionary and at the wrong values (issue #160).
                     seen_order: dict[object, int] = {}
                     dict_values: list = []
                     for v in raw_vals:
-                        if v is None or str(v) == "":
+                        cv = _convert_value_for_dict(v, "String")
+                        if cv is None:
                             continue
-                        v = str(v)
-                        if v not in seen_order:
-                            seen_order[v] = len(dict_values)
-                            dict_values.append(v)
-                    seen = seen_order
+                        k = _val_key(cv)
+                        if k not in seen_order:
+                            seen_order[k] = len(dict_values)
+                            dict_values.append(cv)
+                    seen = {v: seen_order[_val_key(v)] for v in dict_values}
                 else:
                     # Sorted order for numerics
                     non_null_unique = set(v for v in raw_vals if v is not None)
@@ -3515,12 +3594,9 @@ def _modify_metadata_and_encode(
                         key=lambda x: (str(type(x)), x) if not isinstance(x, (int, float)) else x,
                     )
 
-                # Null presence must mirror the encoder's converted-value view:
-                # String "" canonicalizes to NULL there, so it counts here too.
-                col_has_nulls = any(
-                    v is None or (data_type == "String" and str(v) == "")
-                    for v in raw_vals
-                ) and row_count > 0
+                # Null presence mirrors the encoder's converted-value view: only
+                # None is BLANK ("" is a value of its own, #161).
+                col_has_nulls = any(v is None for v in raw_vals) and row_count > 0
 
                 # POS_TO_ID: sorted_pos -> data_id (dict_index + 3).
                 # When the column has NULLs, the BLANK member (reserved data
@@ -3995,9 +4071,10 @@ def _modify_metadata_and_encode(
             # So for each distinct FK value (sorted), store the matching PK row.
 
             # Determine the FK column type: string keys must use the SAME
-            # canonicalization as the dictionary/H$ writers ("" -> NULL,
-            # str() coercion), or the R$ slots desync from the dictionary
-            # (off-by-one join misalignment).
+            # identity as the dictionary/H$ writers (str() coercion, ASCII
+            # case folded, #43; "" a key of its own, #161), or the R$ slots
+            # desync from the dictionary (off-by-one join misalignment) and
+            # "ab" does not reach "AB" as it does in Desktop (issue #160).
             many_col_def = next(
                 (cd for cd in many_tdef["columns"]
                  if cd["name"] == many_col_name), {})
@@ -4007,8 +4084,7 @@ def _modify_metadata_and_encode(
                 if v is None:
                     return None
                 if is_string:
-                    s = str(v)
-                    return s if s != "" else None
+                    return _val_key(_convert_value_for_dict(v, "String"))
                 return v
 
             # A DatePartOnly join (issue #128) matches a key by its DATE: every
@@ -4024,11 +4100,14 @@ def _modify_metadata_and_encode(
                         return float(int(v // 1))      # a serial's day
                 return v
 
-            # Map TO table key values to row indices
+            # Map TO table key values to row indices. A key the one side holds
+            # more than once (exact copies, case variants, a trailing space
+            # the import strips) reaches its LAST row, as Desktop builds the
+            # index (issue #162; build_b160r.py: k1 of rows A, C, K1=D -> D).
             to_key_index: dict[object, int] = {}
             for idx, row in enumerate(to_rows):
                 key_val = _canon_key(row.get(one_col_name), fk_is_string)
-                if key_val is not None and _join_key(key_val) not in to_key_index:
+                if key_val is not None:
                     to_key_index[_join_key(key_val)] = idx
 
             # Get DISTINCT FK values in DICTIONARY (data_id) order: insertion

@@ -40,17 +40,32 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-09 (0.9.131): docs 1-56 and GitHub issues/PRs #1-#158 are
-closed.** 0.9.131 closes #157: the engine compares and orders text in the
-model's collation, as Desktop does (Windows NLS 6.1 sort weights measured per
-character, less the 1,321 characters Desktop's older table does not know:
-case-insensitive, accents after the letters, punctuation before the digits,
-hyphens and apostrophes last; 62 of 62 expression pairs, 0.9.130 35); #156, a
-built text column's attribute hierarchy is written in that order, so a built
-model sorts as it does after Desktop's refresh (build_b156.py 12 of 12, 0.9.130
-5); and #158, TOPN takes every order pair, orders by any value (dates and text
-too, BLANK first) and keeps the ties at the n-th row (build_b158.py 13 of 13,
-0.9.130 6). All three were found verifying #136.
+**Updated 2026-10-10 (0.9.132): docs 1-56 and GitHub issues/PRs #1-#162, #164
+and #165 are closed; #163 is open.** 0.9.132 closes six issues found verifying
+#156, all about text as Desktop's column store holds it. #159: Desktop's import
+strips U+0001-U+0020 from the end of a text, and the builder now stores what it
+stores (build_b159.py 35 of 35 the same as built and refreshed, 0.9.131 13).
+#161: the empty text "" is a value of its own, stored as Desktop stores it -- a
+zero-length record on a page flagged page_contains_nulls, the flag whose
+absence made 0.9.3's "" unloadable (build_b161.py 7 of 7, 0.9.131 0). #160: a
+built text column's hierarchy, relationship index and orientation guess number
+the case-folded dictionary (build_b160.py: COUNTROWS(VALUES) 8, not 14). #162: a
+key the one side holds more than once reaches its last row, as Desktop joins
+it. #164 and #165: the engine takes "" for a value, not BLANK, and text
+functions take a one-row table's value (build_b163.py 38 of 38, 0.9.131 14).
+#163, the engine's own joins of repeated and case-variant keys, is open.
+
+As of 0.9.131, docs 1-56 and #1-#158 were closed. 0.9.131 closes #157: the
+engine compares and orders text in the model's collation, as Desktop does
+(Windows NLS 6.1 sort weights measured per character, less the 1,321
+characters Desktop's older table does not know: case-insensitive, accents
+after the letters, punctuation before the digits, hyphens and apostrophes
+last; 62 of 62 expression pairs, 0.9.130 35); #156, a built text column's
+attribute hierarchy is written in that order, so a built model sorts as it
+does after Desktop's refresh (build_b156.py 12 of 12, 0.9.130 5); and #158,
+TOPN takes every order pair, orders by any value (dates and text too, BLANK
+first) and keeps the ties at the n-th row (build_b158.py 13 of 13, 0.9.130 6).
+All three were found verifying #136.
 
 As of 0.9.130, docs 1-56 and #1-#155 were closed. 0.9.130 closes #136: every
 column of a built model is available in MDX (IsAvailableInMDX = 1, as Desktop

@@ -5,6 +5,127 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.132] - 2026-10-10
+
+A built model stores its text as Desktop's import stores it, and the engine answers for that text as Desktop does. Verifying #156 turned up two rules of Desktop's column store: its import strips trailing whitespace (#159), and it keeps the empty text apart from BLANK (#161). Measuring those turned up four errors: the builder's hierarchy ignored the case fold (#160), its index joined a repeated key to the wrong row (#162), and the engine mishandled the empty text (#164) and one-row tables in text functions (#165). Checked against Power BI Desktop 2.152 over ADOMD, as built against after Desktop's own refresh:
+
+| Battery | 0.9.132 | 0.9.131 |
+|---|---|---|
+| `build_b159.py`: 15 groups of spellings that differ by whitespace | 35 of 35 queries | 13 |
+| `build_b159b.py`: every C0 / C1 control and Unicode space at the end of a text, `""`, whitespace-only text | 15 of 15 | 6 |
+| `build_b161.py`: `""` and BLANK | 7 of 7 | 0 |
+| `build_b161c.py`: `""` in a column past the compression threshold | 10 of 10 | 2 |
+| `build_b160.py`: values that differ only by ASCII case | 11 of 15; the other 4 differ only in the order of `ç` / `Ç`, which the collation ties (#156) | 7 |
+| `build_b160r.py` and `build_b159.py`'s second model: a key the one side holds more than once | 5 of 5 and 3 of 3 | 3 and 0 |
+| `build_b163.py`: `""` in DAX and text functions over a one-row table, the engine against Desktop | 38 of 38 | 14 |
+
+The corpus census (1,508 measures) changes only the 15 measures that use RAND or RANDBETWEEN, as 0.9.131's did; it runs in 2,860 s, against 2,942 s on 0.9.131. `regress_check.py` finds no regression across its Desktop batteries.
+
+### Fixed — an imported text is stored without its trailing whitespace (issue #159)
+
+**What was wrong:** the builder stored each text as supplied. Desktop's import strips trailing whitespace, storing `"ab "` as `"ab"`. A built model therefore counted `"ab"` and `"ab "` as two values until Desktop refreshed it: in VALUES, DISTINCTCOUNT, groupings and filters. The same held for every table `pbix_set_table_data`, `pbix_update_table_rows` and `pbix_append_table_rows` write.
+
+**What Desktop does:** measured by `build_b159.py` and `build_b159b.py`, the latter with every C0 / C1 control and Unicode space as the last character of a text.
+
+- **What it strips:** U+0001 to U+0020 from the end of a text, that is every C0 control (tab, line feed, carriage return, ...) and the space, any number and mix of them.
+- **What it stores:** the stripped spelling, even when the unstripped one comes first. `"cd "` then `"cd"` are stored as `"cd"`.
+- **Filters:** a filter on the unstripped text finds nothing, whether CALCULATE, TREATAS or FILTER.
+- **What it keeps:** DEL, U+0080 to U+009F, the no-break space and every other Unicode space, and leading and inner whitespace. A whitespace-only text becomes `""` (#161).
+- **DAX does not strip:** a calculated table's `DATATABLE(..., {{" "}})` and a calculated column's `" "` are stored as they are, in Desktop-saved files of the corpus.
+
+**The fix:** `vertipaq_encoder.import_text` strips U+0001 to U+0020 from the end of a text. The builder passes every imported text through it once, so the dictionary, the hierarchy, the relationship index, the statistics and the warnings all see the stored text.
+
+- Calculated columns and calculated tables keep their text.
+- The partition's "Enter data" M keeps the supplied text, so a refresh in Desktop strips it the same way.
+- A pre-build warning, `trailing_whitespace`, says how many values were stripped.
+
+**Pinned** by `tests/test_issue159_import_trailing_whitespace.py`: 127 tests generated from Desktop's output. They cover the stored values, 32 filter probes of 5 forms each, the 91-character sweep, a calculated column, the warning and the M source. **114 fail on 0.9.131.**
+
+### Fixed — an empty text `""` is a value of its own (issue #161)
+
+**What was wrong:** an empty text was stored as BLANK, since 0.9.3. Desktop's import keeps `""` apart from BLANK:
+
+- ISBLANK is FALSE for it;
+- `TREATAS({""}, ...)` and `==` select it alone;
+- COUNTA and DISTINCTCOUNTNOBLANK count it;
+- the MIN of a column is `""`.
+
+As built, all 7 of `build_b161.py`'s queries answered differently.
+
+**Why it was stored as BLANK:** in 0.9.3, a `""` record made Desktop refuse the model with "Database consistency checks (DBCC) failed while checking the string store". The record was not the cause. Desktop writes `""` as an ordinary zero-length record and flags its page `page_contains_nulls`. That holds for all 10 such pages in the Desktop-saved files of the corpus, and the 714 pages without one carry 0. The same model with the flag at 0 still fails in Desktop 2.152 with that DBCC error, and with the flag at 1 it loads.
+
+**The fix:** the encoder stores `""` as a zero-length record and sets `page_contains_nulls` on its page. A dictionary that holds `""` stays on one uncompressed page, as Desktop's does: `build_b161c.py`'s column of 13,313 characters is past the compression threshold, and Desktop wrote it uncompressed with `""` but Huffman-compressed without. The encoder now writes that dictionary byte for byte as Desktop's own. A compressed page holding `""` made Desktop refuse the model with the same DBCC error. The builder's null slot, hierarchy and relationship index treat it as a value: the hierarchy holds BLANK, then `""` before every other text, with MinValue `""`. Pass `None` for BLANK.
+
+**Pinned** by `tests/test_issue161_empty_text.py`: the stored values, the dictionary record and its flag, the uncompressed page, the hierarchy, and 25 of Desktop's answers through the reader and the engine. **24 of 29 fail on 0.9.131.**
+
+### Fixed — a built text column's hierarchy numbers its dictionary (issue #160)
+
+**What was wrong:** the builder folds a text column's values that differ only by ASCII case onto the first spelling (#43), as Desktop's import does. But it numbered the attribute hierarchy (H$) with every spelling. The hierarchy held data ids past the dictionary's end, and the values after the first fold pointed at the wrong entries. In Desktop, until a refresh:
+
+- `COUNTROWS(VALUES(T[c]))` was 14 for 8 values;
+- ORDER BY, MIN, TOPN and CONCATENATEX's ordering were scrambled;
+- `MAX(T[c])` failed with an internal error (pfshdata.cpp).
+
+Every built model with such a column has had this since 0.9.88. The relationship index keyed its text the same way, so its slots lost step with a folded key column. The orientation guess for a plain many-to-one with no order given also took a column for unique when it was unique only before the fold.
+
+**The fix:** the hierarchy, the relationship index and the orientation guess all take a text's identity from the encoder (`_convert_value_for_dict`, `_val_key`), so each numbers exactly what the dictionary holds. Tables that `pbix_set_table_data` rewrites already used the encoder's own hierarchy and were not affected.
+
+**Checked:** `build_b160.py`'s 15 queries answer the same as built and after a refresh, except the order of `ç` / `Ç` in 4 of them. The collation finds those two equal, and Desktop's order among such values follows no rule we can see (#156).
+
+**Pinned** by `tests/test_issue160_case_variant_hierarchy.py`: 3 tests. **All 3 fail on 0.9.131.**
+
+### Fixed — a key the one side of a relationship holds more than once reaches its last row (issue #162)
+
+**What was wrong:** the relationship index joined a repeated one-side key to its first row, and Desktop's refresh joins its last. In `build_b160r.py`:
+
+- `k1` of rows A, C and `K1` (D) reaches D;
+- `k2` / `k2 ` reaches F;
+- `k3` reaches G.
+
+RELATED, and groupings by the one side's other columns, differed until Desktop refreshed the model. Desktop's UI refuses such a relationship, but a model that has one loads and refreshes without an error.
+
+**The fix:** the index maps each key to its last row, using the dictionary's identity for text keys (#160).
+
+**Pinned** by `tests/test_issue162_duplicate_one_side_keys.py`: the R$ index against Desktop's RELATED. **It fails on 0.9.131**: there the orientation guess took F for the one side, so F had no index at all.
+
+**Not changed:** the engine's own joins. RELATED and filter propagation look a key up by its exact value and reach every row that holds it, where Desktop joins one row per key. That is #163.
+
+### Fixed — the engine treats the empty text as a value, not BLANK (issue #164)
+
+**What was wrong:** `ISBLANK("")` was TRUE, COUNTX and COUNTAX skipped `""`, and the MIN of a column and COALESCE passed over it. FIRSTNONBLANK(T[c], T[c]) skipped a `""` value too. Desktop-saved models can hold `""` (7 files of the corpus do), and built models do from this release (#161).
+
+**What Desktop does** (`build_b163.py`):
+
+- `ISBLANK("")` and `ISBLANK("" & BLANK())` are FALSE, and a column's `""` rows are not blank;
+- `COUNTX(T, T[c])` counts them;
+- `MIN(T[c])` and `MINX` return `""`;
+- `COALESCE("", "x")` is `""`;
+- `FIRSTNONBLANK(T[c], T[c])` returns a `""` value.
+
+COUNTBLANK counts `""` as blank, and `= ""` matches BLANK, as before.
+
+**Pinned** by `tests/test_issue163_empty_text_in_dax.py`: 22 of Desktop's answers. **11 fail on 0.9.131.**
+
+### Fixed — text functions take a one-row table's value (issue #165)
+
+**What was wrong:** these functions applied `str()` to their argument:
+
+- LEN, UPPER, LOWER, PROPER;
+- LEFT, RIGHT, MID, TRIM, SUBSTITUTE, REPLACE, REPT;
+- SEARCH, FIND, CONTAINSSTRING, CONTAINSSTRINGEXACT, EXACT;
+- UNICODE, VALUE, COMBINEVALUES.
+
+So `LEN(FIRSTNONBLANK(T[c], 1))` measured the internal row list's Python text (56), and `UPPER(TOPN(1, VALUES(T[c]), T[c]))` returned that text. `str(x or '')` also turned a 0 into `""` and a date into Python's text.
+
+**The fix:** they convert their arguments as DAX does, as `&` already did:
+
+- a one-row table is its value;
+- BLANK is `""`;
+- a number is its DAX text (`0` is `"0"`);
+- a date is its text, so `LEN(LASTDATE(T[d]))` is 8 (`"4/2/2024"`).
+
+**Pinned** by `tests/test_issue164_text_functions_one_row_tables.py`: 16 of Desktop's answers. **13 fail on 0.9.131.**
+
 ## [0.9.131] - 2026-10-09
 
 Text is compared and ordered in the model's collation, as Power BI Desktop does it, both in the engine (#157) and in the models the builder writes (#156). TOPN orders by any value and every order pair, and keeps ties (#158). Found while verifying #136. Checked against Power BI Desktop 2.152 over ADOMD:
