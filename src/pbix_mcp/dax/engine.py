@@ -572,6 +572,21 @@ def _scalarize(v):
     return v
 
 
+_NAMED_NUMBER_FORMATS = frozenset({
+    'general number', 'currency', 'fixed', 'standard', 'percent', 'scientific'})
+
+
+def _is_number_format(fmt: str) -> bool:
+    """Is FORMAT picture ``fmt`` a NUMBER format (0 # , . % E and quoted or
+    escaped literals), not a date one?"""
+    f = fmt.strip()
+    if f.lower() in _NAMED_NUMBER_FORMATS:
+        return True
+    bare = re.sub(r'"[^"]*"|\\.', '', f)
+    return (bool(bare) and any(ch in bare for ch in '0#')
+            and all(ch in '0#,.%Ee+-;() ' for ch in bare))
+
+
 def _concat_str(v):
     """Render a value for the DAX `&` operator.
 
@@ -5242,8 +5257,8 @@ class DAXEngine:
         # under a Scenario slice where both operands are blank and Desktop
         # shows nothing -- a measured zero where there is no measurement.
         any_value = acc is not None
-        # Date arithmetic keeps its type in DAX: DATE()+TIME() and d+7 are
-        # datetimes, while d1-d2 is a number of days. The serial coercion
+        # Date arithmetic keeps its type in DAX: DATE()+TIME(), d+7 and d1-d2
+        # are datetimes (#146). The serial coercion
         # below erased that -- DATE(2026,8,2)+TIME(14,5,9) came back as the
         # bare serial 46236.586..., indistinguishable from a numeric measure
         # (issue #24 r22#1). Track datetime-ness across the fold and convert
@@ -5254,9 +5269,12 @@ class DAXEngine:
             any_value = any_value or rhs is not None
             if op == '+':
                 result_is_dt = result_is_dt or isinstance(rhs, (datetime, date))
-            elif op == '-':
-                # datetime - datetime = days (number); datetime - number = datetime
-                result_is_dt = result_is_dt and not isinstance(rhs, (datetime, date))
+            # '-' keeps the LEFT operand's type: Power BI Desktop 2.152
+            # (build_b146.py, issue #146) gives DATE(2024, 3, 31) - DATE(2024, 1,
+            # 1) as the DateTime 1900-03-30 (90 days) and TIME(18,0,0) -
+            # TIME(6,0,0) as 12:00:00, while 50000 - DATE(...) is a number. The
+            # engine made date - date a number of days (0.9.79, a choice that
+            # was never measured).
             # BLANK acts as 0 for + and -, but not for * and /. Every rule
             # below was read off the live Desktop engine (msmdsrv), not the
             # docs:
@@ -5439,6 +5457,13 @@ class DAXEngine:
                     # Text compares case-insensitively ("North" = "north",
                     # "a" < "B"; issue #107).
                     left, right = _text_key(left), _text_key(right)
+                elif isinstance(left, (datetime, date)) != isinstance(right, (datetime, date)):
+                    # A date against a number compares as its serial: date -
+                    # date is a date (#146), and `d1 - d2 < 0` must still work.
+                    if isinstance(right, (int, float)) and not isinstance(right, bool):
+                        left = _as_number(left)
+                    elif isinstance(left, (int, float)) and not isinstance(left, bool):
+                        right = _as_number(right)
                 if left is not None and right is not None:
                     try:
                         return op_fn(left, right)
@@ -6201,10 +6226,26 @@ class DAXEngine:
             return None
         condition = self._eval_expr(args[0].strip(), ctx)
         if condition:
-            return self._eval_expr(args[1].strip(), ctx)
+            return self._if_result(self._eval_expr(args[1].strip(), ctx), args[2:3])
         elif len(args) > 2:
-            return self._eval_expr(args[2].strip(), ctx)
+            return self._if_result(self._eval_expr(args[2].strip(), ctx), args[1:2])
         return None
+
+    _NUMBER_LITERAL_RE = re.compile(r'\s*-?\s*\d+(?:\.\d+)?\s*')
+
+    @classmethod
+    def _if_result(cls, value, other: list) -> Any:
+        """IF's result, typed as both branches type it: a date beside a
+        number literal is a number. Power BI Desktop 2.152 (build_b146.py,
+        issue #146): IF(TRUE(), DATE(2024, 3, 31) - DATE(2024, 1, 1), 0) is
+        90, while beside BLANK() a date stays a date. The engine evaluates one
+        branch, so only a literal other branch is known."""
+        if (isinstance(value, (datetime, date)) and other
+                and cls._NUMBER_LITERAL_RE.fullmatch(str(other[0])) is not None):
+            n = _as_number(value)
+            if n is not None:
+                return int(n) if float(n).is_integer() else n
+        return value
 
     def _fn_switch(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
@@ -7788,6 +7829,11 @@ class DAXEngine:
                 coerced = _as_datetime(val)
                 if coerced is not None:
                     val = coerced
+        # A number format on a date formats its serial: Power BI Desktop 2.152
+        # (build_b146.py, issue #146), FORMAT(DATE(2024, 3, 31) - DATE(2024, 1,
+        # 1), "0") is "90".
+        if isinstance(val, (datetime, date)) and fmt and _is_number_format(str(fmt)):
+            val = _as_number(val)
         # Datetime formatting (NOW()/TODAY()/date columns).
         if isinstance(val, (datetime, date)) and fmt:
             return self._format_datetime_pattern(val, str(fmt))
@@ -7822,22 +7868,29 @@ class DAXEngine:
         if isinstance(table_ref, list):
             total: float = 0
             seen = False
+            dates = True          # every value a date: the sum is a date (#146)
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
                     row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
-                    if isinstance(result, (int, float)):
-                        total += result
-                        seen = True
                 else:
                     result = self._eval_expr(row_expr, ctx)
-                    if isinstance(result, (int, float)):
-                        total += result
-                        seen = True
+                if isinstance(result, (datetime, date)):
+                    # Power BI Desktop 2.152 (build_b146.py, issue #146):
+                    # SUMX(Dt, Dt[Date] - DATE(2024, 1, 1)) is the DateTime
+                    # 1911-03-18 (4095 days). Dates were skipped.
+                    total += _as_number(result) or 0
+                    seen = True
+                elif isinstance(result, (int, float)):
+                    total += result
+                    seen = True
+                    dates = False
             # SUMX over nothing is BLANK, matching SUM and Desktop
             # (SUMX(FILTER({1,2,3}, FALSE()), 1) is BLANK, not 0).
-            return total if seen else None
+            if not seen:
+                return None
+            return _DAX_EPOCH_DT + timedelta(days=total) if dates else total
         return None
 
     def _fn_maxx(self, args_str: str, ctx: DAXContext) -> Any:
@@ -7906,12 +7959,15 @@ class DAXEngine:
                     row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
-                    if isinstance(result, (int, float)):
-                        values.append(result)
                 else:
                     result = self._eval_expr(row_expr, ctx)
-                    if isinstance(result, (int, float)):
-                        values.append(result)
+                if isinstance(result, (datetime, date)):
+                    # A date averages as its serial, and the average is a
+                    # number: Power BI Desktop 2.152 (build_b146.py, issue
+                    # #146), AVERAGEX(Dt, Dt[Date]) is 45337. Dates were skipped.
+                    result = _as_number(result)
+                if isinstance(result, (int, float)):
+                    values.append(result)
         return sum(values) / len(values) if values else None
 
     def _fn_countx(self, args_str: str, ctx: DAXContext) -> Any:
@@ -12938,9 +12994,11 @@ class DAXEngine:
     # =========================================================================
 
     def _fn_isnumber(self, args_str: str, ctx: DAXContext) -> Any:
-        """ISNUMBER(value) — check if value is numeric."""
-        val = self._eval_expr(args_str.strip(), ctx)
-        return isinstance(val, (int, float))
+        """ISNUMBER(value) — check if value is numeric. A date is a number:
+        Power BI Desktop 2.152 (build_b146.py, issue #146), ISNUMBER(DATE(
+        2024, 3, 31)) is TRUE."""
+        val = _scalarize(self._eval_expr(args_str.strip(), ctx))
+        return isinstance(val, (int, float, datetime, date))
 
     def _fn_istext(self, args_str: str, ctx: DAXContext) -> Any:
         """ISTEXT(value) — check if value is text."""

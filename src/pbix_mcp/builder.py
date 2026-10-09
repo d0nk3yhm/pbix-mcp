@@ -464,10 +464,13 @@ def _dax_expr_is_datetime(s: str, bindings: dict[str, str] | None = None,
     """Best-effort: does this DAX expression evaluate to a datetime?
 
     Mirrors ``_dax_expr_is_text``: resolves VAR references, follows
-    IF/IFERROR/SWITCH branches, and understands date arithmetic — a top-level
-    ``+`` chain containing a datetime stays datetime (``DATE(..) + TIME(..)``,
-    ``d + 7``), while ``datetime - datetime`` is a number of days. Conservative:
-    anything unrecognized is NOT datetime (callers who know pass data_type).
+    IF/IFERROR/SWITCH branches, and understands date arithmetic as Power BI
+    Desktop 2.152 types it (build_b146.py, issue #146): ``+`` is a datetime
+    when either side is (``DATE(..) + TIME(..)``, ``d + 7``), ``-`` when its
+    LEFT side is (``d1 - d2`` is the DateTime 1900-03-30 for 90 days;
+    ``50000 - d`` a number), and IF with a date beside a number literal is a
+    number. Conservative: anything unrecognized is NOT datetime (callers who
+    know pass data_type).
     """
     if _depth > 10:
         return False
@@ -495,11 +498,9 @@ def _dax_expr_is_datetime(s: str, bindings: dict[str, str] | None = None,
     if ops:
         running = _dax_expr_is_datetime(operands[0], bindings, _depth + 1)
         for op, operand in zip(ops, operands[1:]):
-            rhs_dt = _dax_expr_is_datetime(operand, bindings, _depth + 1)
             if op == "+":
-                running = running or rhs_dt
-            else:  # '-': dt - dt = number of days; dt - number stays dt
-                running = running and not rhs_dt
+                running = running or _dax_expr_is_datetime(operand, bindings, _depth + 1)
+            # '-' keeps the left side's type (#146)
         return running
     m = 0
     n = len(s)
@@ -539,8 +540,29 @@ def _dax_expr_is_datetime(s: str, bindings: dict[str, str] | None = None,
                 branches = [args[i] for i in range(2, len(args), 2)]
                 if len(args) >= 2 and (len(args) - 1) % 2 == 1:
                     branches.append(args[-1])
+            # a date beside a number literal is a number (#146)
+            if any(re.fullmatch(r"\s*-?\s*\d+(?:\.\d+)?\s*", b) for b in branches):
+                return False
             return any(_dax_expr_is_datetime(b, bindings, _depth + 1)
                        for b in branches)
+    return False
+
+
+def _role_has_levels(visual_type: str, role: str) -> bool:
+    """Is ``role`` of ``visual_type`` a drillable role, whose shown levels
+    Desktop marks ``active``? Read off the Desktop-authored files of
+    test_samples (issue #143): Category of every chart and map, a matrix's
+    Rows and Columns, a slicer's Values, a scatter's X and a decomposition
+    tree's ExplainBy. Y, Values of cards and tables, Tooltips, Size, Series,
+    Data and a chart's small-multiples Rows never carry the key."""
+    if role == "Category" or role == "ExplainBy":
+        return True
+    if role in ("Rows", "Columns"):
+        return visual_type in ("pivotTable", "matrix")
+    if role == "Values":
+        return visual_type in ("slicer", "listSlicer")
+    if role == "X":
+        return visual_type == "scatterChart"
     return False
 
 
@@ -1201,23 +1223,31 @@ class PBIXBuilder:
         # {"roles": {"Rows": [...], "Columns": [...], "Values": [...]}}: what
         # the fixed shapes below cannot say -- a matrix's Rows and Columns, a
         # chart's Series, several values, any implicit aggregation.
+        # `active` marks a drillable role's shown levels, as Desktop writes it
+        # (issue #143): the first entry only -- the top level, Desktop's default
+        # -- or every entry with "expanded": True. Other roles carry no key.
+        expanded = bool(cfg.get("expanded"))
         if isinstance(cfg.get("roles"), dict):
             for role, fields in cfg["roles"].items():
                 items = []
-                for f in fields:
+                drill = _role_has_levels(visual_type, role)
+                for i, f in enumerate(fields):
                     if "measure" in f:
                         ref = _add_measure(f["measure"])
                     elif f.get("aggregation"):
                         ref = _add_aggregation(f["table"], f["column"], f["aggregation"])
                     else:
                         ref = _add_column(f["table"], f["column"])
-                    items.append({"queryRef": ref, "active": True})
+                    item: dict = {"queryRef": ref}
+                    if drill and (i == 0 or expanded):
+                        item["active"] = True
+                    items.append(item)
                 projections[role] = items
 
         # --- Card: single measure -----------------------------------------
         elif visual_type == "card" and "measure" in cfg:
             ref = _add_measure(cfg["measure"])
-            projections["Values"] = [{"queryRef": ref, "active": True}]
+            projections["Values"] = [{"queryRef": ref}]
 
         # --- Slicer: single column ----------------------------------------
         elif visual_type == "slicer" and "column" in cfg:
@@ -1233,7 +1263,7 @@ class PBIXBuilder:
                     ref = _add_measure(col_def["measure"])
                 else:
                     ref = _add_column(col_def["table"], col_def["column"])
-                values.append({"queryRef": ref, "active": True})
+                values.append({"queryRef": ref})
             projections["Values"] = values
 
         # --- Chart types: category + measure ------------------------------
@@ -1242,7 +1272,7 @@ class PBIXBuilder:
             cat_ref = _add_column(cat_cfg["table"], cat_cfg["column"])
             meas_ref = _add_measure(cfg["measure"])
             projections["Category"] = [{"queryRef": cat_ref, "active": True}]
-            projections["Y"] = [{"queryRef": meas_ref, "active": True}]
+            projections["Y"] = [{"queryRef": meas_ref}]
 
         else:
             # A config that names fields but matches no binding shape produces

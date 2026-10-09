@@ -33,6 +33,8 @@ from pbix_mcp.models.responses import DAXResult
     "TODAY() + 7",
     "IF(TRUE(), TODAY(), BLANK())",
     "VAR d = DATE(2026,1,1) RETURN d + 1",
+    # date - date is a DateTime in Desktop 2.152 (build_b146.py, issue #146)
+    "TODAY() - DATE(2026,1,1)",
 ])
 def test_datetime_expressions_infer_datetime(expr):
     assert infer_measure_data_type(expr) == MEASURE_DT_DATETIME
@@ -40,7 +42,8 @@ def test_datetime_expressions_infer_datetime(expr):
 
 @pytest.mark.parametrize("expr,want", [
     ("SUM(S[V])", MEASURE_DT_DOUBLE),
-    ("TODAY() - DATE(2026,1,1)", MEASURE_DT_DOUBLE),   # dt - dt = days
+    ("50000 - TODAY()", MEASURE_DT_DOUBLE),             # '-' keeps the left side's type
+    ("IF(TRUE(), TODAY() - DATE(2026,1,1), 0)", MEASURE_DT_DOUBLE),  # a date beside 0
     ("DATEDIFF(DATE(2026,1,1), TODAY(), DAY)", MEASURE_DT_DOUBLE),
     ("YEAR(TODAY())", MEASURE_DT_DOUBLE),
     ('FORMAT(TODAY(), "yyyy-MM")', MEASURE_DT_STRING),

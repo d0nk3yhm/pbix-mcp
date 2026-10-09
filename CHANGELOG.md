@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.127] - 2026-10-09
+
+Date arithmetic is typed as Desktop types it (#146, found verifying #145), and PBIXBuilder marks a projection `active` as Desktop does, as OpenBI reported (#143). Checked against Power BI Desktop 2.152 over ADOMD:
+
+- the date-arithmetic battery (`build_b146.py`, 36 probes) matches in full, against 20 on 0.9.126, and so do `build_b145.py`'s date − date probes (9; 5);
+- every other Desktop probe answers as before.
+
+### Fixed — date arithmetic is typed as Desktop types it (issue #146)
+
+- **What was wrong:** the engine made date − date a number of days, a choice made in 0.9.79 (#24 r22) and never measured. Desktop:
+  - `DATE(2024, 3, 31) - DATE(2024, 1, 1)` is the DateTime 1900-03-30 (90 days), and `"n:" & (…)` is "n:3/30/1900";
+  - `TIME(18, 0, 0) - TIME(6, 0, 0)` is 12:00:00, and `DATE(…) - TIME(6, 0, 0)` a date;
+  - `50000 - DATE(…)` and `BLANK() - DATE(…)` are numbers.
+
+  So `-` keeps its LEFT operand's type, while `+` is a date when either side is one. Also:
+  - ISNUMBER of a date is TRUE (the engine said FALSE);
+  - `SUMX(Dt, Dt[Date] - DATE(2024, 1, 1))` is the DateTime 1911-03-18 and `AVERAGEX(Dt, Dt[Date])` the number 45337 (the engine skipped dates, giving 4095 and BLANK);
+  - `IF(TRUE(), <date - date>, 0)` is 90: a date beside a number literal is a number.
+- **The fix:**
+  - `_fold_arith` keeps the left operand's type for `-`;
+  - ISNUMBER counts dates;
+  - SUMX adds dates and returns a date when every value is one, and AVERAGEX averages their serials;
+  - IF types a date result beside a number literal as a number;
+  - a comparison of a date with a number uses its serial, so `d1 - d2 < 0` still works;
+  - FORMAT applies a number format to a date's serial (`FORMAT(d1 - d2, "0")` is "90").
+- **The builder's type inference agrees** (`infer_measure_data_type`): `d1 - d2` is DateTime (9), `50000 - d` Double, and IF with a number-literal branch Double.
+- **A calculated column the model declares numeric keeps its type** on a rebuild: a date − date result is written as its serial, as Desktop converts it, instead of retyping the column DateTime.
+- **Tests that pinned the 0.9.79 choice now expect Desktop's answer:** `test_issue24_type_info.py`, `test_dax_silent_wrong.py`, `test_compiled_plans.py` (the tenure-days calculated column holds the DateTimes of 516 and 214 days).
+- **Pinned** by `tests/test_issue146_date_arithmetic_types.py`: 45 tests generated from Desktop's output. **20 fail on 0.9.126.**
+
+### Fixed — PBIXBuilder marks a projection `active` as Desktop does (issue #143)
+
+- **What was wrong:** `add_page` wrote `"active": true` on every projection entry of every role. A chart built with two Category fields therefore opened EXPANDED in Desktop: every level active is the expand-all state. Desktop's own default for a two-field axis is its top level.
+- **Desktop's files** (the community dashboards and templates in `test_samples`, 36 files):
+  - a drillable role marks its FIRST entry active, and every entry only when expanded (`A-` / `AA`). These roles are Category of every chart and map, a matrix's Rows / Columns, a slicer's Values, a scatter's X, and a decomposition tree's ExplainBy;
+  - Y, the Values of cards and tables, Tooltips, Size, Series and a chart's small-multiples Rows never carry the key.
+- **The fix:** the builder writes that (`_role_has_levels`). A visual config's `"expanded": true` asks for every level active.
+- **Pinned** by `tests/test_issue143_projection_active.py`: 9 tests. **9 fail on 0.9.126.**
+
 ## [0.9.126] - 2026-10-09
 
 A row context filters nothing until CALCULATE or a measure reference turns it into a filter, as OpenBI reported (#116). Found verifying it: a VAR block inside a function argument (#144), and the one-date tables of time intelligence used as values (#145). Checked against Power BI Desktop 2.152 over ADOMD:

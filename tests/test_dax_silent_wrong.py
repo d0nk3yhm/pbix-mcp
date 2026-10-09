@@ -759,8 +759,12 @@ class TestDatesAreNumbers:
     def test_date_multiplies_as_its_serial(self):
         assert self._ev("DATE(2020,1,2) * 2") == 87664
 
-    def test_date_difference_is_days(self):
-        assert self._ev("DATE(2020,1,3) - DATE(2020,1,1)") == 2
+    def test_date_difference_is_a_date_of_that_many_days(self):
+        # Power BI Desktop 2.152 (build_b146.py, issue #146): date - date is a
+        # DateTime, 2 days after 1899-12-30; times 1 it is the number.
+        from datetime import datetime
+        assert self._ev("DATE(2020,1,3) - DATE(2020,1,1)") == datetime(1900, 1, 1)
+        assert self._ev("(DATE(2020,1,3) - DATE(2020,1,1)) * 1") == 2
 
     def test_iso_string_with_microseconds_keeps_them(self):
         got = self._ev('"2020-04-15T22:04:42.403333" * 86400000')

@@ -169,7 +169,7 @@ class TestColumnDataCache:
     ("10 - 3 - 2", 5),
     ("20 / 4 / 5", 1.0),
     ('"0" & 0', "00"),
-    ("DATE(2020,1,3) - DATE(2020,1,1)", 2.0),
+    ("(DATE(2020,1,3) - DATE(2020,1,1)) * 1", 2.0),   # date - date is a date (#146)
     ("FORMAT(1, \"000\")", "001"),
     ("IF(BLANK() < 50, 20, 80)", 20),
 ])
@@ -218,7 +218,11 @@ class TestOperatorPrecedence:
         vals, err = evaluate_row_context_column(
             cols, [list(r) for r in rows], e, "Employee", snap, [])
         assert err is None
-        assert vals == [516.0, 214.0]  # both POSITIVE — it is an abs()
+        # both POSITIVE -- it is an abs(). date - date is a date of that many
+        # days in Desktop (issue #146), compared with 0 as its serial.
+        from pbix_mcp.dax.engine import _as_number
+        assert [_as_number(v) for v in vals] == [516.0, 214.0]
+        assert all(isinstance(v, dt.datetime) for v in vals)
 
     def test_the_conditional_formatting_shape(self):
         """IF([a]-[b] < 0, red, blue) — GeoSales' CF measures. Desktop says

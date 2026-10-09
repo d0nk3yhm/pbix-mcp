@@ -12600,6 +12600,16 @@ def _materialize_table_calc_columns(
                 raise ValueError(
                     f"'{table_name}'[{spec['column']}]: {err}")
             dt = spec.get("data_type") or _infer_calc_type_name(vals)
+            declared = spec.get("declared_type")
+            if dt == "DateTime" and declared in ("Int64", "Double", "Decimal"):
+                # date - date is a date (issue #146); a column the model
+                # declares numeric keeps its type and takes the serial, as
+                # Desktop converts it, so a rebuild does not retype it.
+                from pbix_mcp.dax.engine import _as_number
+                serials = [_as_number(v) if v is not None else None for v in vals]
+                vals = [int(n) if (declared == "Int64" and n is not None) else n
+                        for n in serials]
+                dt = declared
             col_names.append(spec["column"])
             for i, r in enumerate(rows):
                 r.append(vals[i])
@@ -13079,7 +13089,8 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
 
     # --- existing calculated COLUMNS: re-evaluate from their DAX ---
     existing = conn.execute(
-        "SELECT t.Name AS tbl, c.ExplicitName AS col, c.Expression AS expr "
+        "SELECT t.Name AS tbl, c.ExplicitName AS col, c.Expression AS expr, "
+        "       c.ExplicitDataType AS edt, c.InferredDataType AS idt "
         "FROM [Column] c JOIN [Table] t ON c.TableID = t.ID "
         "WHERE c.Type = 2 AND t.ModelID = 1").fetchall()
     dropped = {t.lower(): {c.lower() for c in cols}
@@ -13109,8 +13120,10 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
                 f"this engine can't reproduce ({bad.split('.')[0]}). This edit "
                 f"would rebuild it and risk corrupting its values, so it was "
                 f"refused.")
+        _amo = r["edt"] if r["edt"] in _AMO_TO_NAME else r["idt"]
         calc_by_table.setdefault(r["tbl"], []).append(
-            {"column": r["col"], "expression": r["expr"]})
+            {"column": r["col"], "expression": r["expr"],
+             "declared_type": _AMO_TO_NAME.get(_amo)})
     # A table losing its LAST calculated column still has to be re-supplied, or
     # the rebuild guard sees a table that carries Type=2 columns and is not in
     # table_updates, and refuses the very edit that removes them.

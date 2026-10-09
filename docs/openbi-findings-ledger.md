@@ -40,9 +40,17 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-09 (0.9.126): docs 1-55 and GitHub issues/PRs #1-#113,
-#116, #118-#142, #144 and #145 are closed; #114, #115, #117, #136, #143 and
-#146 are open.** 0.9.126 closes #116: a row context filters nothing until
+**Updated 2026-10-09 (0.9.127): docs 1-56 and GitHub issues/PRs #1-#113 and
+#116-#146 except #117 and #136 are closed; #114, #115, #117 and #136 are
+open.** 0.9.127 closes doc 56 = #143: PBIXBuilder marks a projection
+`active` as Desktop does -- a drillable role's first entry (its top level),
+every entry with "expanded": true, never a measure well -- so a two-field axis
+no longer opens expanded. And #146, found verifying #145: date arithmetic is
+typed as Desktop types it (date - date is a DateTime; '-' keeps its left
+operand's type), build_b146.py 36 of 36.
+
+As of 0.9.126, docs 1-55 and #1-#113, #116, #118-#142, #144 and #145 were
+closed; #114, #115, #117, #136, #143 and #146 were open. 0.9.126 closes #116: a row context filters nothing until
 CALCULATE or a measure reference turns it into a filter -- table expressions,
 nested iterators, VALUES, FILTER's aggregates and CALCULATE's filter arguments
 inside an iterator read the context the rows were opened in, while
