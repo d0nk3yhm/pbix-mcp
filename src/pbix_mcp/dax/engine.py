@@ -1100,11 +1100,25 @@ def _date_part_key(v):
 
 def _key_in(v, allowed) -> bool:
     """Does a join cell match a cross filter's key set? By date part across a
-    DatePartOnly relationship, by its str() spelling otherwise."""
+    DatePartOnly relationship, by its join spelling (_jstr) otherwise."""
     if isinstance(allowed, _DatePartKeys):
         k = _date_part_key(v) if v is not None else 'None'
-        return (k or str(v)) in allowed
-    return str(v) in allowed
+        return (k or _jstr(v)) in allowed
+    return _jstr(v) in allowed
+
+
+def _jstr(v) -> str:
+    """A relationship key's spelling for a join: its str(), with a TEXT key's
+    ASCII letters folded. The column store compares a text key as it compares
+    a column's values (#43, #109), also across the two tables, so F's "K1"
+    reaches D's "k1" (Power BI Desktop 2.152, build_b165.py, issue #163)."""
+    return v.translate(_ASCII_LOWER) if isinstance(v, str) else str(v)
+
+
+def _rel_key(v):
+    """RELATED's lookup key: the value, a text key with its ASCII letters
+    folded (as _jstr spells it; numbers keep their own equality, 2 == 2.0)."""
+    return v.translate(_ASCII_LOWER) if isinstance(v, str) else v
 
 
 def _join_key_aliases(v) -> set:
@@ -1118,9 +1132,9 @@ def _join_key_aliases(v) -> set:
     ZERO rows, and measures that should read 11,923 tickets read blank.
 
     Aliases are only ever expanded on the DIMENSION side, which has few rows;
-    the fact side keeps its single str() lookup.
+    the fact side keeps its single _jstr() lookup.
     """
-    out = {str(v)}
+    out = {_jstr(v)}
     if isinstance(v, (datetime, date)) and not isinstance(v, bool):
         dt = v if isinstance(v, datetime) else datetime(v.year, v.month, v.day)
         out.add(dt.isoformat())
@@ -2173,6 +2187,42 @@ class DAXContext:
             hit = self._filter_idx_cache[key] = frozenset(acc)
         return hit
 
+    def _non_owner_rows(self, table_name: str, col_idx: int) -> frozenset:
+        """The ids of the rows of table_name whose key in column col_idx a
+        LATER row holds again. A relationship joins a key the one side holds
+        more than once to its last row (#162, #163), so a filter on an earlier
+        row reaches no row across it. Empty -- the common case -- when every
+        key is unique; memoized on the model-wide cache."""
+        tbl = self.tables.get(table_name)
+        if not tbl:
+            return frozenset()
+        key = (id(tbl), 'non-owners', col_idx)
+        hit = self._filter_idx_cache.get(key)
+        if hit is None:
+            rows = tbl['rows']
+            last: dict = {}
+            for i, r in enumerate(rows):
+                last[_jstr(r[col_idx]) if col_idx < len(r) else 'None'] = i
+            if len(last) == len(rows):
+                hit = frozenset()
+            else:
+                owners = set(last.values())
+                hit = frozenset(id(r) for i, r in enumerate(rows) if i not in owners)
+            self._filter_idx_cache[key] = hit
+        return hit
+
+    def _joins_one_row(self, one_table: str, many_table: str) -> bool:
+        """Does the active relationship between these tables join each key
+        to one row of one_table? Not when it is many-to-many: that one joins
+        every row holding the key."""
+        for rel in self.relationships:
+            if not rel.get('IsActive', 1):
+                continue
+            if {rel.get('FromTable'), rel.get('ToTable')} == {one_table, many_table}:
+                if rel.get('FromCardinality') == 2 and rel.get('ToCardinality') == 2:
+                    return False
+        return True
+
     def _date_part_key_set(self, table_name: str, col_name: str) -> frozenset:
         """Every DATE PART in table_name[col_name] ('dp:...', 'None' for a
         blank), memoized: the keys a DatePartOnly join matches (issue #126)."""
@@ -2186,7 +2236,7 @@ class DAXContext:
         hit = self._filter_idx_cache.get(key)
         if hit is None:
             hit = self._filter_idx_cache[key] = frozenset(
-                (_date_part_key(r[idx]) or str(r[idx])) if r[idx] is not None else 'None'
+                (_date_part_key(r[idx]) or _jstr(r[idx])) if r[idx] is not None else 'None'
                 for r in tbl['rows'])
         return hit
 
@@ -2201,7 +2251,7 @@ class DAXContext:
             dp_keys = self._date_part_key_set(one_table, one_col)
             return any(not _key_in(r[mi], _DatePartKeys(dp_keys)) for r in mtbl['rows'])
         keys = self._key_aliases(one_table, one_col)
-        return any(str(r[mi]) not in keys for r in mtbl['rows'])
+        return any(_jstr(r[mi]) not in keys for r in mtbl['rows'])
 
     def _unmatched_key_strs(self, many_table: str, many_idx: int,
                             one_table: str, one_col: str) -> frozenset:
@@ -2217,11 +2267,11 @@ class DAXContext:
             many_col = mtbl['columns'][many_idx] if many_idx < len(mtbl['columns']) else None
             if (many_table, many_col, one_table, one_col) in self._date_part_joins:
                 keys = self._date_part_key_set(one_table, one_col)
-                out = {(_date_part_key(r[many_idx]) or str(r[many_idx]))
+                out = {(_date_part_key(r[many_idx]) or _jstr(r[many_idx]))
                        if r[many_idx] is not None else 'None' for r in mtbl['rows']}
             else:
                 keys = self._key_aliases(one_table, one_col)
-                out = {str(r[many_idx]) for r in mtbl['rows']}
+                out = {_jstr(r[many_idx]) for r in mtbl['rows']}
             hit = self._filter_idx_cache[key] = frozenset(
                 {k for k in out if k not in keys} | {'None'})
         return hit
@@ -2288,22 +2338,34 @@ class DAXContext:
         many -> one hop (bidirectional or an expanded table filter), the one
         side's blank row is selected when a surviving row's key matches
         nothing. Either way the blank row travels as 'None'.
+
+        A key the one side holds more than once belongs to its LAST row
+        (#162): across a one -> many hop the earlier rows select nothing.
+        Across a many -> one hop the keys select every row that holds them.
+        Power BI Desktop 2.152 (build_b165.py, issue #163): with D's k3 in
+        rows C and D, D[name] = "C" reaches no fact row, RELATEDTABLE of C is
+        empty, and FILTER(F, F[k] = "k3") keeps both C and D.
         """
         cur_tbl = self.tables.get(cur_name) or {}
         nxt_tbl = self.tables.get(nxt_name) or {}
         cur_col = (cur_tbl.get('columns') or [None])[cur_idx] if cur_tbl else None
         nxt_col = (nxt_tbl.get('columns') or [None])[nxt_idx] if nxt_tbl else None
         date_part = (cur_name, cur_col, nxt_name, nxt_col) in self._date_part_joins
+        one_to_many = (nxt_name, cur_name) in self._one_side_of
+        if one_to_many and not date_part:
+            drop = self._non_owner_rows(cur_name, cur_idx)
+            if drop and self._joins_one_row(cur_name, nxt_name):
+                cur_rows = [r for r in cur_rows if id(r) not in drop]
         allowed: set = set()
         for r in cur_rows:
             if date_part:
                 # A DatePartOnly join (auto date/time): the next table's rows
                 # of the same DAY, whatever their time (issue #126).
                 v = r[cur_idx]
-                allowed.add((_date_part_key(v) or str(v)) if v is not None else 'None')
+                allowed.add((_date_part_key(v) or _jstr(v)) if v is not None else 'None')
             else:
                 allowed |= _join_key_aliases(r[cur_idx])
-        if (nxt_name, cur_name) in self._one_side_of:
+        if one_to_many:
             if cur_blank and cur_col is not None:
                 allowed |= self._unmatched_key_strs(nxt_name, nxt_idx, cur_name, cur_col)
         elif nxt_col is not None and nxt_name in self.blank_row_tables():
@@ -2312,7 +2374,7 @@ class DAXContext:
                 missing = any(not _key_in(r[cur_idx], dp_keys) for r in cur_rows)
             else:
                 keys = self._key_aliases(nxt_name, nxt_col)
-                missing = any(str(r[cur_idx]) not in keys for r in cur_rows)
+                missing = any(_jstr(r[cur_idx]) not in keys for r in cur_rows)
             if cur_blank or missing:
                 allowed.add('None')
         return _DatePartKeys(allowed) if date_part else allowed
@@ -3220,7 +3282,7 @@ class DAXContext:
             if dateish:
                 for i, row in enumerate(rows):
                     v = row[col_idx]
-                    sv = str(v)
+                    sv = _jstr(v)
                     acc.setdefault(sv, []).append(i)
                     # STRICT parse (issue #42): a compound key with a date
                     # PREFIX must not alias to the bare date, or every key
@@ -3234,8 +3296,9 @@ class DAXContext:
                         if iso != sv:
                             acc.setdefault(iso, []).append(i)
             else:
+                # keyed as a join spells the key: a text key ASCII-folded (#163)
                 for i, row in enumerate(rows):
-                    acc.setdefault(str(row[col_idx]), []).append(i)
+                    acc.setdefault(_jstr(row[col_idx]), []).append(i)
             vmap = {k: frozenset(v) for k, v in acc.items()}
             self._filter_idx_cache[key] = vmap
         return vmap
@@ -3250,7 +3313,7 @@ class DAXContext:
             acc: dict = {}
             for i, row in enumerate(tbl['rows']):
                 v = row[col_idx]
-                k = (_date_part_key(v) or str(v)) if v is not None else 'None'
+                k = (_date_part_key(v) or _jstr(v)) if v is not None else 'None'
                 acc.setdefault(k, []).append(i)
             dmap = {k: frozenset(v) for k, v in acc.items()}
             self._filter_idx_cache[key] = dmap
@@ -3280,6 +3343,8 @@ class DAXContext:
         vmap = self._value_index_map(tbl, col_idx)
         keys = set()
         for v in values:
+            # the values are join spellings already (_jstr): 'None' is the
+            # blank key's sentinel and must not fold
             keys.add(str(v))
             # strict: no date-prefix aliasing (#42); midnight only (#126)
             dv = _midnight_date(v)
@@ -3535,7 +3600,7 @@ class DAXContext:
                 hit = cache.get(key) if key is not None else None
                 if hit is None:
                     hit = frozenset(i for i, row in enumerate(rows)
-                                    if str(row[join_idx]) in allowed_vals)
+                                    if _jstr(row[join_idx]) in allowed_vals)
                     if key is not None:
                         cache[key] = hit
             sets.append(hit)
@@ -13982,11 +14047,13 @@ class DAXEngine:
 
     def _related_row_index(self, ctx: DAXContext, to_table: str,
                            to_col: str) -> dict:
-        """{ key value -> related row as a column dict } for to_table[to_col],
-        built once per model and memoized in the shared per-model cache
-        (_filter_idx_cache) so an iterator does not rebuild it per row. First
-        matching row wins, matching relationship key semantics (the one side
-        is unique)."""
+        """{ key -> related row as a column dict } for to_table[to_col], keyed
+        by _rel_key, built once per model and memoized in the shared per-model
+        cache (_filter_idx_cache) so an iterator does not rebuild it per row.
+        A key the one side holds more than once reaches its LAST row, and a
+        text key matches with its ASCII case folded, as Desktop joins them
+        (build_b165.py, issues #162, #163: F's "K1" reaches D's "k1", and k3
+        of rows C and D reaches D)."""
         cache = ctx._filter_idx_cache
         ck = ('__related_idx__', to_table, to_col)
         cached: Optional[dict] = cache.get(ck)
@@ -13999,12 +14066,12 @@ class DAXEngine:
             ti = ctx._find_col_idx(cols, to_col)
             if ti >= 0:
                 for r in ttbl['rows']:
-                    if len(r) > ti and r[ti] not in idx:
+                    if len(r) > ti:
                         mrow = {'__table__': to_table, '__row__': True}
                         for i, c in enumerate(cols):
                             if i < len(r):
                                 mrow[c] = r[i]
-                        idx[r[ti]] = mrow
+                        idx[_rel_key(r[ti])] = mrow
         cache[ck] = idx
         return idx
 
@@ -14035,7 +14102,7 @@ class DAXEngine:
             # here made SUMX(fact, RELATED(...)) O(fact x dim) on 200k-row
             # models.
             idx = self._related_row_index(ctx, to_table, to_col)
-            mrow = idx.get(fk)
+            mrow = idx.get(_rel_key(fk))
             if mrow is None:
                 continue          # no related row (orphan FK) -> BLANK
             if to_table == target_table:

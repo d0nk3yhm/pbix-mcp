@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.133] - 2026-10-10
+
+The engine joins a relationship's text keys as Desktop does: with their ASCII case folded, and a key the one side holds more than once through its last row (#163, found verifying #160 and #162). Checked against Power BI Desktop 2.152 over ADOMD: `build_b165.py`'s 26 probes all match (0.9.132: 10).
+
+The corpus census (1,508 measures) changes only measures that use RAND or RANDBETWEEN (14 of the 15 this time); it runs in 2,933 s, against 2,860 s on 0.9.132. `regress_check.py` finds no regression across its Desktop batteries.
+
+### Fixed — the engine joins text keys as Desktop does (issue #163)
+
+**What was wrong:** the engine matched a relationship key by its exact text, and joined every row of a key the one side holds more than once. Desktop differs on both counts. Its column store compares a text key with the ASCII letters' case folded (#43, #109), also across the two tables. A relationship joins a repeated one-side key to its last row, the one its index points at (#162).
+
+**What Desktop does** (`build_b165.py`, a model the same as built and after Desktop's refresh):
+
+- F's `K1` and `k2` reach D's `k1` and `K2`.
+- With D's `k3` in rows C and D:
+  - RELATED of F's `k3` row is D;
+  - `D[name] = "C"` reaches no fact row;
+  - RELATEDTABLE of C is empty.
+- A filter from the many side reaches every row that holds the key. `FILTER(F, F[v] = 100)` keeps both C and D, and so does `CROSSFILTER(..., BOTH)`.
+
+**The fix:**
+
+- **Folding:** a join spells a text key with its ASCII letters folded (`_jstr`). This covers the key aliases, the fact-side index, the unmatched keys behind the blank row, and RELATED's lookup.
+- **One -> many hop:** a repeated key's earlier rows select nothing (`_non_owner_rows`, empty when every key is unique, which is the common case).
+- **RELATED:** it returns the key's last row.
+- **Unchanged:** many-to-many relationships, which join every row, and the many -> one direction.
+
+**Pinned** by `tests/test_issue163_relationship_text_keys.py`: the 26 probes, through pbix-mcp's reader and engine on a built model. **16 fail on 0.9.132.**
+
 ## [0.9.132] - 2026-10-10
 
 A built model stores its text as Desktop's import stores it, and the engine answers for that text as Desktop does. Verifying #156 turned up two rules of Desktop's column store: its import strips trailing whitespace (#159), and it keeps the empty text apart from BLANK (#161). Measuring those turned up four errors: the builder's hierarchy ignored the case fold (#160), its index joined a repeated key to the wrong row (#162), and the engine mishandled the empty text (#164) and one-row tables in text functions (#165). Checked against Power BI Desktop 2.152 over ADOMD, as built against after Desktop's own refresh:

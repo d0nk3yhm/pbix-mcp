@@ -40,9 +40,17 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-10 (0.9.132): docs 1-56 and GitHub issues/PRs #1-#162, #164
-and #165 are closed; #163 is open.** 0.9.132 closes six issues found verifying
-#156, all about text as Desktop's column store holds it. #159: Desktop's import
+**Updated 2026-10-10 (0.9.133): docs 1-56 and GitHub issues/PRs #1-#165 are
+closed.** 0.9.133 closes #163: the engine joins a relationship's text keys as
+Desktop does -- with their ASCII case folded, also across the two tables, and a
+key the one side holds more than once through its last row (a filter on an
+earlier row reaches nothing, RELATED returns the last row), while a filter from
+the many side reaches every row holding the key (build_b165.py 26 of 26,
+0.9.132 10).
+
+As of 0.9.132, docs 1-56 and #1-#162, #164 and #165 were closed; #163 was
+open. 0.9.132 closes six issues found verifying #156, all about text as
+Desktop's column store holds it. #159: Desktop's import
 strips U+0001-U+0020 from the end of a text, and the builder now stores what it
 stores (build_b159.py 35 of 35 the same as built and refreshed, 0.9.131 13).
 #161: the empty text "" is a value of its own, stored as Desktop stores it -- a
@@ -53,7 +61,7 @@ the case-folded dictionary (build_b160.py: COUNTROWS(VALUES) 8, not 14). #162: a
 key the one side holds more than once reaches its last row, as Desktop joins
 it. #164 and #165: the engine takes "" for a value, not BLANK, and text
 functions take a one-row table's value (build_b163.py 38 of 38, 0.9.131 14).
-#163, the engine's own joins of repeated and case-variant keys, is open.
+#163, the engine's own joins of repeated and case-variant keys, was open.
 
 As of 0.9.131, docs 1-56 and #1-#158 were closed. 0.9.131 closes #157: the
 engine compares and orders text in the model's collation, as Desktop does
