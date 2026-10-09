@@ -5,9 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.9.121] - 2026-10-08
+## [0.9.121] - 2026-10-09
 
-Two fixes reported by OpenBI (docs 50 and 51).
+Two fixes reported by OpenBI (docs 50 and 51), and one found by the release's own corpus census (#131).
 
 - **ALLSELECTED:** checked against Power BI Desktop 2.152 over ADOMD. A 400-cell matrix has 390 cells matching; 0.9.120 matched 139. The other 10 are #118.
 - **Colours:** checked against Desktop's own code and a render. The recoloured Desktop-authored template keeps its white and grey cells.
@@ -39,6 +39,18 @@ Two fixes reported by OpenBI (docs 50 and 51).
 - **Measured:** Desktop's answers for 25 measures under 11 query shapes (ungrouped, grouped, under a slicer, grouped under a slicer). 390 of 400 cells match, against 139 on 0.9.120. The 10 that don't keep an explicit CALCULATE filter inside the measure, which is #118.
 - **Pinned** by `tests/test_issue120_allselected_table.py`: 384 tests, every expected value generated from Desktop's output. **245 fail on 0.9.120.**
 - **Still open (#116):** the running-total shape `FILTER(ALL(T), T[c] <= MAX(T[c]))` keeps no rows, with ALL and ALLSELECTED alike, because FILTER binds no row context when its condition holds an aggregate.
+
+### Fixed — "the last week with sales" is evaluated once, not once per date (issue #131)
+
+- **What was wrong:** once ALLSELECTED(<table>) returned its rows (#120), Awesome Chocolates' `Selection max date` and `Selection Sales Calculation` ran out of time and returned BLANK. Desktop answers 2024-02-26 and 34,042,511.25. Both FILTER the 731 dates by `'dim-Date'[WeeknYear] = [Max Week Not Blank]`, where `Max Week Not Blank = MAXX(FILTER(ALLSELECTED('dim-Date'), NOT ISBLANK([Sales Actual])), 'dim-Date'[WeeknYear])`. FILTER puts each date's columns in the filter context, so the measure memo, keyed on the whole context, evaluated `[Max Week Not Blank]` 731 times over 731 dates each.
+- **Why that was waste:** the value cannot depend on any filter on `'dim-Date'`. ALLSELECTED restores the selection, and every `[Sales Actual]` inside runs under a whole `'dim-Date'` row, which replaces the caller's `'dim-Date'` filters.
+- **The fix:** the memo key leaves out the filters on such a table. The proof is syntactic and conservative. The measure may be built only from:
+  - literals, operators, VAR/RETURN, and functions of their arguments alone;
+  - measures with the same property;
+  - MAXX / MINX / SUMX / AVERAGEX / COUNTX / COUNTROWS over ALL(T), ALLSELECTED(T) or FILTER over them, whose row expression reads only the row's columns and measure references.
+  The table may have no BLANK cell. Anything else keeps the full key, such as a top-level aggregate, VALUES or CALCULATE. It holds while ALLSELECTED restores the outermost selection; #118 has to revisit it.
+- **Measured:** `Selection max date` takes 0.24 s, down from over 60 s. All 49 measures of the file take 4.8 s. Both measures match Desktop.
+- **Pinned** by `tests/test_issue131_memo_shield.py`: 21 tests. **19 fail before the fix**; the 20th, the values themselves, was already right, only slow, and the corpus test is skipped without the file. They cover which measures may and may not be shielded, values with and without the shield under four slicers, and one evaluation instead of one per row.
 
 ## [0.9.120] - 2026-10-08
 

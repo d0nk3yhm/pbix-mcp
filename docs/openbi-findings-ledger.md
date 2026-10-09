@@ -40,8 +40,9 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-08 (0.9.121): docs 1-51 and GitHub issues/PRs #1-#113,
-#119-#120 are closed; #114-#118 are open.** 0.9.121 closes docs 50 and 51:
+**Updated 2026-10-09 (0.9.121): docs 1-51 and GitHub issues/PRs #1-#113,
+#119-#120 and #131 are closed; #114-#118 are open.** 0.9.121 closes docs 50
+and 51, and #131, found by its own corpus census:
 
 - doc 50 = #119: a ThemeDataColor's ColorId indexes Desktop's picker row --
   white, black, then the first 8 data colours (from desktop.min.js), so 0 and 1
@@ -50,6 +51,10 @@ alone.
   selection. Desktop keeps only the selection on its own columns for the
   column form, so doc 51's expected 1 for COUNTROWS(ALLSELECTED(T[Region]))
   under a D[Zone] slicer is 2 in Desktop.
+- #131: with #120's rows, a "last week with sales" measure was evaluated
+  once per date row; the measure memo now leaves out filters a measure
+  provably cannot see, so Awesome Chocolates' Selection max date answers
+  in 0.24 s instead of running out of time.
 
 As of 0.9.120, docs 1-49 and #1-#113 were closed. 0.9.120 closes docs 48 and
 49, found by OpenBI's port of the engine:

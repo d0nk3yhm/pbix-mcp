@@ -1755,6 +1755,9 @@ class DAXContext:
         self._measure_cache: dict = {}
         # measure-cache key -> the unsupported functions that evaluation hit
         self._measure_cache_unsupported: dict = {}
+        # measure -> the tables whose filters its memo key leaves out
+        # (DAXEngine._shielded_tables), shared like the memo itself.
+        self._shield_cache: dict = {}
         self._eval_stack: set = set()  # Prevent circular refs
         # Bound total sub-expression evaluations per top-level measure so a
         # pathological/non-terminating measure degrades to BLANK instead of
@@ -2864,6 +2867,7 @@ class DAXContext:
         # for all of it twice.
         ctx._measure_cache = self._measure_cache
         ctx._measure_cache_unsupported = self._measure_cache_unsupported
+        ctx._shield_cache = self._shield_cache
         return ctx
 
     def with_relationships(self, relationships: list) -> 'DAXContext':
@@ -3435,8 +3439,13 @@ class DAXEngine:
                     return ("__pred__" + tag, json.dumps(v, sort_keys=True,
                                                          default=str))
                 return v
+            # Filters the measure provably cannot see are not part of the key
+            # (_shielded_keys): "the last week with sales" called once per
+            # date row is then evaluated once.
+            _skip = self._shielded_keys(measure_name, ctx) if ctx.filter_context else ()
             fc_key = tuple(sorted(
                 (k, _fc_part(v)) for k, v in ctx.filter_context.items()
+                if k not in _skip
             )) if ctx.filter_context else ()
             cache_key = (measure_name, fc_key)
         except Exception:
@@ -3535,6 +3544,244 @@ class DAXEngine:
             self.unsupported_by_measure.setdefault(m, set()).update(funcs)
         if measure is not None:
             self.unsupported_by_measure.setdefault(measure, set()).update(funcs)
+
+    # ---- measure memo: filters a measure provably cannot see ----------------
+    # "The last week with sales" is MAXX(FILTER(ALLSELECTED('Date'),
+    # NOT ISBLANK([Sales])), 'Date'[Week]). Its value does not depend on any
+    # filter on 'Date': ALLSELECTED restores the selection, and every [Sales]
+    # inside runs under the transition of a whole 'Date' row, which replaces
+    # whatever 'Date' filters the caller had. Report measures call it once
+    # per date row (FILTER(ALLSELECTED('Date'), 'Date'[Week] = [Max Week])),
+    # and a memo keyed on the full filter context missed on every row: 731
+    # dates x 731 inner rows, so Awesome Chocolates' "Selection max date" ran
+    # out of time where Desktop answers at once. The memo key now leaves out
+    # the filters on such a table. The proof is syntactic and conservative:
+    # anything it does not recognise keeps the full key.
+    #
+    # Functions whose value is a function of their arguments alone.
+    _SHIELD_PURE_FNS = frozenset({
+        'NOT', 'ISBLANK', 'AND', 'OR', 'IF', 'SWITCH', 'TRUE', 'FALSE',
+        'BLANK', 'COALESCE', 'IFERROR', 'ISERROR', 'ISNUMBER', 'ISTEXT',
+        'ISNONTEXT', 'ISLOGICAL', 'ABS', 'SIGN', 'ROUND', 'ROUNDUP',
+        'ROUNDDOWN', 'INT', 'TRUNC', 'MOD', 'POWER', 'SQRT', 'EXP', 'LN',
+        'LOG', 'LOG10', 'CEILING', 'FLOOR', 'DIVIDE', 'YEAR', 'MONTH', 'DAY',
+        'QUARTER', 'WEEKDAY', 'WEEKNUM', 'HOUR', 'MINUTE', 'SECOND', 'DATE',
+        'TIME', 'EOMONTH', 'EDATE', 'DATEDIFF', 'LEN', 'LEFT', 'RIGHT', 'MID',
+        'UPPER', 'LOWER', 'TRIM', 'CONCATENATE', 'SUBSTITUTE', 'REPT',
+        'SEARCH', 'FIND', 'CONTAINSSTRING', 'CONTAINSSTRINGEXACT', 'VALUE',
+        'FORMAT', 'CONVERT', 'UNICHAR', 'EXACT'})
+    # Iterators (table, expression) whose value is a function of the rows and
+    # of the expression evaluated in each row.
+    _SHIELD_ITER_FNS = frozenset({
+        'MAXX', 'MINX', 'SUMX', 'AVERAGEX', 'COUNTX', 'COUNTAX', 'PRODUCTX'})
+    _SHIELD_CAND_RE = re.compile(
+        r"(?i)\bALL(?:SELECTED)?\s*\(\s*('(?:[^']|'')+'|[A-Za-z_][\w \-]*?)\s*\)")
+
+    def _shielded_keys(self, name: str, ctx: DAXContext) -> frozenset:
+        """The filter_context keys measure ``name``'s value cannot depend on,
+        so its memo key leaves them out (see the note above)."""
+        tables = self._shielded_tables(name, ctx)
+        if not tables or not ctx.filter_context:
+            return frozenset()
+        out = set()
+        for t in tables:
+            tbl = ctx.tables.get(t)
+            if tbl is None:
+                continue
+            # A table filter's expanded propagation is not replaced by a row
+            # transition, so a table with one keeps its full key.
+            prefix = t + '.'
+            if any(k.startswith(prefix) for k in ctx._expanded_keys):
+                continue
+            for c in tbl['columns']:
+                k = prefix + c
+                if k in ctx.filter_context:
+                    out.add(k)
+        return frozenset(out)
+
+    def _shielded_tables(self, name: str, ctx: DAXContext) -> frozenset:
+        """Tables (model spelling) whose filters cannot change the value of
+        measure ``name``: a whole-row transition replaces every one of them
+        before anything in the measure reads the context."""
+        cache = ctx._shield_cache
+        hit: frozenset | None = cache.get(name)
+        if hit is not None:
+            return hit
+        cache[name] = frozenset()               # a cycle proves nothing
+        expr = ctx.measures.get(name) or ''
+        out = set()
+        for m in self._SHIELD_CAND_RE.finditer(expr):
+            raw = m.group(1).strip()
+            if raw.startswith("'"):
+                raw = raw[1:-1].replace("''", "'")
+            t = ctx.model_table(raw)
+            if t in out or t not in ctx.tables or not self._every_cell_valued(t, ctx):
+                continue
+            try:
+                if self._shield_ind(expr, t, ctx, frozenset(), {name}):
+                    out.add(t)
+            except RecursionError:
+                pass
+        res = frozenset(out)
+        cache[name] = res
+        return res
+
+    def _every_cell_valued(self, table: str, ctx: DAXContext) -> bool:
+        """No BLANK cell anywhere in ``table``. A row transition skips a
+        BLANK cell's column (_row_filters), which would leave the caller's
+        filter on that column in force."""
+        rows = ctx.tables[table].get('rows') or []
+        key = ('every-cell-valued', table, id(rows), len(rows))
+        cache = ctx._filter_idx_cache
+        hit = cache.get(key)
+        if hit is None:
+            hit = cache[key] = all(v is not None for row in rows for v in row)
+        return hit
+
+    def _shield_steps(self, expr: str):
+        plan = _PLAN_CACHE.get(expr)
+        if plan is None:
+            plan = _analyze_expr(expr)
+            _PLAN_CACHE[expr] = plan
+        return plan
+
+    def _shield_cmp_sides(self, expr: str):
+        for op in ('==', '<>', '>=', '<=', '>', '<', '='):
+            parts = self._split_operators(expr, op)
+            if len(parts) == 2:
+                return [p.strip() for p in parts]
+        return None
+
+    def _shield_scalar(self, expr: str, table: str, ctx: DAXContext, vars_: frozenset,
+                       visiting: set, row: bool) -> bool:
+        """``expr`` reads no filter on ``table``: at the measure's top level
+        (``row`` False), or in a row context over whole rows of ``table``
+        (``row`` True), where a column of the row is read from the row and a
+        measure reference runs under the row's transition."""
+        steps = self._shield_steps(expr)
+        for kind, data in steps:
+            if kind in (_P_NONE, _P_CONST):
+                return True
+            if kind in (_P_PAREN, _P_NOT, _P_NEG):
+                return self._shield_scalar(data, table, ctx, vars_, visiting, row)
+            if kind in (_P_LOGICAL, _P_BINARY):
+                return all(self._shield_scalar(p, table, ctx, vars_, visiting, row)
+                           for p in data[1])
+            if kind == _P_CONCAT:
+                return all(self._shield_scalar(p, table, ctx, vars_, visiting, row)
+                           for p in data)
+            if kind == _P_CMP:
+                sides = self._shield_cmp_sides(data)
+                if not sides or not all(self._shield_scalar(p, table, ctx, vars_, visiting, row)
+                                        for p in sides):
+                    return False
+                continue                     # a blank side falls through
+            if kind == _P_IN:
+                lhs, rhs = data
+                rs = rhs.strip()
+                if not (rs.startswith('{') and rs.endswith('}')):
+                    return False
+                if not self._shield_scalar(lhs, table, ctx, vars_, visiting, row):
+                    return False
+                if not all(self._shield_scalar(e, table, ctx, vars_, visiting, row)
+                           for e in self._split_top_level(rs[1:-1], ',') if e.strip()):
+                    return False
+                continue
+            if kind == _P_MAYBEVAR:
+                return data.lower() in vars_
+            if kind in (_P_BRACKET1, _P_BRACKET2):
+                if self._measure_exists(data, ctx):
+                    return row or self._shield_measure(data, table, ctx, visiting)
+                return row and ctx._find_col_idx(ctx.tables[table]['columns'], data) >= 0
+            if kind == _P_TCOL:
+                tname, col = data
+                if ctx.model_table(tname) == table and \
+                        ctx._find_col_idx(ctx.tables[table]['columns'], col) >= 0:
+                    return row
+                if self._measure_exists(col, ctx):   # Table[Measure]
+                    return row or self._shield_measure(col, table, ctx, visiting)
+                return False
+            if kind == _P_FUNC:
+                fname, args_text = data
+                args = [a.strip() for a in self._split_args(args_text)] if args_text.strip() else []
+                if fname in self._SHIELD_PURE_FNS:
+                    return all(self._shield_scalar(a, table, ctx, vars_, visiting, row)
+                               for a in args)
+                if fname in self._SHIELD_ITER_FNS and len(args) == 2:
+                    return (self._shield_rows(args[0], table, ctx, vars_, visiting)
+                            and self._shield_scalar(args[1], table, ctx, vars_, visiting, True))
+                if fname == 'COUNTROWS' and len(args) == 1:
+                    return self._shield_rows(args[0], table, ctx, vars_, visiting)
+                return False
+            if kind == _P_VARRET and not row:
+                return self._shield_var_block(data, table, ctx, vars_, visiting)
+            if kind == _P_TAIL:
+                # The fallthrough after a comparison: BLANK unless the text
+                # names a table (_eval_tail), whose rows depend on the filters.
+                return ctx.tables.get(data.strip().strip("'")) is None
+            return False
+        return False
+
+    def _shield_rows(self, expr: str, table: str, ctx: DAXContext, vars_: frozenset,
+                     visiting: set) -> bool:
+        """``expr`` is whole rows of ``table`` that no filter on it can change:
+        ALL(table), ALLSELECTED(table), or FILTER over those."""
+        steps = self._shield_steps(expr)
+        if len(steps) != 1:
+            return False
+        kind, data = steps[0]
+        if kind == _P_PAREN:
+            return self._shield_rows(data, table, ctx, vars_, visiting)
+        if kind != _P_FUNC:
+            return False
+        fname, args_text = data
+        args = [a.strip() for a in self._split_args(args_text)]
+        if fname in ('ALL', 'ALLSELECTED') and len(args) == 1:
+            raw = args[0]
+            if raw.startswith("'") and raw.endswith("'"):
+                raw = raw[1:-1].replace("''", "'")
+            return '[' not in raw and ctx.model_table(raw.strip()) == table
+        if fname == 'FILTER' and len(args) == 2:
+            return (self._shield_rows(args[0], table, ctx, vars_, visiting)
+                    and self._shield_scalar(args[1], table, ctx, vars_, visiting, True))
+        return False
+
+    def _shield_measure(self, name: str, table: str, ctx: DAXContext, visiting: set) -> bool:
+        """A measure referenced at the top level, outside any row transition."""
+        canon = next((m for m in ctx.measures if m.lower() == name.lower()), name)
+        if canon in visiting:
+            return False
+        expr = ctx.measures.get(canon)
+        if not expr:
+            return False
+        return self._shield_ind(expr, table, ctx, frozenset(), visiting | {canon})
+
+    def _shield_ind(self, expr: str, table: str, ctx: DAXContext, vars_: frozenset,
+                    visiting: set) -> bool:
+        return self._shield_scalar(expr, table, ctx, vars_, visiting, False)
+
+    def _shield_var_block(self, expr: str, table: str, ctx: DAXContext, vars_: frozenset,
+                          visiting: set) -> bool:
+        """VAR ... RETURN at the top level, split as _eval_var_return splits it:
+        each variable and the result must read no filter on ``table``."""
+        text = _collapse_ws_outside_strings(expr)
+        kws = [(m.start(), m.group().upper(), m.end())
+               for m in re.finditer(r'\b(VAR|RETURN)\b', text, re.IGNORECASE)]
+        scope = set(vars_)
+        seen_return = False
+        for i, (_pos, kw, end) in enumerate(kws):
+            block = text[end:kws[i + 1][0] if i + 1 < len(kws) else len(text)].strip()
+            if kw == 'VAR':
+                vm = re.match(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)', block, re.DOTALL)
+                if not vm or not self._shield_scalar(vm.group(2).strip(), table, ctx,
+                                                     frozenset(scope), visiting, False):
+                    return False
+                scope.add(vm.group(1).lower())
+            else:
+                if not self._shield_scalar(block, table, ctx, frozenset(scope), visiting, False):
+                    return False
+                seen_return = True
+        return seen_return
 
     def _eval_expr(self, expr: str, ctx: DAXContext, var_scope: dict | None = None) -> Any:
         """Evaluate a DAX expression string.
