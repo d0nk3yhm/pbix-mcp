@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.131] - 2026-10-09
+
+Text is compared and ordered in the model's collation, as Power BI Desktop does it, both in the engine (#157) and in the models the builder writes (#156). TOPN orders by any value and every order pair, and keeps ties (#158). Found while verifying #136. Checked against Power BI Desktop 2.152 over ADOMD:
+
+| Check | 0.9.131 | 0.9.130 |
+|---|---|---|
+| expression comparisons of text (62 pairs, `build_b157*.py`) | 62 of 62 | 35 |
+| `build_b156.py`: MIN / MAX / FIRSTNONBLANK / CONCATENATEX / TOPN of text | 11 of 11 | 4 |
+| `build_b158.py`: TOPN | 13 of 13 | 6 |
+| a built model: as built = after Desktop's refresh (`build_b156.py`) | 12 of 12 queries | 5 |
+| a built column of 3,017 random strings, order against Desktop's (`build_b157d.py`) | 14 adjacent swaps, all ties or the edge cases below | — |
+
+The corpus census (1,508 measures) changes only the 15 measures that use RAND or RANDBETWEEN, directly or through another measure; it runs in 2,942 s, against 2,954 s on 0.9.129. `regress_check.py` finds no regression across its Desktop batteries; the 7 TOPN misses of `build_b158.py` are fixed.
+
+### Fixed — the engine compares and orders text in the model's collation (issue #157)
+
+**What was wrong:** text was compared by code point after case-folding. `"_x" < "1x"` and `"Ölund" < "Zeta"` were FALSE. MIN, MAX, FIRSTNONBLANK, LASTNONBLANK and CONCATENATEX's ordering followed the code points: MIN of `b, APAC, Americas, apple, Zeta, a10, a2, Bz, ba, _x, 1x, éclair, eclair, Ölund, olive` was `1x` and MAX `éclair`, where Desktop says `_x` and `Zeta`.
+
+**What Desktop does:** it compares text as Windows' NLS sorting does for the model's locale, at the version of its own sort tables:
+
+- case-insensitively;
+- an accented letter with its letter, the accent deciding only after the letters, left to right (`cote < coté < côte < côté`);
+- punctuation before the digits, the digits before the letters (`_x < 1x < a10 < a2 < Americas < APAC < apple`);
+- `æ = ae`, `ß = ss`, `² = 2`;
+- hyphens and apostrophes weighing nothing until everything else is equal (`coop < co-op < cop`), and at the end of a text more than an accent (`é < e-`).
+
+**The fix:** `pbix_mcp.dax.collation`, a pure-Python collation built from Windows NLS 6.1's sort weights, measured per character in context (all 65,536 BMP and surrogate code units). Desktop's own differences were measured over ADOMD:
+
+- 1,321 characters its older table does not know are ignorable, `ẞ` among them;
+- Cyrillic `ї` and `й` are letters of their own;
+- the trailing-punctuation rule above.
+
+Over 16,307 single characters (the whole BMP, sampled CJK and Hangul, the emoji blocks) Desktop's order and the collation's disagree only among exotic characters: Arabic presentation forms, Thaana, combining marks on their own. Two things are not reproduced:
+
+- texts that begin with a combining mark;
+- the width level Desktop's column sort uses for `²` / `2`. Its expressions ignore that level, as the collation does.
+
+Expression comparisons, MIN / MAX (one and two arguments), MINX / MAXX, FIRSTNONBLANK / LASTNONBLANK(VALUE), CONCATENATEX's ordering, RANKX of text, the window functions' ordering, TOPN, TOPNSKIP and SAMPLE all use it. A column filter's `=` and `<>` keep the column store's comparison (ASCII case only, #107).
+
+**Pinned** by `tests/test_issue157_text_collation.py`: 77 tests generated from Desktop's output. They cover 3 Desktop sort orders (b156, 185 strings of b157, 54 hyphen strings of b157g), 62 expression pairs, 11 aggregates and the collation's ties. **33 of the 73 engine tests fail on 0.9.130**, and the rest need the new module.
+
+### Fixed — a built model orders text as Desktop does (issue #156)
+
+**What was wrong:** `PBIXBuilder` wrote each text column's attribute hierarchy (the H$ table's POS_TO_ID) in Python's code-point order. Desktop's engine reads that order for ORDER BY, SUMMARIZECOLUMNS, TOPN, MIN / MAX of text and sorted visuals, so a built file sorted `APAC` before `Americas` and `_x` after `Zeta` until Desktop refreshed it. The tables `pbix_set_table_data` rewrites were affected the same way.
+
+**The fix:** the hierarchy is written in the collation's order, with code points breaking ties between values a column keeps apart (`é` / `É`). Desktop's own order among those follows no rule we can see. The stored MinValue / MaxValue follow suit.
+
+**Checked:** `build_b156.py`'s 12 queries now answer the same as built and after Desktop's refresh; 0.9.130 differed on 7. A built column of 3,017 random strings sorts as Desktop's refresh sorts it, apart from 7 ties, 6 texts that begin with a combining mark and the `²` / `-2` width case.
+
+**Pinned** by `tests/test_issue156_built_text_order.py`: the built hierarchy's order and its Min / MaxValue against Desktop's. **1 fails on 0.9.130.**
+
+### Fixed — TOPN orders by any value and every order pair, and keeps ties (issue #158)
+
+**What was wrong:** TOPN ordered by its first expression only, and only by numbers. Any other value scored 0 and kept the table's input order, so `TOPN(1, VALUES(D[Date]), D[Date], ASC)` returned the first row, not the earliest date. The latest date came out right only when the table listed it first. TOPN also cut at n, where DAX returns every row tied with the n-th.
+
+**The fix:**
+
+- every `orderBy [, order]` pair, in turn;
+- dates, text and TRUE / FALSE by value, BLANK first (`_order_key`);
+- the ties at the n-th row.
+
+TOPNSKIP and SAMPLE order by the same key.
+
+**Checked:** `build_b158.py`'s 13 probes match Desktop: dates and text ascending and descending, a measure returning text, TRUE / FALSE, BLANK, two order pairs, a tie.
+
+**Pinned** by `tests/test_issue158_topn_order.py`: 13 tests. **7 fail on 0.9.130.**
+
 ## [0.9.130] - 2026-10-09
 
 A built model's columns are available in MDX, as Desktop's are (#136). Working on it turned up #155: a table rewrite in a model with a renamed calculation-group column produced a file Desktop would not open. Checked in Power BI Desktop 2.152, as built and after Desktop's own refresh. The DAX engine is unchanged.

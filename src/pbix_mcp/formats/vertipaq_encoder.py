@@ -21,7 +21,9 @@ import os
 import sqlite3
 import struct
 import tempfile
-from typing import Optional
+from typing import Any, Optional
+
+from pbix_mcp.dax.collation import column_order_key
 
 # ---------------------------------------------------------------------------
 # Constants & Tag bytes (from IDFMETA Kaitai spec)
@@ -1164,7 +1166,7 @@ def _encode_h_dollar_data(
 
     # Build dictionary with same ordering as _encode_column
     if data_type == "String":
-        seen: dict[object, int] = {}
+        seen: dict[Any, int] = {}
         for v in non_null:
             key = _val_key(v)
             if key not in seen:
@@ -1180,11 +1182,15 @@ def _encode_h_dollar_data(
     if distinct == 0:
         return None
 
-    # sorted_keys: always sorted for H$ regardless of dict ordering
-    sorted_keys = sorted(
-        seen.keys(),
-        key=lambda x: x if isinstance(x, (int, float)) else (str(type(x)), x),
-    )
+    # sorted_keys: always sorted for H$ regardless of dict ordering -- text in
+    # the model's collation, as Desktop orders a column (issue #156)
+    if data_type == "String":
+        sorted_keys = sorted(seen.keys(), key=column_order_key)
+    else:
+        sorted_keys = sorted(
+            seen.keys(),
+            key=lambda x: x if isinstance(x, (int, float)) else (str(type(x)), x),
+        )
 
     # POS_TO_ID: sorted_pos -> data_id (dict_index + 3). When the column has
     # NULLs (conversion also canonicalizes String "" to None), the BLANK
@@ -2166,7 +2172,8 @@ def _apply_metadata_updates(
                 # Compute min/max for AHS
                 sorted_vals = sorted(
                     set(_val_key(v) for v in non_null),
-                    key=lambda x: x if isinstance(x, (int, float)) else (str(type(x)), x),
+                    key=(column_order_key if all(isinstance(x, str) for x in non_null) else
+                         (lambda x: x if isinstance(x, (int, float)) else (str(type(x)), x))),
                 )
                 def _ahs_str(v):
                     """Convert value to string for AHS, matching builder format."""

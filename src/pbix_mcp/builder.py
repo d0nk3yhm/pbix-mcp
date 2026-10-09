@@ -35,6 +35,8 @@ import warnings
 import zipfile
 from typing import Any
 
+from pbix_mcp.dax.collation import column_order_key
+
 # AMO data-type codes used in metadata.sqlitedb
 _TYPE_NAME_TO_AMO = {
     "String": 2,
@@ -3502,10 +3504,16 @@ def _modify_metadata_and_encode(
                     )
                     seen = {v: i for i, v in enumerate(dict_values)}
                 distinct = len(dict_values)
-                sorted_vals = sorted(
-                    dict_values,
-                    key=lambda x: (str(type(x)), x) if not isinstance(x, (int, float)) else x,
-                )
+                if data_type == "String":
+                    # the model's collation, as Desktop orders a column (issue
+                    # #156): by code point, "APAC" < "Americas" < "_x" and MIN /
+                    # MAX / ORDER BY / sorted visuals followed it until a refresh
+                    sorted_vals = sorted(dict_values, key=column_order_key)
+                else:
+                    sorted_vals = sorted(
+                        dict_values,
+                        key=lambda x: (str(type(x)), x) if not isinstance(x, (int, float)) else x,
+                    )
 
                 # Null presence must mirror the encoder's converted-value view:
                 # String "" canonicalizes to NULL there, so it counts here too.

@@ -48,6 +48,7 @@ from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import AbstractSet, Any, Optional
 
+from pbix_mcp.dax import collation as _collation
 from pbix_mcp.errors import DAXEvaluationError as _DAXEvaluationError
 
 # Sentinel returned by _eval_binary to mean "this expression is NOT a binary
@@ -1378,10 +1379,35 @@ def _intersect_tuple_filters(a: dict, b: dict) -> dict:
             'rows': [r for r in a.get('rows') or [] if _tuple_key(r) in keep]}
 
 
-def _text_key(s: str) -> str:
-    """Text as DAX compares it: case-insensitively (the model's collation;
-    issue #107). Accents still count."""
-    return s.casefold()
+def _text_key(s: str) -> tuple:
+    """Text as DAX compares and orders it in an expression: in the model's
+    collation (pbix_mcp.dax.collation) -- case-insensitively ("North" =
+    "north", #107), an accent after its letter, punctuation before the
+    digits, hyphens and apostrophes weighing only where nothing else tells
+    two texts apart. Power BI Desktop 2.152 (build_b156.py / build_b157*.py,
+    issue #157): "_x" < "1x" < "a10" < "a2" < "Americas" < "APAC" < "apple",
+    "Ölund" < "Zeta", "æ" = "ae", "ß" = "ss"; the code-point order put "1x"
+    before "_x" and "éclair" after "Zeta"."""
+    return _collation.sort_key(s)
+
+
+def _order_key(v) -> tuple:
+    """A value's place in DAX's sort order, for TOPN, SAMPLE, CONCATENATEX's
+    ordering and the like: BLANK first, then numbers, dates and TRUE / FALSE
+    by value, then text in the model's collation (issues #157, #158)."""
+    if v is None:
+        return (0, 0.0, _EMPTY_TEXT_KEY)
+    if isinstance(v, bool):
+        return (1, float(v), _EMPTY_TEXT_KEY)
+    if isinstance(v, (int, float, decimal.Decimal)):
+        return (1, float(v), _EMPTY_TEXT_KEY)
+    if isinstance(v, (datetime, date)):
+        return (1, _dax_serial(v if isinstance(v, datetime) else datetime(v.year, v.month, v.day)),
+                _EMPTY_TEXT_KEY)
+    return (2, 0.0, _text_key(v if isinstance(v, str) else str(v)))
+
+
+_EMPTY_TEXT_KEY = _collation.sort_key("")
 
 
 def _dax_equal(a, b) -> bool:
@@ -1408,8 +1434,14 @@ def _compare(cell, op: str, target) -> bool:
         if a_dt is not None and b_dt is not None:
             a, b = a_dt, b_dt
         else:
-            a = _text_key("" if cell is None else str(cell))
-            b = _text_key("" if target is None else str(target))
+            sa = "" if cell is None else str(cell)
+            sb = "" if target is None else str(target)
+            if op in ("=", "==", "eq", "<>", "!=", "ne"):
+                # equality on a column, case-insensitively (#107)
+                a, b = sa.casefold(), sb.casefold()   # type: ignore[assignment]
+            else:
+                # an order in the model's collation (issue #157)
+                a, b = _text_key(sa), _text_key(sb)   # type: ignore[assignment]
     if op == ">":
         return bool(a > b)
     if op in (">=", "=>"):
@@ -1691,11 +1723,12 @@ def _extremum(cur, cand, want_max: bool):
         return cur
     if cur is None:
         return cand
-    a, b = cand, cur
-    if isinstance(a, str) and isinstance(b, str):
-        # Text orders case-insensitively (Desktop: MAXX({"a", "B"}, [Value])
-        # is "B"; issue #107).
-        a, b = _text_key(a), _text_key(b)
+    a: Any = cand
+    b: Any = cur
+    if isinstance(cand, str) and isinstance(cur, str):
+        # Text orders in the model's collation, case-insensitively (Desktop:
+        # MAXX({"a", "B"}, [Value]) is "B"; issues #107, #157).
+        a, b = _text_key(cand), _text_key(cur)
     try:
         return cand if ((a > b) if want_max else (a < b)) else cur
     except TypeError:
@@ -6403,16 +6436,19 @@ class DAXEngine:
             self._agg_ctx(ctx).get_column_data(*col))
         # MIN/MAX over no rows is BLANK, like every other aggregate
         # (Desktop: CALCULATE(MIN(T[c]), FILTER(ALL(T), FALSE())) is BLANK).
-        return pick(values) if values else None
+        if not values:
+            return None
+        # text in the model's collation (Desktop: MIN "_x", MAX "Zeta"; #157)
+        return pick(values, key=_text_key) if isinstance(values[0], str) else pick(values)
 
     @staticmethod
     def _minmax_pair(a, b, pick):
         """Two-argument form. Compares dates and text as well as numbers, but
-        never across incompatible types."""
+        never across incompatible types; text in the model's collation."""
         for kinds in ((int, float), (datetime, date), (str,)):
             if isinstance(a, kinds) and isinstance(b, kinds) \
                     and not isinstance(a, bool) and not isinstance(b, bool):
-                return pick(a, b)
+                return pick(a, b, key=_text_key) if kinds == (str,) else pick(a, b)
         return None
 
     def _fn_min(self, args_str: str, ctx: DAXContext) -> Any:
@@ -8752,10 +8788,8 @@ class DAXEngine:
             seen.add(key)
             values.append(v)
         values = [v for v in values if v is not None]
-        try:
-            values.sort(key=lambda v: (v is None, v))
-        except TypeError:
-            values.sort(key=lambda v: (v is None, str(v)))
+        # the column's own order: text in the model's collation (#157)
+        values.sort(key=_order_key)
         if last:
             values.reverse()
         for v in values:
@@ -8903,43 +8937,70 @@ class DAXEngine:
     # =========================================================================
 
     def _fn_topn(self, args_str: str, ctx: DAXContext) -> Any:
-        """TOPN(n, table, orderBy, order) — return top N rows."""
+        """TOPN(n, table, orderBy [, order [, orderBy [, order]]...]) — the first
+        n rows by every order pair in turn, with the rows tied with the n-th.
+
+        Each orderBy orders by its value as DAX does (_order_key): numbers,
+        dates and TRUE / FALSE by value, text in the model's collation, BLANK
+        first; an order is DESC unless it says ASC. Only numbers used to
+        order -- any other value scored 0 and kept the table's order -- and
+        only the first pair counted, cut at n. Power BI Desktop 2.152
+        (build_b158.py, issue #158): TOPN(1, VALUES(D[Date]), D[Date], ASC)
+        is the earliest date; TOPN(1, D, D[Name], ASC) the first name;
+        TOPN(2, D, D[Grp], ASC, D[Date], DESC) orders each group by date;
+        TOPN(1, D, D[Grp], ASC) returns both rows of the lowest group."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return []
         n = self._eval_expr(args[0].strip(), ctx)
-        if not isinstance(n, (int, float)):
+        if not isinstance(n, (int, float)) or isinstance(n, bool):
             return []
         n = int(n)
         table_ref = self._eval_expr(args[1].strip(), ctx)
         if not isinstance(table_ref, list):
             return []
-
-        order_expr = args[2].strip() if len(args) > 2 else None
-        # order: 1 or ASC = ascending, 0 or DESC = descending (default DESC)
-        descending = True
-        if len(args) > 3:
-            order_val = args[3].strip().upper()
-            if order_val in ('1', 'ASC'):
-                descending = False
-
-        if order_expr:
-            # Evaluate order expression for each row and sort
-            scored = []
-            for row_item in table_ref:
-                if isinstance(row_item, dict) and '__table__' in row_item:
-                    # _make_row_context handles BOTH single-column
-                    # (__column__/__value__) and bare-table (__row__) iterators;
-                    # the old direct __column__ lookup KeyError'd on a bare table.
-                    row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
-                    score = self._eval_expr(order_expr, row_ctx)
-                else:
-                    score = self._eval_expr(order_expr, ctx)
-                scored.append((row_item, score if isinstance(score, (int, float)) else 0))
-            scored.sort(key=lambda x: x[1], reverse=descending)
-            return [item for item, _ in scored[:n]]
-        else:
+        pairs: list = []        # (orderBy, descending)
+        i = 2
+        while i < len(args):
+            desc = True
+            step = 1
+            if i + 1 < len(args):
+                word = args[i + 1].strip().upper()
+                if word in ('1', 'ASC', 'TRUE', 'TRUE()'):
+                    desc, step = False, 2
+                elif word in ('0', 'DESC', 'FALSE', 'FALSE()'):
+                    step = 2
+            pairs.append((args[i].strip(), desc))
+            i += step
+        if n <= 0:
+            return []
+        if not pairs:
             return table_ref[:n]
+        keyed = []
+        for row_item in table_ref:
+            if isinstance(row_item, dict) and '__table__' in row_item:
+                # _make_row_context handles BOTH single-column
+                # (__column__/__value__) and bare-table (__row__) iterators;
+                # the old direct __column__ lookup KeyError'd on a bare table.
+                row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
+                vals = [self._resolve_row_result(self._eval_expr(e, row_ctx), row_item, row_ctx)
+                        for e, _d in pairs]
+            else:
+                vals = [self._eval_expr(e, ctx) for e, _d in pairs]
+            keyed.append((tuple(_order_key(_scalarize(v)) for v in vals), row_item))
+        order = list(range(len(keyed)))
+        for k in range(len(pairs) - 1, -1, -1):     # stable, last pair first
+            ks = [key[k] for key, _row in keyed]
+            order.sort(key=ks.__getitem__, reverse=pairs[k][1])
+        if n >= len(order):
+            return [keyed[j][1] for j in order]
+        cut = keyed[order[n - 1]][0]
+        out = [keyed[j][1] for j in order[:n]]
+        for j in order[n:]:
+            if keyed[j][0] != cut:
+                break
+            out.append(keyed[j][1])                 # tied with the n-th row
+        return out
 
     def _fn_addcolumns(self, args_str: str, ctx: DAXContext) -> Any:
         """ADDCOLUMNS(table, name, expression, ...) — add computed columns to table."""
@@ -10987,7 +11048,7 @@ class DAXEngine:
             row_ctx = self._make_row_context(r, ctx, shadow=rows)
             k = self._eval_expr(order_expr, row_ctx)
             k = self._resolve_row_result(k, r, row_ctx)
-            keyed.append((k if isinstance(k, (int, float)) else float('-inf'), r))
+            keyed.append((_order_key(_scalarize(k)), r))     # any value, as TOPN (#158)
         keyed.sort(key=lambda t2: t2[0], reverse=True)
         lo, hi = int(skip), int(skip) + int(n)
         return [r for _, r in keyed[lo:hi]]
@@ -12309,7 +12370,7 @@ class DAXEngine:
             return None
         t, c = ref
         vals = sorted(set(v for v in ctx.get_column_data(t, c)
-                          if v is not None), key=lambda x: (str(type(x)), x))
+                          if v is not None), key=_order_key)
         seq = vals if name == "FIRSTNONBLANKVALUE" else list(reversed(vals))
         # an iteration over the column's values: ALLSELECTED inside restores
         # them all (#118)
@@ -12442,7 +12503,7 @@ class DAXEngine:
             row_ctx = self._make_row_context(r, ctx, shadow=rows)
             k = self._eval_expr(order_expr, row_ctx)
             k = self._resolve_row_result(k, r, row_ctx)
-            keyed.append((k if isinstance(k, (int, float)) else float("-inf"), r))
+            keyed.append((_order_key(_scalarize(k)), r))     # any value, as TOPN (#158)
         keyed.sort(key=lambda t2: t2[0], reverse=desc)
         n = int(n)
         if n >= len(keyed):
@@ -12665,15 +12726,15 @@ class DAXEngine:
     def _win_ord(v):
         """One orderable key: blanks first, then numbers/dates, then text."""
         if v is None:
-            return (0, 0.0, '')
+            return (0, 0.0, _EMPTY_TEXT_KEY)
         if isinstance(v, bool):
-            return (1, float(v), '')
+            return (1, float(v), _EMPTY_TEXT_KEY)
         if isinstance(v, (int, float)):
-            return (1, float(v), '')
+            return (1, float(v), _EMPTY_TEXT_KEY)
         if isinstance(v, datetime):
             return (1, v.toordinal() + (v.hour * 3600 + v.minute * 60
-                                        + v.second) / 86400.0, '')
-        return (2, 0.0, str(v).casefold())
+                                        + v.second) / 86400.0, _EMPTY_TEXT_KEY)
+        return (2, 0.0, _text_key(str(v)))   # the model's collation (#157)
 
     def _win_sort(self, rows: list, orderby: list, base_ctx: DAXContext) -> list:
         if not orderby:
@@ -13535,11 +13596,8 @@ class DAXEngine:
                 else:
                     parts.append(str(result))
         if order_expr is not None:
-            # Stable sort; BLANK keys sort first (as smallest).
-            def _key(item):
-                k = item[0]
-                return (k is None, k if isinstance(k, (int, float, str)) else str(k))
-            parts.sort(key=_key, reverse=descending)
+            # Stable sort; BLANK keys sort first, text in the model's collation (#157).
+            parts.sort(key=lambda item: _order_key(item[0]), reverse=descending)
             return delimiter.join(text for _, text in parts)
         return delimiter.join(parts)
 
@@ -13563,13 +13621,13 @@ class DAXEngine:
         for all expressions that result in a number, or as an empty text for
         all text expressions" (Microsoft's RANKX reference); Desktop 2.152
         ranks a member with no data 5th of 6, above a -5. Dates are numbers.
-        Text compares as the formula engine does (case-insensitively). A value
-        of any other kind maps to None and is left out."""
+        Text compares as the formula engine does: in the model's collation
+        (issue #157). A value of any other kind maps to None and is left out."""
         text = any(isinstance(v, str) for v in values)
-        out: list[str | float | None] = []
+        out: list[tuple | float | None] = []
         for v in values:
             if text:
-                out.append('' if v is None else (_text_key(v) if isinstance(v, str) else None))
+                out.append(_EMPTY_TEXT_KEY if v is None else (_text_key(v) if isinstance(v, str) else None))
             elif v is None:
                 out.append(0.0)
             elif isinstance(v, (int, float)):
