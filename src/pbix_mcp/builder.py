@@ -2829,14 +2829,6 @@ def _modify_metadata_and_encode(
             # ============================================================
             # INSERT user columns (Type=1)
             # ============================================================
-            # Determine which columns are used in user hierarchies
-            # (they need IsAvailableInMDX=1)
-            _hier_cols = set()
-            for _uh in (user_hierarchies or []):
-                if _uh["table"] == tname:
-                    for _lv in _uh["levels"]:
-                        _hier_cols.add(_lv["column"])
-
             for col_idx, col_def in enumerate(tdef["columns"]):
                 col_name = col_def["name"]
                 data_type = col_def.get("data_type", "String")
@@ -2915,7 +2907,14 @@ def _modify_metadata_and_encode(
                      (1 if amo_type in (6, 8, 10) else 2),
                      cs_id,
                      col_name,  # SourceColumn
-                     1 if col_name in _hier_cols else 0,  # IsAvailableInMDX
+                     # IsAvailableInMDX: 1 on every column, as Desktop writes
+                     # it. Its attribute hierarchy storage (the H$ table
+                     # below) is there for each, so MDX clients -- Analyze in
+                     # Excel -- see the column. Writing 0 off a user
+                     # hierarchy left a built model's columns out of MDX, and
+                     # a table rewrite (the server's rebuild) took a Desktop
+                     # file's columns out with them (issue #136).
+                     1,
                      _FIXED_TIMESTAMP, _FIXED_TIMESTAMP,
                      col_idx,  # DisplayOrdinal
                      str(uuid.uuid4())),  # LineageTag only; SourceLineageTag = NULL
@@ -3956,8 +3955,8 @@ def _modify_metadata_and_encode(
                     (hier_storage_id, hier_id),
                 )
 
-                # IsAvailableInMDX=1 is set during column creation for hierarchy columns
-                # (see _hier_cols set built before the column INSERT loop)
+                # A level's column has IsAvailableInMDX=1 from its creation,
+                # as every column does (issue #136).
 
                 # Note: No U$ table needed. PBI Desktop creates it on first data refresh.
 

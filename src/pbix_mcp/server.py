@@ -9951,6 +9951,18 @@ def _restore_carryable_metadata(dm_path: str, snap: dict) -> list[str]:
                 c.execute("UPDATE [Partition] SET Type = 7, "
                           "QueryDefinition = NULL WHERE TableID = ?",
                           (g["TableID"],))
+                # The group's two data columns read Desktop's fixed source
+                # columns whatever they are called, and the rebuild names each
+                # source column after its column. A group whose column was
+                # renamed ("Time" in Awesome Chocolates) then failed to open:
+                # "Calculation group table 'Time Intelligence' supports maximum
+                # two data columns: one is string datatype with source column
+                # 'Name' and the other is integer datatype with source column
+                # 'Ordinal'" (Power BI Desktop 2.152, issue #155).
+                for src_col, dtype in (("Name", 2), ("Ordinal", 6)):
+                    c.execute("UPDATE [Column] SET SourceColumn = ? WHERE TableID = ? "
+                              "AND Type = 1 AND ExplicitDataType = ?",
+                              (src_col, g["TableID"], dtype))
             except sqlite3.Error:
                 pass
 

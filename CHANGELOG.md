@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.130] - 2026-10-09
+
+A built model's columns are available in MDX, as Desktop's are (#136). Working on it turned up #155: a table rewrite in a model with a renamed calculation-group column produced a file Desktop would not open. Checked in Power BI Desktop 2.152, as built and after Desktop's own refresh. The DAX engine is unchanged.
+
+### Fixed — every column of a built model is available in MDX (issue #136)
+
+**What was wrong:** `PBIXBuilder` wrote `Column.IsAvailableInMDX = 0` on every data column outside a user hierarchy. Desktop writes 1 on every column. MDX clients, such as Analyze in Excel or an MDX query, saw no attribute hierarchy. `SELECT {[Measures].[S]} ON 0 FROM [Model] WHERE ([T].[c].&[a])` returned an empty cell.
+
+The server's table rewrite (`pbix_set_table_data`) rebuilds the whole model through the builder. One edit of a Desktop-authored file therefore took its columns out of MDX: 34 of Awesome Chocolates' 109 data columns.
+
+**The fix:** the builder writes 1 on every column. The attribute-hierarchy storage was already there (an H$ table for each column), so the flag is all it takes.
+
+**Checked** with `build_b136.py` (new):
+
+- Desktop's `MDSCHEMA_HIERARCHIES` lists every column, and MDX slicers and member sets answer as DAX does. That covers text, decimal, whole-number and date columns, TRUE/FALSE, the BLANK member (`[T].[c].&`), a related table, a user hierarchy, a hidden table and an empty one.
+- Every cell and schema row is the same as built and after Desktop's refresh, on 16 MDX cells and 9 probes.
+- On 0.9.129 every slicer was empty.
+
+Two cells answer empty in Desktop's own processing too: a Decimal key written `&[1.5]`, and a column that is all BLANK, whose hierarchy holds only `[All]`.
+
+**Pinned** by `tests/test_issue136_mdx_columns.py`: a built model's data columns, and the same after a table rewrite. **2 fail on 0.9.129.**
+
+### Fixed — a table rewrite keeps a calculation group's source columns (issue #155)
+
+**What was wrong:** the rebuild names each column's SourceColumn after the column. A calculation group's two data columns must read Desktop's fixed source columns, `Name` (text) and `Ordinal` (whole number), whatever they are called. Once the group's column had been renamed, any `pbix_set_table_data` produced a file Desktop refuses. Awesome Chocolates names its column `Time`, and Desktop said: "Calculation group table 'Time Intelligence' supports maximum two data columns: one is string datatype with source column 'Name' and the other is integer datatype with source column 'Ordinal'."
+
+**The fix:** the rebuild already re-wires the group (CalculationGroupID, partition Type 7, no QueryDefinition). It now restores the two source columns too.
+
+**Checked:** Awesome Chocolates, with `dim-Products` rewritten, opens in Desktop. It answers as the original does in 9 of 9 DAX queries (the three calculation items included) and 7 of 7 MDX cells, as built and after a refresh. All 40 of its attribute hierarchies are listed.
+
+**Pinned** by `tests/test_issue155_calc_group_rewrite.py`: a renamed group column after a table rewrite. **1 fails on 0.9.129.**
+
 ## [0.9.129] - 2026-10-09
 
 SUMMARIZE takes its groups from the source rows and keeps each column's lineage (#117, from OpenBI). Working on it turned up four more:

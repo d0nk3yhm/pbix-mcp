@@ -40,8 +40,16 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-09 (0.9.129): docs 1-56 and GitHub issues/PRs #1-#135 and
-#137-#154 are closed; #136 is open.** 0.9.129 closes #117 (OpenBI's):
+**Updated 2026-10-09 (0.9.130): docs 1-56 and GitHub issues/PRs #1-#155 are
+closed.** 0.9.130 closes #136: every column of a built model is available in
+MDX (IsAvailableInMDX = 1, as Desktop writes it; Desktop's MDX slicers, member
+sets and schema rowsets answer as DAX does, the same as built and after a
+refresh), and #155, found verifying it: a table rewrite keeps a calculation
+group's source columns ('Name' / 'Ordinal'), so a model whose group column was
+renamed still opens in Desktop after pbix_set_table_data.
+
+As of 0.9.129, docs 1-56 and #1-#135 and #137-#154 were closed; #136 was
+open. 0.9.129 closes #117 (OpenBI's):
 SUMMARIZE by a related table's column groups the SOURCE rows and keeps each
 column's lineage -- one part per table, as a CROSSJOIN row, so the table
 filters the combinations and a transition over it filters each table -- and
