@@ -40,8 +40,15 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-09 (0.9.124): docs 1-55 and GitHub issues/PRs #1-#113 and
-#118-#141 are closed; #114-#117 and #136 are open.** 0.9.124 closes four
+**Updated 2026-10-09 (0.9.125): docs 1-55 and GitHub issues/PRs #1-#113 and
+#118-#142 are closed; #114-#117 and #136 are open.** 0.9.125 closes #142:
+the #131 shield also proves a measure that re-filters a date table through a
+CALCULATE on its date column independent of the date row, so Awesome
+Chocolates' calculation items answer in under a second (70-110 s before),
+every cell of Desktop's by-item query matching.
+
+As of 0.9.124, docs 1-55 and #1-#113, #118-#141 were closed; #114-#117,
+#136 and #142 were open. 0.9.124 closes four
 defects found verifying #118 on Awesome Chocolates, whose QOQ calculation item
 now matches Desktop end to end:
 

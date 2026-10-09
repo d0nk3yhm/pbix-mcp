@@ -4072,8 +4072,10 @@ class DAXEngine:
     # of the expression evaluated in each row.
     _SHIELD_ITER_FNS = frozenset({
         'MAXX', 'MINX', 'SUMX', 'AVERAGEX', 'COUNTX', 'COUNTAX', 'PRODUCTX'})
+    # ALL / ALLSELECTED of a table, or of one of its columns (a date column
+    # whose filter clears the table, _shield_date_rows).
     _SHIELD_CAND_RE = re.compile(
-        r"(?i)\bALL(?:SELECTED)?\s*\(\s*('(?:[^']|'')+'|[A-Za-z_][\w \-]*?)\s*\)")
+        r"(?i)\bALL(?:SELECTED)?\s*\(\s*('(?:[^']|'')+'|[A-Za-z_][\w \-]*?)\s*(?:\[[^\]]*\]\s*)?\)")
 
     def _shielded_keys(self, name: str, ctx: DAXContext) -> dict:
         """For measure ``name``: its memo key's entry for each filter on a
@@ -4234,11 +4236,13 @@ class DAXEngine:
         return None
 
     def _shield_scalar(self, expr: str, table: str, ctx: DAXContext, vars_: frozenset,
-                       visiting: set, row: bool) -> bool:
+                       visiting: set, row: bool | str) -> bool:
         """``expr`` reads no filter on ``table``: at the measure's top level
         (``row`` False), or in a row context over whole rows of ``table``
         (``row`` True), where a column of the row is read from the row and a
-        measure reference runs under the row's transition."""
+        measure reference runs under the row's transition. ``row`` a column
+        name: a row context over that one column of ``table``, a date column
+        whose transition clears the table's other filters (#137)."""
         steps = self._shield_steps(expr)
         for kind, data in steps:
             if kind in (_P_NONE, _P_CONST):
@@ -4272,15 +4276,15 @@ class DAXEngine:
                 return data.lower() in vars_
             if kind in (_P_BRACKET1, _P_BRACKET2):
                 if self._measure_exists(data, ctx):
-                    return row or self._shield_measure(data, table, ctx, visiting)
-                return row and ctx._find_col_idx(ctx.tables[table]['columns'], data) >= 0
+                    return bool(row) or self._shield_measure(data, table, ctx, visiting)
+                return self._shield_row_col(row, data, table, ctx)
             if kind == _P_TCOL:
                 tname, col = data
                 if ctx.model_table(tname) == table and \
                         ctx._find_col_idx(ctx.tables[table]['columns'], col) >= 0:
-                    return row
+                    return self._shield_row_col(row, col, table, ctx)
                 if self._measure_exists(col, ctx):   # Table[Measure]
-                    return row or self._shield_measure(col, table, ctx, visiting)
+                    return bool(row) or self._shield_measure(col, table, ctx, visiting)
                 return False
             if kind == _P_FUNC:
                 fname, args_text = data
@@ -4293,6 +4297,15 @@ class DAXEngine:
                             and self._shield_scalar(args[1], table, ctx, vars_, visiting, True))
                 if fname == 'COUNTROWS' and len(args) == 1:
                     return self._shield_rows(args[0], table, ctx, vars_, visiting)
+                if fname == 'CALCULATE':
+                    if row:
+                        # In a row context, CALCULATE(e) is the row's transition,
+                        # which replaces every filter on the table.
+                        return len(args) == 1
+                    # A filter on a date column that clears the table (#78):
+                    # its body sees only those dates of the table (issue #142).
+                    return (len(args) == 2
+                            and self._shield_date_filter(args[1], table, ctx, vars_, visiting))
                 return False
             if kind == _P_VARRET and not row:
                 return self._shield_var_block(data, table, ctx, vars_, visiting)
@@ -4326,6 +4339,87 @@ class DAXEngine:
             return (self._shield_rows(args[0], table, ctx, vars_, visiting)
                     and self._shield_scalar(args[1], table, ctx, vars_, visiting, True))
         return False
+
+    @staticmethod
+    def _shield_row_col(row: bool | str, col: str, table: str, ctx: DAXContext) -> bool:
+        """Is column ``col`` of ``table`` read from the iterated row? Any
+        column of a whole row (``row`` True); only that column in a row over
+        one column (``row`` its name)."""
+        if not row:
+            return False
+        cols = ctx.tables[table]['columns']
+        idx = ctx._find_col_idx(cols, col)
+        return idx >= 0 and (row is True or cols[idx] == row)
+
+    def _shield_date_rows(self, expr: str, table: str, ctx: DAXContext, vars_: frozenset,
+                          visiting: set) -> Optional[str]:
+        """``expr`` is values of one column of ``table`` whose filter clears
+        the table's other filters (a marked date table's date column, or a
+        DateTime relationship column: #78), and no filter on the table changes
+        them except through ALLSELECTED's restore: ALL(T[c]), ALLSELECTED(T[c])
+        (the column form keeps its own column only, #118), or FILTER over them
+        with a condition that reads the table only through the row, whose
+        transition clears the rest (#137). Returns the column, else None."""
+        steps = self._shield_steps(expr)
+        if len(steps) != 1:
+            return None
+        kind, data = steps[0]
+        if kind == _P_PAREN:
+            return self._shield_date_rows(data, table, ctx, vars_, visiting)
+        if kind != _P_FUNC:
+            return None
+        fname, args_text = data
+        args = [a.strip() for a in self._split_args(args_text)] if args_text.strip() else []
+        if fname in ('ALL', 'ALLSELECTED') and len(args) == 1:
+            m = _WHOLE_TCOL_RE.match(args[0])
+            if not m or ctx.model_table((m.group(1) or m.group(2) or '').strip()) != table:
+                return None
+            cols = ctx.tables[table]['columns']
+            idx = ctx._find_col_idx(cols, m.group(3).strip())
+            if idx < 0 or (table, cols[idx]) not in self._clearing_date_columns(ctx):
+                return None
+            # The blank row's BLANK writes no filter, so its transition would
+            # leave the table's other filters in force.
+            if table in ctx.blank_row_tables():
+                return None
+            return str(cols[idx])
+        if fname == 'FILTER' and len(args) == 2:
+            col = self._shield_date_rows(args[0], table, ctx, vars_, visiting)
+            if col is not None and self._shield_scalar(args[1], table, ctx, vars_, visiting, col):
+                return col
+        return None
+
+    def _shield_date_filter(self, expr: str, table: str, ctx: DAXContext, vars_: frozenset,
+                            visiting: set) -> bool:
+        """``expr``, a CALCULATE filter argument, is dates of a column of
+        ``table`` that clears the table's other filters (#78), whatever filters
+        the table had: such dates (_shield_date_rows), or DATEADD /
+        SAMEPERIODLASTYEAR of them, which shift a table's own dates (#138,
+        #141). The CALCULATE's body then sees only these dates of ``table``:
+        Awesome Chocolates' [Max Previous Quarter Not Blank], CALCULATE([Max
+        Quarter Not Blank], DATEADD(FILTER(ALLSELECTED('dim-Date'[Date]), NOT
+        ISBLANK([Sales Actual])), -1, QUARTER)), is one value for every date
+        row (issue #142)."""
+        steps = self._shield_steps(expr)
+        if len(steps) != 1:
+            return False
+        kind, data = steps[0]
+        if kind == _P_PAREN:
+            return self._shield_date_filter(data, table, ctx, vars_, visiting)
+        if kind != _P_FUNC:
+            return False
+        fname, args_text = data
+        args = [a.strip() for a in self._split_args(args_text)] if args_text.strip() else []
+        if fname == 'DATEADD' and len(args) == 3:
+            return (self._shield_date_rows(args[0], table, ctx, vars_, visiting) is not None
+                    and self._shield_scalar(args[1], table, ctx, vars_, visiting, False)
+                    and re.fullmatch(r'[A-Za-z]+', args[2]) is not None)
+        if fname == 'SAMEPERIODLASTYEAR' and len(args) == 1:
+            return self._shield_date_rows(args[0], table, ctx, vars_, visiting) is not None
+        # FILTER only: ALL(T[c]) / ALLSELECTED(T[c]) as an argument are
+        # modifiers, which write no date filter and leave the rest in force.
+        return fname == 'FILTER' and self._shield_date_rows(expr, table, ctx, vars_,
+                                                            visiting) is not None
 
     def _shield_measure(self, name: str, table: str, ctx: DAXContext, visiting: set) -> bool:
         """A measure referenced at the top level, outside any row transition."""

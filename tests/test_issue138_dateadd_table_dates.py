@@ -115,14 +115,7 @@ DESKTOP = [   # (probe, expression, Power BI Desktop 2.152) -- generated from bu
 ]
 
 
-# The per-row form of the Chocolates measure takes ~20 s a probe; its per-quarter
-# form (mpq_q_*) pins the same rule in well under a second.
-SLOW = ("mpq_row_", "mpq_rows_", "mpq_pq_sum_")
-
-
-@pytest.mark.parametrize("probe,expr,want", [
-    pytest.param(p, e, w, id=p, marks=[pytest.mark.slow] if p.startswith(SLOW) else [])
-    for p, e, w in DESKTOP])
+@pytest.mark.parametrize("probe,expr,want", DESKTOP, ids=[p for p, _e, _w in DESKTOP])
 def test_matches_desktop(probe, expr, want):
     m = dict(MEASURES)
     m["p"] = expr

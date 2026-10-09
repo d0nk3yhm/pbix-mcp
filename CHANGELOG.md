@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.125] - 2026-10-09
+
+Awesome Chocolates' calculation items answer at once (#142). Under QOQ, `Sales Previous`, `Sales Change`, `Sales CF` and `Sales color` took 70–110 s each in 0.9.124; each now takes under a second, with the same values. Checked against Power BI Desktop 2.152 over ADOMD:
+
+- Desktop's `SUMMARIZECOLUMNS('Time Intelligence'[Time], …)` query matches in every cell: 18 measures under each of WOW, MOM and QOQ;
+- the two-item slicer and QOQ by region match too, 27 more cells;
+- every Desktop probe from earlier releases answers as before.
+
+### Fixed — a measure that re-filters a date table through its date column is evaluated once per iteration (issue #142)
+
+- **What was slow:** the QOQ item filters the 731 dates by `[Max Previous Quarter Not Blank]`, one row at a time. That measure is `CALCULATE([Max Quarter Not Blank], DATEADD(FILTER(ALLSELECTED('dim-Date'[Date]), NOT ISBLANK([Sales Actual])), -1, QUARTER))`. The memo missed on every row: 731 × 731 inner transitions.
+- **Why its value cannot depend on the row:**
+  - ALLSELECTED(D[Date]) restores the iteration's dates (#118);
+  - each date's transition clears the date table's other filters (#137);
+  - DATEADD of a table shifts the table's own dates (#138, #141);
+  - the CALCULATE filter on the date column clears the rest (#78).
+- **The fix:** the #131 shield's proof now also accepts a CALCULATE whose one filter is dates of a date column that clears its table (`_shield_date_filter`, `_shield_date_rows`): FILTER over ALL / ALLSELECTED(D[Date]) with a condition that reads the table only through the row, or DATEADD / SAMEPERIODLASTYEAR of that. The memo then keys such a measure by the iteration, as for #131, and evaluates it once per iteration.
+- **Not accepted,** because each reads a filter on the table:
+  - ALL(D[Date]) or ALLSELECTED(D[Date]) as a modifier;
+  - DATEADD of the column itself;
+  - a condition that reads another column, or MAX(D[Date]);
+  - KEEPFILTERS, or a second filter argument;
+  - a date column whose filter clears nothing.
+- **Pinned** by `tests/test_issue142_shield_date_filters.py`: 24 tests. **6 fail on 0.9.124.** Values are identical with and without the shield under four slicers. The 8 per-row probes of `tests/test_issue138_dateadd_table_dates.py` now take 0.1 s instead of 20 s, so they lose the `slow` marker.
+
 ## [0.9.124] - 2026-10-09
 
 Four defects found verifying #118 on Awesome Chocolates, whose QOQ calculation item now matches Power BI Desktop end to end. Checked against Power BI Desktop 2.152 over ADOMD:
