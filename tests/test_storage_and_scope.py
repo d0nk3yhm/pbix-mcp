@@ -82,12 +82,13 @@ class TestAllOverSeveralColumns:
 
 
 class TestAllSelectedRestoresTheOuterContext:
-    """ALLSELECTED keeps the filters from OUTSIDE the measure and drops the
-    ones CALCULATE applied inside it. Approximated as VALUES, it never removed
-    a filter on its own column."""
+    """ALLSELECTED takes out the filters an iteration put there and keeps an
+    explicit CALCULATE filter, on its own column included (issue #118, Power
+    BI Desktop 2.152: CALCULATE(COUNTROWS(ALLSELECTED(T[Cat])), T[Cat] = "A")
+    is 1 under every query shape of build_b118.py)."""
 
-    def test_it_removes_an_inner_calculate_filter(self):
-        assert ev('CALCULATE(COUNTROWS(ALLSELECTED(fact[Q])), fact[Q] = "a")') == 2
+    def test_it_keeps_an_inner_calculate_filter(self):
+        assert ev('CALCULATE(COUNTROWS(ALLSELECTED(fact[Q])), fact[Q] = "a")') == 1
 
     def test_all_agrees(self):
         assert ev('CALCULATE(COUNTROWS(ALL(fact[Q])), fact[Q] = "a")') == 2

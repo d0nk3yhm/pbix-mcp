@@ -40,8 +40,15 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-09 (0.9.122): docs 1-55 and GitHub issues/PRs #1-#113,
-#119-#135 are closed; #114-#118 are open.** 0.9.122 also solves PR #123 by
+**Updated 2026-10-09 (0.9.123): docs 1-55 and GitHub issues/PRs #1-#113,
+#118-#135 are closed; #114-#117 and #136 are open.** 0.9.123 closes #118:
+ALLSELECTED keeps the measure's own CALCULATE filters and puts back what
+an iteration iterated (its shadow), measured on 420 cells (build_b118.py);
+Awesome Chocolates and the Financial Sample's Arrow Chart now match Desktop
+on every measure.
+
+As of 0.9.122, docs 1-55 and #1-#113, #119-#135 were closed; #114-#118
+were open. 0.9.122 also solves PR #123 by
 @allanon2 on our side (#130, the modern visual header). It closes docs 52-55:
 
 - doc 52 = #121: calculation groups are applied -- the item a filter on the

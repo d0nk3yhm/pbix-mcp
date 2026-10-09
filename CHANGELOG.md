@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.123] - 2026-10-09
+
+ALLSELECTED keeps the measure's own CALCULATE filters, as OpenBI reported (#118), and puts back what an iteration iterated. Checked against Power BI Desktop 2.152 over ADOMD:
+
+- a 420-cell ALLSELECTED battery (`build_b118.py`) has 405 cells matching; 0.9.122 matched 158. The other 15 are #116;
+- #120's 400-cell matrix now matches in full, the 10 explicit-filter cells included;
+- on the community reports, Awesome Chocolates matches all 49 measures (0.9.122: 45), the Financial Sample's Arrow Chart all 49 (45), and Target Line Bar Charts 10 of 11 (8);
+- every Desktop probe from earlier releases still matches; #115's battery gained 22 cells and a date-table battery (`build_b137.py`) 4.
+
+### Fixed — ALLSELECTED keeps the measure's own CALCULATE filters (issue #118)
+
+- **What was wrong:** ALLSELECTED put back the query's selection and dropped everything else, a CALCULATE filter inside the measure included. `CALCULATE(CALCULATE([Sales], ALLSELECTED(T)), T[Cat] = "A")` answered the 75 total where Desktop gives A's 40. The community dashboards hit it through `DATEADD` inside ALLSELECTED: Awesome Chocolates' `Max Previous Quarter Not Blank` and the Financial Sample's `Sales PM` read the current period.
+- **Desktop 2.152's rules,** measured one cell per query under ten query shapes (`build_b118.py`):
+  - **an explicit CALCULATE filter stays**, in every form: modifier or table, table, column or no argument. The DATEADD filter survives an inner `ALLSELECTED('Date')`;
+  - **a filter an iteration put there goes:** a grouping goes back to the query's selection, and a row transition to the iteration's *rows* (its shadow filter context). `SUMX(FILTER(ALL(T[Cat]), T[Cat] = "A"), CALCULATE(COUNTROWS(ALLSELECTED(T))))` is 2, not 4, and `SUMX(T, CALCULATE(COUNTROWS(ALLSELECTED(T))))` under a zone grouping is 2 rows each;
+  - **the column form keeps its own columns only**, explicit filters on the others included: `CALCULATE(COUNTROWS(ALLSELECTED(Dt[Date])), Dt[Month] = 2)` is all 91 dates;
+  - **FILTER's row transition puts the row in scope:** `COUNTROWS(FILTER(T, CALCULATE(IF(ISINSCOPE(T[Cat]), 1, 0)) = 1))` is 4.
+- **The fix:**
+  - a row transition's filter (`RowContextValues`) carries its iteration's rows. Nineteen iterator call sites (SUMX, MAXX, RANKX, TOPN, ADDCOLUMNS, ...) pass them, as do FILTER over whole rows (plain lists before), SUMMARIZE / SUMMARIZECOLUMNS groups and FIRSTNONBLANKVALUE;
+  - ALLSELECTED replaces only an iteration's filter: with the distinct values among those rows, else the query's selection. It keeps every other filter;
+  - the measure memo keys a transition by its iteration's rows, so the same row under two iterations is not one value. The #131 shield now leaves out only a filter that ALLSELECTED restores the same way for every row: a transition or a grouping.
+  - what ALLSELECTED puts back is no new date filter. A filter on a DateTime column that joins a relationship clears the table's other filters (#78), but Desktop keeps the row's month in `MINX(D, CALCULATE(CALCULATE(COUNTROWS(D), ALLSELECTED(D[Date]))))`: 29, the shortest month (`build_b137.py`).
+- **Found verifying it:** IT Support's `Time Wasting Patterns` evaluates `ALLSELECTED(fact[Queue])` inside SUMMARIZE's extension columns. With SUMMARIZE's groups as plain lists it counted 1 alert where Desktop counts 4. They are now an iteration's rows, and the measure matches.
+- **Still open:** a FILTER condition that holds an aggregate and reads the row's own column, such as `Dt[Month] = MAXX(FILTER(ALLSELECTED(Dt), ...), Dt[Month])`. That is #116. Also, an outer row's other columns are not seen inside `FILTER(ALLSELECTED(D[Date]), ...)` in Desktop (`build_b137.py`: `MINX(D, CALCULATE(MAXX(FILTER(ALLSELECTED(D[Date]), NOT ISBLANK([M])), D[Date])))` is the last sale date, 31 March). The engine still sees them and answers 31 January (#137).
+- **Pinned** by `tests/test_issue118_allselected_explicit.py`: 409 tests, every expected value generated from Desktop's output. **247 fail on 0.9.122.** `tests/test_issue120_allselected_table.py` gains the 16 explicit-filter cells it left out, and `tests/test_storage_and_scope.py` now expects Desktop's 1 for an inner filter on the ALLSELECTED column.
+
 ## [0.9.122] - 2026-10-09
 
 Calculation groups are applied (OpenBI doc 52). Also three fixes reported by OpenBI (docs 53, 54 and 55), six found while verifying them, one found by the 0.9.121 corpus census (#132), and one reported by @allanon2 (PR #123). All were checked against Power BI Desktop 2.152 over ADOMD:

@@ -1832,7 +1832,12 @@ class RowContextValues(list):
         SUMX(VALUES(T[c]), [ISINSCOPE(T[c]) measure] + 0)          -- 5
         SUMX(T, IF(CALCULATE(ISINSCOPE(T[c])), 1, 0))              -- 40, one per row
         SUMX(VALUES(T[c]), IF(ISINSCOPE(T[c]), 1, 0))              -- 0 (no transition)
+
+    ``shadow`` is the iteration's rows (its "shadow filter context"): what
+    ALLSELECTED puts back for this column (issue #118). None when the
+    iterator did not say.
     """
+    shadow: Optional[list] = None
 
 
 class RowContextPredicate(dict):
@@ -1841,6 +1846,19 @@ class RowContextPredicate(dict):
     for ISINSCOPE (issue #80). Desktop 2.152: SUMX(VALUES(S[Region]),
     CALCULATE(IF(ISINSCOPE(S[Region]), 1, 0), KEEPFILTERS(S[Region] = "West")))
     is 1 for every region, 4 at the total."""
+    shadow: Optional[list] = None
+
+
+def _row_value(vals: list, shadow: Optional[list]) -> RowContextValues:
+    """A row transition's filter value, carrying the iteration's rows."""
+    tagged = RowContextValues(vals)
+    tagged.shadow = shadow
+    return tagged
+
+
+def _iteration_tagged(v) -> bool:
+    """A filter an iteration put there: a grouping or a row transition."""
+    return isinstance(v, (GroupByValues, GroupByPredicate, RowContextValues, RowContextPredicate))
 
 
 def _keep_scope_tag(outer, value):
@@ -1850,7 +1868,9 @@ def _keep_scope_tag(outer, value):
     if isinstance(outer, (GroupByValues, GroupByPredicate)):
         return GroupByPredicate(value)
     if isinstance(outer, (RowContextValues, RowContextPredicate)):
-        return RowContextPredicate(value)
+        tagged = RowContextPredicate(value)
+        tagged.shadow = outer.shadow
+        return tagged
     return value
 
 
@@ -3239,6 +3259,11 @@ class DAXEngine:
         # Measure errors degraded to BLANK so far: IFERROR / ISERROR compare it
         # before and after their argument (issue #135).
         self._nested_errors = 0
+        # (id(rows), table, column) -> (rows, distinct values): an iteration's
+        # shadow per column, for ALLSELECTED and the measure memo (#118).
+        self._shadow_cache: dict = {}
+        self._shadow_tokens: dict = {}       # shadow fingerprint -> number
+        self._shadow_next = 0
         # Bare `[Column]` -> owning table, memoized per model (see
         # _resolve_bare_column): the lookup scans every table's column list and
         # runs inside per-row iteration.
@@ -3733,22 +3758,29 @@ class DAXEngine:
             # from a plain list with the same members, so the tag is part of
             # the key -- without it, a measure cached under a plain filter was
             # returned for the grouped row with the same value.
-            def _fc_part(v):
+            # A row transition's value also carries its iteration's rows, which
+            # ALLSELECTED restores (#118): the same row under two iterations
+            # can have two values, so the iteration is part of the key.
+            def _fc_part(k, v):
                 tag = type(v).__name__ if type(v) not in (list, dict) else ''
                 if isinstance(v, list):
-                    return (tag, tuple(v)) if tag else tuple(v)
+                    if tag:
+                        shadow = self._shadow_token(k, v)
+                        return (tag, tuple(v)) if shadow is None else (tag, tuple(v), shadow)
+                    return tuple(v)
                 if isinstance(v, dict):
                     return ("__pred__" + tag, json.dumps(v, sort_keys=True,
-                                                         default=str))
+                                                         default=str),
+                            self._shadow_token(k, v))
                 return v
-            # Filters the measure provably cannot see are not part of the key
-            # (_shielded_keys): "the last week with sales" called once per
-            # date row is then evaluated once.
-            _skip = (self._shielded_keys(measure_name, ctx)
-                     if ctx.filter_context and not _cg_sig else ())
+            # Filters the measure provably cannot see are keyed by what it
+            # does see of them (_shielded_keys): "the last week with sales"
+            # called once per date row is then evaluated once.
+            _repl = (self._shielded_keys(measure_name, ctx)
+                     if ctx.filter_context and not _cg_sig else {})
             fc_key = tuple(sorted(
-                (k, _fc_part(v)) for k, v in ctx.filter_context.items()
-                if k not in _skip
+                (k, _repl[k] if k in _repl else _fc_part(k, v))
+                for k, v in ctx.filter_context.items()
             )) if ctx.filter_context else ()
             # Under the same filters, a reference whose item applies and one
             # whose item is already applied (inside the item, or nested in the
@@ -4040,13 +4072,18 @@ class DAXEngine:
     _SHIELD_CAND_RE = re.compile(
         r"(?i)\bALL(?:SELECTED)?\s*\(\s*('(?:[^']|'')+'|[A-Za-z_][\w \-]*?)\s*\)")
 
-    def _shielded_keys(self, name: str, ctx: DAXContext) -> frozenset:
-        """The filter_context keys measure ``name``'s value cannot depend on,
-        so its memo key leaves them out (see the note above)."""
+    def _shielded_keys(self, name: str, ctx: DAXContext) -> dict:
+        """For measure ``name``: its memo key's entry for each filter on a
+        shielded table that the measure sees only through ALLSELECTED's
+        restore (see the note above). Since #118 ALLSELECTED keeps an explicit
+        filter, so only an ITERATION's filter qualifies: a row transition is
+        keyed by its iteration's rows (the same for every row of one
+        iteration), a grouping by nothing (it restores the query's selection).
+        An explicit filter keeps its own value in the key."""
         tables = self._shielded_tables(name, ctx)
         if not tables or not ctx.filter_context:
-            return frozenset()
-        out = set()
+            return {}
+        out: dict = {}
         for t in tables:
             tbl = ctx.tables.get(t)
             if tbl is None:
@@ -4058,9 +4095,36 @@ class DAXEngine:
                 continue
             for c in tbl['columns']:
                 k = prefix + c
-                if k in ctx.filter_context:
-                    out.add(k)
-        return frozenset(out)
+                v = ctx.filter_context.get(k)
+                if isinstance(v, (RowContextValues, RowContextPredicate)):
+                    out[k] = ('shadow', self._shadow_token(k, v))
+                elif isinstance(v, (GroupByValues, GroupByPredicate)):
+                    out[k] = ('grouping',)
+        return out
+
+    def _shadow_token(self, key: str, value) -> Optional[int]:
+        """A small number standing for the distinct values of ``key``'s column
+        among ``value``'s iteration rows (None without them). Numbers are
+        never reused, so two different shadows never share one."""
+        shadow = getattr(value, 'shadow', None)
+        if shadow is None:
+            return None
+        table, _, col = key.partition('.')
+        ck = ('token', id(shadow), table, col)
+        hit = self._shadow_cache.get(ck)
+        if hit is not None and hit[0] is shadow:
+            tok: int = hit[1]
+            return tok
+        vals = self._shadow_values(shadow, table, col)
+        fp = tuple(sorted((type(x).__name__, repr(x)) for x in vals))
+        known: Optional[int] = self._shadow_tokens.get(fp)
+        if known is None:
+            if len(self._shadow_tokens) > 50_000:
+                self._shadow_tokens.clear()
+            self._shadow_next += 1
+            known = self._shadow_tokens[fp] = self._shadow_next
+        self._shadow_cache[ck] = (shadow, known)
+        return known
 
     def _shielded_tables(self, name: str, ctx: DAXContext) -> frozenset:
         """Tables (model spelling) whose filters cannot change the value of
@@ -4840,7 +4904,8 @@ class DAXEngine:
         parts.append(''.join(cur))
         return tuple(parts)
 
-    def _make_row_context(self, row_item: dict, ctx: 'DAXContext') -> 'DAXContext':
+    def _make_row_context(self, row_item: dict, ctx: 'DAXContext',
+                          shadow: Optional[list] = None) -> 'DAXContext':
         """Create a filter context from a row dict, filtering on ALL columns of the row.
         This implements the row context → filter context transition."""
         parts = row_item.get('__parts__')
@@ -4849,12 +4914,12 @@ class DAXEngine:
             # columns, and the row context reads each of them (issue #108).
             filters_all: dict = {}
             for part in parts:
-                filters_all.update(self._row_filters(part))
+                filters_all.update(self._row_filters(part, shadow))
             new_ctx = ctx.with_filters(filters_all)
             new_ctx._current_row = row_item
             new_ctx._outer_ctx = ctx
             return new_ctx
-        new_ctx = ctx.with_filters(self._row_filters(row_item))
+        new_ctx = ctx.with_filters(self._row_filters(row_item, shadow))
         # Bind the current row for ALL iteration shapes (full-row SUMX dicts,
         # single-column VALUES/ALL dicts, ADDCOLUMNS/SELECTCOLUMNS extension
         # columns) so column references resolve against the row even inside
@@ -4867,28 +4932,30 @@ class DAXEngine:
         return new_ctx
 
     @staticmethod
-    def _row_filters(row_item: dict) -> dict:
+    def _row_filters(row_item: dict, shadow: Optional[list] = None) -> dict:
         """The filters one row's context transition applies: every column of
-        the row, as an iterated (in-scope) value."""
+        the row, as an iterated (in-scope) value. ``shadow`` is the iteration's
+        rows, which ALLSELECTED restores (issue #118)."""
         meta_keys = {'__table__', '__column__', '__value__', '__row__',
                      '__blank_row__', '__parts__', '__tuple__'}
         table_name = row_item.get('__table__', '')
         filters: dict[str, list] = {}
+
         if row_item.get('__blank_row__'):
             # The blank row of ALL(T) / VALUES(T): every column BLANK, which
             # the propagation resolves to the rows that match no row of T.
             for k in row_item:
                 if k not in meta_keys:
-                    filters[f"{table_name}.{k}"] = RowContextValues([None])
+                    filters[f"{table_name}.{k}"] = _row_value([None], shadow)
         for k, v in row_item.items():
             if k in meta_keys or v is None:
                 continue
-            filters[f"{table_name}.{k}"] = RowContextValues([v])
+            filters[f"{table_name}.{k}"] = _row_value([v], shadow)
         # Also add the primary column filter
         col = row_item.get('__column__', '')
         val = row_item.get('__value__')
         if col and val is not None:
-            filters[f"{table_name}.{col}"] = RowContextValues([val])
+            filters[f"{table_name}.{col}"] = _row_value([val], shadow)
         elif col and '__value__' in row_item:
             # The BLANK (unknown) member. It must still emit a filter -- skipping
             # it left the context UNFILTERED, so iterating a dimension that has an
@@ -4897,7 +4964,7 @@ class DAXEngine:
             # rows whose key matches no dimension row. It is the iterated row,
             # so it stays in scope like any other (Desktop: ISINSCOPE TRUE on
             # the blank row after a transition, #80 / #82).
-            filters[f"{table_name}.{col}"] = RowContextValues([None])
+            filters[f"{table_name}.{col}"] = _row_value([None], shadow)
         return filters
 
     def _resolve_row_result(self, result, row_item, row_ctx):
@@ -5251,6 +5318,81 @@ class DAXEngine:
             return dict(outer)
         return {k: v for k, v in outer.items() if k not in gk}
 
+    # ---- what ALLSELECTED restores (issue #118) -----------------------------
+    # Power BI Desktop 2.152 over ADOMD (build_b118.py):
+    #   * an EXPLICIT CALCULATE filter stays, in every form:
+    #     CALCULATE(CALCULATE([Sales], ALLSELECTED(T)), T[Cat] = "A") is A's
+    #     40, CALCULATE(COUNTROWS(ALLSELECTED(T[Cat])), T[Cat] = "A") is 1, and
+    #     a DATEADD filter survives an inner ALLSELECTED('Date');
+    #   * a filter an ITERATION put there goes: a grouping goes back to the
+    #     query's selection, a row transition to the iteration's ROWS (its
+    #     shadow): SUMX(FILTER(ALL(T[Cat]), T[Cat] = "A"),
+    #     CALCULATE(COUNTROWS(ALLSELECTED(T)))) is 2, not 4;
+    #   * the column form keeps its own columns only, explicit filters on the
+    #     others included: CALCULATE(COUNTROWS(ALLSELECTED(Dt[Date])),
+    #     Dt[Month] = 2) is all 91 dates.
+
+    def _shadow_values(self, shadow: list, table: str, col: str) -> list:
+        """The distinct values of ``table.col`` among an iteration's rows."""
+        key = (id(shadow), table, col)
+        hit = self._shadow_cache.get(key)
+        if hit is not None and hit[0] is shadow:
+            cached: list = hit[1]
+            return cached
+        if len(self._shadow_cache) > 20_000:
+            self._shadow_cache.clear()
+        vals: list = []
+        seen: set = set()
+        for r in shadow:
+            if not isinstance(r, dict):
+                continue
+            for part in (r.get('__parts__') or (r,)):
+                if part.get('__table__') != table:
+                    continue
+                if part.get('__column__') == col:
+                    v = part.get('__value__')
+                elif col in part:
+                    v = part[col]
+                else:
+                    continue
+                marker = (type(v).__name__, repr(v))
+                if marker not in seen:
+                    seen.add(marker)
+                    vals.append(v)
+        self._shadow_cache[key] = (shadow, vals)
+        return vals
+
+    def _restore_selected(self, key: str, value):
+        """What ALLSELECTED puts back for ``key``, whose filter ``value`` an
+        iteration put there: the values among the iteration's rows, else the
+        query's selection, else None (no filter)."""
+        shadow = getattr(value, 'shadow', None)
+        if shadow is not None:
+            table, _, col = key.partition('.')
+            return list(self._shadow_values(shadow, table, col))
+        return self._selected_filters().get(key)
+
+    def _allselected_ctx(self, ctx: DAXContext, in_scope) -> DAXContext:
+        """``ctx`` as ALLSELECTED leaves it for the keys ``in_scope(key)``
+        accepts: an iteration's filter replaced by what it restores, an
+        explicit filter kept, and the query's selection put back where the
+        context no longer has one."""
+        removes: list = []
+        restores: dict = {}
+        for k, v in ctx.filter_context.items():
+            if k.startswith(_TUPLE_FILTER_PREFIX) or not in_scope(k) or not _iteration_tagged(v):
+                continue
+            back = self._restore_selected(k, v)
+            if back is None:
+                removes.append(k)
+            else:
+                restores[k] = back
+        for k, v in self._selected_filters().items():
+            if not k.startswith(_TUPLE_FILTER_PREFIX) and in_scope(k) and k not in ctx.filter_context:
+                restores[k] = v
+        out = ctx.without_filters(removes) if removes else ctx
+        return out.with_filters(restores) if restores else out
+
     def _selected_ctx(self, ctx: DAXContext) -> DAXContext:
         """The filter context ALLSELECTED restores.
 
@@ -5281,11 +5423,22 @@ class DAXEngine:
         D(Region, Zone), one slicer at a time: COUNTROWS(ALLSELECTED(T[Region]))
         is 1 only under a T[Region] slicer, and stays 2 under slicers on
         T[Amount], T[Cat], D[Zone] and D[Region] that leave one region. The
-        TABLE form keeps every selection reaching the table (_selected_ctx)."""
+        TABLE form keeps every selection reaching the table (_allselected_ctx).
+
+        On those columns an explicit CALCULATE filter stays and an iteration's
+        filter comes back as the iteration's rows (issue #118): Desktop's
+        CALCULATE(COUNTROWS(ALLSELECTED(T[Cat])), T[Cat] = "A") is 1. An
+        explicit filter on ANOTHER column plays no part:
+        CALCULATE(COUNTROWS(ALLSELECTED(Dt[Date])), Dt[Month] = 2) is 91."""
         tl = table.lower()
         cl = {str(c).lower() for c in columns}
+
+        def own(k: str) -> bool:
+            t, sep, c = k.partition('.')
+            return bool(sep) and t.lower() == tl and c.lower() in cl
+
         keep: dict = {}
-        for k, v in self._selected_filters().items():
+        for k, v in ctx.filter_context.items():
             if k.startswith(_TUPLE_FILTER_PREFIX):
                 pos = [i for i, (t, c) in enumerate(v.get('tuple_columns') or [])
                        if str(t).lower() == tl and str(c).lower() in cl]
@@ -5293,8 +5446,16 @@ class DAXEngine:
                     spec = _project_tuple_filter(v, pos)
                     keep[_tuple_filter_key(spec['tuple_columns'])] = spec
                 continue
-            t, sep, c = k.partition('.')
-            if sep and t.lower() == tl and c.lower() in cl:
+            if not own(k):
+                continue
+            if _iteration_tagged(v):
+                back = self._restore_selected(k, v)
+                if back is not None:
+                    keep[k] = back
+            else:
+                keep[k] = v
+        for k, v in self._selected_filters().items():
+            if not k.startswith(_TUPLE_FILTER_PREFIX) and own(k) and k not in ctx.filter_context:
                 keep[k] = v
         sel = DAXContext(ctx.tables, ctx.measures, ctx.date_table,
                          ctx.date_column, keep, ctx.relationships)
@@ -5873,10 +6034,17 @@ class DAXEngine:
                 # grouping/CALCULATE added, put back the slicer selection.
                 if selected and re.match(r"(?is)^ALLSELECTED\s*\(\s*\)\s*$",
                                          filter_arg.strip()):
-                    outer_sel = self._selected_filters()
-                    new_ctx = new_ctx.without_filters(
-                        [k for k in new_ctx.filter_context
-                         if k not in outer_sel]).with_filters(outer_sel)
+                    # Every iteration's filter goes back to its rows or the
+                    # selection; an explicit CALCULATE filter stays (#118:
+                    # Desktop's CALCULATE(CALCULATE([Sales], ALLSELECTED()),
+                    # T[Cat] = "A") is A's 40, not the 75 total).
+                    _as_before = new_ctx
+                    new_ctx = self._allselected_ctx(new_ctx, lambda k: True)
+                    # What ALLSELECTED puts back is no new date filter: it does
+                    # not clear the date table's other filters (#78) -- Desktop's
+                    # CALCULATE(COUNTROWS(D), ALLSELECTED(D[Date])) inside an
+                    # iteration over D keeps the row's month (build_b137.py).
+                    keep_keys |= self._written_keys(_as_before, new_ctx)
                     continue
                 # Bare REMOVEFILTERS() / ALL() — same empty-paren blind spot as
                 # bare ALLSELECTED() above: the reference regex cannot match
@@ -5941,13 +6109,13 @@ class DAXEngine:
                         # Cat IN (A,B) it answered the 180 grand total where
                         # Desktop answers 60 (issue #26 r24#2; two of these
                         # together stay per-column, fixing r24#3).
-                        key = f"{table}.{col}"
-                        outer_sel = self._selected_filters()
-                        new_ctx = new_ctx.without_columns(
-                            lambda t, c: f"{t}.{c}" == key)
-                        if key in outer_sel:
-                            new_ctx = new_ctx.with_filters(
-                                {key: outer_sel[key]})
+                        # An explicit filter on the column stays (#118: Desktop's
+                        # CALCULATE(CALCULATE([Sales], ALLSELECTED(T[Cat])),
+                        # T[Cat] = "A") is 40 at the total and 10 / 30 by zone).
+                        key = f"{new_ctx.model_table(table)}.{col}".lower()
+                        _as_before = new_ctx
+                        new_ctx = self._allselected_ctx(new_ctx, lambda k: k.lower() == key)
+                        keep_keys |= self._written_keys(_as_before, new_ctx)
                     elif col:
                         new_ctx = new_ctx.without_columns(
                             lambda t, c: t == table and c == col)
@@ -5968,15 +6136,14 @@ class DAXEngine:
                         # scalar `CALCULATE(MIN(EventEdges[timestampMs]),
                         # ALLSELECTED(EventEdges))` under a component slicer
                         # still reads 0.
-                        outer_sel = self._selected_filters()
+                        # An explicit filter inside the measure stays (#118:
+                        # CALCULATE(CALCULATE([Sales], ALLSELECTED(T)),
+                        # T[Cat] = "A") is A's 40 in Desktop).
                         exp = new_ctx.expanded_tables(new_ctx.model_table(table))
-                        new_ctx = new_ctx.without_columns(
-                            lambda t, c: t in exp and f"{t}.{c}" not in outer_sel)
-                        restore = {k: v for k, v in outer_sel.items()
-                                   if k.partition('.')[0] in exp
-                                   and new_ctx.filter_context.get(k) != v}
-                        if restore:
-                            new_ctx = new_ctx.with_filters(restore)
+                        _as_before = new_ctx
+                        new_ctx = self._allselected_ctx(
+                            new_ctx, lambda k: k.partition('.')[0] in exp)
+                        keep_keys |= self._written_keys(_as_before, new_ctx)
                     else:
                         # ALL(Table) / REMOVEFILTERS(Table) clear every column
                         # of the table's EXPANDED table: its own and those of
@@ -7392,7 +7559,7 @@ class DAXEngine:
             seen = False
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    row_ctx = self._make_row_context(row_item, ctx)
+                    row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
                     if isinstance(result, (int, float)):
@@ -7419,7 +7586,7 @@ class DAXEngine:
             max_val = None
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    row_ctx = self._make_row_context(row_item, ctx)
+                    row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
                     max_val = _extremum(max_val, result, True)
@@ -7447,7 +7614,7 @@ class DAXEngine:
                     # _make_row_context handles both single-column (ALL(T[c]))
                     # and multi-column (bare-table ALL(T)/FILTER(T)) row dicts;
                     # the old __column__/__value__ access KeyError'd on the latter.
-                    row_ctx = self._make_row_context(row_item, ctx)
+                    row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
                     min_val = _extremum(min_val, result, False)
@@ -7471,7 +7638,7 @@ class DAXEngine:
         if isinstance(table_ref, list):
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    row_ctx = self._make_row_context(row_item, ctx)
+                    row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
                     if isinstance(result, (int, float)):
@@ -7493,7 +7660,7 @@ class DAXEngine:
         if isinstance(table_ref, list):
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    row_ctx = self._make_row_context(row_item, ctx)
+                    row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
                 else:
@@ -7555,7 +7722,7 @@ class DAXEngine:
         values = []
         for row_item in table_ref:
             if isinstance(row_item, dict) and '__table__' in row_item:
-                row_ctx = self._make_row_context(row_item, ctx)
+                row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                 result = self._eval_expr(row_expr, row_ctx)
                 result = self._resolve_row_result(result, row_item, row_ctx)
             else:
@@ -7751,7 +7918,13 @@ class DAXEngine:
                         for col_name, val in row_item.items():
                             if col_name.startswith('__'):
                                 continue
-                            extra_filters[f"{table_name}.{col_name}"] = [val]
+                            # A row transition like any iterator's: in scope
+                            # after CALCULATE (Desktop: COUNTROWS(FILTER(T,
+                            # CALCULATE(IF(ISINSCOPE(T[Cat]), 1, 0)) = 1)) is
+                            # 4), and ALLSELECTED puts back FILTER's rows
+                            # (issue #118). Plain lists read as explicit
+                            # CALCULATE filters.
+                            extra_filters[f"{table_name}.{col_name}"] = _row_value([val], table_ref)
                         row_ctx = ctx.with_filters(extra_filters)
                         if substitute_row_values:
                             row_cond = _substitute_row_refs(
@@ -7788,7 +7961,7 @@ class DAXEngine:
                         # returned 262 rows where Desktop has 261, which pushed
                         # Rank MTD Asc to 128 against Desktop's 127. Every other
                         # iterator (MAXX/MINX/RANKX) already used this helper.
-                        row_ctx = self._make_row_context(row_item, ctx)
+                        row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                         cond = self._eval_expr(args[1].strip(), row_ctx)
                         if cond:
                             filtered.append(row_item)
@@ -7828,7 +8001,7 @@ class DAXEngine:
                     # _make_row_context handles BOTH single-column
                     # (__column__/__value__) and bare-table (__row__) iterators;
                     # the old direct __column__ lookup KeyError'd on a bare table.
-                    row_ctx = self._make_row_context(row_item, ctx)
+                    row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                     score = self._eval_expr(order_expr, row_ctx)
                 else:
                     score = self._eval_expr(order_expr, ctx)
@@ -7852,7 +8025,7 @@ class DAXEngine:
         for row_item in table_ref:
             new_item = dict(row_item) if isinstance(row_item, dict) else row_item
             if isinstance(row_item, dict) and '__table__' in row_item:
-                row_ctx = self._make_row_context(row_item, ctx)
+                row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
             else:
                 row_ctx = ctx
             # Process name/expression pairs
@@ -8013,17 +8186,22 @@ class DAXEngine:
             row_dict = {'__table__': table_name}
             for col_name, col_idx in group_cols:
                 row_dict[col_name] = row[col_idx]
-            if extensions:
-                group_ctx = ctx.with_filters({
-                    f"{table_name}.{col_name}": [row[col_idx]]
-                    for col_name, col_idx in group_cols
-                })
-                for ext_name, ext_expr in extensions:
-                    row_dict[ext_name] = self._eval_expr(ext_expr, group_ctx)
             # Use first group col as the iteration column
             row_dict['__column__'] = group_cols[0][0]
             row_dict['__value__'] = row[group_cols[0][1]]
             result.append(row_dict)
+        if extensions:
+            # Each group is an ITERATION's row: ALLSELECTED inside an
+            # extension puts back the groups, not the group (#118). As plain
+            # lists they read as explicit filters, and IT Support's "Time
+            # Wasting Patterns" counted 1 alert where Desktop counts 4.
+            group_names = [c for c, _i in group_cols]
+            for row_dict in result:
+                group_ctx = ctx.with_filters({
+                    f"{table_name}.{c}": _row_value([row_dict[c]], result)
+                    for c in group_names})
+                for ext_name, ext_expr in extensions:
+                    row_dict[ext_name] = self._eval_expr(ext_expr, group_ctx)
         return result
 
     def _summarize_with_related(self, table_name, tbl, group_cols, remote_cols,
@@ -8064,20 +8242,33 @@ class DAXEngine:
             return []
 
         result = []
+        combos = []
         for combo in itertools.product(*axes):
             filters = {key: [val] for key, _disp, val in combo}
-            group_ctx = ctx.with_filters(filters)
-            if not group_ctx.get_filtered_rows(table_name):
+            if not ctx.with_filters(filters).get_filtered_rows(table_name):
                 continue  # combination doesn't exist in the base table
             row_dict = {'__table__': table_name}
             for _key, disp, val in combo:
                 row_dict[disp] = val
-            for ext_name, ext_expr in extensions:
-                row_dict[ext_name] = self._eval_expr(ext_expr, group_ctx)
             first_disp, first_val = combo[0][1], combo[0][2]
             row_dict['__column__'] = first_disp
             row_dict['__value__'] = first_val
             result.append(row_dict)
+            combos.append(combo)
+        if extensions and combos:
+            # The groups are an iteration's rows; ALLSELECTED in an extension
+            # puts back the groups, per column (#118).
+            shadows: dict = {}
+            for combo in combos:
+                for key, _disp, val in combo:
+                    t, _, c = key.partition('.')
+                    shadows.setdefault(key, []).append(
+                        {'__table__': t, '__column__': c, '__value__': val})
+            for row_dict, combo in zip(result, combos):
+                group_ctx = ctx.with_filters({key: _row_value([val], shadows[key])
+                                              for key, _disp, val in combo})
+                for ext_name, ext_expr in extensions:
+                    row_dict[ext_name] = self._eval_expr(ext_expr, group_ctx)
         return result
 
     def _fn_summarizecolumns(self, args_str: str, ctx: DAXContext) -> Any:
@@ -8223,7 +8414,7 @@ class DAXEngine:
         result = []
         for row_item in table_ref:
             if isinstance(row_item, dict) and '__table__' in row_item:
-                row_ctx = self._make_row_context(row_item, ctx)
+                row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
             else:
                 row_ctx = ctx
             new_row = {}
@@ -8510,7 +8701,7 @@ class DAXEngine:
         result = []
         for row_item in table_ref:
             if isinstance(row_item, dict) and '__table__' in row_item:
-                row_ctx = self._make_row_context(row_item, ctx)
+                row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
             else:
                 row_ctx = ctx
             inner = self._eval_expr(args[1].strip(), row_ctx)
@@ -8535,7 +8726,7 @@ class DAXEngine:
         result = []
         for row_item in table_ref:
             if isinstance(row_item, dict) and '__table__' in row_item:
-                row_ctx = self._make_row_context(row_item, ctx)
+                row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
             else:
                 row_ctx = ctx
             inner = self._eval_expr(args[1].strip(), row_ctx)
@@ -8660,7 +8851,10 @@ class DAXEngine:
         table_name = ctx.model_table(name) if name else name
         tbl = ctx.tables.get(table_name) if name else None
         if tbl is not None:
-            sel = self._selected_ctx(ctx)
+            # The iterations' filters on the table's expanded table come back
+            # as their rows or the selection; explicit filters stay (#118).
+            exp = ctx.expanded_tables(table_name)
+            sel = self._allselected_ctx(ctx, lambda k: k.partition('.')[0] in exp)
             cols = tbl['columns']
             out = []
             for row in sel.get_filtered_rows(table_name):
@@ -9273,7 +9467,7 @@ class DAXEngine:
         values = []
         for row_item in table_ref:
             if isinstance(row_item, dict) and '__table__' in row_item:
-                row_ctx = self._make_row_context(row_item, ctx)
+                row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                 result = self._eval_expr(row_expr, row_ctx)
                 result = self._resolve_row_result(result, row_item, row_ctx)
             else:
@@ -9568,7 +9762,7 @@ class DAXEngine:
         order_expr = parts[3].strip()
         keyed = []
         for r in rows:
-            row_ctx = self._make_row_context(r, ctx)
+            row_ctx = self._make_row_context(r, ctx, shadow=rows)
             k = self._eval_expr(order_expr, row_ctx)
             k = self._resolve_row_result(k, r, row_ctx)
             keyed.append((k if isinstance(k, (int, float)) else float('-inf'), r))
@@ -10156,7 +10350,7 @@ class DAXEngine:
             return None
         vals, dates = [], []
         for r in rows:
-            row_ctx = self._make_row_context(r, ctx)
+            row_ctx = self._make_row_context(r, ctx, shadow=rows)
             v = self._eval_expr(parts[1].strip(), row_ctx)
             v = self._resolve_row_result(v, r, row_ctx)
             d = self._eval_expr(parts[2].strip(), row_ctx)
@@ -10895,8 +11089,11 @@ class DAXEngine:
         vals = sorted(set(v for v in ctx.get_column_data(t, c)
                           if v is not None), key=lambda x: (str(type(x)), x))
         seq = vals if name == "FIRSTNONBLANKVALUE" else list(reversed(vals))
+        # an iteration over the column's values: ALLSELECTED inside restores
+        # them all (#118)
+        shadow = [{'__table__': t, '__column__': c, '__value__': v} for v in vals]
         for v in seq:
-            sub = ctx.with_filters({f"{t}.{c}": [v]})
+            sub = ctx.with_filters({f"{t}.{c}": _row_value([v], shadow)})
             res = self._eval_expr(parts[1].strip(), sub)
             if res is not None:
                 return res
@@ -11020,7 +11217,7 @@ class DAXEngine:
             desc = parts[3].strip().upper() == "DESC"
         keyed = []
         for r in rows:
-            row_ctx = self._make_row_context(r, ctx)
+            row_ctx = self._make_row_context(r, ctx, shadow=rows)
             k = self._eval_expr(order_expr, row_ctx)
             k = self._resolve_row_result(k, r, row_ctx)
             keyed.append((k if isinstance(k, (int, float)) else float("-inf"), r))
@@ -11107,7 +11304,7 @@ class DAXEngine:
                 return None
             ys, xs = [], []
             for r in rows:
-                row_ctx = self._make_row_context(r, ctx)
+                row_ctx = self._make_row_context(r, ctx, shadow=rows)
                 yv = self._resolve_row_result(
                     self._eval_expr(parts[1].strip(), row_ctx), r, row_ctx)
                 xv = self._resolve_row_result(
@@ -12099,7 +12296,7 @@ class DAXEngine:
         if isinstance(table_ref, list):
             for row_item in table_ref:
                 if isinstance(row_item, dict) and '__table__' in row_item:
-                    row_ctx = self._make_row_context(row_item, ctx)
+                    row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
                 else:
@@ -12185,7 +12382,7 @@ class DAXEngine:
                 if isinstance(row_item, dict) and '__table__' in row_item:
                     # _make_row_context handles bare-table (__row__) iterators
                     # too; the old direct __column__ lookup KeyError'd on them.
-                    row_ctx = self._make_row_context(row_item, ctx)
+                    row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                     row_raw.append(self._eval_expr(rank_expr, row_ctx))
 
         keys = self._rankx_keys([current_raw] + row_raw)
