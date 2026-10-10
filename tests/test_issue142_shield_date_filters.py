@@ -75,7 +75,12 @@ MEASURES = {
                  "-1, MONTH))",
 }
 SHIELDED = {"MaxQ": {"Dt"}, "MaxPrevQ": {"Dt"}, "MaxPrevM": {"Dt"}, "SalesLY": {"Dt"}, "SalesDays": {"Dt"},
-            "MaxPrevQ_Du": {"Du"}}
+            "MaxPrevQ_Du": {"Du"},
+            # issue #166: an aggregation reads no filter on a table that cannot
+            # reach its own -- F's sum sees nothing of Dn, Du or G (Dt, the
+            # date table, is never claimed: its filters reach a table without
+            # a relationship through its date column)
+            "FS": {"Dn", "Du", "G"}, "GS": {"Dn", "F"}}
 # per date row: the shapes the QOQ item uses
 PROBES = {
     "rows_q": "COUNTROWS(FILTER(Dt, Dt[Quarter] = [MaxPrevQ]))",

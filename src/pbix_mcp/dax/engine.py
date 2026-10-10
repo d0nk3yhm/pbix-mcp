@@ -4712,12 +4712,16 @@ class DAXEngine:
     def _shielded_tables(self, name: str, ctx: DAXContext) -> frozenset:
         """Tables (model spelling) whose filters cannot change the value of
         measure ``name``: a whole-row transition replaces every one of them
-        before anything in the measure reads the context."""
+        before anything in the measure reads the context, or nothing in the
+        measure reads their filters at all (_shield_noread, issue #166).
+        Whether a filter reaches a table depends on the relationships, so
+        they are part of the cache key."""
         cache = ctx._shield_cache
-        hit: frozenset | None = cache.get(name)
+        ck = ('shielded', name, ctx._rels_sig)
+        hit: frozenset | None = cache.get(ck)
         if hit is not None:
             return hit
-        cache[name] = frozenset()               # a cycle proves nothing
+        cache[ck] = frozenset()               # a cycle proves nothing
         expr = ctx.measures.get(name) or ''
         out = set()
         for m in self._SHIELD_CAND_RE.finditer(expr):
@@ -4732,8 +4736,17 @@ class DAXEngine:
                     out.add(t)
             except RecursionError:
                 pass
+        if ctx._rels_sig is not None:
+            for t in ctx.tables:
+                if t in out:
+                    continue
+                try:
+                    if self._shield_noread(expr, t, ctx, frozenset(), {name}):
+                        out.add(t)
+                except RecursionError:
+                    pass
         res = frozenset(out)
-        cache[name] = res
+        cache[ck] = res
         return res
 
     def _every_cell_valued(self, table: str, ctx: DAXContext) -> bool:
@@ -4981,6 +4994,164 @@ class DAXEngine:
                 scope.add(vm.group(1).lower())
             else:
                 if not self._shield_scalar(block, table, ctx, frozenset(scope), visiting, False):
+                    return False
+                seen_return = True
+        return seen_return
+
+    # ---- "reads no filter on the table at all" (issue #166) -----------------
+    # A measure whose every read of the context either clears all filters
+    # first or reads a table the shielded table's filters cannot reach has one
+    # value whatever that table's filters are -- [_ShowValueForDates] under
+    # FILTER(ALL(DimEmployee[EmployeeKey]), ...) was evaluated, and FactSales
+    # scanned, once per employee. Unlike the proofs above, these rules rely on
+    # no row transition: they hold for any table.
+    _NOREAD_AGG_FNS = frozenset({
+        'SUM', 'MIN', 'MAX', 'AVERAGE', 'COUNT', 'COUNTA', 'COUNTBLANK',
+        'DISTINCTCOUNT', 'DISTINCTCOUNTNOBLANK', 'MEDIAN'})
+    # CALCULATE modifiers that only remove filters or choose relationships:
+    # they read nothing of the outer context.
+    _NOREAD_CLEAR_FNS = frozenset({'REMOVEFILTERS', 'ALL', 'ALLNOBLANKROW', 'ALLEXCEPT',
+                                   'USERELATIONSHIP', 'CROSSFILTER'})
+
+    def _shield_noread(self, expr: str, table: str, ctx: DAXContext, vars_: frozenset,
+                       visiting: set) -> bool:
+        """``expr``, at a measure's top level (no row context), reads no
+        filter on ``table``: constants, proven variables, pure functions and
+        operators over such parts, measures whose body proves the same, a
+        CALCULATE that clears every filter before its body runs, and an
+        aggregation over a table ``table``'s filters cannot reach."""
+        steps = self._shield_steps(expr)
+        for kind, data in steps:
+            if kind in (_P_NONE, _P_CONST):
+                return True
+            if kind in (_P_PAREN, _P_NOT, _P_NEG):
+                return self._shield_noread(data, table, ctx, vars_, visiting)
+            if kind in (_P_LOGICAL, _P_BINARY):
+                return all(self._shield_noread(p, table, ctx, vars_, visiting) for p in data[1])
+            if kind == _P_CONCAT:
+                return all(self._shield_noread(p, table, ctx, vars_, visiting) for p in data)
+            if kind == _P_CMP:
+                sides = self._shield_cmp_sides(data)
+                if not sides or not all(self._shield_noread(p, table, ctx, vars_, visiting)
+                                        for p in sides):
+                    return False
+                continue                     # a blank side falls through
+            if kind == _P_IN:
+                lhs, rhs = data
+                rs = rhs.strip()
+                if not (rs.startswith('{') and rs.endswith('}')):
+                    return False
+                if not self._shield_noread(lhs, table, ctx, vars_, visiting):
+                    return False
+                if not all(self._shield_noread(e, table, ctx, vars_, visiting)
+                           for e in self._split_top_level(rs[1:-1], ',') if e.strip()):
+                    return False
+                continue
+            if kind == _P_MAYBEVAR:
+                return data.lower() in vars_
+            if kind in (_P_BRACKET1, _P_BRACKET2):
+                return (self._measure_exists(data, ctx)
+                        and self._shield_noread_measure(data, table, ctx, visiting))
+            if kind == _P_TCOL:
+                tname, col = data
+                t2 = ctx.model_table(tname)
+                if t2 in ctx.tables and ctx._find_col_idx(ctx.tables[t2]['columns'], col) >= 0:
+                    return False             # a column read from a row, not here
+                if self._measure_exists(col, ctx):   # Table[Measure]
+                    return self._shield_noread_measure(col, table, ctx, visiting)
+                return False
+            if kind == _P_TAIL:
+                # the fallthrough after a comparison: BLANK unless it names a table
+                return ctx.tables.get(data.strip().strip("'")) is None
+            if kind == _P_FUNC:
+                fname, args_text = data
+                args = [a.strip() for a in self._split_args(args_text)] if args_text.strip() else []
+                if fname in self._SHIELD_PURE_FNS:
+                    return all(self._shield_noread(a, table, ctx, vars_, visiting) for a in args)
+                if fname in self._NOREAD_AGG_FNS and len(args) == 1:
+                    return self._noread_column_table(args[0], table, ctx)
+                if fname in ('MIN', 'MAX') and len(args) == 2:
+                    return all(self._shield_noread(a, table, ctx, vars_, visiting) for a in args)
+                if fname == 'COUNTROWS' and len(args) == 1:
+                    raw = args[0]
+                    if raw.startswith("'") and raw.endswith("'"):
+                        raw = raw[1:-1].replace("''", "'")
+                    t2 = ctx.model_table(raw.strip())
+                    return t2 in ctx.tables and self._cannot_reach(table, t2, ctx)
+                if fname == 'CALCULATE' and args:
+                    return self._noread_clearing_calculate(args[1:])
+                return False
+            if kind == _P_VARRET:
+                return self._shield_noread_vars(data, table, ctx, vars_, visiting)
+            return False
+        return False
+
+    def _noread_column_table(self, arg: str, table: str, ctx: DAXContext) -> bool:
+        """``arg`` is one column of a table ``table``'s filters cannot reach."""
+        m = _WHOLE_TCOL_RE.match(arg)
+        if not m:
+            return False
+        t2 = ctx.model_table((m.group(1) or m.group(2) or '').strip())
+        if t2 not in ctx.tables or ctx._find_col_idx(ctx.tables[t2]['columns'], m.group(3).strip()) < 0:
+            return False
+        return self._cannot_reach(table, t2, ctx)
+
+    @staticmethod
+    def _cannot_reach(table: str, target: str, ctx: DAXContext) -> bool:
+        """No filter on ``table`` reaches ``target`` as the engine propagates
+        filters (_get_cross_table_filters): no relationship in filter
+        direction, no multi-hop path, and not the date table, whose filters
+        reach a table without a relationship through its date column."""
+        if table == target or table == ctx.date_table:
+            return False
+        return ctx._rel_dir.get((target, table)) is None and ctx._find_rel_path(table, target) is None
+
+    def _noread_clearing_calculate(self, modifiers: list) -> bool:
+        """A CALCULATE whose modifiers clear every filter (REMOVEFILTERS() or
+        ALL() with no argument) and otherwise only remove filters or choose
+        relationships: its body sees none of the outer filters. A body that
+        reaches ALLSELECTED sees the iteration's rows, which the memo key
+        keeps (_shielded_keys)."""
+        full = False
+        for mod in modifiers:
+            steps = self._shield_steps(mod)
+            if len(steps) != 1 or steps[0][0] != _P_FUNC:
+                return False
+            fname, args_text = steps[0][1]
+            if fname not in self._NOREAD_CLEAR_FNS:
+                return False
+            if fname in ('REMOVEFILTERS', 'ALL') and not args_text.strip():
+                full = True
+        return full
+
+    def _shield_noread_measure(self, name: str, table: str, ctx: DAXContext, visiting: set) -> bool:
+        canon = next((m for m in ctx.measures if m.lower() == name.lower()), name)
+        if canon in visiting:
+            return False
+        expr = ctx.measures.get(canon)
+        if not expr:
+            return False
+        return self._shield_noread(expr, table, ctx, frozenset(), visiting | {canon})
+
+    def _shield_noread_vars(self, expr: str, table: str, ctx: DAXContext, vars_: frozenset,
+                            visiting: set) -> bool:
+        """VAR ... RETURN, each variable and the result proven by
+        _shield_noread (split as _shield_var_block splits it)."""
+        text = _collapse_ws_outside_strings(expr)
+        kws = [(m.start(), m.group().upper(), m.end())
+               for m in re.finditer(r'\b(VAR|RETURN)\b', text, re.IGNORECASE)]
+        scope = set(vars_)
+        seen_return = False
+        for i, (_pos, kw, end) in enumerate(kws):
+            block = text[end:kws[i + 1][0] if i + 1 < len(kws) else len(text)].strip()
+            if kw == 'VAR':
+                vm = re.match(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)', block, re.DOTALL)
+                if not vm or not self._shield_noread(vm.group(2).strip(), table, ctx,
+                                                     frozenset(scope), visiting):
+                    return False
+                scope.add(vm.group(1).lower())
+            else:
+                if not self._shield_noread(block, table, ctx, frozenset(scope), visiting):
                     return False
                 seen_return = True
         return seen_return

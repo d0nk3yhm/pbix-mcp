@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.134] - 2026-10-10
+
+A measure that reads nothing of an iteration's filters is evaluated once per iteration, not once per row (#166, OpenBI's doc 57). Agents Performance's [Number of Employees with Positive Change] answers 137 (Desktop: 137) in 4.5 s; it took 44.6 s on 0.9.133 and hit the census's 30 s cap.
+
+The corpus census (1,508 measures) changes 45. The 30 Agents Performance measures that took past its 30 s cap now answer, each as Desktop does; the other 15 use RAND or RANDBETWEEN. It runs in 1,800 s, against 2,933 s on 0.9.133 (Agents Performance: 132 s, against 1,223 s). `regress_check.py` finds no regression across its Desktop batteries.
+
+### Fixed — a measure that reads no filter of an iteration's table is evaluated once for the iteration (issue #166)
+
+**What was wrong:** the measure memo keys a measure by the filter context. Inside `FILTER(ALL(Emp[EmployeeKey]), [Guard])` that context includes each employee's row, so the memo missed on every row. That held even for a measure whose value cannot depend on the employee.
+
+Agents Performance's guard `[_ShowValueForDates]` is an example:
+
+- **`CALCULATE(MAXX({ MAX(FactSales[DateKey]) }, ''[Value]), REMOVEFILTERS())`** clears the employee's filter;
+- **`MIN('Date'[Date])`** reads a table the employees cannot reach.
+
+So FactSales was scanned once per employee. In the issue's repro, `COUNTX(FILTER(ALL(Emp[EmployeeKey]), [Guard]), ...)` over 300 employees and 200,000 sales took 15.7 s.
+
+**The fix:** the memo's shield (`_shielded_tables`, #131 / #142) proved only that a row transition replaces a table's filters, and only for tables a measure names in ALL / ALLSELECTED. It now also proves, for any table, that a measure reads none of its filters (`_shield_noread`):
+
+- constants, proven variables, pure functions and operators;
+- measures whose bodies prove the same;
+- a CALCULATE whose modifiers clear every filter before its body runs (`REMOVEFILTERS()` / `ALL()`, with only filter-removing or relationship modifiers beside them);
+- an aggregation over a table the shielded table's filters cannot reach, as the engine propagates them.
+
+The date table is never claimed, because its filters reach a table without a relationship. Such a table's row filters are keyed by the iteration, so the 300 evaluations become one: 15.7 s → 0.07 s in the repro. The shield's cache now includes the relationship set, which the reachability depends on.
+
+**Pinned** by `tests/test_issue166_noread_shield.py`:
+
+- the shield's claims, including that Emp is not claimed for a measure that sums Sales;
+- one evaluation of `[Plain]` and of `[Guard]` per iteration of 40 employees (each runs once, counted at the memo miss);
+- the values against the proof switched off;
+- a measure the filter does reach still runs once per row.
+
+**4 fail on 0.9.133.** `test_issue142_shield_date_filters.py` now expects the larger shields this proves for its fact sums.
+
 ## [0.9.133] - 2026-10-10
 
 The engine joins a relationship's text keys as Desktop does: with their ASCII case folded, and a key the one side holds more than once through its last row (#163, found verifying #160 and #162). Checked against Power BI Desktop 2.152 over ADOMD: `build_b165.py`'s 26 probes all match (0.9.132: 10).

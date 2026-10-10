@@ -40,13 +40,22 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-10 (0.9.133): docs 1-56 and GitHub issues/PRs #1-#165 are
-closed.** 0.9.133 closes #163: the engine joins a relationship's text keys as
-Desktop does -- with their ASCII case folded, also across the two tables, and a
-key the one side holds more than once through its last row (a filter on an
-earlier row reaches nothing, RELATED returns the last row), while a filter from
-the many side reaches every row holding the key (build_b165.py 26 of 26,
-0.9.132 10).
+**Updated 2026-10-10 (0.9.134): docs 1-57 and GitHub issues/PRs #1-#166 are
+closed; #167-#173 (DAX text functions at their edges, measured against
+Desktop: TRIM, the counts of LEFT / RIGHT / MID / REPT, SEARCH's wildcards,
+VALUE, UPPER / LOWER, UNICHAR, PROPER) are open.** 0.9.134 closes doc 57 =
+#166 (OpenBI's): a measure that reads no filter of an iteration's table --
+every read under a CALCULATE that clears all filters, or over a table the
+iteration's filters cannot reach -- is evaluated once per iteration, not once
+per row (Agents Performance's [Number of Employees with Positive Change]: 137,
+as Desktop, in 4.5 s instead of 44.6 s).
+
+As of 0.9.133, docs 1-56 and #1-#165 were closed. 0.9.133 closes #163: the
+engine joins a relationship's text keys as Desktop does -- with their ASCII
+case folded, also across the two tables, and a key the one side holds more
+than once through its last row (a filter on an earlier row reaches nothing,
+RELATED returns the last row), while a filter from the many side reaches every
+row holding the key (build_b165.py 26 of 26, 0.9.132 10).
 
 As of 0.9.132, docs 1-56 and #1-#162, #164 and #165 were closed; #163 was
 open. 0.9.132 closes six issues found verifying #156, all about text as
@@ -438,6 +447,11 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **doc 57 (GH #166)** -- CLOSED (0.9.134). A measure that reads no filter
+  of an iteration's table -- every read under a CALCULATE that clears all
+  filters, or over a table the iteration's filters cannot reach -- was
+  evaluated once per row. The memo's shield now proves it and keys those
+  filters by the iteration. Regression: tests/test_issue166_noread_shield.py.
 - **doc 52 (GH #121)** -- CLOSED (0.9.122). Calculation groups were read as
   ordinary tables, so no item was ever applied. Now the item that the filter
   on the group's item column selects is applied, with Desktop's rules,
