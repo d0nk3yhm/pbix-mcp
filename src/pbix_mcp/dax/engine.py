@@ -1172,8 +1172,78 @@ _VAR_START_RE = re.compile(r'VAR\b', re.IGNORECASE)   # .match: at the start
 _RETURN_KW_RE = re.compile(r'\bRETURN\b', re.IGNORECASE)
 
 
+def _skip_literal(text: str, i: int) -> int:
+    """The index after the literal that starts at text[i] -- a "string", a
+    'quoted name' or a [name], each closed by its own character and escaping
+    it by doubling ("" '' ]]) -- or i when text[i] starts none."""
+    close = {'"': '"', "'": "'", '[': ']'}.get(text[i])
+    if close is None:
+        return i
+    n = len(text)
+    j = i + 1
+    while j < n:
+        if text[j] == close:
+            if j + 1 < n and text[j + 1] == close:
+                j += 2
+                continue
+            return j + 1
+        j += 1
+    return n
+
+
+def _var_block_keywords(text: str) -> list:
+    """[(start, 'VAR' | 'RETURN', end)] of a VAR block's own keywords (issue
+    #174): at depth 0 -- not inside ( ) or { } -- and outside "strings",
+    'quoted names' and [names]; VAR only when white space follows it, so
+    VAR.P( and VAR.S( stay calls. Every word VAR / RETURN cut the block: a
+    block nested in a declaration or in RETURN, [Sales Var], a [Return Qty]
+    column or a "Return rate" literal made the measure BLANK."""
+    out = []
+    depth = 0
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in '"\'[':
+            i = _skip_literal(text, i)
+            continue
+        if ch in '({':
+            depth += 1
+        elif ch in ')}':
+            depth -= 1
+        elif depth == 0 and ch in 'VvRr' and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == '_')):
+            if text[i:i + 3].upper() == 'VAR' and i + 3 < n and text[i + 3].isspace():
+                out.append((i, 'VAR', i + 3))
+                i += 3
+                continue
+            if text[i:i + 6].upper() == 'RETURN' and (i + 6 == n or not (text[i + 6].isalnum() or text[i + 6] == '_')):
+                out.append((i, 'RETURN', i + 6))
+                i += 6
+                continue
+        i += 1
+    return out
+
+
+def _var_block_parts(text: str):
+    """([(name or None, expression)], RETURN expression or None) of a VAR
+    block (_var_block_keywords); the RETURN expression runs to the end. A
+    declaration that is no `name = expression` has the name None."""
+    decls: list = []
+    kws = _var_block_keywords(text)
+    for k, (_pos, kw, end) in enumerate(kws):
+        if kw == 'RETURN':
+            return decls, text[end:].strip()
+        stop = kws[k + 1][0] if k + 1 < len(kws) else len(text)
+        block = text[end:stop].strip()
+        m = re.match(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)', block, re.DOTALL)
+        decls.append((m.group(1), m.group(2).strip()) if m else (None, block))
+    return decls, None
+
+
 def _strip_line_comments(expr):
-    """Strip // and -- comments, respecting string literals.
+    """Strip // and -- comments and /* */ comments (issue #175), outside
+    "strings", [names] and 'quoted names', which stay exactly as written: a
+    /* */ comment anywhere made the measure BLANK -- before a VAR block, TRUE
+    -- and a -- inside [Profit -- Net] was taken for a comment.
 
     The string state is tracked across the WHOLE expression, not per line. It
     used to reset on every newline, so a multi-line string literal lost its
@@ -1184,51 +1254,43 @@ def _strip_line_comments(expr):
 
     Newlines INSIDE a string literal are preserved for the same reason -- they
     are part of the value. Outside a string they become spaces, as before, since
-    DAX is whitespace-insensitive there.
+    DAX is whitespace-insensitive there. A /* */ comment becomes one space.
     """
-    # Segments alternate between outside-string and inside-string text so the
-    # whitespace collapse can be applied to the former ONLY. Collapsing runs of
-    # spaces everywhere flattened the indentation of an SVG literal and made the
+    # Segments alternate between plain text and literals so the whitespace
+    # collapse can be applied to the former ONLY. Collapsing runs of spaces
+    # everywhere flattened the indentation of an SVG literal and made the
     # value 32 characters shorter than Desktop's.
-    segs: list = []          # (text, is_string)
+    segs: list = []          # (text, is_literal)
     buf: list = []
-    in_str = False
     i = 0
     n = len(expr)
     while i < n:
         ch = expr[i]
-        if in_str:
-            if ch == '"':
-                # "" is an escaped quote inside a DAX string, not a terminator.
-                if i + 1 < n and expr[i + 1] == '"':
-                    buf.append('""')
-                    i += 2
-                    continue
-                buf.append(ch)
-                segs.append((''.join(buf), True))
-                buf = []
-                in_str = False
-                i += 1
-                continue
-            buf.append(ch)
-            i += 1
-            continue
-        if ch == '"':
+        if ch in '"\'[':
+            j = _skip_literal(expr, i)
             segs.append((''.join(buf), False))
-            buf = [ch]
-            in_str = True
-            i += 1
+            segs.append((expr[i:j], True))
+            buf = []
+            i = j
             continue
-        if expr[i:i + 2] in ('//', '--'):
+        two = expr[i:i + 2]
+        if two in ('//', '--'):
             j = expr.find('\n', i)
             if j < 0:
                 break
             i = j          # leave the newline; it becomes the line separator
             continue
+        if two == '/*':
+            j = expr.find('*/', i + 2)
+            buf.append(' ')
+            if j < 0:
+                break
+            i = j + 2
+            continue
         buf.append(' ' if ch == '\n' else ch)
         i += 1
-    segs.append((''.join(buf), in_str))
-    parts = [t if is_s else re.sub(r'[ \t]+', ' ', t) for t, is_s in segs]
+    segs.append((''.join(buf), False))
+    parts = [t if is_lit else re.sub(r'[ \t]+', ' ', t) for t, is_lit in segs]
     return ''.join(parts).strip()
 
 
@@ -1239,25 +1301,15 @@ def _collapse_ws_outside_strings(expr: str) -> str:
     characters came back as 633 with every line joined.
     """
     out = []
-    in_str = False
     i = 0
     n = len(expr)
     while i < n:
         ch = expr[i]
-        if in_str:
-            if ch == '"':
-                if i + 1 < n and expr[i + 1] == '"':
-                    out.append('""')
-                    i += 2
-                    continue
-                in_str = False
-            out.append(ch)
-            i += 1
-            continue
-        if ch == '"':
-            in_str = True
-            out.append(ch)
-            i += 1
+        if ch in '"\'[':
+            # a string, a 'quoted name' or a [name] stays as written (#174)
+            j = _skip_literal(expr, i)
+            out.append(expr[i:j])
+            i = j
             continue
         if ch.isspace():
             if out and out[-1] != ' ':
@@ -5468,24 +5520,13 @@ class DAXEngine:
                           visiting: set) -> bool:
         """VAR ... RETURN at the top level, split as _eval_var_return splits it:
         each variable and the result must read no filter on ``table``."""
-        text = _collapse_ws_outside_strings(expr)
-        kws = [(m.start(), m.group().upper(), m.end())
-               for m in re.finditer(r'\b(VAR|RETURN)\b', text, re.IGNORECASE)]
+        decls, ret = _var_block_parts(_collapse_ws_outside_strings(expr))
         scope = set(vars_)
-        seen_return = False
-        for i, (_pos, kw, end) in enumerate(kws):
-            block = text[end:kws[i + 1][0] if i + 1 < len(kws) else len(text)].strip()
-            if kw == 'VAR':
-                vm = re.match(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)', block, re.DOTALL)
-                if not vm or not self._shield_scalar(vm.group(2).strip(), table, ctx,
-                                                     frozenset(scope), visiting, False):
-                    return False
-                scope.add(vm.group(1).lower())
-            else:
-                if not self._shield_scalar(block, table, ctx, frozenset(scope), visiting, False):
-                    return False
-                seen_return = True
-        return seen_return
+        for name, var_expr in decls:
+            if name is None or not self._shield_scalar(var_expr, table, ctx, frozenset(scope), visiting, False):
+                return False
+            scope.add(name.lower())
+        return ret is not None and self._shield_scalar(ret, table, ctx, frozenset(scope), visiting, False)
 
     # ---- "reads no filter on the table at all" (issue #166) -----------------
     # A measure whose every read of the context either clears all filters
@@ -5626,24 +5667,13 @@ class DAXEngine:
                             visiting: set) -> bool:
         """VAR ... RETURN, each variable and the result proven by
         _shield_noread (split as _shield_var_block splits it)."""
-        text = _collapse_ws_outside_strings(expr)
-        kws = [(m.start(), m.group().upper(), m.end())
-               for m in re.finditer(r'\b(VAR|RETURN)\b', text, re.IGNORECASE)]
+        decls, ret = _var_block_parts(_collapse_ws_outside_strings(expr))
         scope = set(vars_)
-        seen_return = False
-        for i, (_pos, kw, end) in enumerate(kws):
-            block = text[end:kws[i + 1][0] if i + 1 < len(kws) else len(text)].strip()
-            if kw == 'VAR':
-                vm = re.match(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)', block, re.DOTALL)
-                if not vm or not self._shield_noread(vm.group(2).strip(), table, ctx,
-                                                     frozenset(scope), visiting):
-                    return False
-                scope.add(vm.group(1).lower())
-            else:
-                if not self._shield_noread(block, table, ctx, frozenset(scope), visiting):
-                    return False
-                seen_return = True
-        return seen_return
+        for name, var_expr in decls:
+            if name is None or not self._shield_noread(var_expr, table, ctx, frozenset(scope), visiting):
+                return False
+            scope.add(name.lower())
+        return ret is not None and self._shield_noread(ret, table, ctx, frozenset(scope), visiting)
 
     def _eval_expr(self, expr: str, ctx: DAXContext, var_scope: dict | None = None) -> Any:
         """Evaluate a DAX expression string.
@@ -5943,48 +5973,12 @@ class DAXEngine:
         """
         scope = dict(var_scope) if var_scope else {}
 
-        # We need to split the expression into VAR declarations and a RETURN part.
-        # Strategy: use a regex to find top-level VAR and RETURN keywords.
-        # We work on the joined, comment-stripped expression.
-
-        # Tokenize into VAR blocks and the RETURN expression.
-        # Split on VAR keyword (case-insensitive) that appears as a word boundary.
-        # First, find all VAR ... = ... segments and the RETURN segment.
-
-        # Build a list of tokens: [ ('VAR', '_name', 'expression'), ..., ('RETURN', 'expression') ]
-        # We'll use a simple state-machine approach scanning word by word.
-
-        # Normalise whitespace
+        # Split the comment-stripped, whitespace-normalised text at the block's
+        # own VAR / RETURN keywords: at depth 0 and outside strings and names
+        # (_var_block_keywords, issue #174).
         text = _collapse_ws_outside_strings(expr)
-
-        var_decls = []
-        return_expr = None
-
-        # Find all VAR declarations and RETURN using regex on the normalized text.
-        # Pattern: VAR <name> = <expression> (terminated by next VAR or RETURN)
-        # We find positions of all top-level VAR and RETURN keywords.
-        keyword_positions = []
-        for m in re.finditer(r'\b(VAR|RETURN)\b', text, re.IGNORECASE):
-            keyword_positions.append((m.start(), m.group().upper(), m.end()))
-
-        for idx, (pos, kw, end_pos) in enumerate(keyword_positions):
-            # Determine where this block ends (next keyword position or end of string)
-            if idx + 1 < len(keyword_positions):
-                block_end = keyword_positions[idx + 1][0]
-            else:
-                block_end = len(text)
-
-            block_text = text[end_pos:block_end].strip()
-
-            if kw == 'VAR':
-                # Parse: _name = expression
-                var_match = re.match(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)', block_text, re.DOTALL)
-                if var_match:
-                    var_name = var_match.group(1)
-                    var_expr = var_match.group(2).strip()
-                    var_decls.append((var_name, var_expr))
-            elif kw == 'RETURN':
-                return_expr = block_text
+        decls, return_expr = _var_block_parts(text)
+        var_decls = [(name, var_expr) for name, var_expr in decls if name is not None]
 
         # Evaluate each VAR declaration in order.
         # Set _current_var_scope so that function handlers (which don't receive
@@ -15945,7 +15939,11 @@ def evaluate_per_dimension(measure_names: list, tables: dict, measures: dict,
                 if date_part:
                     k = (_date_part_key(cell) or str(cell)) if cell is not None else 'None'
                 else:
-                    k = str(cell)
+                    # the join spelling the propagated keys are in: a text key
+                    # with its ASCII case folded (#163). str(cell) kept the
+                    # case, so a text-keyed dimension matched no fact row and
+                    # every member was BLANK (issue #181).
+                    k = _jstr(cell)
                 if k in key_to_value:
                     # BLANK is a group of its own: the rows that reach the
                     # dimension's blank row (issue #82)

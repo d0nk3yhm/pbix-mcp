@@ -11516,10 +11516,15 @@ def pbix_datamodel_add_measure(
                 raise ValueError(f"Table '{table_name}' not found")
             table_id = trow[0]
 
-            # Check if measure already exists
-            c.execute("SELECT ID FROM Measure WHERE Name = ?", (measure_name,))
-            if c.fetchone():
-                raise ValueError(f"Measure '{measure_name}' already exists")
+            # Check if measure already exists -- in any table, ignoring case:
+            # Analysis Services compares measure names case-insensitively
+            # across the model, and Power BI Desktop cannot load a file with
+            # "Margin" and "margin" (issue #183). SQLite's = is case-sensitive.
+            for (existing,) in c.execute("SELECT Name FROM Measure").fetchall():
+                if str(existing).casefold() == measure_name.casefold():
+                    raise ValueError(f"Measure '{existing}' already exists" + (
+                        "" if existing == measure_name else
+                        f" (measure names are case-insensitive: '{measure_name}' is the same name)"))
 
             # A measure cannot share its name (case-insensitively) with a
             # column on the SAME table. Analysis Services rejects the resulting

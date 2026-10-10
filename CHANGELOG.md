@@ -5,6 +5,87 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.136] - 2026-10-10
+
+A VAR block splits only at its own keywords, `/* */` comments are read (#174, #175, OpenBI's doc 58), `pbix_evaluate_dax_per_dimension` answers again for a dimension joined on a text key (#181, doc 59, a regression of 0.9.133), and the builder refuses two measures whose names differ only by case (#183). Checked against Power BI Desktop 2.152 over ADOMD:
+
+- `build_b177.py`: all 27 probes match, against 7 on 0.9.135.
+- `build_b179.py`: all the per-member answers match.
+- `build_b178.py`: the files Desktop could not open are now refused.
+
+The corpus census (1,508 measures) changes only measures that use RAND or RANDBETWEEN (14 of the 15 this time); it runs in 1,831 s, against 1,813 s on 0.9.135. `regress_check.py` finds no regression across its Desktop batteries.
+
+### Fixed — a VAR block splits only at its own VAR / RETURN (issue #174)
+
+**What was wrong:** `_eval_var_return` cut the block at every word VAR or RETURN in the text. Each of these cut the block in the wrong place, and the measure was BLANK:
+
+- a block nested in a declaration or in RETURN;
+- a `[Sales Var]` reference;
+- a `[Return Qty]` column;
+- a `"Return rate"` literal;
+- `'Var Table'`;
+- `VAR.P(...)`.
+
+The memo's shield split blocks the same way. The builder's reserved-name check read `COUNTROWS('Var Table')` as a variable named `Table` and refused to build. A calculated column's block was cut at a RETURN inside a quoted table name.
+
+**What Desktop does** (`build_b177.py`, a model built by pbix-mcp):
+
+| Probe | Desktop | 0.9.135 |
+|---|---|---|
+| `VAR a = SUMX(VALUES(Emp[k]), VAR b = Emp[k] RETURN b * 2) RETURN a` | 12 | BLANK |
+| `VAR m = 10 RETURN SUMX(VALUES(Emp[k]), VAR b = Emp[k] RETURN b + m)` | 36 | BLANK |
+| `VAR x = [Sales Var] RETURN x` / `VAR x = SUM(Emp[Return Qty]) RETURN x` | 6 / 15 | BLANK / BLANK |
+| `VAR t = "Return rate" RETURN t` / `VAR x = COUNTROWS('Var Table') RETURN x` | `Return rate` / 2 | BLANK / BLANK |
+| `VAR x = VAR.P(Emp[k]) RETURN x` | 0.667 | BLANK |
+| `VAR a = 1 RETURN (VAR b = 2 RETURN a + b)` | 3 | 1 |
+| a CONCATENATEX whose loop body is a VAR block, inside a VAR | `<2><3><4>` | BLANK |
+
+**The fix:**
+
+- **Engine:** one scan (`_var_block_keywords`) finds a block's own keywords. They sit at depth 0, outside `"strings"`, `'quoted names'` and `[names]`, and VAR counts only when white space follows it. `_var_block_parts` splits the block there, and the RETURN expression runs to the end. `_eval_var_return` and the memo's two shields use it.
+- **Whitespace:** collapsing white space leaves names alone.
+- **Builder:** the reserved-name check (`find_reserved_var_names`) masks strings, names and comments first.
+- **Calculated columns:** the scan's shadow (`_agg_shadow`) blanks quoted names too.
+
+**Pinned** by `tests/test_issue174_var_block_split.py`: 12 Desktop probes, the split itself, and the builder's check. **17 fail on 0.9.135.**
+
+### Fixed — `/* */` comments are read, and no comment is looked for inside a name (issue #175)
+
+**What was wrong:** `_strip_line_comments` removed `//` and `--` comments only. A `/* */` comment anywhere made the measure BLANK; before a VAR block it made the measure TRUE. A `--` inside a column name was taken for a comment.
+
+**What Desktop does** (`build_b177.py`): `/* note */ SUM(Emp[k])`, `SUM(/* note */ Emp[k])` and `VAR /* note */ x = 5 RETURN x` read past the comment. `SUM(Emp[Profit -- Net])` is 60, and `COUNTROWS('A//B')` is 1.
+
+**The fix:** the stripper turns a `/* */` comment into one space. It skips `"strings"`, `[names]` and `'quoted names'` whole and keeps them exactly as written.
+
+**Pinned** by `tests/test_issue175_block_comments.py`: 14 Desktop probes and the stripper itself. **15 fail on 0.9.135.**
+
+### Fixed — `pbix_evaluate_dax_per_dimension` is BLANK for every member of a dimension joined on a text key (issue #181)
+
+**What was wrong:** since #163, the engine propagates a text key with its ASCII case folded: `_get_cross_table_filters` gives `'p1'` for `"P1"`. `evaluate_per_dimension` still bucketed the fact rows by `str(cell)`. No row matched, so every member was BLANK, the blank member included, while `evaluate_measures_batch` with the same filter was right. OpenBI's category charts over product or country codes drew blank bars.
+
+**What Desktop does** (`build_b179.py`, the same as built and after Desktop's refresh, with the keys' case differing between the tables): SUMMARIZECOLUMNS by the dimension's category gives A 157, B 250 and 1,000 for the blank member, which holds an unmatched key. By its key it gives p1 150, P2 250, p3 7, and blank 1,000. 0.9.135 gave BLANK for A, p1, p3 and the blank member.
+
+**The fix:** the fact rows are bucketed by their join spelling (`_jstr`), the same function that folds the propagated keys.
+
+**Pinned** by `tests/test_issue181_per_dimension_text_keys.py`: both groupings against Desktop, the issue's repro, each member against a filtered evaluation, and the server tool on a built model. **4 fail on 0.9.135.**
+
+### Fixed — two measures whose names are equal ignoring case are refused (issue #183)
+
+**What was wrong:** Analysis Services keeps measure names in one case-insensitive namespace across the model. The builder checked tables, columns, and measures against columns, but never one measure against another. `pbix_datamodel_add_measure` compared names with SQLite's case-sensitive `=`. A model with two such measures was written without complaint, and Power BI Desktop could not open it. That is how `build_b174c.py`'s first run stopped, with probes named `f_Fi_fi` and `f_fi_fi`.
+
+**What Desktop does** (`build_b178.py`, files written by 0.9.135's builder): Desktop opens none of these four files:
+
+- `m` and `M` in one table;
+- `m` twice in one table;
+- `m` in T and `m` in U;
+- `m` in T and `M` in U.
+
+It shows "Something went wrong" over an empty Untitled report; for the first file the message is "Could not add Measure with the name 'M' because a Measure with the same name already exists in the 'Model' Model". A measure named like a column of *another* table opens.
+
+**The fix:** the builder's pre-build check refuses two measures whose names are equal ignoring case, in one table or in two, as it already refuses such tables and columns. `pbix_datamodel_add_measure` compares the new name with every measure the same way.
+
+**Pinned** by `tests/test_issue183_measure_name_collisions.py`: the four collisions, distinct names, and `pbix_datamodel_add_measure`. **5 fail on 0.9.135.**
+
 ## [0.9.135] - 2026-10-10
 
 The DAX text functions answer as Desktop does at their edges (#167 – #173, #176 – #179). Eight batteries measured them against Power BI Desktop 2.152 over ADOMD; non-ASCII text is made with UNICHAR inside DAX:

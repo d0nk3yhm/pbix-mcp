@@ -40,20 +40,31 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-10 (0.9.135): docs 1-57 and GitHub issues/PRs #1-#173 and
-#176-#179 are closed; #174 and #175 (OpenBI's doc 58: a VAR block cut at
-every VAR / RETURN word, /* */ comments) and #180 (SEARCH / FIND / SUBSTITUTE
-match linguistically in Desktop: ss = sharp s, a soft hyphen skipped, width
-and kana ignored by SEARCH) are open.** 0.9.135 closes #167-#173 and
-#176-#179, the DAX text functions at their edges, measured against Desktop in
-eight batteries: TRIM removes spaces only; counts, starts and instances are
-rounded half away from zero and checked; SEARCH's wildcards and its matcher's
-own rules (a start past the text, a leading *, `**`, the tildes); VALUE reads
-as OLE Automation does (hex, D exponents, dates in Desktop's orders); UPPER /
-LOWER through Desktop's casing table; UNICHAR's refusals; UTF-16 lengths and
-positions; BLANK through the text functions; CONCATENATEX renders as `&`;
-and a one-row table of any shape is its value (FILTER over a table leaked
-Python text).
+**Updated 2026-10-10 (0.9.136): docs 1-59 and GitHub issues/PRs #1-#179,
+#181 and #183 are closed; #180 (SEARCH / FIND / SUBSTITUTE match
+linguistically in Desktop) and #182 (OpenBI's doc 60: a time-intelligence
+function given a table of dates returns nothing) are open.** 0.9.136 closes doc
+58 = #174 and #175 (OpenBI's): a VAR block splits only at its own VAR / RETURN
+-- at depth 0, outside strings, 'quoted names' and [names], VAR only before
+white space (VAR.P stays a call) -- and /* */ comments are read; doc 59 = #181
+(OpenBI's): evaluate_per_dimension buckets the fact rows by the folded join
+key, so a dimension joined on a text key answers again (a regression of
+0.9.133); and #183: the builder and pbix_datamodel_add_measure refuse two
+measures whose names are equal ignoring case, which Desktop cannot open.
+
+As of 0.9.135, docs 1-57 and GitHub issues/PRs #1-#173 and #176-#179 were
+closed; #174 and #175 (OpenBI's doc 58: a VAR block cut at every VAR / RETURN
+word, /* */ comments) and #180 (SEARCH / FIND / SUBSTITUTE match
+linguistically in Desktop: ss = sharp s, a soft hyphen skipped, width and kana
+ignored by SEARCH) were open. 0.9.135 closes #167-#173 and #176-#179, the DAX
+text functions at their edges, measured against Desktop in eight batteries:
+TRIM removes spaces only; counts, starts and instances are rounded half away
+from zero and checked; SEARCH's wildcards and its matcher's own rules (a start
+past the text, a leading *, `**`, the tildes); VALUE reads as OLE Automation
+does (hex, D exponents, dates in Desktop's orders); UPPER / LOWER through
+Desktop's casing table; UNICHAR's refusals; UTF-16 lengths and positions;
+BLANK through the text functions; CONCATENATEX renders as `&`; and a one-row
+table of any shape is its value (FILTER over a table leaked Python text).
 
 As of 0.9.134, docs 1-57 and #1-#166 were closed; #167-#173 were open. 0.9.134
 closes doc 57 = #166 (OpenBI's): a measure that reads no filter of an
@@ -459,6 +470,15 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **doc 58 (GH #174, #175), doc 59 (GH #181), GH #183** -- CLOSED (0.9.136).
+  A VAR block split at every VAR / RETURN word and /* */ comments were not
+  read (Desktop: build_b177.py, 27 probes); evaluate_per_dimension was BLANK
+  for a text-keyed dimension since 0.9.133 (build_b179.py); two measures whose
+  names differ only by case made a file Desktop cannot open (build_b178.py).
+  Regression: tests/test_issue174_var_block_split.py,
+  tests/test_issue175_block_comments.py,
+  tests/test_issue181_per_dimension_text_keys.py,
+  tests/test_issue183_measure_name_collisions.py.
 - **GH #167-#173, #176-#179** -- CLOSED (0.9.135). The DAX text functions at
   their edges, each measured against Power BI Desktop 2.152 (build_b166.py,
   build_b166b.py, build_b170.py, build_b174.py - build_b176.py): TRIM,

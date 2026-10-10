@@ -1130,11 +1130,16 @@ def _agg_shadow(expr: str) -> str:
         T[A] and T[B] from both the row substitution and the reference check;
       * a COLUMN NAMED after one, e.g. [Total Count (n)] or [Max (temp)] --
         scanning the raw text chopped the name in half.
+
+    A 'quoted name' is blanked too (issue #174): RETURN in 'Return Table'
+    cut a calculated column's VAR block there.
     """
     out = _STRING_LITERAL.sub(
         lambda m: '"' + "\x01" * (len(m.group(0)) - 2) + '"', expr)
-    return re.sub(r"\[[^\]]*\]",
-                  lambda m: "[" + "\x01" * (len(m.group(0)) - 2) + "]", out)
+    out = re.sub(r"\[[^\]]*\]",
+                 lambda m: "[" + "\x01" * (len(m.group(0)) - 2) + "]", out)
+    return re.sub(r"'(?:[^']|'')*'",
+                  lambda m: "'" + "\x01" * (len(m.group(0)) - 2) + "'", out)
 
 
 def _scan_aggregate_calls(expr: str):

@@ -685,6 +685,10 @@ _DAX_FUNCTIONS = {
 DAX_RESERVED_IDENTIFIERS = frozenset(_DAX_MDX_KEYWORDS | _DAX_FUNCTIONS)
 
 _VAR_NAME_RE = re.compile(r"\bVAR\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+# a "string", a 'quoted name' or a [name] (each escapes its closer by doubling
+# it), or a // / -- / /* */ comment: text the VAR scan must not read
+_DAX_LITERAL_OR_COMMENT_RE = re.compile(
+    r'"(?:[^"]|"")*"?|\'(?:[^\']|\'\')*\'?|\[(?:[^\]]|\]\])*\]?|//[^\n]*|--[^\n]*|/\*.*?(?:\*/|$)', re.S)
 
 
 def find_reserved_var_names(expression: str) -> list[str]:
@@ -693,11 +697,14 @@ def find_reserved_var_names(expression: str) -> list[str]:
     A VAR name equal (case-insensitively) to a DAX function name or a DAX/MDX
     reserved keyword compiles in our lenient engine but makes the Power BI
     service fail the visual. Returns the offending names in source order,
-    de-duplicated. Empty list = safe.
+    de-duplicated. Empty list = safe. A VAR inside a string, a quoted or
+    bracketed name or a comment declares nothing: COUNTROWS('Var Table')
+    has no variable "Table" (issue #174).
     """
     seen: set[str] = set()
     hits: list[str] = []
-    for name in _VAR_NAME_RE.findall(expression or ""):
+    masked = _DAX_LITERAL_OR_COMMENT_RE.sub(" ", expression or "")
+    for name in _VAR_NAME_RE.findall(masked):
         low = name.lower()
         if low in DAX_RESERVED_IDENTIFIERS and low not in seen:
             seen.add(low)
@@ -1554,6 +1561,29 @@ class PBIXBuilder:
                         f"Rename the measure or the column."
                     )
                     break
+
+        # Measure names are one namespace across the MODEL, compared
+        # case-insensitively, as Analysis Services compares them: two measures
+        # whose names are equal or differ only by case -- in one table or in
+        # two -- make Power BI Desktop hang loading the file; its model never
+        # answers (build_b178.py, issue #183). The column checks above never
+        # looked at measures.
+        seen_measures: dict[str, tuple[str, str]] = {}
+        for m in self._measures:
+            mname = str(m["name"])
+            key = mname.casefold()
+            if key not in seen_measures:
+                seen_measures[key] = (str(m["table"]), mname)
+                continue
+            first_table, first_name = seen_measures[key]
+            same = "duplicate" if first_name == mname else "differ only by case"
+            issues.append(
+                f"CRITICAL: Two measures have names that {same}: "
+                f"'{first_table}'[{first_name}] and '{m['table']}'[{mname}]. "
+                f"Analysis Services treats measure names as one case-insensitive "
+                f"namespace across the model, so Power BI Desktop cannot load the "
+                f"file. Rename or drop one of them."
+            )
 
         for m in self._measures:
             if m["table"] not in table_names:
