@@ -40,15 +40,27 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-10 (0.9.134): docs 1-57 and GitHub issues/PRs #1-#166 are
-closed; #167-#173 (DAX text functions at their edges, measured against
-Desktop: TRIM, the counts of LEFT / RIGHT / MID / REPT, SEARCH's wildcards,
-VALUE, UPPER / LOWER, UNICHAR, PROPER) are open.** 0.9.134 closes doc 57 =
-#166 (OpenBI's): a measure that reads no filter of an iteration's table --
-every read under a CALCULATE that clears all filters, or over a table the
-iteration's filters cannot reach -- is evaluated once per iteration, not once
-per row (Agents Performance's [Number of Employees with Positive Change]: 137,
-as Desktop, in 4.5 s instead of 44.6 s).
+**Updated 2026-10-10 (0.9.135): docs 1-57 and GitHub issues/PRs #1-#173 and
+#176-#179 are closed; #174 and #175 (OpenBI's doc 58: a VAR block cut at
+every VAR / RETURN word, /* */ comments) and #180 (SEARCH / FIND / SUBSTITUTE
+match linguistically in Desktop: ss = sharp s, a soft hyphen skipped, width
+and kana ignored by SEARCH) are open.** 0.9.135 closes #167-#173 and
+#176-#179, the DAX text functions at their edges, measured against Desktop in
+eight batteries: TRIM removes spaces only; counts, starts and instances are
+rounded half away from zero and checked; SEARCH's wildcards and its matcher's
+own rules (a start past the text, a leading *, `**`, the tildes); VALUE reads
+as OLE Automation does (hex, D exponents, dates in Desktop's orders); UPPER /
+LOWER through Desktop's casing table; UNICHAR's refusals; UTF-16 lengths and
+positions; BLANK through the text functions; CONCATENATEX renders as `&`;
+and a one-row table of any shape is its value (FILTER over a table leaked
+Python text).
+
+As of 0.9.134, docs 1-57 and #1-#166 were closed; #167-#173 were open. 0.9.134
+closes doc 57 = #166 (OpenBI's): a measure that reads no filter of an
+iteration's table -- every read under a CALCULATE that clears all filters, or
+over a table the iteration's filters cannot reach -- is evaluated once per
+iteration, not once per row (Agents Performance's [Number of Employees with
+Positive Change]: 137, as Desktop, in 4.5 s instead of 44.6 s).
 
 As of 0.9.133, docs 1-56 and #1-#165 were closed. 0.9.133 closes #163: the
 engine joins a relationship's text keys as Desktop does -- with their ASCII
@@ -447,6 +459,13 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **GH #167-#173, #176-#179** -- CLOSED (0.9.135). The DAX text functions at
+  their edges, each measured against Power BI Desktop 2.152 (build_b166.py,
+  build_b166b.py, build_b170.py, build_b174.py - build_b176.py): TRIM,
+  counts, SEARCH / FIND / CONTAINSSTRING, VALUE, UPPER / LOWER, UNICHAR /
+  UNICODE / SUBSTITUTE / COMBINEVALUES, PROPER (removed), UTF-16, BLANK,
+  CONCATENATEX, one-row tables as values. Regression:
+  tests/test_issue167_trim_spaces.py ... tests/test_issue179_one_row_tables.py.
 - **doc 57 (GH #166)** -- CLOSED (0.9.134). A measure that reads no filter
   of an iteration's table -- every read under a CALCULATE that clears all
   filters, or over a table the iteration's filters cannot reach -- was

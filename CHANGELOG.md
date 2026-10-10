@@ -5,6 +5,189 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.135] - 2026-10-10
+
+The DAX text functions answer as Desktop does at their edges (#167 – #173, #176 – #179). Eight batteries measured them against Power BI Desktop 2.152 over ADOMD; non-ASCII text is made with UNICHAR inside DAX:
+
+| Battery | 0.9.135 | 0.9.134 |
+|---|---|---|
+| `build_b166.py`: TRIM, counts, SEARCH and FIND, VALUE, case, UNICHAR, PROPER | 54 of 54 | 26 |
+| `build_b166b.py`: rounding, TRIM, case, VALUE, wildcards at the edges | 45 of 45 | 15 |
+| `build_b170.py`: UPPER and LOWER of every BMP code point | all 63,425 | 62,719 |
+| `build_b174.py`: UTF-16, BLANK, starts, wildcards, VALUE, case beyond ASCII | 153 of 160 | 53 |
+| `build_b174b.py`: how wildcards compose, lone surrogates, BLANK, VALUE | 158 of 178 | 43 |
+| `build_b174c.py`: the matcher's shape, ignorable characters, VALUE's dates and hex | 184 of 205 | 44 |
+| `build_b175.py`: BLANK and tables, CONCATENATEX, VALUE | 62 of 62 | 17 |
+| `build_b176.py`: one-row tables as values | 21 of 21 | 3 |
+
+The counts leave out the probes Desktop refuses, where the engine now fails too.
+
+The 48 probes that still differ fall under SEARCH's, FIND's and SUBSTITUTE's linguistic matching: `ß` = `ss`, a soft hyphen skipped, width and kana ignored. That is the next issue (#180), together with one case of the collation it brings up, `"K" = UNICHAR(8490)`.
+
+The corpus census (1,508 measures) changes only the 15 measures that use RAND or RANDBETWEEN; it runs in 1,813 s, against 1,800 s on 0.9.134. `regress_check.py` finds no regression across its Desktop batteries, which now include the seven text batteries.
+
+### Fixed — TRIM removes spaces only, and collapses a run of them between words (issue #167)
+
+**What was wrong:** TRIM stripped every kind of whitespace from both ends (`str.strip()`) and left the spaces between words. `TRIM("  a   b  ")` was `"a   b"`, where Desktop gives `"a b"`. A tab or a no-break space at an end was removed, where Desktop keeps it.
+
+**The fix:** TRIM removes U+0020 from both ends and turns each run of U+0020 between words into one. Tabs, line breaks, the no-break space and the other Unicode spaces stay where they are.
+
+**Pinned** by `tests/test_issue167_trim_spaces.py`: 10 probes. **7 fail on 0.9.134.**
+
+### Fixed — counts and starts are rounded; one out of range is an error (issue #168)
+
+**What was wrong:** LEFT, RIGHT, MID, REPT, REPLACE, UNICHAR, SUBSTITUTE's instance and SEARCH's and FIND's start truncated a fraction (`int()`). A negative count still returned a value. `RIGHT(x, 0)` returned the whole text, because `s[-0:]` is all of it. `REPLACE("abc", 1, BLANK(), "X")` failed in Python (`int(None)`).
+
+**What Desktop does** (`build_b166.py`, `build_b166b.py`, `build_b174.py`):
+
+- **Rounding:** a count, a start or an instance is rounded half away from zero, as ROUND rounds. `LEFT("abcd", 2.5)` is `"abc"`, `MID("abcdef", 1.5, 1)` is `"b"`, `REPLACE("abcdef", 2.5, 1, "X")` is `"abXdef"`, `SUBSTITUTE("aaa", "a", "b", 1.5)` is `"aba"`, and `UNICHAR(65.7)` is `"B"`.
+- **BLANK** is 0.
+- **Errors:** a count below 0 is an error, and so is a start or an instance below 1. `LEFT("abc", -0.6)` fails, while `LEFT("abc", -0.4)` is `""`.
+- **Zero:** `RIGHT(x, 0)` is `""`.
+
+**The fix:** one helper (`_text_count`) converts these arguments as Desktop does.
+
+**Pinned** by `tests/test_issue168_text_counts.py`: 61 probes. **40 fail on 0.9.134.**
+
+### Fixed — SEARCH and CONTAINSSTRING take wildcards; SEARCH and FIND fail when nothing is found (issue #169)
+
+**What was wrong:** SEARCH and CONTAINSSTRING compared their text literally (`SEARCH("b*", "xabc")` was -1, where Desktop gives 3). SEARCH and FIND returned -1 for text they didn't find, where Desktop raises an error, and FIND ignored its NotFoundValue.
+
+**What Desktop does** (`build_b166.py`, `build_b166b.py`, `build_b174.py` – `build_b175.py`):
+
+- **Wildcards:** SEARCH and CONTAINSSTRING take `?` for any one character and `*` for any run. FIND and CONTAINSSTRINGEXACT match literally, case and all.
+- **Not found:** SEARCH and FIND raise an error, unless a NotFoundValue is given; then that value is the answer.
+- **Starts:** a start past the text finds nothing, not even `""`. `SEARCH("", "")` fails and `CONTAINSSTRING("", "")` is FALSE, though FIND and CONTAINSSTRINGEXACT do find `""` in `""`.
+- **A leading `*`:** a pattern that begins with `*` is found at position 1 whatever the start, as long as the rest is found from the start on.
+- **Only stars:** two or more `*` and nothing else are never found. One `*` alone is found.
+- **Tildes:** `~` decides by the character before it. A character right after a `~` is literal, and a `~` gives nothing unless a `~` precedes it. So a final `~` is nothing, `~b` is `b`, and `~~*` is the literal text `~*`.
+
+**The fix:** SEARCH and CONTAINSSTRING tokenize the pattern that way (`_wild_tokens`) and match it by Desktop's rules (`_wild_search`). Both texts are folded with Desktop's lower case (#171), plus the final sigma and the Angstrom sign, which Desktop's SEARCH also matches. A position counts the same characters either way.
+
+**Pinned** by `tests/test_issue169_search_wildcards.py`: 138 probes. **105 fail on 0.9.134.**
+
+### Fixed — VALUE reads what Desktop reads, and fails on the rest (issue #170)
+
+**What was wrong:** VALUE returned 0 for any text it could not parse, and it could parse little. `VALUE("1e3")`, `VALUE("(5)")`, `VALUE("2024-01-02")` and `VALUE("&H10")` were 0. So were `VALUE("abc")` and `VALUE("TRUE")`, where Desktop raises an error. `VALUE("50%")` was 50.
+
+**What Desktop does** (`build_b166.py`, `build_b166b.py`, `build_b174.py` – `build_b175.py`, en-US): it reads the text as OLE Automation does, as a number (VarR8FromStr) or else as a date (VarDateFromStr).
+
+- **A number:**
+  - **Spaces:** any Unicode space may surround it.
+  - **Signs and parentheses:** one sign, leading or trailing. Parentheses mean minus but can't combine with a sign.
+  - **Currency:** the currency sign may come before the number, after it, or both.
+  - **Digits:** ASCII digits only.
+  - **Group separators:** allowed anywhere after the first digit, even after the decimal point (`"1.2,3"` is 1.23).
+  - **Exponent:** e, E, d or D.
+  - **Hex and octal:** `&H`, `&O` or `&` followed by hex or octal digits. Eight hex digits are a signed 32-bit number (`"&HFFFFFFFF"` is -1).
+- **Otherwise a date or a time, as its serial:**
+  - **Parts:** numbers separated by `/ - ,` or a space, an English month name (or a prefix of it of three letters or more), and `h:m[:s]` with AM / PM, in any order.
+  - **Two numbers:** tried as month-day of this year, month-year, day-month, then year-month. `"1 000"` is 1 January 2000.
+  - **Three numbers:** tried as month-day-year, year-month-day, then day-month-year.
+  - **Beside a month name:** a number that is a day of that month is the day, otherwise it is the year (`"Feb 30"` is February 2030).
+  - **Two-digit years:** a year below 100 falls in 1950–2049.
+- **Errors:** a percent, a weekday name, an ISO `T` and fractional seconds.
+- **BLANK** stays BLANK.
+
+**The fix:** VALUE parses with that grammar (`_value_text_number`, `_value_text_moment`) and raises where Desktop does.
+
+**Pinned** by `tests/test_issue170_value.py`: 205 probes. A probe whose answer is a day of the measuring year is pinned to that day of the current year. **167 fail on 0.9.134.**
+
+### Fixed — UPPER and LOWER use Desktop's casing table (issue #171)
+
+**What was wrong:** UPPER and LOWER used Python's full Unicode case mapping. That mapping turns one character into several (`UPPER("ß")` was `"SS"`, `UPPER("ﬁ")` was `"FI"`), and it maps characters Desktop leaves alone: the micro sign, the Kelvin sign, the later Greek, Cherokee and Georgian letters, and the Deseret alphabet.
+
+**What Desktop does** (`build_b170.py`, every BMP code point; `build_b174.py`, the 520 characters beyond it):
+
+- **One to one:** UPPER changes 887 characters and LOWER 881, each to exactly one character.
+- **Agreement:** where Desktop and Python both map a character, they agree.
+- **Desktop only:** Desktop maps a few characters that Python expands. UPPER of `ΐ` is `Ϊ`, and LOWER of `İ` is `i`.
+- **Beyond the BMP:** characters keep their case.
+
+**The fix:** UPPER and LOWER translate through Desktop's table (`_case_data`, generated from the measurement by the toolkit's `gen_case_data.py`).
+
+**Pinned** by `tests/test_issue171_case_maps.py`. It checks 13 probes, both maps over the BMP against digests of Desktop's answers, 10 characters Python maps otherwise, and the 520 supplementary characters. **19 fail on 0.9.134.**
+
+### Fixed — UNICHAR refuses what Desktop refuses; UNICODE of "" is BLANK; SUBSTITUTE of an empty text; COMBINEVALUES' arity (issue #172)
+
+**What was wrong:**
+
+- **UNICHAR** returned a character for every code point.
+- **UNICODE** of `""` or of BLANK was 0.
+- **SUBSTITUTE** with an empty old text inserted the new text between every character.
+- **COMBINEVALUES** with a single value returned that value.
+
+**What Desktop does:**
+
+- **UNICHAR** refuses 0 and the code points XML 1.0 forbids, saying "The function UNICHAR does not return invalid XML characters". It refuses the noncharacters U+FDD0 to U+FDEF too.
+- **UNICODE** of `""` or of BLANK is BLANK.
+- **SUBSTITUTE** with an empty old text returns the text unchanged.
+- **COMBINEVALUES** takes two values or more ("The minimum argument count for the function is 3").
+
+**Pinned** by `tests/test_issue172_unichar_unicode_substitute.py`. It checks 16 probes, UNICHAR at the edges of every refused range, and every BMP code point. **23 fail on 0.9.134.**
+
+### Removed — PROPER, which is no DAX function (issue #173)
+
+PROPER is an Excel function, not a DAX one. Desktop fails a measure that uses it because it cannot resolve the name, but the engine evaluated it. It is now an unknown function, as in Desktop: the measure is BLANK and reports PROPER as unsupported. PROPER is gone from the README and `docs/supported-dax.md` too.
+
+**Pinned** by `tests/test_issue173_no_proper.py`. **2 fail on 0.9.134.**
+
+### Fixed — text is UTF-16: a character beyond the BMP counts as two (issue #176)
+
+**What was wrong:** the engine counted Python characters (code points). Desktop counts UTF-16 code units, so every length and position differed once a text held an emoji or another character beyond the BMP.
+
+**What Desktop does** (`build_b174.py` – `build_b174c.py`):
+
+- **Lengths:** LEN of an emoji is 2. The positions of LEFT, RIGHT, MID, REPLACE, SEARCH, FIND and SUBSTITUTE, and the `?` wildcard, all count units.
+- **Surrogates:** LEFT of an emoji is its high surrogate. Joining the two halves again with `&` or CONCATENATE gives the emoji back.
+- **UNICODE:** of a lone low surrogate it is the unit itself. A high surrogate with no low one after it is an error.
+- **UNICHAR beyond plane 1:** it keeps only the code point's low 16 bits, so `UNICHAR(0x20000)` is U+10000. The last two code points of every plane are errors.
+
+**The fix:** the text functions work on UTF-16 units (`_u16`) and join a valid surrogate pair back into one character (`_from_u16`). `&`, CONCATENATE, CONCATENATEX, COMBINEVALUES, REPT, REPLACE and SUBSTITUTE join pairs too. UNICODE and UNICHAR follow the rules above.
+
+**Pinned** by `tests/test_issue176_utf16_text.py`: 50 probes, and UNICHAR over 87 code points of the planes beyond the BMP. **122 fail on 0.9.134.**
+
+### Fixed — a BLANK text gives BLANK, an empty table is BLANK, and a table of several rows is an error (issue #177)
+
+**What was wrong:** the engine read a BLANK text as `""` in every text function. `LEN(BLANK())` was 0, and `ISBLANK(UPPER(BLANK()))` was FALSE. CONCATENATEX over no rows was `""`. A table of two rows read as its internal Python text: LEN gave 114.
+
+**What Desktop does** (`build_b174.py`, `build_b174b.py`, `build_b175.py`):
+
+- **BLANK in, BLANK out:** LEFT, RIGHT, MID, LEN, UPPER, LOWER, TRIM, SUBSTITUTE, REPT, VALUE and UNICODE return BLANK for a BLANK text, even `LEFT(BLANK(), 0)`. So do `UNICHAR(BLANK())`, CONCATENATE of two BLANKs, and CONCATENATEX over no rows.
+- **BLANK as `""`:** REPLACE, EXACT, COMBINEVALUES, SEARCH and FIND read BLANK as `""`.
+- **Order of errors:** LEFT and RIGHT read their count first, so `LEFT(BLANK(), -1)` fails, while `MID(BLANK(), 0, 1)` is BLANK.
+- **Tables:** an empty table is BLANK, and a table of several rows is an error.
+
+**Pinned** by `tests/test_issue177_blank_text.py`: 64 probes. **36 fail on 0.9.134.**
+
+### Fixed — CONCATENATEX renders values as `&` does (issue #178)
+
+**What was wrong:** CONCATENATEX used Python's `str()`. It gave `1.0` for 1, `2024-01-02 00:00:00` for a date and `True` for TRUE, and it dropped a delimiter of 0 (`str(x or '')`).
+
+**The fix:** each value and the delimiter go through `_concat_str`, the renderer `&`, CONCATENATE and COMBINEVALUES use. Desktop (`build_b175.py`) gives `1|2.5`, `1/2/2024|3/4/2024 3:30:00 PM`, `TRUE|FALSE` and `a0b`.
+
+**Pinned** by `tests/test_issue178_concatenatex_text.py`: 13 probes. **6 fail on 0.9.134.**
+
+### Fixed — a one-row table is its value, whatever made it (issue #179)
+
+**What was wrong:** FILTER, TOPN and SELECTCOLUMNS over a table give rows that carry the table's columns rather than one value, and the engine read only the latter as a value:
+
+- **Python text leaked:** `FILTER(T2, T2[c] = "x") & "!"` gave the rows' Python text followed by `!`, and LEN of the row was 48.
+- **Wrong comparisons and arithmetic:** `FILTER(...) = "x"` was FALSE, and `FILTER(N2, N2[n] = 5) + 1` was BLANK.
+- **Measures:** a measure defined as such a FILTER returned the rows.
+- **Empty tables:** ISBLANK of an empty FILTER was FALSE.
+
+**What Desktop does** (`build_b176.py`):
+
+- **One row, one column:** the table is its value wherever a value is needed: in `&`, comparisons, arithmetic, text functions, FORMAT, COALESCE and a measure's result.
+- **No rows:** the table is BLANK.
+- **Several rows:** using the table as a value is an error that IFERROR catches.
+- **Several columns:** Desktop refuses it outright ("The expression refers to multiple columns. Multiple columns cannot be converted to a scalar value"), and IFERROR doesn't catch that.
+
+**The fix:** `_scalarize` takes the one value of any one-row table and reads an empty table as BLANK. `_table_as_scalar` raises Desktop's two errors, and the one for several columns passes through IFERROR (`_ScalarColumnsError`).
+
+**Pinned** by `tests/test_issue179_one_row_tables.py`: 24 probes and a measure. **22 fail on 0.9.134.**
+
 ## [0.9.134] - 2026-10-10
 
 A measure that reads nothing of an iteration's filters is evaluated once per iteration, not once per row (#166, OpenBI's doc 57). Agents Performance's [Number of Employees with Positive Change] answers 137 (Desktop: 137) in 4.5 s; it took 44.6 s on 0.9.133 and hit the census's 30 s cap.

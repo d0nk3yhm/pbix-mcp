@@ -18,7 +18,7 @@ Supports 150+ DAX functions:
                      FIRSTDATE, LASTDATE, DATESBETWEEN, DATESINPERIOD, CALENDAR, CALENDARAUTO
 - Math: DIVIDE, ABS, ROUND, INT, CEILING, FLOOR, MOD, POWER, SQRT, LOG, LOG10, LN, EXP,
         SIGN, TRUNC, EVEN, ODD, FACT, GCD, LCM, RAND, RANDBETWEEN, PI, CURRENCY, FIXED
-- Text: CONCATENATE, FORMAT, SELECTEDVALUE, LEFT, RIGHT, MID, LEN, UPPER, LOWER, PROPER,
+- Text: CONCATENATE, FORMAT, SELECTEDVALUE, LEFT, RIGHT, MID, LEN, UPPER, LOWER,
         TRIM, SUBSTITUTE, REPLACE, REPT, SEARCH, FIND, CONTAINSSTRING, CONTAINSSTRINGEXACT,
         EXACT, UNICHAR, UNICODE, VALUE, COMBINEVALUES, PATHCONTAINS, PATHITEM, PATHLENGTH
 - Logic: IF, SWITCH, AND, OR, NOT, ISBLANK, BLANK, TRUE, FALSE, IFERROR, COALESCE, CONTAINS
@@ -41,6 +41,7 @@ import os
 import random
 import re
 import statistics
+import struct
 import threading
 import time
 from calendar import monthrange
@@ -567,11 +568,43 @@ def _scalarize(v):
     the internal row-dict list, whose str() is 72 characters of Python repr --
     the kind of leak that shows up in a report as literal
     "[{'__table__': ...}]" text.
+
+    A one-row table of one column is its value whatever made it -- FILTER /
+    TOPN / SELECTCOLUMNS over a table give rows of the table's columns, not
+    __value__ -- and a table with no rows is BLANK: Power BI Desktop 2.152,
+    build_b176.py (issue #179), FILTER(T, T[c] = "x") & "!" is "x!",
+    FILTER(N, N[n] = 5) + 1 is 6, ISBLANK(FILTER(T, FALSE())) TRUE. A table
+    of several rows or columns stays a table (_table_as_scalar raises for
+    it where a text is needed).
     """
-    if (isinstance(v, list) and len(v) == 1 and isinstance(v[0], dict)
-            and '__value__' in v[0]):
-        return v[0]['__value__']
+    if isinstance(v, list):
+        if not v:
+            return None
+        if len(v) == 1 and isinstance(v[0], dict):
+            row = v[0]
+            if '__value__' in row:
+                return row['__value__']
+            vals = DAXEngine._row_values(row)
+            if len(vals) == 1:
+                return vals[0]
     return v
+
+
+class _ScalarColumnsError(_DAXEvaluationError):
+    """A table of several columns used as a value. Desktop refuses the whole
+    expression -- "The expression refers to multiple columns. Multiple
+    columns cannot be converted to a scalar value." -- so IFERROR does not
+    catch it (build_b176.py, issue #179)."""
+
+
+def _table_as_scalar(v):
+    """Raise for a table where a value is needed (_scalarize left it): several
+    columns cannot be a value at all (_ScalarColumnsError); several rows fail
+    as Desktop's evaluation does, which IFERROR catches."""
+    if len(v) == 1 or (isinstance(v[0], dict) and len(DAXEngine._row_values(v[0])) > 1):
+        raise _ScalarColumnsError(
+            "The expression refers to multiple columns. Multiple columns cannot be converted to a scalar value.")
+    raise _DAXEvaluationError("A table of multiple values was supplied where a single value was expected.")
 
 
 _NAMED_NUMBER_FORMATS = frozenset({
@@ -601,6 +634,8 @@ def _concat_str(v):
     v = _scalarize(v)
     if v is None:
         return ''
+    if isinstance(v, list):
+        _table_as_scalar(v)     # several rows or columns: no text (#179)
     if isinstance(v, bool):
         return 'TRUE' if v else 'FALSE'
     if isinstance(v, float):
@@ -608,6 +643,461 @@ def _concat_str(v):
     if isinstance(v, (datetime, date)):
         return _dax_datetime_str(v)
     return str(v)
+
+
+# ---- Text functions as Power BI Desktop 2.152 computes them (#167 - #178) ----
+
+def _round_half_away(v) -> int:
+    """A number rounded to a whole one half away from zero, as ROUND rounds
+    (#110): 2.5 is 3, -0.4 is 0, -0.6 is -1."""
+    return int(decimal.Decimal(repr(float(v))).quantize(
+        decimal.Decimal(1), rounding=decimal.ROUND_HALF_UP))
+
+
+_CASE_TABLES: dict = {}
+
+
+def _case_table(which: str) -> dict:
+    """``str.translate`` table of Desktop's UPPER or LOWER (issue #171):
+    which = 'UPPER' / 'LOWER'. Desktop maps a character to exactly one
+    character, from a casing table older and narrower than Python's: UPPER
+    leaves 'ß', 'ﬁ', 'ŉ' and 'µ' alone, LOWER the Kelvin sign, and LOWER of
+    'İ' is 'i' (build_b170.py, every BMP code point; _case_data). Characters
+    beyond the BMP keep their case (build_b174.py: all 520 Python maps)."""
+    table = _CASE_TABLES.get(which)
+    if table is None:
+        from pbix_mcp.dax import _case_data
+        table = {cp: cp + delta for first, last, step, delta in getattr(_case_data, which)
+                 for cp in range(first, last + 1, step)}
+        _CASE_TABLES[which] = table
+    return table
+
+
+def _search_fold() -> dict:
+    """``str.translate`` table for SEARCH / CONTAINSSTRING's case-insensitive
+    match (issue #169): Desktop's LOWER (_case_table), and the final sigma
+    and the Angstrom sign with sigma and a-ring, which Desktop's SEARCH finds
+    equal too (SEARCH(UNICHAR(962), "x" & UNICHAR(931)) is 2, SEARCH(UNICHAR(
+    197), "x" & UNICHAR(8491)) 2; build_b174.py, build_b174c.py) -- while the
+    Kelvin and Ohm signs, the dotless and dotted i stay apart. Desktop
+    compares linguistically (its collation, ß = ss); this is that comparison
+    one character to one."""
+    table = _CASE_TABLES.get('SEARCH')
+    if table is None:
+        table = dict(_case_table('LOWER'))
+        table[0x03C2] = 0x03C3
+        table[0x212B] = 0x00E5
+        _CASE_TABLES['SEARCH'] = table
+    return table
+
+
+def _unichar(cp: int):
+    """UNICHAR(cp)'s character, or None where Desktop raises (issues #172,
+    #176). Power BI Desktop 2.152 (build_b170.py over the BMP, build_b174.py
+    and build_b174b.py beyond it):
+
+    - refused: 0 and the code points XML 1.0 forbids -- the C0 controls but
+      tab, line feed and carriage return, the surrogates, U+FFFE and U+FFFF
+      ("UNICHAR does not return invalid XML characters") -- the
+      noncharacters U+FDD0 - U+FDEF, and the last two code points of every
+      plane (U+1FFFE ... U+10FFFF);
+    - beyond plane 1 the plane is dropped: UNICHAR(0x20000) is U+10000 and
+      UNICHAR(0x2A6DF) U+1A6DF -- the character two UTF-16 units that keep
+      the code point's low 16 bits."""
+    if cp < 1 or cp > 0x10FFFF:
+        return None
+    if cp >= 0x10000:
+        if (cp & 0xFFFE) == 0xFFFE:
+            return None
+        return chr(0x10000 | (cp & 0xFFFF))
+    from pbix_mcp.dax import _case_data
+    if any(first <= cp <= last for first, last in _case_data.UNICHAR_REFUSED):
+        return None
+    return chr(cp)
+
+
+# ---- UTF-16 (issue #176) -----------------------------------------------------
+# Desktop's text is UTF-16: LEN counts code units, so a character beyond the
+# BMP is 2, and LEFT / RIGHT / MID / REPLACE / SEARCH / FIND positions, `?`
+# and SUBSTITUTE work on units -- LEFT of an emoji is its high surrogate, and
+# joining the two halves back (`&`, CONCATENATE) gives the emoji again
+# (build_b174.py, build_b174b.py, build_b174c.py). Python's text is code
+# points; _u16 splits a text into units and _from_u16 joins a valid pair back.
+_NON_BMP = re.compile('[\U00010000-\U0010FFFF]')
+_SURROGATE = re.compile('[\ud800-\udfff]')
+
+
+def _u16(s: str) -> str:
+    """``s`` as UTF-16 code units, one character each (a character beyond the
+    BMP becomes its two surrogates)."""
+    if s.isascii() or not _NON_BMP.search(s):
+        return s
+    b = s.encode('utf-16-le', 'surrogatepass')
+    return ''.join(map(chr, struct.unpack(f'<{len(b) // 2}H', b)))
+
+
+def _from_u16(s: str) -> str:
+    """UTF-16 code units back to text: a high surrogate followed by a low one
+    is one character again; a lone surrogate stays."""
+    if s.isascii() or not _SURROGATE.search(s):
+        return s
+    return s.encode('utf-16-le', 'surrogatepass').decode('utf-16-le', 'surrogatepass')
+
+
+def _u16_len(s: str) -> int:
+    """LEN: the UTF-16 code units of ``s``."""
+    if s.isascii():
+        return len(s)
+    return len(s) + len(_NON_BMP.findall(s))
+
+
+_SPACE_RUNS = re.compile(' {2,}')
+
+# SEARCH / CONTAINSSTRING's find text, tokenized (issue #169): a literal
+# character, or one of these two
+_WILD_ANY = object()
+_WILD_RUN = object()
+
+
+@lru_cache(maxsize=4096)
+def _wild_tokens(find: str) -> tuple:
+    """The find text of SEARCH / CONTAINSSTRING as tokens: _WILD_RUN for `*`
+    (any run of characters), _WILD_ANY for `?` (one UTF-16 unit), or a
+    literal character.
+
+    A character right after a `~` is literal, and a `~` gives nothing unless
+    a `~` precedes it, where it is the literal tilde. Power BI Desktop 2.152
+    reads the pattern that way, one character and the one before it at a
+    time (build_b174.py - build_b174c.py): "~*" is a literal star, "~b" is
+    "b", a final "~" is nothing (SEARCH("~", "abc") is 1), "~~" is "~", and
+    "~~*" and "~~~*" are the literal texts "~*" and "~~*" -- SEARCH("~~*",
+    "a~*b") is 2 and SEARCH("~~*", "~") finds nothing."""
+    out: list = []
+    for i, ch in enumerate(find):
+        after_tilde = i > 0 and find[i - 1] == '~'
+        if ch == '~':
+            if after_tilde:
+                out.append('~')
+        elif ch in '*?' and not after_tilde:
+            out.append(_WILD_RUN if ch == '*' else _WILD_ANY)
+        else:
+            out.append(ch)
+    return tuple(out)
+
+
+@lru_cache(maxsize=4096)
+def _wild_regex(tokens: tuple):
+    return re.compile(''.join('.*?' if t is _WILD_RUN else '.' if t is _WILD_ANY else re.escape(t)
+                              for t in tokens), re.DOTALL)
+
+
+def _wild_search(tokens: tuple, text: str, start0: int) -> int:
+    """The 0-based position where SEARCH's pattern matches ``text`` (UTF-16
+    units, folded as the caller compares) from ``start0`` on, or -1. Power BI
+    Desktop 2.152 (build_b174.py - build_b174c.py):
+
+    - a start past the text finds nothing, so neither "" nor "*" is found in
+      "" (SEARCH("", "") fails, CONTAINSSTRING("", "") is FALSE);
+    - an empty pattern is found at the start;
+    - a pattern that begins with `*` is found at position 1 whatever the
+      start, as long as the rest is found from the start on (SEARCH("*a",
+      "aba", 2) is 1, SEARCH("*a", "abc", 2) fails);
+    - two or more `*` and nothing else are never found (SEARCH("**", "a*c")
+      fails), while one alone is."""
+    if start0 >= len(text):
+        return -1
+    if not tokens:
+        return start0
+    if tokens[0] is _WILD_RUN:
+        rest = tokens
+        while rest and rest[0] is _WILD_RUN:
+            rest = rest[1:]
+        if not rest:
+            return 0 if len(tokens) == 1 else -1
+        return 0 if _wild_regex(rest).search(text, start0) else -1
+    m = _wild_regex(tokens).search(text, start0)
+    return m.start() if m else -1
+
+
+# ---- VALUE (issue #170) -------------------------------------------------------
+# Power BI Desktop 2.152 reads VALUE's text as OLE Automation does
+# (VarR8FromStr, then VarDateFromStr) -- build_b166.py, build_b166b.py,
+# build_b174.py - build_b174c.py, en-US.
+_MONTHS = ('january', 'february', 'march', 'april', 'may', 'june', 'july',
+           'august', 'september', 'october', 'november', 'december')
+
+
+def _value_text_number(s: str, culture=None):
+    """Text as VALUE reads a number, or None:
+
+    - white space (any Unicode space) around it; one sign, leading or
+      trailing ("5-" is -5); parentheses for a minus sign ("( 5 )" is -5,
+      but "(-5)" and "+(5)" fail); the currency sign before and / or after
+      ("$5$" is 5, "$(5)" -5);
+    - ASCII digits only; a group separator anywhere after the first digit,
+      even after the decimal point ("1,5" is 15, "1.2,3" 1.23, ",5" fails);
+      one decimal point ("1." and ".5" are numbers, "." is not); an
+      exponent with e, E, d or D ("2D-1" is 0.2; "1e" fails, "1e400" too);
+    - &H / &O / & followed by hex / octal digits and nothing but space
+      ("&17" is 15): eight hex digits read as a signed 32-bit number
+      ("&HFFFFFFFF" is -1, "&H7FFFFFFF" 2147483647), more as 64-bit.
+    No percent ("50%" fails)."""
+    group, dec = _culture_seps(culture)
+    cur = '$'
+    t, n, i = s, len(s), 0
+    sign = 0
+    lead_cur = paren = False
+    while i < n:
+        c = t[i]
+        if c.isspace():
+            i += 1
+        elif c in '+-' and not sign:
+            sign = -1 if c == '-' else 1
+            i += 1
+        elif c == cur and not lead_cur:
+            lead_cur = True
+            i += 1
+        elif c == '(' and not paren:
+            paren = True
+            i += 1
+        else:
+            break
+    if i < n and t[i] == '&':
+        if sign or paren or lead_cur:
+            return None
+        j = i + 1
+        base, digits = 8, '01234567'
+        if j < n and t[j] in 'hH':
+            base, digits = 16, '0123456789abcdefABCDEF'
+            j += 1
+        elif j < n and t[j] in 'oO':
+            j += 1
+        k = j
+        while k < n and t[k] in digits:
+            k += 1
+        if k == j or t[k:].strip():
+            return None
+        hv = int(t[j:k], base)
+        if hv <= 0xFFFFFFFF:
+            return hv - (1 << 32) if hv >= 1 << 31 else hv
+        if hv <= 0xFFFFFFFFFFFFFFFF:
+            return hv - (1 << 64) if hv >= 1 << 63 else hv
+        return None
+    whole: list = []
+    frac: list = []
+    seen_digit = seen_dec = False
+    while i < n:
+        c = t[i]
+        if '0' <= c <= '9':
+            (frac if seen_dec else whole).append(c)
+            seen_digit = True
+        elif c == group and group and seen_digit:
+            pass
+        elif c == dec and not seen_dec:
+            seen_dec = True
+        else:
+            break
+        i += 1
+    if not seen_digit:
+        return None
+    exp = ''
+    if i < n and t[i] in 'eEdD':
+        j = i + 1
+        if j < n and t[j] in '+-':
+            j += 1
+        k = j
+        while k < n and '0' <= t[k] <= '9':
+            k += 1
+        if k == j:
+            return None
+        exp = 'e' + t[i + 1:k]
+        i = k
+    trail_cur = closed = False
+    while i < n:
+        c = t[i]
+        if c.isspace():
+            i += 1
+        elif c in '+-' and not sign:
+            sign = -1 if c == '-' else 1
+            i += 1
+        elif c == cur and not trail_cur:
+            trail_cur = True
+            i += 1
+        elif c == ')' and paren and not closed:
+            closed = True
+            i += 1
+        else:
+            return None
+    if paren and (not closed or sign):
+        return None
+    mant = ''.join(whole) + ('.' + ''.join(frac) if frac else '')
+    v = float(mant + exp)
+    if math.isinf(v):
+        return None
+    if sign < 0 or paren:
+        v = -v
+    if not seen_dec and not exp and abs(v) < 2 ** 53:
+        return int(v)
+    return v
+
+
+_DATE_TOKENS = re.compile(r'(?P<num>[0-9]+)|(?P<word>[A-Za-z]+)|(?P<sep>[:/,.\-])|(?P<space>\s+)|(?P<other>.)',
+                          re.S)
+
+
+def _value_text_moment(t: str, culture=None, today=None):
+    """A date, a time, or both spelt as VALUE reads them, as the serial;
+    None when it is not one (en-US: the month first).
+
+    - Numbers separated by / - , or space, a month name (an English month or
+      a prefix of three letters or more: "Jan", "Sept"; a "." may follow it),
+      a time h:m[:s] and AM / PM (or A / P), in any order. A weekday name, a
+      "T", "." between numbers and fractional seconds fail.
+    - Two numbers are tried as month-day (this year), month-year (day 1),
+      day-month, year-month ("1 32" is January 2032, "13 1" January 13,
+      "0 5" May 2000, "1 000" January 2000); three as month-day-year,
+      year-month-day, day-month-year ("13/1/2024" is January 13).
+    - With a month name, a number that is a day of that month this year is
+      the day, else the year ("Jan 24" is this year's January 24, "Jan 32"
+      January 2032, "Feb 30" February 2030); of two numbers, one up to 31
+      is the day and the other the year.
+    - A year below 100 is 1950 - 2049; years run from 100 to 9999.
+    - Hours 0-23 (an AM / PM hour above 12 keeps its value), minutes and
+      seconds 0-59; "3 PM" is an hour."""
+    today = today or date.today()
+    month_first = str(culture or 'en-US').lower().replace('_', '-') in ('en-us', 'en')
+    toks = [(m.lastgroup, m.group()) for m in _DATE_TOKENS.finditer(t) if m.lastgroup != 'space']
+    nums: list = []            # (value, digit count) of the date part
+    month = None
+    time_parts: list = []
+    ampm = None
+    i = 0
+    prev_kind = None
+    while i < len(toks):
+        kind, tok = toks[i]
+        if kind == 'num':
+            if i + 1 < len(toks) and toks[i + 1][1] == ':':
+                if time_parts:
+                    return None
+                parts = [tok]
+                j = i + 1
+                while j + 1 < len(toks) and toks[j][1] == ':' and toks[j + 1][0] == 'num':
+                    parts.append(toks[j + 1][1])
+                    j += 2
+                if j < len(toks) and toks[j][1] in (':', '.'):
+                    return None                       # "13:", fractional seconds
+                if len(parts) > 3:
+                    return None
+                time_parts = [int(p) for p in parts]
+                i = j
+                prev_kind = 'time'
+                continue
+            if (i + 1 < len(toks) and toks[i + 1][0] == 'word'
+                    and toks[i + 1][1].lower() in ('am', 'pm', 'a', 'p') and not time_parts):
+                time_parts = [int(tok)]
+                i += 1
+                prev_kind = 'time'
+                continue
+            nums.append((int(tok), len(tok)))
+            i += 1
+            prev_kind = 'num'
+            continue
+        if kind == 'word':
+            low = tok.lower()
+            if low in ('am', 'pm', 'a', 'p') and time_parts and ampm is None:
+                ampm = low[0]
+                i += 1
+                prev_kind = 'ampm'
+                continue
+            hit = [k for k, name in enumerate(_MONTHS) if len(low) >= 3 and name.startswith(low)]
+            if len(hit) != 1 or month is not None:
+                return None
+            month = hit[0] + 1
+            i += 1
+            if i < len(toks) and toks[i][1] == '.':
+                i += 1
+            prev_kind = 'month'
+            continue
+        if kind == 'sep' and tok in '/,-':
+            i += 1
+            continue
+        return None
+    if prev_kind is None:
+        return None
+    # time of day
+    frac = 0.0
+    if time_parts:
+        h = time_parts[0]
+        mi = time_parts[1] if len(time_parts) > 1 else 0
+        se = time_parts[2] if len(time_parts) > 2 else 0
+        if ampm is not None and h <= 12:
+            if ampm == 'p' and h < 12:
+                h += 12
+            elif ampm == 'a' and h == 12:
+                h = 0
+        if not (0 <= h <= 23 and 0 <= mi <= 59 and 0 <= se <= 59):
+            return None
+        frac = (h * 3600 + mi * 60 + se) / 86400
+
+    def year_of(v):
+        y = v[0]
+        if y < 100:
+            y += 2000 if y < 50 else 1900
+        return y
+
+    def ok(y, m, d):
+        if not (100 <= y <= 9999 and 1 <= m <= 12 and d >= 1):
+            return None
+        if d > monthrange(y, m)[1]:
+            return None
+        return date(y, m, d)
+
+    day = None
+    if month is None:
+        if not nums:
+            day = None
+        elif len(nums) == 2:
+            a, b = nums
+            tries = ([(today.year, a[0], b[0]), (year_of(b), a[0], 1), (today.year, b[0], a[0]), (year_of(a), b[0], 1)]
+                     if month_first else
+                     [(today.year, b[0], a[0]), (year_of(b), a[0], 1), (today.year, a[0], b[0]), (year_of(a), b[0], 1)])
+            for y, m_, d_ in tries:
+                day = ok(y, m_, d_)
+                if day:
+                    break
+            if day is None:
+                return None
+        elif len(nums) == 3:
+            a, b, c = nums
+            orders = ([(year_of(c), a[0], b[0]), (year_of(a), b[0], c[0]), (year_of(c), b[0], a[0])]
+                      if month_first else
+                      [(year_of(c), b[0], a[0]), (year_of(a), b[0], c[0]), (year_of(c), a[0], b[0])])
+            for y, m_, d_ in orders:
+                day = ok(y, m_, d_)
+                if day:
+                    break
+            if day is None:
+                return None
+        else:
+            return None
+    else:
+        if len(nums) == 1:
+            # a day of that month this year, else the year ("Feb 30" is
+            # February 2030; build_b175.py)
+            v = nums[0]
+            day = ok(today.year, month, v[0]) or ok(year_of(v), month, 1)
+        elif len(nums) == 2:
+            a, b = nums
+            d_, y_ = (a, b) if a[0] <= 31 else (b, a)
+            day = ok(year_of(y_), month, d_[0])
+        else:
+            return None
+        if day is None:
+            return None
+    if day is None and not time_parts:
+        return None
+    base = float((day - date(1899, 12, 30)).days) if day is not None else 0.0
+    return base + frac
 
 
 # ---------------------------------------------------------------------------
@@ -4152,7 +4642,6 @@ class DAXEngine:
             'LEN': self._fn_len,
             'UPPER': self._fn_upper,
             'LOWER': self._fn_lower,
-            'PROPER': self._fn_proper,
             'TRIM': self._fn_trim,
             'SUBSTITUTE': self._fn_substitute,
             'REPLACE': self._fn_replace,
@@ -5377,9 +5866,10 @@ class DAXEngine:
                 # BLANK, not the empty string -- Desktop: BLANK() & BLANK() is
                 # blank, while BLANK() & "x" is "x".
                 vals = [self._eval_expr(p, ctx, var_scope) for p in data]
-                if all(v is None for v in vals):
+                if all(v is None or (isinstance(v, list) and _scalarize(v) is None) for v in vals):
                     return None
-                return ''.join(_concat_str(v) for v in vals)
+                # the halves of a UTF-16 pair join back into the character (#176)
+                return _from_u16(''.join(_concat_str(v) for v in vals))
             if kind == _P_NEG:
                 inner_val = self._eval_expr(data, ctx, var_scope)
                 if isinstance(inner_val, (int, float)) and not isinstance(inner_val, bool):
@@ -8750,8 +9240,11 @@ class DAXEngine:
         out with DAX's 15-digit formatting rather than Python's repr.
         """
         args = self._split_args(args_str)
-        return ''.join(_concat_str(self._eval_expr(a.strip(), ctx))
-                       for a in args)
+        vals = [self._eval_expr(a.strip(), ctx) for a in args]
+        # two BLANKs are BLANK, as for `&` (Desktop 2.152, build_b174.py, #177)
+        if vals and all(_scalarize(v) is None for v in vals):
+            return None
+        return _from_u16(''.join(_concat_str(v) for v in vals))
 
     def _fn_sumx(self, args_str: str, ctx: DAXContext) -> Any:
         """SUMX(table_expression, expression) — iterate over table rows, sum expression."""
@@ -13613,144 +14106,240 @@ class DAXEngine:
     # Text functions
     # =========================================================================
 
-    def _eval_text(self, expr: str, ctx: DAXContext) -> str:
+    def _eval_text_or_blank(self, expr: str, ctx: DAXContext):
         """A text argument as DAX converts it (issue #165): a one-row table is
         its value -- LEN(FIRSTNONBLANK(T[c], 1)), UPPER(TOPN(1, VALUES(T[c]),
-        T[c])), LEN(LASTDATE(D[Date])) is 8 -- BLANK is "", and numbers, dates
-        and TRUE / FALSE are their DAX text, as for `&` (_concat_str). str()
-        made a table's Python repr the text (LEN 56) and `str(x or '')`
-        dropped a 0."""
-        text: str = _concat_str(self._eval_expr(expr.strip(), ctx))
-        return text
+        T[c])), LEN(LASTDATE(D[Date])) is 8 -- and numbers, dates and TRUE /
+        FALSE are their DAX text, as for `&` (_concat_str). None for BLANK
+        and for a table with no rows (issue #177); a table of several rows
+        is an error, as in Desktop."""
+        v = _scalarize(self._eval_expr(expr.strip(), ctx))
+        if isinstance(v, list):
+            _table_as_scalar(v)
+        return None if v is None else _concat_str(v)
+
+    def _eval_text(self, expr: str, ctx: DAXContext) -> str:
+        """A text argument, BLANK as "" (_eval_text_or_blank)."""
+        text = self._eval_text_or_blank(expr, ctx)
+        return '' if text is None else text
+
+    def _text_count(self, expr: str, ctx: DAXContext, least: int = 0) -> int:
+        """A count or a start of LEFT, RIGHT, MID, REPT, REPLACE, SEARCH and
+        FIND as Power BI Desktop 2.152 takes it (build_b166.py,
+        build_b166b.py, build_b174.py, issue #168): rounded half away from
+        zero, as ROUND -- LEFT("abcd", 2.5) is "abc", MID("abcdef", 1.5, 1)
+        "b", REPT("x", 2.5) "xxx", REPLACE("abcdef", 2.5, 1, "X") "abXdef"
+        -- and BLANK is 0. One that rounds below ``least`` (0, or 1 for a
+        start) is an error: IFERROR(LEFT("abc", -0.6), "err") is "err", where
+        LEFT("abc", -0.4) is "". int() truncated 2.9 to 2."""
+        v = self._num_arg(expr, ctx)
+        try:
+            n = 0 if v is None else _round_half_away(v)
+        except (decimal.InvalidOperation, ValueError, OverflowError):
+            raise _DAXEvaluationError(f"The value {v} is not a valid count of characters") from None
+        if n < least:
+            raise _DAXEvaluationError(f"The value {n} is out of range for a count of characters")
+        return n
+
+    # BLANK in, BLANK out (issue #177): Power BI Desktop 2.152 gives BLANK for
+    # a BLANK text in LEFT, RIGHT, MID, LEN, UPPER, LOWER, TRIM, SUBSTITUTE,
+    # REPT, UNICODE and VALUE, and for CONCATENATE of two BLANKs -- even
+    # LEFT(BLANK(), 0) and REPT(BLANK(), 0) -- while REPLACE, EXACT,
+    # COMBINEVALUES, SEARCH and FIND read BLANK as "" (build_b174.py,
+    # build_b174b.py). The engine read every BLANK as "".
 
     def _fn_left(self, args_str: str, ctx: DAXContext) -> Any:
-        """LEFT(text, n) — leftmost n characters."""
+        """LEFT(text, n) — the first n UTF-16 units (n: _text_count; #176).
+        The count is read even for a BLANK text: Desktop's LEFT(BLANK(), -1)
+        fails, where MID(BLANK(), 0, 1) is BLANK (build_b175.py)."""
         args = self._split_args(args_str)
-        text = self._eval_text(args[0], ctx)
-        n = int(self._eval_expr(args[1].strip(), ctx)) if len(args) > 1 else 1
-        return text[:n]
+        text = self._eval_text_or_blank(args[0], ctx)
+        n = self._text_count(args[1], ctx) if len(args) > 1 else 1
+        if text is None:
+            return None
+        return _from_u16(_u16(text)[:n])
 
     def _fn_right(self, args_str: str, ctx: DAXContext) -> Any:
-        """RIGHT(text, n) — rightmost n characters."""
+        """RIGHT(text, n) — the last n UTF-16 units (n: _text_count).
+        RIGHT(x, 0) is "": s[-0:] was the whole text (issue #168). The count
+        is read even for a BLANK text, as LEFT's."""
         args = self._split_args(args_str)
-        s = self._eval_text(args[0], ctx)
-        n = int(self._eval_expr(args[1].strip(), ctx)) if len(args) > 1 else 1
-        return s[-n:] if n <= len(s) else s
+        text = self._eval_text_or_blank(args[0], ctx)
+        n = self._text_count(args[1], ctx) if len(args) > 1 else 1
+        if text is None:
+            return None
+        u = _u16(text)
+        return _from_u16(u[len(u) - n:]) if n < len(u) else text
 
     def _fn_mid(self, args_str: str, ctx: DAXContext) -> Any:
-        """MID(text, start, n) — substring from start position (1-based) for n characters."""
+        """MID(text, start, n) — n UTF-16 units from the 1-based start (both
+        _text_count; a start below 1 is an error)."""
         args = self._split_args(args_str)
         if len(args) < 3:
             return ''
-        s = self._eval_text(args[0], ctx)
-        start = int(self._eval_expr(args[1].strip(), ctx))
-        n = int(self._eval_expr(args[2].strip(), ctx))
-        return s[start - 1:start - 1 + n]  # DAX uses 1-based indexing
+        text = self._eval_text_or_blank(args[0], ctx)
+        if text is None:
+            return None
+        start = self._text_count(args[1], ctx, least=1)
+        n = self._text_count(args[2], ctx)
+        return _from_u16(_u16(text)[start - 1:start - 1 + n])
 
     def _fn_len(self, args_str: str, ctx: DAXContext) -> Any:
-        """LEN(text) — length of text."""
-        return len(self._eval_text(args_str, ctx))
+        """LEN(text) — the text's UTF-16 units: a character beyond the BMP
+        counts 2, as in Desktop (issue #176); BLANK for BLANK (#177)."""
+        text = self._eval_text_or_blank(args_str, ctx)
+        return None if text is None else _u16_len(text)
 
     def _fn_upper(self, args_str: str, ctx: DAXContext) -> Any:
-        """UPPER(text) — convert to uppercase."""
-        return self._eval_text(args_str, ctx).upper()
+        """UPPER(text) — Desktop's upper case, one character to one
+        (_case_table, issue #171): UPPER("ß") is "ß", where str.upper()
+        made it "SS"."""
+        text = self._eval_text_or_blank(args_str, ctx)
+        return None if text is None else text.translate(_case_table('UPPER'))
 
     def _fn_lower(self, args_str: str, ctx: DAXContext) -> Any:
-        """LOWER(text) — convert to lowercase."""
-        return self._eval_text(args_str, ctx).lower()
-
-    def _fn_proper(self, args_str: str, ctx: DAXContext) -> Any:
-        """PROPER(text) — capitalize first letter of each word."""
-        return self._eval_text(args_str, ctx).title()
+        """LOWER(text) — Desktop's lower case, one character to one
+        (_case_table, issue #171): LOWER of 'İ' is 'i', where str.lower()
+        made it two characters."""
+        text = self._eval_text_or_blank(args_str, ctx)
+        return None if text is None else text.translate(_case_table('LOWER'))
 
     def _fn_trim(self, args_str: str, ctx: DAXContext) -> Any:
-        """TRIM(text) — remove leading/trailing spaces."""
-        return self._eval_text(args_str, ctx).strip()
+        """TRIM(text) — Power BI Desktop 2.152 (build_b166.py, issue #167)
+        trims the SPACE (U+0020) only: from both ends, and each run of
+        spaces between words becomes one, so TRIM("  a   b  ") is "a b".
+        Tabs, line breaks, the no-break space and the other Unicode spaces
+        stay where they are; str.strip() took them off the ends and kept
+        "a   b"."""
+        text = self._eval_text_or_blank(args_str, ctx)
+        return None if text is None else _SPACE_RUNS.sub(' ', text.strip(' '))
 
     def _fn_substitute(self, args_str: str, ctx: DAXContext) -> Any:
-        """SUBSTITUTE(text, old, new, instance) — replace text occurrences."""
+        """SUBSTITUTE(text, old, new, instance) — replace text occurrences,
+        in UTF-16 units (#176). An empty old text replaces nothing:
+        SUBSTITUTE("abc", "", "x") is "abc" in Desktop (issue #172), where
+        str.replace put "x" between every character. The instance is
+        rounded half away from zero and must be 1 or more -- BLANK, 0 and
+        -1 are errors (build_b174.py, issue #168); occurrences are counted
+        overlapping (SUBSTITUTE("aaa", "aa", "b", 2) is "ab")."""
         args = self._split_args(args_str)
         if len(args) < 3:
             return ''
-        text = self._eval_text(args[0], ctx)
-        old = self._eval_text(args[1], ctx)
-        new = self._eval_text(args[2], ctx)
-        if len(args) > 3:
-            instance = int(self._eval_expr(args[3].strip(), ctx) or 1)
+        text = self._eval_text_or_blank(args[0], ctx)
+        if text is None:
+            return None
+        old = _u16(self._eval_text(args[1], ctx))
+        new = _u16(self._eval_text(args[2], ctx))
+        instance = self._text_count(args[3], ctx, least=1) if len(args) > 3 else None
+        if not old:
+            return text
+        u = _u16(text)
+        if instance is not None:
             # Replace only the nth occurrence
             count = 0
             result = []
             i = 0
-            while i < len(text):
-                if text[i:i + len(old)] == old:
+            while i < len(u):
+                if u[i:i + len(old)] == old:
                     count += 1
                     if count == instance:
                         result.append(new)
                         i += len(old)
                         continue
-                result.append(text[i])
+                result.append(u[i])
                 i += 1
-            return ''.join(result)
-        return text.replace(old, new)
+            return _from_u16(''.join(result))
+        return _from_u16(u.replace(old, new))
 
     def _fn_replace(self, args_str: str, ctx: DAXContext) -> Any:
-        """REPLACE(text, start, n, new) — replace by position."""
+        """REPLACE(text, start, n, new) — replace n UTF-16 units from the
+        1-based start. Power BI Desktop 2.152 (build_b174.py, issue #168):
+        start and n are rounded half away from zero (_text_count); a start
+        below 1 or a negative n is an error; BLANK is 0 for n (and so an
+        error for start); a start past the end appends; a BLANK text is ""."""
         args = self._split_args(args_str)
         if len(args) < 4:
             return ''
         text = self._eval_text(args[0], ctx)
-        start = int(self._eval_expr(args[1].strip(), ctx)) - 1  # DAX is 1-based
-        n = int(self._eval_expr(args[2].strip(), ctx))
+        start = self._text_count(args[1], ctx, least=1)
+        n = self._text_count(args[2], ctx)
         new = self._eval_text(args[3], ctx)
-        return text[:start] + new + text[start + n:]
+        u = _u16(text)
+        return _from_u16(u[:start - 1] + _u16(new) + u[start - 1 + n:])
 
     def _fn_rept(self, args_str: str, ctx: DAXContext) -> Any:
-        """REPT(text, n) — repeat text n times."""
+        """REPT(text, n) — text repeated n times (n: _text_count)."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return ''
-        text = self._eval_text(args[0], ctx)
-        n = int(self._eval_expr(args[1].strip(), ctx) or 0)
-        return text * max(0, n)
+        text = self._eval_text_or_blank(args[0], ctx)
+        if text is None:
+            return None
+        return _from_u16(text * self._text_count(args[1], ctx))
+
+    def _text_position(self, fn: str, args: list, ctx: DAXContext, wildcards: bool) -> Any:
+        """SEARCH / FIND(find, within, start, NotFoundValue) as Power BI
+        Desktop 2.152 finds (build_b166.py - build_b174c.py, issue #169):
+        SEARCH ignores case and takes the wildcards ? * and ~ (_wild_tokens,
+        _wild_search); FIND matches literally, case and all. Positions count
+        UTF-16 units (#176). A start below 1 is an error, and a start past
+        the text finds nothing -- not even "" (SEARCH("", "abc", 4) and
+        SEARCH("", "") fail), except that FIND finds "" at 1 in "" (FIND("",
+        "") is 1; build_b175.py). Text that isn't found is an error, unless
+        a NotFoundValue is given: then that is the answer (FIND ignored it).
+        Both returned -1."""
+        if len(args) < 2:
+            return -1
+        find_text = _u16(self._eval_text(args[0], ctx))
+        within_text = _u16(self._eval_text(args[1], ctx))
+        start = (self._text_count(args[2], ctx, least=1)
+                 if len(args) > 2 and args[2].strip() else 1)
+        if wildcards:
+            fold = _search_fold()
+            pos = _wild_search(_wild_tokens(find_text.translate(fold)), within_text.translate(fold), start - 1)
+        elif start - 1 >= max(len(within_text), 1):
+            pos = -1
+        else:
+            pos = within_text.find(find_text, start - 1)
+        if pos >= 0:
+            return pos + 1      # DAX positions are 1-based
+        if len(args) > 3:
+            return self._eval_expr(args[3].strip(), ctx)
+        raise _DAXEvaluationError(
+            f"The search Text provided to function '{fn}' could not be found in the given text.")
 
     def _fn_search(self, args_str: str, ctx: DAXContext) -> Any:
-        """SEARCH(find, within, start) — find position (case-insensitive, 1-based). Returns -1 if not found."""
-        args = self._split_args(args_str)
-        if len(args) < 2:
-            return -1
-        find_text = self._eval_text(args[0], ctx).lower()
-        within_text = self._eval_text(args[1], ctx).lower()
-        start = int(self._eval_expr(args[2].strip(), ctx)) - 1 if len(args) > 2 else 0
-        pos = within_text.find(find_text, start)
-        return pos + 1 if pos >= 0 else -1  # DAX returns 1-based
+        """SEARCH(find, within, start, NotFoundValue) — 1-based position,
+        case-insensitive, with wildcards (_text_position)."""
+        return self._text_position('SEARCH', self._split_args(args_str), ctx, wildcards=True)
 
     def _fn_find(self, args_str: str, ctx: DAXContext) -> Any:
-        """FIND(find, within, start) — find position (case-sensitive, 1-based). Returns -1 if not found."""
-        args = self._split_args(args_str)
-        if len(args) < 2:
-            return -1
-        find_text = self._eval_text(args[0], ctx)
-        within_text = self._eval_text(args[1], ctx)
-        start = int(self._eval_expr(args[2].strip(), ctx)) - 1 if len(args) > 2 else 0
-        pos = within_text.find(find_text, start)
-        return pos + 1 if pos >= 0 else -1
+        """FIND(find, within, start, NotFoundValue) — 1-based position,
+        case-sensitive and literal (_text_position)."""
+        return self._text_position('FIND', self._split_args(args_str), ctx, wildcards=False)
 
     def _fn_containsstring(self, args_str: str, ctx: DAXContext) -> Any:
-        """CONTAINSSTRING(within, find) — case-insensitive contains check."""
+        """CONTAINSSTRING(within, find) — SEARCH's match from the first
+        position (case-insensitive, with the wildcards ? * and ~; issue
+        #169): Desktop 2.152's CONTAINSSTRING("abc", "a?c") is TRUE, and
+        CONTAINSSTRING("", "") and CONTAINSSTRING("", "*") are FALSE."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return False
-        within = self._eval_text(args[0], ctx).lower()
-        find = self._eval_text(args[1], ctx).lower()
-        return find in within
+        fold = _search_fold()
+        within = _u16(self._eval_text(args[0], ctx)).translate(fold)
+        find = _u16(self._eval_text(args[1], ctx)).translate(fold)
+        return _wild_search(_wild_tokens(find), within, 0) >= 0
 
     def _fn_containsstringexact(self, args_str: str, ctx: DAXContext) -> Any:
-        """CONTAINSSTRINGEXACT(within, find) — case-sensitive contains check."""
+        """CONTAINSSTRINGEXACT(within, find) — case-sensitive and literal,
+        found as FIND finds: "" contains "" (Desktop 2.152,
+        build_b175.py), where CONTAINSSTRING("", "") is FALSE."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return False
-        within = self._eval_text(args[0], ctx)
-        find = self._eval_text(args[1], ctx)
+        within = _u16(self._eval_text(args[0], ctx))
+        find = _u16(self._eval_text(args[1], ctx))
         return find in within
 
     def _fn_exact(self, args_str: str, ctx: DAXContext) -> Any:
@@ -13763,43 +14352,72 @@ class DAXEngine:
         return t1 == t2
 
     def _fn_unichar(self, args_str: str, ctx: DAXContext) -> Any:
-        """UNICHAR(number) — return unicode character for code point."""
-        val = self._eval_expr(args_str.strip(), ctx)
-        if isinstance(val, (int, float)):
-            try:
-                return chr(int(val))
-            except (ValueError, OverflowError):
-                return ''
-        return ''
+        """UNICHAR(number) — the character of a code point (_unichar), the
+        number rounded half away from zero (UNICHAR(65.7) is "B"; issue
+        #168); BLANK for BLANK (#177). A code point Desktop refuses is an
+        error (issue #172)."""
+        v = self._num_arg(args_str, ctx)
+        if v is None:
+            return None
+        try:
+            cp = _round_half_away(v)
+        except (decimal.InvalidOperation, ValueError, OverflowError):
+            cp = -1
+        ch = _unichar(cp)
+        if ch is None:
+            raise _DAXEvaluationError("The function UNICHAR does not return invalid XML characters.")
+        return ch
 
     def _fn_unicode(self, args_str: str, ctx: DAXContext) -> Any:
-        """UNICODE(text) — return unicode code point of first character."""
-        s = self._eval_text(args_str, ctx)
-        if s:
-            return ord(s[0])
-        return 0
+        """UNICODE(text) — the code point of the first character; BLANK for
+        "" and BLANK, as in Desktop (issue #172), where this gave 0. The
+        first UTF-16 unit decides (#176): a lone low surrogate is its own
+        value, and a high surrogate with no low one after it is an error."""
+        text = self._eval_text_or_blank(args_str, ctx)
+        if not text:
+            return None
+        u = _u16(text)
+        c = ord(u[0])
+        if 0xD800 <= c <= 0xDBFF:
+            if len(u) > 1 and 0xDC00 <= ord(u[1]) <= 0xDFFF:
+                return 0x10000 + ((c - 0xD800) << 10) + (ord(u[1]) - 0xDC00)
+            raise _DAXEvaluationError(
+                "An argument of function 'UNICODE' has the wrong data type or has an invalid value.")
+        return c
 
     def _fn_value(self, args_str: str, ctx: DAXContext) -> Any:
-        """VALUE(text) — convert text to number."""
+        """VALUE(text) — text as a number, as Desktop reads it: a number
+        (_value_text_number), else a date or a time as its serial
+        (_value_text_moment); anything else is an error, where this gave 0
+        (issue #170). A number is itself; BLANK is BLANK (#177)."""
         val = _scalarize(self._eval_expr(args_str.strip(), ctx))
         if val is None:
-            return 0
-        try:
-            s = _concat_str(val).replace(',', '').replace('$', '').replace('%', '').strip()
-            if '.' in s:
-                return float(s)
-            return int(s)
-        except (ValueError, TypeError):
-            return 0
+            return None
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return val
+        text = _concat_str(val)
+        culture = getattr(ctx, 'culture', None)
+        n = _value_text_number(text, culture)
+        if n is None:
+            n = _value_text_moment(text, culture)
+        if n is None:
+            raise _DAXEvaluationError(f"Cannot convert value '{text}' of type Text to type Number.")
+        return n
 
     def _fn_combinevalues(self, args_str: str, ctx: DAXContext) -> Any:
-        """COMBINEVALUES(delimiter, value1, value2, ...) — join values with delimiter."""
+        """COMBINEVALUES(delimiter, value1, value2, ...) — join values with
+        delimiter. It takes two values or more: Desktop 2.152 refuses
+        COMBINEVALUES(",", BLANK()) -- "Too few arguments were passed to the
+        COMBINEVALUES function. The minimum argument count for the function
+        is 3." (build_b174b.py, issue #172)."""
         args = self._split_args(args_str)
-        if len(args) < 2:
-            return ''
+        if len(args) < 3:
+            raise _DAXEvaluationError(
+                "Too few arguments were passed to the COMBINEVALUES function. "
+                "The minimum argument count for the function is 3.")
         delimiter = self._eval_text(args[0], ctx)
         parts = [self._eval_text(a, ctx) for a in args[1:]]
-        return delimiter.join(parts)
+        return _from_u16(delimiter.join(parts))
 
     def _fn_concatenatex(self, args_str: str, ctx: DAXContext) -> Any:
         """CONCATENATEX(table, expression, delimiter[, orderBy_expr[, order]]) —
@@ -13810,7 +14428,8 @@ class DAXEngine:
             return ''
         table_ref = self._eval_expr(args[0].strip(), ctx)
         row_expr = args[1].strip()
-        delimiter = str(self._eval_expr(args[2].strip(), ctx) or '') if len(args) > 2 else ''
+        # the delimiter is text as `&` writes it: a 0 is "0", which `or ''` dropped (#178)
+        delimiter = _concat_str(self._eval_expr(args[2].strip(), ctx)) if len(args) > 2 else ''
         order_expr = args[3].strip() if len(args) > 3 else None
         descending = len(args) > 4 and 'DESC' in args[4].strip().upper()
 
@@ -13824,20 +14443,23 @@ class DAXEngine:
                 else:
                     row_ctx = ctx
                     result = self._eval_expr(row_expr, ctx)
-                if result is None:
-                    # BLANK joins as "" -- the delimiter stays (Desktop:
-                    # CONCATENATEX(VALUES(BD[Name]), BD[Name], ",") = "X,Y,Z,").
-                    result = ''
+                # BLANK joins as "" -- the delimiter stays (Desktop:
+                # CONCATENATEX(VALUES(BD[Name]), BD[Name], ",") = "X,Y,Z,");
+                # a value is its DAX text, as for `&` (_concat_str): str()
+                # wrote 1.0, 2024-01-02 00:00:00 and True (issue #178)
+                text = _concat_str(result)
                 if order_expr is not None:
                     key = self._eval_expr(order_expr, row_ctx)
-                    parts.append((key, str(result)))
+                    parts.append((key, text))
                 else:
-                    parts.append(str(result))
+                    parts.append(text)
+        if not parts:
+            return None     # no rows: BLANK (Desktop 2.152, build_b174b.py, #177)
         if order_expr is not None:
             # Stable sort; BLANK keys sort first, text in the model's collation (#157).
             parts.sort(key=lambda item: _order_key(item[0]), reverse=descending)
-            return delimiter.join(text for _, text in parts)
-        return delimiter.join(parts)
+            return _from_u16(delimiter.join(text for _, text in parts))
+        return _from_u16(delimiter.join(parts))
 
     def _rankx_order_desc(self, order: str, ctx: DAXContext) -> bool:
         """RANKX's order argument: 0 / FALSE / DESC -- and an omitted or empty
@@ -14055,7 +14677,7 @@ class DAXEngine:
         before = self._nested_errors
         try:
             value = self._eval_expr(expr.strip(), ctx)
-        except _VarEvalError:
+        except (_VarEvalError, _ScalarColumnsError):
             raise
         except Exception as exc:
             if getattr(exc, "_pbix_deadline", False):
