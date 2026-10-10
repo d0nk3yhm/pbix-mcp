@@ -40,17 +40,27 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-10 (0.9.136): docs 1-59 and GitHub issues/PRs #1-#179,
-#181 and #183 are closed; #180 (SEARCH / FIND / SUBSTITUTE match
-linguistically in Desktop) and #182 (OpenBI's doc 60: a time-intelligence
-function given a table of dates returns nothing) are open.** 0.9.136 closes doc
-58 = #174 and #175 (OpenBI's): a VAR block splits only at its own VAR / RETURN
--- at depth 0, outside strings, 'quoted names' and [names], VAR only before
-white space (VAR.P stays a call) -- and /* */ comments are read; doc 59 = #181
-(OpenBI's): evaluate_per_dimension buckets the fact rows by the folded join
-key, so a dimension joined on a text key answers again (a regression of
-0.9.133); and #183: the builder and pbix_datamodel_add_measure refuse two
-measures whose names are equal ignoring case, which Desktop cannot open.
+**Updated 2026-10-10 (0.9.137): docs 1-60 and GitHub issues/PRs #1-#179 and
+#181-#184 are closed; #180 (SEARCH / FIND / SUBSTITUTE match linguistically in
+Desktop) is open.** 0.9.137 closes doc 60 = #182 (OpenBI's): a
+time-intelligence function takes a table of one date column as its <dates>
+-- PREVIOUSMONTH(DATESINPERIOD(...)) or of a variable holding one was empty
+(Executive Sales Report's [Orders Previous month]); and #184: with both
+columns of a relationship unique, the builder took the larger table for the
+Many side and turned a fact -> dates relationship around, so a date filter
+never reached the facts.
+
+As of 0.9.136, docs 1-59 and GitHub issues/PRs #1-#179, #181 and #183 were
+closed; #180 (SEARCH / FIND / SUBSTITUTE match linguistically in Desktop) and
+#182 (OpenBI's doc 60: a time-intelligence function given a table of dates
+returns nothing) were open. 0.9.136 closes doc 58 = #174 and #175 (OpenBI's):
+a VAR block splits only at its own VAR / RETURN -- at depth 0, outside
+strings, 'quoted names' and [names], VAR only before white space (VAR.P stays
+a call) -- and /* */ comments are read; doc 59 = #181 (OpenBI's):
+evaluate_per_dimension buckets the fact rows by the folded join key, so a
+dimension joined on a text key answers again (a regression of 0.9.133); and
+#183: the builder and pbix_datamodel_add_measure refuse two measures whose
+names are equal ignoring case, which Desktop cannot open.
 
 As of 0.9.135, docs 1-57 and GitHub issues/PRs #1-#173 and #176-#179 were
 closed; #174 and #175 (OpenBI's doc 58: a VAR block cut at every VAR / RETURN
@@ -470,6 +480,12 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **doc 60 (GH #182), GH #184** -- CLOSED (0.9.137). A time-intelligence
+  function given a table of dates returned nothing (Desktop: build_b180.py,
+  24 probes); the builder turned a relationship around when both columns
+  were unique (build_b184.py). Regression:
+  tests/test_issue182_dates_table_argument.py,
+  tests/test_issue184_relationship_orientation.py.
 - **doc 58 (GH #174, #175), doc 59 (GH #181), GH #183** -- CLOSED (0.9.136).
   A VAR block split at every VAR / RETURN word and /* */ comments were not
   read (Desktop: build_b177.py, 27 probes); evaluate_per_dimension was BLANK

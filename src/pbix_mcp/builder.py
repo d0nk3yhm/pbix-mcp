@@ -3297,8 +3297,17 @@ def _modify_metadata_and_encode(
                                for v in (r.get(tc) for r in to_tdef.get("rows", []))]
                     from_is_unique = len(set(from_vals)) == len(from_vals)
                     to_is_unique = len(set(to_vals)) == len(to_vals)
-                    # If from has unique values and to doesn't (or has more rows), swap
-                    if from_is_unique and (not to_is_unique or len(to_vals) > len(from_vals)):
+                    # Swap only on evidence: From holds each key once and To
+                    # repeats one. Both unique (a small fact sample) is no
+                    # evidence -- the caller's order stands. The larger table
+                    # was taken for Many, which turned a fact -> date
+                    # relationship around whenever the fact's dates were
+                    # unique: Power BI Desktop then filtered the dates by the
+                    # facts, and a date filter never reached them
+                    # (build_b184.py, issue #184). Which side contains the
+                    # other is no evidence either: a fact with an orphan key
+                    # contains its small dimension's keys.
+                    if from_is_unique and not to_is_unique:
                         ft, fc, tt, tc = tt, tc, ft, fc
             from_tid = table_id_map.get(ft)
             to_tid = table_id_map.get(tt)

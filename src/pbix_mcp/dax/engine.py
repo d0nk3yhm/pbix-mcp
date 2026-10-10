@@ -14983,8 +14983,13 @@ class DAXEngine:
         return None
 
     def _get_date_column_dates(self, args_str: str, ctx: DAXContext) -> tuple:
-        """Parse a date column reference and return (table_name, col_name, list_of_dates).
-        Returns (table_name, col_name, dates) where dates are datetime objects."""
+        """A time-intelligence function's <dates>: (table_name, col_name, dates),
+        the dates datetime objects. A column reference gives the column's dates
+        in the filter context; a table of one date column -- DATESINPERIOD(...),
+        FILTER(ALL(D[Date]), ...), DATEADD(...), a variable holding one -- gives
+        its rows' dates, and keeps the column's lineage from them (issue #182:
+        PREVIOUSMONTH(t) of such a variable was empty, so Executive Sales
+        Report's [Orders Previous month] was BLANK)."""
         ref = self._column_arg(args_str, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             table_name, col_name = ref
@@ -14995,6 +15000,19 @@ class DAXEngine:
                 if d:
                     dates.append(d)
             return table_name, col_name, dates
+        if isinstance(ref, list):
+            table_name = col_name = None
+            dates = []
+            for row in ref:
+                if not isinstance(row, dict) or '__value__' not in row:
+                    return None, None, []      # not a table of one column
+                table_name = table_name or row.get('__table__')
+                col_name = col_name or row.get('__column__')
+                d = self._parse_date(row['__value__'])
+                if d:
+                    dates.append(d)
+            if table_name and col_name:
+                return table_name, col_name, dates
         return None, None, []
 
     def _make_date_table_result(self, table_name: str, col_name: str, dates: list,

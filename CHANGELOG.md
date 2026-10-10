@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.137] - 2026-10-10
+
+A time-intelligence function takes a table of dates as its `<dates>` (#182, OpenBI's doc 60), and the builder no longer turns a relationship around when both of its columns are unique (#184). Checked against Power BI Desktop 2.152 over ADOMD:
+
+- `build_b180.py`: all 24 probes match, against 6 on 0.9.136.
+- `build_b184.py`: a relationship called Sales → Date stays Sales → Date, so a March filter on the dates leaves 2 sales, against 12 on 0.9.136.
+
+The corpus census (1,508 measures) changes eight measures of Executive Sales Report, which now give Desktop's answers (#182), and otherwise only measures that use RAND or RANDBETWEEN (14 of the 15 this time); it runs in 1,809 s, against 1,831 s on 0.9.136. `regress_check.py` finds no regression across its Desktop batteries, and 18 answers that now match Desktop.
+
+### Fixed — a time-intelligence function given a table of dates returned nothing (issue #182)
+
+**What was wrong:** `_get_date_column_dates` read its argument only as a column reference. A table of one date column is what DAX also takes as `<dates>`: a DATESINPERIOD, FILTER or DATEADD result, inline or in a variable. Given one, these functions all came back empty:
+
+- PREVIOUSMONTH, NEXTMONTH and PREVIOUSQUARTER;
+- DATESYTD and DATESMTD;
+- FIRSTDATE and LASTDATE;
+- SAMEPERIODLASTYEAR, DATEADD and PARALLELPERIOD;
+- STARTOFMONTH and ENDOFMONTH.
+
+Executive Sales Report's `VAR _datetable = DATESINPERIOD(...) RETURN CALCULATE([Total Sales], PREVIOUSMONTH(_datetable))` was BLANK.
+
+**What Desktop does** (`build_b180.py`, under March 2024, with `t` = `DATESINPERIOD('Date'[Date], MAX(Sales[SDate]), -1, MONTH)`, which is 16 February to 15 March):
+
+- **PREVIOUS\* functions** anchor on the table's first date: PREVIOUSMONTH(t) is January, 31 days. PREVIOUSQUARTER(t) is the quarter before Q1, as far as the date table goes.
+- **NEXT\* functions** anchor on its last date: NEXTMONTH(t) is April, 30 days.
+- **To-date functions** run to the last date: DATESYTD(t) is 1 January to 15 March, 75 days, and DATESMTD(t) is 1 to 15 March.
+- **FIRSTDATE / LASTDATE** give 16 February and 15 March. STARTOFMONTH and ENDOFMONTH give 1 February and 31 March.
+- **Shifting:** DATEADD(t, -1, MONTH) shifts it by a month. PARALLELPERIOD(t, -1, MONTH) is the whole of January and February, 60 days.
+- **Outside the table:** SAMEPERIODLASTYEAR(t) falls outside the date table and is empty.
+- **Empty tables:** FIRSTDATE of an empty table is BLANK, and COUNTROWS of PREVIOUSMONTH of one is BLANK.
+
+**The fix:** given a table, `_get_date_column_dates` takes its rows' dates, and the column's lineage from the rows' `__table__` / `__column__`. A table of several columns is still no `<dates>`.
+
+**Pinned** by `tests/test_issue182_dates_table_argument.py`: the 24 probes. **18 fail on 0.9.136.**
+
+### Fixed — the builder kept a relationship's orientation only by row counts when both columns were unique (issue #184)
+
+**What was wrong:** when both columns of a plain many-to-one relationship were unique, the builder took the larger table for the Many side. A sample fact whose dates were all different, related Sales → Date, was written Date (Many) → Sales (One). Power BI Desktop then filtered the dates by the facts, and a filter on the dates never reached the facts: under March, all 12 sales stayed. Nothing warned. That is how `build_b180.py`'s first run went wrong.
+
+**The fix:** the builder swaps From and To only on evidence, that is, when From holds each key once and To repeats one. When both are unique, the caller's From (Many) → To (One) stands. Row counts were no evidence, since a fact sample is smaller than its dimension. Containment is no evidence either: a fact with an orphan key contains its small dimension's keys.
+
+**Pinned** by `tests/test_issue184_relationship_orientation.py`, which checks:
+
+- both call orders with unique dates;
+- repeated dates, which decide as before;
+- an orphan key;
+- two unique tables of different sizes.
+
+**2 fail on 0.9.136.**
+
 ## [0.9.136] - 2026-10-10
 
 A VAR block splits only at its own keywords, `/* */` comments are read (#174, #175, OpenBI's doc 58), `pbix_evaluate_dax_per_dimension` answers again for a dimension joined on a text key (#181, doc 59, a regression of 0.9.133), and the builder refuses two measures whose names differ only by case (#183). Checked against Power BI Desktop 2.152 over ADOMD:
