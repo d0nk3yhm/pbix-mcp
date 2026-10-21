@@ -14285,16 +14285,6 @@ def pbix_evaluate_dax(
             fc = None
 
         # Reset unsupported + error trackers before evaluation
-        dax_engine._engine.unsupported_functions.clear()
-        dax_engine._engine.unsupported_by_measure.clear()
-        dax_engine._engine.eval_errors.clear()
-        dax_engine._engine.timed_out.clear()
-        logger.info("Evaluating %d measures for '%s'", len(measure_names), alias)
-
-        # simulate_row_context=False: report what the MODEL returns, exactly as
-        # Desktop's own engine does. The fallback that guesses a parameter-table
-        # selection when a measure is BLANK produced numbers Desktop never shows
-        # at the grand total (see evaluate_measures_smart).
         group_keys: set = set()
         if group_by:
             try:
@@ -14323,6 +14313,32 @@ def pbix_evaluate_dax(
                     "INVALID_INPUT").to_text()
             selected = parsed_sel
 
+        return _evaluate_dax_response(ctx, alias, measure_names, fc, group_keys, selected)
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
+
+
+
+def _evaluate_dax_response(ctx: dict, alias: str, measure_names: list, fc, group_keys: set, selected,
+                           cache: dict | None = None) -> str:
+    """pbix_evaluate_dax's answer for one parsed filter context: the measures'
+    results, statuses and warnings as its response text. ``cache``: a measure
+    memo shared by several contexts of one query (pbix_evaluate_dax_batch)."""
+    try:
+        from pbix_mcp.dax import engine as dax_engine
+
+        dax_engine._engine.unsupported_functions.clear()
+        dax_engine._engine.unsupported_by_measure.clear()
+        dax_engine._engine.eval_errors.clear()
+        dax_engine._engine.timed_out.clear()
+        logger.info("Evaluating %d measures for '%s'", len(measure_names), alias)
+
+        # simulate_row_context=False: report what the MODEL returns, exactly as
+        # Desktop's own engine does. The fallback that guesses a parameter-table
+        # selection when a measure is BLANK produced numbers Desktop never shows
+        # at the grand total (see evaluate_measures_smart).
         results = dax_engine.evaluate_measures_smart(
             measure_names, ctx['tables'], ctx['measure_defs'],
             fc, ctx['date_table'], ctx['date_column'],
@@ -14333,6 +14349,7 @@ def pbix_evaluate_dax(
             group_by=group_keys or None,
             selected_filters=selected,
             date_tables=ctx.get('date_tables'),
+            cache=cache,
         )
         # A selected calculation item's format-string expression decides the
         # format its values are shown with (issue #121).
@@ -14423,6 +14440,74 @@ def pbix_evaluate_dax(
                       sum(1 for r in dax_results if r.status == "ok"),
                       sum(1 for r in dax_results if r.status == "blank"))
         return response.to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
+
+
+@mcp.tool()
+def pbix_evaluate_dax_batch(alias: str, measures: str, contexts: str) -> str:
+    """Evaluate DAX measures under many filter contexts in one call.
+
+    What pbix_evaluate_dax answers for each context, as a JSON array of its
+    responses in order: for a caller that asks one filter context per row of
+    a visual. The model, the measures and the arguments are looked up once,
+    and the contexts share one measure memo, as pbix_evaluate_dax_grouped's
+    groups do. Default filters are never applied: an empty filter context is
+    the unfiltered model (pbix_evaluate_dax with apply_default_filters=False).
+
+    Args:
+        alias: The alias of the open file
+        measures: Comma-separated measure names, as pbix_evaluate_dax takes them
+        contexts: JSON array of objects {"filter_context": {...}, "group_by":
+            [...], "selected_filter_context": {...}}, the last two optional,
+            each as pbix_evaluate_dax takes it.
+    """
+    try:
+        info = _ensure_open(alias)
+        if info.get("is_directquery"):
+            return ToolResponse.error(
+                "This file uses DirectQuery — DAX evaluation requires local data. "
+                "Use layout, measure, and metadata tools instead.",
+                UnsupportedFormatError.code,
+            ).to_text()
+        ctx = _get_dax_context(alias)
+        measure_names = _parse_measure_names(measures, ctx['measure_defs'])
+        try:
+            items = json.loads(contexts)
+        except (json.JSONDecodeError, TypeError):
+            items = None
+        if not isinstance(items, list) or not all(isinstance(x, dict) for x in items):
+            return ToolResponse.error("contexts must be a JSON array of objects", "INVALID_INPUT").to_text()
+        cache: dict = {}
+        out = []
+        for item in items:
+            fc = item.get("filter_context") or None
+            if fc is not None and not isinstance(fc, dict):
+                return ToolResponse.error("filter_context must be a JSON object", "INVALID_INPUT").to_text()
+            if fc:
+                fc = _resolve_topn_filters(ctx, fc)
+            gb = item.get("group_by") or []
+            if not isinstance(gb, list) or not all(isinstance(k, str) for k in gb):
+                return ToolResponse.error(
+                    "group_by must be a JSON array of 'Table.Column' filter_context keys",
+                    "INVALID_INPUT").to_text()
+            missing = [k for k in gb if k not in (fc or {})]
+            if missing:
+                return ToolResponse.error(
+                    f"group_by keys must also be in filter_context: {missing}",
+                    "INVALID_INPUT").to_text()
+            group_keys = set(gb)
+            selected = None
+            if group_keys and "selected_filter_context" in item:
+                selected = item["selected_filter_context"]
+                if not isinstance(selected, dict):
+                    return ToolResponse.error(
+                        "selected_filter_context must be a JSON object like filter_context",
+                        "INVALID_INPUT").to_text()
+            out.append(_evaluate_dax_response(ctx, alias, measure_names, fc, group_keys, selected, cache))
+        return '{"success": true, "results": [' + ",".join(out) + "]}"
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:

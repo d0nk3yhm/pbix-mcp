@@ -66,7 +66,7 @@ DAX evaluation returns extended results:
 | `pbix_save` | `strip_sensitivity_label` | `False` | Removes MSIP sensitivity labels when True |
 | `pbix_close` | `force` | `False` | Refuses to close with unsaved changes |
 
-## Tool Categories (133 tools)
+## Tool Categories (134 tools)
 
 ### Create & File Management (7)
 `pbix_create` · `pbix_open` · `pbix_open_pbip` · `pbix_save` · `pbix_close` · `pbix_list_open` · `pbix_report_format`
@@ -83,7 +83,7 @@ Visual CRUD, visual-level sort authoring (`pbix_set_visual_sort`), page manageme
 **Format-normalized fields** — `_get_layout` returns the classic shape whichever format the file uses, so callers never branch on format: `displayOption` is an int (PBIR stores the enum name), page visibility is `config.visibility` as an int (PBIR stores an enum name), and bookmarks are in `config.bookmarks` (PBIR stores them under `definition/bookmarks/`). Each is converted back on write.
 
 ### DAX Engine (5)
-Measure evaluation, per-dimension evaluation, **grouped (GROUP-BY) evaluation** (`pbix_evaluate_dax_grouped` — evaluates measures for every group key in ONE call and returns structured per-group rows; the fact rows are bucketed by the propagated join key once instead of one evaluation per category value, so a chart bound to thousands of categories is a single call. Measures the fast path can't bucket are still evaluated exactly, per group. `max_groups` defaults to 3500 — Power BI's own data-reduction window — and truncation is reported via `group_count`/`truncated`), calculated columns, cache management.
+Measure evaluation, **batched evaluation** (`pbix_evaluate_dax_batch` — what `pbix_evaluate_dax` answers for each of many filter contexts, in one call: the model and arguments looked up once and one measure memo shared by the contexts, for a caller asking one context per row of a visual), per-dimension evaluation, **grouped (GROUP-BY) evaluation** (`pbix_evaluate_dax_grouped` — evaluates measures for every group key in ONE call and returns structured per-group rows; the fact rows are bucketed by the propagated join key once instead of one evaluation per category value, so a chart bound to thousands of categories is a single call. Measures the fast path can't bucket are still evaluated exactly, per group. `max_groups` defaults to 3500 — Power BI's own data-reduction window — and truncation is reported via `group_count`/`truncated`), calculated columns, cache management.
 
 **Filter-context values** — each `filter_context` entry is either a LIST (In-set: `{"dim-Geo.State": ["WA","OR"]}`) or a structured PREDICATE dict evaluated natively, so a caller need not enumerate a high-cardinality column's matching values first: `{"op": ">", "value": 100}` (`>`, `>=`, `<`, `<=`, `=`, `<>`), `{"between": [lo, hi]}`, `{"in": [...]}`, `{"not_in": [...]}`, `{"contains"|"starts_with"|"ends_with": "text"}` (case-insensitive), `{"relative_date": {"last": 7, "unit": "day"|"week"|"month"|"year", "anchor": "<ISO date, default today>"}}`, `{"is_blank": true|false}`. Multiple keys in one dict are ANDed; comparisons are numeric when both sides are numbers, date-aware when both parse as dates, text otherwise.
 

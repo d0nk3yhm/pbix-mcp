@@ -53,7 +53,10 @@ def test_values_python_calls_equal_are_not_confused():
     assert ctx._indices_for_values(tbl, 3, [1, 0]) == frozenset()     # True is not 1 (#39)
 
 
-def test_year_to_date_by_country_and_day_through_the_memo():
+def test_year_to_date_by_country_and_day_through_the_memo(monkeypatch):
+    # The memo serves a hop by keys; with the fast filters on, this direct hop goes
+    # through per-row buckets instead (_hop_row_set, test_fast_filters_differential.py).
+    monkeypatch.setattr(de, "_FAST_FILTERS", False)
     tables = model()
     eng = de.DAXEngine()
     for day in DAYS:

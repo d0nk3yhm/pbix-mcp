@@ -1290,6 +1290,7 @@ def _strip_line_comments(expr):
     return ''.join(parts).strip()
 
 
+@lru_cache(maxsize=100_000)
 def _collapse_ws_outside_strings(expr: str) -> str:
     r"""Collapse runs of whitespace to one space, but NEVER inside a string
     literal. A blanket re.sub(r'\s+', ' ') flattened the newlines and
@@ -1522,6 +1523,9 @@ def _as_date(v):
     return None
 
 
+_ISO_STRICT = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)?")
+
+
 @lru_cache(maxsize=100_000)
 def _as_date_str_strict(s: str):
     """Whole-string date parse: None unless the ENTIRE value is a date.
@@ -1532,6 +1536,14 @@ def _as_date_str_strict(s: str):
     prefix-parse to 2017-01-01, so the value-index aliasing merged every
     distinct key sharing a date prefix into ONE bucket and a filtered fact
     table came back UNFILTERED (issue #42)."""
+    if _ISO_STRICT.fullmatch(s):
+        # what the first five formats accept, without trying each with
+        # strptime: a running total parsed every date that way. An impossible
+        # date (2025-02-30) goes on to the formats below, which give it None.
+        try:
+            return datetime.fromisoformat(s).date()
+        except ValueError:
+            pass
     for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%f",
                 "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
                 "%d/%m/%Y", "%m/%d/%Y"):
@@ -2089,6 +2101,119 @@ def _relative_date_bounds(spec: dict):
 
 _SHARED_FILTER_CACHES: dict = {}
 _SHARED_FILTER_CACHE_MAX = 4
+# The elements (keys, row indices, values) one model's filter-index cache may
+# hold, in all. Its entries are keyed by filter context, so a measure asked
+# under a new context per group -- a running total by date -- adds one per
+# date: 4,000 dates of a 1 MB model's cross-table key sets held 16 GB and the
+# process was never given it back. Past the bound the cache starts again.
+_FILTER_CACHE_MAX_WEIGHT = 4_000_000
+
+
+def _cache_weight(v, depth: int = 2) -> int:
+    """About how many elements a cached value holds: its length, and its
+    parts' when it is a small container of collections (a cross-table filter
+    is [(keys, index)], a hop ({column: values}, blank)). Never walks a large
+    collection, so it costs little beside building the entry. A value that
+    knows its own weight (_Weighed) says so."""
+    if isinstance(v, (str, bytes)):
+        return 1
+    if type(v) is _Weighed:
+        return v.weight
+    try:
+        n = len(v)
+    except TypeError:
+        return 1
+    if depth and n <= 64:
+        parts = v.values() if isinstance(v, dict) else v if isinstance(v, (list, tuple)) else ()
+        n += sum(_cache_weight(x, depth - 1) for x in parts)
+    return max(n, 1)
+
+
+class _Weighed(list):
+    """A cached list that carries its weight: the elements its parts hold."""
+    __slots__ = ('weight',)
+
+
+class _HopRows(frozenset):
+    """A cross-table filter already resolved to the target table's row
+    indices (_hop_row_set), not join keys."""
+
+
+# Faster, same-answer filtering: a direct one -> many hop
+# resolved to row indices through per-row buckets (_hop_row_set) rather than
+# join keys, and an inequality on a number or date column answered from a
+# sorted index (_indices_for_column_predicate) rather than a scan. Off, every
+# filter goes as before; the differential tests compare the two.
+_FAST_FILTERS = True
+_INEQUALITIES = {"<": "lt", "<=": "le", "=<": "le", ">": "gt", ">=": "ge", "=>": "ge"}
+
+
+def _range_parts(spec) -> list | None:
+    """An inequality, or several under "all", with numeric targets, as
+    [(lt | le | gt | ge, number)]; None for any other filter (as
+    _indices_for_column_predicate takes them)."""
+    if not isinstance(spec, dict):
+        return None
+    if set(spec) == {"all"} and isinstance(spec["all"], list) and spec["all"]:
+        out = []
+        for x in spec["all"]:
+            got = _range_parts(x)
+            if got is None:
+                return None
+            out += got
+        return out
+    if set(spec) != {"op", "value"} or spec["op"] not in _INEQUALITIES or spec["value"] is None:
+        return None
+    target = _as_number(spec["value"])
+    if target is None or target != target:
+        return None
+    return [(_INEQUALITIES[spec["op"]], target)]
+
+
+class _FilterIndexCache(dict):
+    """One model's filter-index cache (_shared_filter_cache). Every entry is a
+    pure function of its key. Two kinds are held: STRUCTURAL ones, facts about
+    the model that no filter changes (value maps, sorted orders, hop buckets,
+    blank-row tables, key ownership, the shield memo), and the rest, which a
+    filter set or a source filter names. Once the filter-named entries pass
+    _FILTER_CACHE_MAX_WEIGHT elements they are dropped, as the module's other
+    caches are past their count; the structural ones stay, unless they alone
+    pass twice the bound: emptying both would rebuild the model's indexes in
+    the middle of a query, which then fills the cache with filter-named entries
+    again. Entries added by mutating a held container (the union and
+    row-expansion memos) carry bounds of their own."""
+
+    def __init__(self, tables):
+        super().__init__(__tables_ref__=tables)
+        self.weight = 0       # the filter-named entries'
+        self.pinned = 0       # the structural entries'
+
+    def __setitem__(self, key, value):
+        w = _cache_weight(value)
+        structural = _cache_kind(key) in _STRUCTURAL_KINDS
+        with _CACHE_LOCK:
+            if structural:
+                if self.pinned + w > 2 * _FILTER_CACHE_MAX_WEIGHT:
+                    self._drop(everything=True)
+                self.pinned += w
+            else:
+                if self.weight + w > _FILTER_CACHE_MAX_WEIGHT:
+                    self._drop(everything=False)
+                self.weight += w
+            dict.__setitem__(self, key, value)
+
+    def _drop(self, everything: bool) -> None:
+        tables = dict.get(self, '__tables_ref__')
+        if everything:
+            dict.clear(self)
+            self.pinned = 0
+        else:
+            for k in [k for k in dict.keys(self) if _cache_kind(k) not in _STRUCTURAL_KINDS]:
+                dict.__delitem__(self, k)
+        dict.__setitem__(self, '__tables_ref__', tables)
+        self.weight = 0
+
+
 
 # Guards the insert / evict / id-assign steps of the module-level caches below,
 # which evaluations on different threads (see _PerThreadEngine) may run at
@@ -2096,6 +2221,27 @@ _SHARED_FILTER_CACHE_MAX = 4
 # it two relationship sets interned together could get the SAME id, and the
 # cross-filter memo keyed by it would serve one set's answer for the other.
 _CACHE_LOCK = threading.Lock()
+
+
+# Entries that are facts about the model, not about a filter set: kept when the
+# filter-named entries are dropped (_FilterIndexCache).
+_STRUCTURAL_KINDS = frozenset({
+    '__tables_ref__', '__shield__', 'blank-row-tables', 'every-cell-valued', 'vmap', 'tmap', 'dpmap',
+    'numeric-order', 'non-owners', 'key-aliases', 'dp-keys', 'hop-buckets', 'unmatched', 'is-datetime',
+})
+
+
+def _cache_kind(key) -> str | None:
+    """An entry's kind: a key's leading string, or the string after a table's
+    id ((id(tbl), 'vmap', ...))."""
+    if isinstance(key, str):
+        return key
+    if isinstance(key, tuple) and key:
+        if isinstance(key[0], str):
+            return key[0]
+        if len(key) > 1 and isinstance(key[1], str):
+            return key[1]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -2312,7 +2458,7 @@ def _shared_filter_cache(tables) -> dict:
             if hit is None:
                 if len(_SHARED_FILTER_CACHES) >= _SHARED_FILTER_CACHE_MAX:
                     _SHARED_FILTER_CACHES.pop(next(iter(_SHARED_FILTER_CACHES)), None)
-                hit = _SHARED_FILTER_CACHES[fp] = {'__tables_ref__': tables}
+                hit = _SHARED_FILTER_CACHES[fp] = _FilterIndexCache(tables)
     return hit
 
 
@@ -2928,6 +3074,58 @@ class DAXContext:
             row[c] = None
         return row
 
+    def _hop_row_set(self, src_table: str, src_tbl: dict, col_filters, dim_idx: int,
+                  table_name: str, tbl: dict, fact_idx: int):
+        """The rows of table_name that src_table's filters select across a
+        direct one -> many relationship, as row indices: what _hop_keys and
+        then _indices_for_values give, as the union of one bucket per selected
+        row of src_table (_hop_buckets), built once per relationship. A union
+        of key sets is the union of their rows, so the answer is the same; a
+        running total by date spelled ~2,000 join keys per date to find them.
+        None where it doesn't apply (a DatePartOnly join,
+        a hop that isn't one -> many): the caller then hops by keys."""
+        cur_col = src_tbl['columns'][dim_idx]
+        nxt_col = tbl['columns'][fact_idx]
+        if ((src_table, cur_col, table_name, nxt_col) in self._date_part_joins
+                or (table_name, src_table) not in self._one_side_of):
+            return None
+        keep, applied = self._row_indices_where(src_tbl, col_filters)
+        src_blank = (src_table in self.blank_row_tables()
+                     and self._filters_admit_blank(applied))
+        buckets = self._hop_buckets(src_tbl, dim_idx, tbl, fact_idx)
+        idxs = range(len(src_tbl['rows'])) if keep is None else keep
+        drop = self._non_owner_rows(src_table, dim_idx)
+        if drop and self._joins_one_row(src_table, table_name):
+            src_rows = src_tbl['rows']
+            idxs = [i for i in idxs if id(src_rows[i]) not in drop]
+        parts = [buckets[i] for i in idxs]
+        if src_blank:
+            parts.append(self._indices_for_values(
+                tbl, fact_idx, self._unmatched_key_strs(table_name, fact_idx, src_table, cur_col)))
+        return _HopRows(i for part in parts for i in part)
+
+    def _hop_buckets(self, src_tbl: dict, dim_idx: int, tbl: dict, fact_idx: int) -> list:
+        """For each row of src_tbl, the rows of tbl its key joins: the value
+        map's rows of every spelling of the key (_hop_keys's aliases, then
+        _indices_for_values's spellings). Memoized on the model-wide cache."""
+        key = (id(src_tbl), 'hop-buckets', dim_idx, id(tbl), fact_idx)
+        hit = self._filter_idx_cache.get(key)
+        if hit is None:
+            vmap = self._value_index_map(tbl, fact_idx)
+            hit = _Weighed()
+            held = 0
+            for r in src_tbl['rows']:
+                keys: set = set()
+                for a in _join_key_aliases(r[dim_idx] if dim_idx < len(r) else None):
+                    keys.update(_index_spellings(a))
+                found = [vmap[k] for k in keys if k in vmap]
+                rows = found[0] if len(found) == 1 else frozenset().union(*found)
+                held += len(rows) + 1
+                hit.append(rows)
+            hit.weight = held
+            self._filter_idx_cache[key] = hit
+        return hit
+
     def _hop_keys(self, cur_name: str, cur_rows: list, cur_blank: bool,
                   cur_idx: int, nxt_name: str, nxt_idx: int) -> AbstractSet[str]:
         """The keys of nxt_name[nxt_idx] that the filtered rows of cur_name
@@ -3414,11 +3612,13 @@ class DAXContext:
                 snap[k] = self._filter_sig_exact(v)
         return snap
 
-    def _get_cross_table_filters(self, table_name: str) -> list:
+    def _get_cross_table_filters(self, table_name: str, rows: bool = False) -> list:
         """
         Get ALL cross-table filters that apply to a target table.
         Uses model relationships to propagate dimension filters to fact tables.
-        Returns list of (allowed_values_set, fact_col_idx) tuples.
+        Returns list of (allowed_values_set, fact_col_idx) tuples; with
+        ``rows``, a direct one -> many hop's set is the target's row indices
+        already (_HopRows) where _hop_row_set applies.
 
         Memoized on the shared cache: this walks the relationship graph and reads
         intermediate tables, and every get_column_data / get_filtered_rows call
@@ -3458,7 +3658,7 @@ class DAXContext:
         try:
             if self._rels_sig is None:
                 raise TypeError
-            ck = (id(tbl), 'xtf', self._filters_sig(),
+            ck = (id(tbl), 'xtf-rows' if rows else 'xtf', self._filters_sig(),
                 tuple(sorted((self._no_prop_keys.get(table_name) or {}).items())),
                 self._rels_sig)
         except TypeError:
@@ -3467,12 +3667,12 @@ class DAXContext:
             hit = self._filter_idx_cache.get(ck)
             if hit is not None:
                 return list(hit)
-            out = self._get_cross_table_filters_uncached(table_name, tbl)
+            out = self._get_cross_table_filters_uncached(table_name, tbl, rows)
             self._filter_idx_cache[ck] = out
             return out
-        return self._get_cross_table_filters_uncached(table_name, tbl)
+        return self._get_cross_table_filters_uncached(table_name, tbl, rows)
 
-    def _get_cross_table_filters_uncached(self, table_name: str, tbl: dict) -> list:
+    def _get_cross_table_filters_uncached(self, table_name: str, tbl: dict, rows: bool = False) -> list:
 
         result_filters = []
 
@@ -3511,58 +3711,101 @@ class DAXContext:
             src_tbl = self.tables.get(src_table)
             if not src_tbl:
                 continue
-
-            # Find relationship between source dim table and target table:
-            # one -> many, plus bidirectional. A column filter on the MANY side
-            # does not reach the one side -- DimStore[StoreType]="Catalog"
-            # leaves COUNTROWS(DimEmployee) at 293 in Desktop. A TABLE filter
-            # on it does, and so does the transition of its row, by filtering
-            # the one side's own columns (expansion_filters; FILTER(Employee,
-            # ...) restricts Date, [Actives] = 32,401).
-            rel = self._rel_dir.get((table_name, src_table))
-            if not rel:
-                # Try via date table special handling (for Year/Month filters on date dim)
-                if src_table == self.date_table:
-                    result_filters.extend(self._get_date_cross_filter(table_name, src_tbl, col_filters))
-                    continue
-                # No direct relationship: try a multi-hop (snowflake) path so a
-                # filter on a dimension 2+ hops from the fact is not silently
-                # dropped (e.g. Regions -> Customers -> Orders).
-                path = self._find_rel_path(src_table, table_name)
-                if path:
-                    res = self._propagate_filter_path(src_tbl, col_filters, path, table_name)
-                    # res is None only on a structural error; an (empty) set is a
-                    # real result and MUST be applied so the fact filters to zero
-                    # rows rather than falling back to the grand total.
-                    if res is not None:
-                        result_filters.append(res)
-                continue
-
-            # Direct relationship exists: filter source dim table, get join key values
-            fact_join_col = rel['from_col']  # Column in target (fact) table
-            dim_join_col = rel['to_col']     # Column in source (dim) table
-
-            fact_join_idx = self._find_col_idx(tbl['columns'], fact_join_col)
-            dim_join_idx = self._find_col_idx(src_tbl['columns'], dim_join_col)
-            if fact_join_idx < 0 or dim_join_idx < 0:
-                continue
-
-            # Filter dim table rows by all filters on that table
-            filtered_dim_rows, applied = self._rows_where(src_tbl, col_filters)
-            # The source's blank row survives when every filter on it keeps
-            # BLANK; it then selects the target rows no source row matches.
-            src_blank = (src_table in self.blank_row_tables()
-                         and self._filters_admit_blank(applied))
-
-            # Get allowed join key values. Append even an EMPTY set: an empty
-            # dimension selection must filter the fact to zero rows (BLANK), not
-            # be dropped (which would leave the fact unfiltered -> grand total).
-            # Mirrors the multi-hop path's empty-set handling.
-            allowed_keys = self._hop_keys(src_table, filtered_dim_rows, src_blank,
-                                          dim_join_idx, table_name, fact_join_idx)
-            result_filters.append((allowed_keys, fact_join_idx))
+            result_filters.extend(self._cross_filters_from(table_name, tbl, src_table, src_tbl, col_filters, rows))
 
         return result_filters
+
+    def _cross_filters_from(self, table_name: str, tbl: dict, src_table: str, src_tbl: dict,
+                            col_filters: list, rows: bool) -> list:
+        """The filters on src_table as they reach table_name: (allowed, index)
+        pairs, as _get_cross_table_filters lists them. They depend only on
+        src_table's own filters and the model, so they are memoized by those:
+        a query asks for the same source filters under every group (a running
+        total's date filter changes per date, its year filter never does)."""
+        try:
+            sk = (id(tbl), 'xtf-src', src_table, rows,
+                  frozenset((c, self._filter_sig_exact(v)) for c, v in col_filters),
+                  self._rels_sig, self.date_table, self.date_column)
+            hash(sk)
+        except TypeError:
+            sk = None
+        if sk is not None and self._rels_sig is not None:
+            hit = self._filter_idx_cache.get(sk)
+            if hit is not None:
+                return hit
+        out = self._cross_filters_from_uncached(table_name, tbl, src_table, src_tbl, col_filters, rows)
+        if rows:
+            # Resolved to the target's rows here, once per source filter, with the
+            # same _indices_for_values the caller would apply on every call: a
+            # multi-hop year filter's ~2,000 date keys were spelled again for each
+            # of a running total's dates.
+            resolved = []
+            for allowed, idx in out:
+                if type(allowed) is not _HopRows:
+                    hit = self._indices_for_values(tbl, idx, allowed)
+                    if hit is not None:
+                        allowed = _HopRows(hit)
+                resolved.append((allowed, idx))
+            out = resolved
+        if sk is not None and self._rels_sig is not None:
+            self._filter_idx_cache[sk] = out
+        return out
+
+    def _cross_filters_from_uncached(self, table_name: str, tbl: dict, src_table: str, src_tbl: dict,
+                                     col_filters: list, rows: bool) -> list:
+        # Find relationship between source dim table and target table:
+        # one -> many, plus bidirectional. A column filter on the MANY side
+        # does not reach the one side -- DimStore[StoreType]="Catalog"
+        # leaves COUNTROWS(DimEmployee) at 293 in Desktop. A TABLE filter
+        # on it does, and so does the transition of its row, by filtering
+        # the one side's own columns (expansion_filters; FILTER(Employee,
+        # ...) restricts Date, [Actives] = 32,401).
+        rel = self._rel_dir.get((table_name, src_table))
+        if not rel:
+            # Try via date table special handling (for Year/Month filters on date dim)
+            if src_table == self.date_table:
+                return list(self._get_date_cross_filter(table_name, src_tbl, col_filters))
+            # No direct relationship: try a multi-hop (snowflake) path so a
+            # filter on a dimension 2+ hops from the fact is not silently
+            # dropped (e.g. Regions -> Customers -> Orders).
+            path = self._find_rel_path(src_table, table_name)
+            if path:
+                res = self._propagate_filter_path(src_tbl, col_filters, path, table_name)
+                # res is None only on a structural error; an (empty) set is a
+                # real result and MUST be applied so the fact filters to zero
+                # rows rather than falling back to the grand total.
+                if res is not None:
+                    return [res]
+            return []
+
+        # Direct relationship exists: filter source dim table, get join key values
+        fact_join_col = rel['from_col']  # Column in target (fact) table
+        dim_join_col = rel['to_col']     # Column in source (dim) table
+
+        fact_join_idx = self._find_col_idx(tbl['columns'], fact_join_col)
+        dim_join_idx = self._find_col_idx(src_tbl['columns'], dim_join_col)
+        if fact_join_idx < 0 or dim_join_idx < 0:
+            return []
+        if rows:
+            hop = self._hop_row_set(src_table, src_tbl, col_filters, dim_join_idx, table_name, tbl, fact_join_idx)
+            if hop is not None:
+                return [(hop, fact_join_idx)]
+
+        # Filter dim table rows by all filters on that table
+        filtered_dim_rows, applied = self._rows_where(src_tbl, col_filters)
+        # The source's blank row survives when every filter on it keeps
+        # BLANK; it then selects the target rows no source row matches.
+        src_blank = (src_table in self.blank_row_tables()
+                     and self._filters_admit_blank(applied))
+
+        # Get allowed join key values. Append even an EMPTY set: an empty
+        # dimension selection must filter the fact to zero rows (BLANK), not
+        # be dropped (which would leave the fact unfiltered -> grand total).
+        # Mirrors the multi-hop path's empty-set handling.
+        allowed_keys = self._hop_keys(src_table, filtered_dim_rows, src_blank,
+                                      dim_join_idx, table_name, fact_join_idx)
+        return [(allowed_keys, fact_join_idx)]
+
 
     def _find_rel_path(self, src_table: str, target_table: str) -> Optional[list]:
         """BFS the directed relationship graph for a filter-propagation path.
@@ -4034,6 +4277,67 @@ class DAXContext:
             acc |= f
         return frozenset(acc)
 
+    def _indices_for_column_predicate(self, tbl: dict, col_idx: int, spec):
+        """Row indices an inequality (<, <=, >, >=; several under "all") on a
+        column of numbers or dates selects, from the column sorted once by the
+        number _compare compares (_as_number): a binary search, not a scan of
+        every row per filter. None when that isn't the comparison
+        make_value_matcher would make (a BLANK, text or a NaN in the column, a
+        BLANK or non-numeric target, any other kind of predicate): the caller
+        then scans with the matcher. A running total's 'Calendar'[Date] <= v
+        scanned the calendar once per date."""
+        if not isinstance(spec, dict):
+            return None
+        if set(spec) == {"all"} and isinstance(spec["all"], list) and spec["all"]:
+            parts = [self._indices_for_column_predicate(tbl, col_idx, x) for x in spec["all"]]
+            if any(p is None for p in parts):
+                return None
+            parts.sort(key=len)
+            out = parts[0]
+            for p in parts[1:]:
+                out = out & p
+            return out
+        if set(spec) != {"op", "value"} or spec["op"] not in _INEQUALITIES:
+            return None
+        target = _as_number(spec["value"]) if spec["value"] is not None else None
+        if target is None or target != target:
+            return None
+        index = self._numeric_order(tbl, col_idx)
+        if index is None:
+            return None
+        keys, order = index
+        kind = _INEQUALITIES[spec["op"]]
+        if kind == "lt":
+            return frozenset(order[:bisect.bisect_left(keys, target)])
+        if kind == "le":
+            return frozenset(order[:bisect.bisect_right(keys, target)])
+        if kind == "gt":
+            return frozenset(order[bisect.bisect_right(keys, target):])
+        return frozenset(order[bisect.bisect_left(keys, target):])
+
+    def _numeric_order(self, tbl: dict, col_idx: int):
+        """(sorted numbers, their row indices) of a column whose every cell is
+        a number or a date (_as_number), memoized; None (also memoized) when a
+        cell is BLANK, text, a boolean or NaN."""
+        key = (id(tbl), 'numeric-order', col_idx)
+        hit = self._filter_idx_cache.get(key)
+        if hit is None:
+            nums = []
+            for i, r in enumerate(tbl['rows']):
+                v = r[col_idx] if col_idx < len(r) else None
+                n = None if v is None or isinstance(v, (bool, str)) else _as_number(v)
+                if n is None or n != n:
+                    nums = None
+                    break
+                nums.append((n, i))
+            if nums is None:
+                hit = (False,)
+            else:
+                nums.sort()
+                hit = ([n for n, _ in nums], [i for _, i in nums])
+            self._filter_idx_cache[key] = hit
+        return None if hit == (False,) else hit
+
     def _rows_where(self, tbl: dict, col_filters) -> tuple:
         """``(rows, applied)``: the rows of ``tbl`` that every ``(column,
         values)`` filter keeps, in row order, and the filters that applied.
@@ -4043,6 +4347,15 @@ class DAXContext:
         dimension side of a relationship used to be filtered row by row with
         the matcher, once per propagation: a TOPN over 1,850 products made
         3.4 million matcher calls."""
+        keep, applied = self._row_indices_where(tbl, col_filters)
+        rows = tbl['rows']
+        if keep is None:
+            return rows, applied
+        return [rows[i] for i in sorted(keep)], applied
+
+    def _row_indices_where(self, tbl: dict, col_filters) -> tuple:
+        """``(indices, applied)``: _rows_where's rows as their indices, None
+        when no filter applied (every row)."""
         rows = tbl['rows']
         keep = None
         applied = []
@@ -4051,6 +4364,8 @@ class DAXContext:
             if idx < 0:
                 continue
             hit = self._indices_for_column_filter(tbl, idx, values)
+            if hit is None and _FAST_FILTERS:
+                hit = self._indices_for_column_predicate(tbl, idx, values)
             if hit is None:
                 sig = self._filter_sig(values)
                 ck = (id(tbl), 'd', idx, sig) if sig is not None else None
@@ -4062,9 +4377,7 @@ class DAXContext:
                         self._filter_idx_cache[ck] = hit
             keep = hit if keep is None else keep & hit
             applied.append((col, values))
-        if keep is None:
-            return rows, applied
-        return [rows[i] for i in sorted(keep)], applied
+        return keep, applied
 
     def _tuple_column_getter(self, table_name: str, t: str, c: str):
         """``row of table_name -> its value of t[c]``, when t[c] is in
@@ -4185,6 +4498,8 @@ class DAXContext:
             if filt_idx < 0:
                 continue
             hit = self._indices_for_column_filter(tbl, filt_idx, allowed)
+            if hit is None and _FAST_FILTERS:
+                hit = self._indices_for_column_predicate(tbl, filt_idx, allowed)
             if hit is None:
                 sig = self._filter_sig(allowed)
                 key = (id(tbl), 'd', filt_idx, sig) if sig is not None else None
@@ -4196,8 +4511,8 @@ class DAXContext:
                     if key is not None:
                         cache[key] = hit
             sets.append(hit)
-        for allowed_vals, join_idx in self._get_cross_table_filters(table_name):
-            hit = self._indices_for_values(tbl, join_idx, allowed_vals)
+        for allowed_vals, join_idx in self._get_cross_table_filters(table_name, rows=_FAST_FILTERS):
+            hit = allowed_vals if type(allowed_vals) is _HopRows else self._indices_for_values(tbl, join_idx, allowed_vals)
             if hit is None:
                 sig = self._filter_sig(allowed_vals)
                 key = (id(tbl), 'x', join_idx, sig) if sig is not None else None
@@ -7190,6 +7505,169 @@ class DAXEngine:
         outer = getattr(ctx, '_outer_ctx', None)
         return outer if outer is not None else ctx
 
+    _NO_MEMO = object()
+
+    def _agg_memo(self, ctx: DAXContext, kind: str, col: tuple, compute) -> Any:
+        """``compute`` over the column's visible values, memoized on the
+        model-wide cache by what decides those values -- the whole filter set,
+        the table's ALL() snapshot, the relationships and the date table, as
+        the cross-table filter memo is keyed -- outside a row context. A
+        CALCULATE(MAX(T[d]), REMOVEFILTERS()) inside a measure asked once per
+        group read every row each time; the answer
+        is a pure function of that key."""
+        actx = self._agg_ctx(ctx)
+        if not _FAST_FILTERS or actx._outer_ctx is not None or actx._rels_sig is None:
+            return compute(actx.get_column_data(*col))
+        tbl = actx.tables.get(col[0])
+        try:
+            key = (id(tbl), 'agg', kind, col[1], actx._filters_sig(),
+                   tuple(sorted((actx._no_prop_keys.get(col[0]) or {}).items())),
+                   actx._rels_sig, actx.date_table, actx.date_column)
+            hit = actx._filter_idx_cache.get(key, self._NO_MEMO)
+        except TypeError:
+            return compute(actx.get_column_data(*col))
+        if hit is not self._NO_MEMO:
+            return hit
+        out = self._range_aggregate(actx, kind, col) if kind in ('sum', 'count') else self._NO_MEMO
+        if out is self._NO_MEMO:
+            out = compute(actx.get_column_data(*col))
+        actx._filter_idx_cache[key] = out
+        return out
+
+    def _range_aggregate(self, ctx: DAXContext, kind: str, col: tuple) -> Any:
+        """SUM or COUNT of T[c] under a filter set whose one inequality is on a
+        column of a table D directly on T's one side (a running total's
+        'Calendar'[Date] <= v), from per-D-row partials of T's rows that the
+        OTHER filters keep, ordered by D's column, with running totals: a
+        binary search and a lookup per evaluation, not a sum over the rows.
+        Desktop answers a running total so: one scan of SUM by date, then the
+        cached sums at or before each date. For a
+        many-to-one join, the rows a D filter set keeps are the rows each of
+        its filters keeps, so the inequality's rows can be taken apart from
+        the others; non-owner rows and the blank row as the hop treats them.
+        Floats are added in another order than row by row: equal within
+        rounding, as Desktop's are. _NO_MEMO where the shape doesn't hold."""
+        NO = self._NO_MEMO
+        t_name, c_name = col
+        tbl = ctx.tables.get(t_name)
+        if (tbl is None or ctx._no_prop_keys or ctx._no_propagate or ctx._rels_sig is None
+                or ctx.has_tuple_filters()):
+            return NO
+        ranges = [(k, v) for k, v in ctx.filter_context.items()
+                  if isinstance(v, dict) and _range_parts(v) is not None]
+        if len(ranges) != 1:
+            return NO
+        key, spec = ranges[0]
+        d_name, d_col = key.split('.', 1) if '.' in key else (None, None)
+        src = ctx.tables.get(d_name) if d_name else None
+        rel = ctx._rel_dir.get((t_name, d_name)) if d_name else None
+        if src is None or d_name == t_name or not rel or (t_name, d_name) not in ctx._one_side_of:
+            return NO
+        dim_idx = ctx._find_col_idx(src['columns'], rel['to_col'])
+        fact_idx = ctx._find_col_idx(tbl['columns'], rel['from_col'])
+        r_idx = ctx._find_col_idx(src['columns'], d_col)
+        v_idx = ctx._find_col_idx(tbl['columns'], c_name)
+        if min(dim_idx, fact_idx, r_idx, v_idx) < 0:
+            return NO
+        if (d_name, src['columns'][dim_idx], t_name, tbl['columns'][fact_idx]) in ctx._date_part_joins:
+            return NO
+        order = ctx._numeric_order(src, r_idx)
+        if order is None:
+            return NO
+        base = ctx.without_filters([key])
+        try:
+            ck = (id(tbl), 'range', kind, v_idx, key, base._filters_sig(), ctx._rels_sig,
+                  ctx.date_table, ctx.date_column)
+            entry = ctx._filter_idx_cache.get(ck)
+        except TypeError:
+            return NO
+        if entry is None:
+            entry = self._range_partials(ctx, base, kind, t_name, tbl, d_name, src, dim_idx, fact_idx, v_idx, order)
+            ctx._filter_idx_cache[ck] = entry
+        if entry == (False,):
+            return NO
+        keys, sums, counts, pre_s, pre_n, suf_s, suf_n, blank_s, blank_n = entry
+        lo, hi = 0, len(keys)
+        for op, target in _range_parts(spec):
+            if op == 'lt':
+                hi = min(hi, bisect.bisect_left(keys, target))
+            elif op == 'le':
+                hi = min(hi, bisect.bisect_right(keys, target))
+            elif op == 'gt':
+                lo = max(lo, bisect.bisect_right(keys, target))
+            else:
+                lo = max(lo, bisect.bisect_left(keys, target))
+        if hi <= lo:
+            total, n = (0, 0)
+        elif lo == 0:
+            total, n = pre_s[hi], pre_n[hi]
+        elif hi == len(keys):
+            total, n = suf_s[lo], suf_n[lo]
+        else:
+            total, n = 0, 0
+            for i in range(lo, hi):
+                total += sums[i]
+                n += counts[i]
+        if blank_n and ctx._filters_admit_blank([(d_col, spec)]):
+            total += blank_s
+            n += blank_n
+        if kind == 'count':
+            return n or None
+        return total if n else None
+
+    def _range_partials(self, ctx, base, kind, t_name, tbl, d_name, src, dim_idx, fact_idx, v_idx, order):
+        """_range_aggregate's per-D-row partials (sum, count) in the column's
+        order with their running totals from each end, and the blank row's;
+        (False,) when a NaN or infinity would make running totals wrong."""
+        keys, d_rows = order
+        keep = base._surviving_indices(t_name, tbl)
+        rows = tbl['rows']
+        buckets = ctx._hop_buckets(src, dim_idx, tbl, fact_idx)
+        drop = ctx._non_owner_rows(d_name, dim_idx)
+        if drop and not ctx._joins_one_row(d_name, t_name):
+            drop = frozenset()
+        src_rows = src['rows']
+
+        def part(idx):
+            total, n = 0, 0
+            for i in idx:
+                if keep is not None and i not in keep:
+                    continue
+                v = rows[i][v_idx]
+                if kind == 'count':
+                    n += v is not None
+                elif isinstance(v, (int, float)):
+                    total += v
+                    n += 1
+            return total, n
+        sums, counts = [], []
+        for d in d_rows:
+            total, n = (0, 0) if id(src_rows[d]) in drop else part(buckets[d])
+            sums.append(total)
+            counts.append(n)
+        blank_s, blank_n = 0, 0
+        if d_name in ctx.blank_row_tables():
+            unmatched = ctx._indices_for_values(
+                tbl, fact_idx, ctx._unmatched_key_strs(t_name, fact_idx, d_name, src['columns'][dim_idx]))
+            blank_s, blank_n = part(unmatched)
+        if any(isinstance(x, float) and not math.isfinite(x) for x in sums + [blank_s]):
+            return (False,)
+        pre_s, pre_n, total, n = [0], [0], 0, 0
+        for x, c in zip(sums, counts):
+            total += x
+            n += c
+            pre_s.append(total)
+            pre_n.append(n)
+        suf_s, suf_n, total, n = [0], [0], 0, 0
+        for x, c in zip(reversed(sums), reversed(counts)):
+            total += x
+            n += c
+            suf_s.append(total)
+            suf_n.append(n)
+        suf_s.reverse()
+        suf_n.reverse()
+        return (keys, sums, counts, pre_s, pre_n, suf_s, suf_n, blank_s, blank_n)
+
     def _fn_sum(self, args_str: str, ctx: DAXContext) -> Any:
         col = self._parse_column_ref(args_str)
         if col is not None:
@@ -7200,10 +7678,11 @@ class DAXEngine:
             if not (isinstance(ref, tuple) and len(ref) == 2):
                 return None
             col = ref
-        values = self._agg_ctx(ctx).get_column_data(*col)
-        nums = [v for v in values if isinstance(v, (int, float))]
-        # SUM over no rows is BLANK in DAX (so ISBLANK fires), not 0.
-        return sum(nums) if nums else None
+        def total(values):
+            nums = [v for v in values if isinstance(v, (int, float))]
+            # SUM over no rows is BLANK in DAX (so ISBLANK fires), not 0.
+            return sum(nums) if nums else None
+        return self._agg_memo(ctx, 'sum', col, total)
 
     def _fn_average(self, args_str: str, ctx: DAXContext) -> Any:
         col = self._parse_column_ref(args_str)
@@ -7215,15 +7694,16 @@ class DAXEngine:
             if not (isinstance(ref, tuple) and len(ref) == 2):
                 return None
             col = ref
-        values = [v for v in self._agg_ctx(ctx).get_column_data(*col)
-                  if isinstance(v, (int, float))]
+        def mean(data):
+            values = [v for v in data if isinstance(v, (int, float))]
+            return sum(values) / len(values) if values else None
+        return self._agg_memo(ctx, 'average', col, mean)
         # Every aggregate is BLANK over an empty set, never 0. Verified on
         # Desktop with CALCULATE(<agg>, FILTER(ALL(T), FALSE())): COUNT,
         # COUNTA, COUNTROWS, COUNTBLANK, DISTINCTCOUNT, MIN, COUNTX,
         # AVERAGEX, SUMX, MINX and MEDIANX all came back BLANK. A 0 is the
         # worst kind of wrong here: it reads as a measured zero, and it is
         # what ISBLANK() is testing for.
-        return sum(values) / len(values) if values else None
 
     def _fn_count(self, args_str: str, ctx: DAXContext) -> Any:
         col = self._parse_column_ref(args_str)
@@ -7235,9 +7715,7 @@ class DAXEngine:
             if not (isinstance(ref, tuple) and len(ref) == 2):
                 return None
             col = ref
-        n = len([v for v in self._agg_ctx(ctx).get_column_data(*col)
-                 if v is not None])
-        return n or None
+        return self._agg_memo(ctx, 'count', col, lambda data: len([v for v in data if v is not None]) or None)
 
     def _fn_countrows(self, args_str: str, ctx: DAXContext) -> Any:
         # Try evaluating as an expression first (handles TOPN, FILTER, etc.)
@@ -7281,14 +7759,15 @@ class DAXEngine:
             col = ref if isinstance(ref, tuple) and len(ref) == 2 else None
         if not col:
             return None
-        values = self._comparable_values(
-            self._agg_ctx(ctx).get_column_data(*col))
-        # MIN/MAX over no rows is BLANK, like every other aggregate
-        # (Desktop: CALCULATE(MIN(T[c]), FILTER(ALL(T), FALSE())) is BLANK).
-        if not values:
-            return None
-        # text in the model's collation (Desktop: MIN "_x", MAX "Zeta"; #157)
-        return pick(values, key=_text_key) if isinstance(values[0], str) else pick(values)
+        def extreme(data):
+            values = self._comparable_values(data)
+            # MIN/MAX over no rows is BLANK, like every other aggregate
+            # (Desktop: CALCULATE(MIN(T[c]), FILTER(ALL(T), FALSE())) is BLANK).
+            if not values:
+                return None
+            # text in the model's collation (Desktop: MIN "_x", MAX "Zeta"; #157)
+            return pick(values, key=_text_key) if isinstance(values[0], str) else pick(values)
+        return self._agg_memo(ctx, pick.__name__, col, extreme)
 
     @staticmethod
     def _minmax_pair(a, b, pick):
@@ -7334,15 +7813,15 @@ class DAXEngine:
             if not (isinstance(ref, tuple) and len(ref) == 2):
                 return None
             col = ref
-        values = self._agg_ctx(ctx).get_column_data(*col)
         # DAX COUNTS THE BLANK as one distinct value -- that is exactly what
         # DISTINCTCOUNTNOBLANK exists to avoid. MS_Blog_2020_Sep's
         # DISTINCTCOUNT('Online Sales'[Customer]) is 119387 in Desktop over a
         # column with 119386 distinct customers and 8 blank rows; we reported
         # 119386 by dropping the blank.
-        distinct = {str(v) for v in values if v is not None}
-        n = len(distinct) + (1 if any(v is None for v in values) else 0)
-        return n or None
+        def distinct(values):
+            n = len({str(v) for v in values if v is not None}) + (1 if any(v is None for v in values) else 0)
+            return n or None
+        return self._agg_memo(ctx, 'distinctcount', col, distinct)
 
     def _fn_distinctcountnoblank(self, args_str: str, ctx: DAXContext) -> Any:
         """DISTINCTCOUNTNOBLANK(column) — distinct values, blank NOT counted."""
@@ -8351,12 +8830,19 @@ class DAXEngine:
     @staticmethod
     def _column_is_datetime(ctx: DAXContext, table, column) -> bool:
         tbl = (ctx.tables or {}).get(table) or {}
+        key = (id(tbl), 'is-datetime', column)
+        hit = ctx._filter_idx_cache.get(key)
+        if hit is not None:
+            return hit
         cols = tbl.get('columns') or []
         if column not in cols:
-            return False
-        i = cols.index(column)
-        v = next((r[i] for r in (tbl.get('rows') or []) if r[i] is not None), None)
-        return isinstance(v, (datetime, date))
+            out = False
+        else:
+            i = cols.index(column)
+            v = next((r[i] for r in (tbl.get('rows') or []) if r[i] is not None), None)
+            out = isinstance(v, (datetime, date))
+        ctx._filter_idx_cache[key] = out
+        return out
 
     def _drop_marked_date_table_filters(self, outer: DAXContext, new_ctx: DAXContext,
                                         keep_keys: set | frozenset = frozenset()) -> DAXContext:
@@ -16035,6 +16521,32 @@ def _canonical(value) -> str:
     return json.dumps(value, sort_keys=True, default=_default)
 
 
+def _memo_name(ctx: 'DAXContext') -> tuple:
+    """What a memo of measure analysis or values is valid for, besides the
+    model's data: the measures, calculation groups and formats, relationships,
+    marked date tables, culture, measure home tables and model columns."""
+    groups, formats = _calc_registry(ctx.measures)
+    return (_canonical(ctx.measures),
+            _canonical([(g.table, g.column, g.precedence, g.items) for g in groups]),
+            _canonical(formats), _canonical(ctx.relationships),
+            ctx.date_table, ctx.date_column, _canonical(ctx.date_tables),
+            ctx.culture, _canonical(ctx.measure_tables), _canonical(ctx.model_columns))
+
+
+def _model_shield_cache(ctx: 'DAXContext') -> dict:
+    """The shield analysis's memo (_shielded_tables, _reads_shadow) kept on
+    the model-wide cache, so a caller asking one filter context per call
+    doesn't read every measure's text again each time: the per-filter route
+    gave each call an empty one, three milliseconds a call. Named as
+    _attach_query_memo names a query's memo; the model's data is the
+    model-wide cache's own."""
+    key = ('__shield__',) + _memo_name(ctx)
+    hit = ctx._filter_idx_cache.get(key)
+    if hit is None:
+        hit = ctx._filter_idx_cache[key] = {}
+    return hit
+
+
 def _attach_query_memo(ctx: 'DAXContext', cache: dict) -> None:
     """Give ``ctx`` the measure memo kept in a caller's ``cache`` (issue #186).
 
@@ -16044,12 +16556,17 @@ def _attach_query_memo(ctx: 'DAXContext', cache: dict) -> None:
     name the memo inside ``cache``, so one dict can serve several queries
     and never hands a value across models. The query's ALLSELECTED state is
     keyed per measure (DAXEngine._selection_token)."""
-    groups, formats = _calc_registry(ctx.measures)
-    name = (id(ctx.tables), _canonical(ctx.measures),
-            _canonical([(g.table, g.column, g.precedence, g.items) for g in groups]),
-            _canonical(formats), _canonical(ctx.relationships),
-            ctx.date_table, ctx.date_column, _canonical(ctx.date_tables),
-            ctx.culture, _canonical(ctx.measure_tables), _canonical(ctx.model_columns))
+    # A query's contexts come from one model: the same objects every time, so
+    # the name, which serialises every measure, is worked out once per cache
+    # (a batch of thousands named it per context).
+    ident = getattr(ctx, '_memo_ident', None)
+    named = cache.get('__named__') if ident is not None else None
+    if named is not None and named[0] == ident:
+        name = named[1]
+    else:
+        name = (id(ctx.tables),) + _memo_name(ctx)
+        if ident is not None:
+            cache['__named__'] = (ident, name)
     entry = cache.get(name)
     if entry is None or entry[0] is not ctx.tables:
         # the tables are held, so their id cannot name another model
@@ -16448,7 +16965,13 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
     ctx.model_columns = model_columns or {}
     ctx.culture = culture
     if cache is not None:
+        # The arguments are the model's own objects, the same for every context
+        # of a query; the context's are built per call (model_columns or {}).
+        ctx._memo_ident = (id(tables), id(measures), id(relationships), id(date_tables), id(measure_tables),
+                           id(model_columns), date_table, date_column, culture)
         _attach_query_memo(ctx, cache)
+    elif _FAST_FILTERS:
+        ctx._shield_cache = _model_shield_cache(ctx)
     results = {}
 
     for name in measure_names:
