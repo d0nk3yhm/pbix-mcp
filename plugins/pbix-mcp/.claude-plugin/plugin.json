@@ -1,0 +1,20 @@
+{
+  "name": "pbix-mcp",
+  "displayName": "Power BI (pbix-mcp)",
+  "version": "0.9.152",
+  "description": "Create, read, edit and evaluate Power BI .pbix / .pbit files and PBIP projects from Claude Code, without Power BI Desktop: reports, visuals, data models, measures, RLS and DAX evaluation.",
+  "author": {
+    "name": "d0nk3yhm",
+    "url": "https://github.com/d0nk3yhm"
+  },
+  "homepage": "https://github.com/d0nk3yhm/pbix-mcp",
+  "repository": "https://github.com/d0nk3yhm/pbix-mcp",
+  "license": "MIT",
+  "keywords": [
+    "power-bi",
+    "pbix",
+    "dax",
+    "mcp",
+    "business-intelligence"
+  ]
+}

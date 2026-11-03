@@ -142,6 +142,18 @@ Two independent issue streams, and "everything is closed" has to mean both:
   unimplemented through four releases because nothing tracked it; that ledger is
   the fix. Re-audit before declaring the queue clear.
 
+## The Claude Code plugin
+
+`plugins/pbix-mcp` is the Claude Code plugin and `.claude-plugin/marketplace.json` makes this repository its marketplace. The plugin runs one exact PyPI release, so a release does not reach plugin users by itself.
+
+Once PyPI has the new version, not before (a plugin ahead of PyPI cannot start), set that version in both `plugins/pbix-mcp/.claude-plugin/plugin.json` and the `--from` argument in `plugins/pbix-mcp/.mcp.json`, then run:
+
+```bash
+claude plugin validate --strict ./plugins/pbix-mcp
+```
+
+Claude Code only offers users an update when the `version` in `plugin.json` changes. Never rename the plugin. `tests/test_issue364_claude_code_plugin.py` keeps the two versions equal and no newer than the package.
+
 ## Commit Messages
 
 Use conventional format:

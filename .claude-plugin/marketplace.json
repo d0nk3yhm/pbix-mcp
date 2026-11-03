@@ -1,0 +1,16 @@
+{
+  "name": "pbix-mcp",
+  "description": "Power BI .pbix / .pbit editing and DAX evaluation for Claude Code",
+  "owner": {
+    "name": "d0nk3yhm",
+    "url": "https://github.com/d0nk3yhm"
+  },
+  "plugins": [
+    {
+      "name": "pbix-mcp",
+      "source": "./plugins/pbix-mcp",
+      "description": "Create, read, edit and evaluate Power BI .pbix / .pbit files and PBIP projects without Power BI Desktop.",
+      "category": "data"
+    }
+  ]
+}

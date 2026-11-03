@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — a Claude Code plugin, with this repository as its marketplace (issue #364)
+
+`/plugin marketplace add d0nk3yhm/pbix-mcp`, then `/plugin install pbix-mcp@pbix-mcp`, adds the server to Claude Code without installing the package or writing configuration; it needs [uv](https://docs.astral.sh/uv/). The plugin runs `uvx --python 3.13 --from pbix-mcp==<version> pbix-mcp-server`. The exact version is what Anthropic's plugin directory requires of a launcher, and the server changes only when the plugin is updated. The Python is named because `uvx` otherwise takes what it finds: 3.14 on a machine with no Python, which CI does not test, and on a machine with a damaged uv-managed 3.12 the server failed at startup (`No module named '_sqlite3'`). Measured through that exact command, on this machine and with only freshly downloaded Pythons: the server starts in about 6 seconds and lists its 134 tools; through it, a model was created and reopened and a measure evaluated (7 = 1 + 2 + 4). `claude plugin validate --strict` passes on the plugin and the marketplace, and an isolated install reports it connected. Tests: `tests/test_issue364_claude_code_plugin.py`.
+
 ## [0.9.152] - 2026-10-28
 
 Reported by @allanon2 in issue #361: a measure reference in an iteration over a model table had become slower in 0.9.150.

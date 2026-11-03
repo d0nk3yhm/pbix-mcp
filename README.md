@@ -31,6 +31,17 @@ cd pbix-mcp
 pip install -e .
 ```
 
+### Claude Code plugin
+
+The quickest way in Claude Code. You need [uv](https://docs.astral.sh/uv/getting-started/installation/); it fetches the server and Python itself.
+
+```
+/plugin marketplace add d0nk3yhm/pbix-mcp
+/plugin install pbix-mcp@pbix-mcp
+```
+
+Check with `/mcp` that `plugin:pbix-mcp:powerbi-editor` is connected. See [the plugin's README](plugins/pbix-mcp/README.md).
+
 ### Claude Desktop / Claude Code
 
 Add to your MCP config file:
