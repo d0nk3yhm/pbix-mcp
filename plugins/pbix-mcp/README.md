@@ -25,7 +25,7 @@ claude plugin marketplace add d0nk3yhm/pbix-mcp
 claude plugin install pbix-mcp@pbix-mcp
 ```
 
-Run `/mcp` in Claude Code to check that `plugin:pbix-mcp:powerbi-editor` is connected. If it failed to start, the usual cause is that `uvx` is not on your `PATH`.
+Run `/mcp` in Claude Code to check that `plugin:pbix-mcp:powerbi-editor` is connected. If it failed to start, the usual cause is that `uv` is not on your `PATH`.
 
 ## Try it
 
@@ -43,7 +43,7 @@ claude plugin marketplace update pbix-mcp
 claude plugin update pbix-mcp@pbix-mcp
 ```
 
-Each plugin version runs one exact pbix-mcp release from PyPI, so the server only changes when you update.
+Each plugin version runs one exact pbix-mcp release from PyPI, with the exact dependencies in its `uv.lock`, and `uv` checks their hashes. The server and its dependencies only change when you update.
 
 ## Privacy
 

@@ -144,15 +144,23 @@ Two independent issue streams, and "everything is closed" has to mean both:
 
 ## The Claude Code plugin
 
-`plugins/pbix-mcp` is the Claude Code plugin and `.claude-plugin/marketplace.json` makes this repository its marketplace. The plugin runs one exact PyPI release, so a release does not reach plugin users by itself.
+`plugins/pbix-mcp` is the Claude Code plugin and `.claude-plugin/marketplace.json` makes this repository its marketplace. The plugin runs one exact PyPI release with the dependencies fixed in its `uv.lock`, so a release does not reach plugin users by itself.
 
-Once PyPI has the new version, not before (a plugin ahead of PyPI cannot start), set that version in both `plugins/pbix-mcp/.claude-plugin/plugin.json` and the `--from` argument in `plugins/pbix-mcp/.mcp.json`, then run:
+Once PyPI has the new version, not before (a plugin ahead of PyPI cannot start), set that version in `plugins/pbix-mcp/.claude-plugin/plugin.json` and in `plugins/pbix-mcp/pyproject.toml` (its `version` and its `pbix-mcp==` dependency), then run:
 
 ```bash
-claude plugin validate --strict ./plugins/pbix-mcp
+uv lock --upgrade --project plugins/pbix-mcp
 ```
 
-Claude Code only offers users an update when the `version` in `plugin.json` changes. Never rename the plugin. `tests/test_issue364_claude_code_plugin.py` keeps the two versions equal and no newer than the package.
+```bash
+claude plugin validate ./plugins/pbix-mcp
+```
+
+It warns about `icon`, `documentationUrl` and `supportUrl`, which Claude Code ignores and the plugin directory reads; anything else needs a look. `--strict` fails on those three.
+
+`--upgrade` also takes the dependencies' current releases, which is how their fixes reach plugin users. Start the server once from the new lock before pushing.
+
+Claude Code only offers users an update when the `version` in `plugin.json` changes. Never rename the plugin. `tests/test_issue364_claude_code_plugin.py` keeps these versions and the lock equal, and no newer than the package.
 
 ## Commit Messages
 

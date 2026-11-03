@@ -5,10 +5,14 @@ The manifests are read by Claude Code and by Anthropic's plugin directory, not
 by anything in this package, so nothing else notices when they go wrong. These
 tests pin what would break an install without failing any other test:
 
-- the launcher runs one exact PyPI release (the directory blocks an unpinned
-  uvx), the same one plugin.json names, and never one newer than this package:
-  a plugin released ahead of PyPI cannot start for anyone who updates;
-- it names the Python to use. Without --python, uvx takes what it finds: 3.14
+- the launcher runs from the plugin's uv.lock, unchanged (--frozen) and without
+  touching the plugin folder or the user's project (--isolated), so one plugin
+  version always installs the same files (#365);
+- the lock holds the exact PyPI release plugin.json names, and never one newer
+  than this package: a plugin released ahead of PyPI cannot start for anyone who
+  updates;
+- every locked download has a hash, and comes from PyPI;
+- it names one Python, and one CI tests. Left open, uv takes what it finds: 3.14
   on a machine with no Python, which CI does not test, and on a machine with a
   damaged uv-managed 3.12 the server failed at startup (No module named
   '_sqlite3');
@@ -19,6 +23,9 @@ tests pin what would break an install without failing any other test:
 - the directory's blocking rules that a local run can check: a README of at
   least 40 words in the plugin folder, a licence, and no other file in
   .claude-plugin/ (Claude Code does not load one).
+
+That the lock is current for pyproject.toml is `uv lock --check`, which needs uv
+and the network, so it is not run here.
 
 Expected values: Claude Code's plugin reference and Anthropic's pre-submission
 checklist. That the command really starts and answers was measured over MCP
@@ -62,7 +69,7 @@ def marketplace() -> dict:
 @pytest.fixture
 def args() -> list:
     server = _json(PLUGIN / ".mcp.json")["mcpServers"]["powerbi-editor"]
-    assert server["command"] == "uvx"
+    assert server["command"] == "uv"
     return server["args"]
 
 
@@ -70,8 +77,43 @@ def _option(args: list, name: str) -> str:
     return args[args.index(name) + 1]
 
 
-def test_the_launcher_runs_the_exact_release_plugin_json_names(args, manifest):
-    assert _option(args, "--from") == f"pbix-mcp=={manifest['version']}"
+@pytest.fixture
+def plugin_pyproject() -> str:
+    return (PLUGIN / "pyproject.toml").read_text(encoding="utf-8")
+
+
+@pytest.fixture
+def lock_packages() -> list:
+    # (read as text: tomllib is not in Python 3.10, which CI runs)
+    return (PLUGIN / "uv.lock").read_text(encoding="utf-8").split("[[package]]")[1:]
+
+
+def _locked(lock_packages: list, name: str) -> str:
+    return next(p for p in lock_packages if p.lstrip().startswith(f'name = "{name}"\n'))
+
+
+def test_the_launcher_runs_from_the_plugins_lock_unchanged(args):
+    assert args[0] == "run"
+    assert _option(args, "--project") == "${CLAUDE_PLUGIN_ROOT}"
+    assert "--frozen" in args
+    assert "--isolated" in args
+
+
+def test_the_lock_holds_the_exact_release_plugin_json_names(lock_packages, plugin_pyproject, manifest):
+    assert f'"pbix-mcp=={manifest["version"]}"' in plugin_pyproject
+    assert f'\nversion = "{manifest["version"]}"\n' in plugin_pyproject
+    assert f'version = "{manifest["version"]}"' in _locked(lock_packages, "pbix-mcp")
+
+
+def test_every_locked_download_has_a_hash_and_comes_from_pypi(lock_packages):
+    assert len(lock_packages) > 1
+    for package in lock_packages:
+        if 'source = { virtual = "." }' in package:
+            continue
+        assert 'source = { registry = "https://pypi.org/simple" }' in package
+        files = [line for line in package.splitlines() if "url = " in line and "source" not in line]
+        assert files
+        assert all("files.pythonhosted.org" in line and "hash = \"sha256:" in line for line in files)
 
 
 def test_the_plugin_is_never_ahead_of_this_package(manifest):
@@ -80,8 +122,8 @@ def test_the_plugin_is_never_ahead_of_this_package(manifest):
     assert _version(manifest["version"]) <= _version(pbix_mcp.__version__)
 
 
-def test_the_launcher_names_a_python_ci_tests(args):
-    assert _option(args, "--python") in CI_PYTHONS
+def test_the_plugin_names_a_python_ci_tests(plugin_pyproject):
+    assert re.search(r'^requires-python = "==(\d+\.\d+)\.\*"$', plugin_pyproject, re.M).group(1) in CI_PYTHONS
 
 
 def test_the_command_is_one_the_package_installs(args):
