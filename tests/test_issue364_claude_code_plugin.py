@@ -106,6 +106,15 @@ def test_the_manifest_names_an_author(manifest):
     assert manifest["author"]["name"]
 
 
+def test_the_manifests_icon_is_a_png_in_the_plugin(manifest):
+    # the directory portal's checks look for an icon in plugin.json
+    icon = PLUGIN / manifest["icon"]
+    assert manifest["icon"].startswith("./")
+    assert icon.read_bytes()[:8] == b"PNG
+
+"
+
+
 def test_the_plugin_folder_has_a_readme_the_directory_accepts():
     assert len((PLUGIN / "README.md").read_text(encoding="utf-8").split()) >= 40
 

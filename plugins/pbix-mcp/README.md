@@ -1,4 +1,4 @@
-# Power BI (pbix-mcp) plugin for Claude Code
+# pbix-mcp: Power BI files in Claude Code
 
 Lets Claude create, read, edit and evaluate Power BI `.pbix` / `.pbit` files and PBIP projects, without Power BI Desktop. It adds the [pbix-mcp](https://github.com/d0nk3yhm/pbix-mcp) MCP server to Claude Code: report pages and visuals, tables and relationships, measures and calculated columns, row-level security, themes, TMDL import and export, and a pure-Python DAX engine checked against Power BI Desktop's answers.
 
@@ -53,4 +53,4 @@ The server runs on your machine and works on the files you point it at. It has n
 
 DAX is evaluated by a Python engine, so very large models run slower than in Power BI Desktop. The plugin works where Claude Code runs a local server, and not on claude.ai. See the [full documentation](https://github.com/d0nk3yhm/pbix-mcp#readme), and report problems in the [issue tracker](https://github.com/d0nk3yhm/pbix-mcp/issues).
 
-MIT licensed.
+MIT licensed. An independent open-source project, not affiliated with or endorsed by Microsoft. Power BI is a trademark of Microsoft.
