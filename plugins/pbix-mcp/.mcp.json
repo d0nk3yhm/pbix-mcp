@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "powerbi-editor": {
-      "command": "uv",
-      "args": ["run", "--project", "${CLAUDE_PLUGIN_ROOT}", "--frozen", "--isolated", "pbix-mcp-server"]
+      "command": "uvx",
+      "args": ["--python", "3.13", "--from", "pbix-mcp==0.9.152", "pbix-mcp-server"]
     }
   }
 }
