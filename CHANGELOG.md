@@ -5,7 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.153] - 2026-11-04
+
+For Anthropic's plugin directory: its policy's tool annotations, a privacy link, and names of our own. No answer of the DAX engine and no file the package writes changes.
+
+Verified before release: full suite 10964 passed, 157 skipped, 7 xfailed; ruff clean on `src` and `tests`, mypy 131.
+
+### Added — every tool declares a title and what it does (issue #366)
+
+None of the 134 tools declared MCP annotations, which Anthropic's Software Directory Policy requires (5.E: "in particular readOnlyHint, destructiveHint, and title"). Each now has a title and the four hints, classified from what its code does; `openWorldHint` is false on all of them, as the package makes no network call. Marked destructive are also the ones that do not look it: `pbix_close` (`force=True` discards unsaved edits), `pbix_create`, `pbix_import_tmdl` and the exports (they replace a file already at the path, and `pbix_export_pbip` a folder). A client may act on `readOnlyHint` without asking anyone, so `tests/test_issue366_tool_annotations.py` calls every read-only tool against an open file and checks by digest that the file and its working copy do not change, nor its unsaved-changes flag; a read-only tool it does not call fails it. The minimum `mcp` is now 1.7.1, the lowest checked with annotations.
+
+### Changed — the server's names are pbix-mcp (issue #368)
+
+The server called itself `PowerBI-PBIX-Editor`, and the plugin and the README's examples used the key `powerbi-editor`. Both are `pbix-mcp`. An existing configuration keeps working under the key it chose; a plugin user's tool prefix changes when the plugin updates (`/mcp` shows `plugin:pbix-mcp:pbix-mcp`).
+
+### Added — a privacy section that says what is read, where it goes and how long it stays (issue #367)
+
+The plugin's README now states all three, and `plugin.json` links to it as `privacyPolicyUrl`.
 
 ### Added — a Claude Code plugin, with this repository as its marketplace (issue #364)
 

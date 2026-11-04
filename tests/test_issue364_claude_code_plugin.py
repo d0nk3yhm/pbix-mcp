@@ -68,7 +68,7 @@ def marketplace() -> dict:
 
 @pytest.fixture
 def args() -> list:
-    server = _json(PLUGIN / ".mcp.json")["mcpServers"]["powerbi-editor"]
+    server = _json(PLUGIN / ".mcp.json")["mcpServers"]["pbix-mcp"]
     assert server["command"] == "uvx"
     return server["args"]
 

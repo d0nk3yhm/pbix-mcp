@@ -25,7 +25,7 @@ claude plugin marketplace add d0nk3yhm/pbix-mcp
 claude plugin install pbix-mcp@pbix-mcp
 ```
 
-Run `/mcp` in Claude Code to check that `plugin:pbix-mcp:powerbi-editor` is connected. If it failed to start, the usual cause is that `uvx` is not on your `PATH`.
+Run `/mcp` in Claude Code to check that `plugin:pbix-mcp:pbix-mcp` is connected. If it failed to start, the usual cause is that `uvx` is not on your `PATH`.
 
 ## Try it
 
@@ -47,7 +47,11 @@ Each plugin version runs one exact pbix-mcp release from PyPI, so the server onl
 
 ## Privacy
 
-The server runs on your machine and works on the files you point it at. It has no telemetry and sends nothing to any service of its own. `uv` downloads the packages from PyPI when they are first needed. As with any MCP tool, what the tools return goes into your Claude conversation, including any data Claude reads from a report.
+- **What it reads:** the files you point it at, which can hold personal data if your reports do.
+- **Where it goes:** the server runs on your machine, has no telemetry and sends nothing to any service of its own. `uv` downloads the packages from PyPI when they are first needed. As with any MCP tool, what the tools return goes into your Claude conversation, including any data Claude reads from a report, and is handled under your agreement with Anthropic.
+- **What it keeps:** nothing of its own. It works on a temporary copy that is removed when the file is closed or the server exits, and it writes only where you ask it to. `pbix_save` leaves a `.bak` backup beside a file it overwrites.
+
+Questions go to the [issue tracker](https://github.com/d0nk3yhm/pbix-mcp/issues).
 
 ## Limits
 

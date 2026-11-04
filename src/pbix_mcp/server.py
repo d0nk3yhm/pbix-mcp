@@ -39,6 +39,7 @@ from typing import Any, Callable
 
 try:
     from mcp.server.fastmcp import FastMCP
+    from mcp.types import ToolAnnotations
 except ModuleNotFoundError as _exc:  # pragma: no cover - import-time guard
     # mcp 2.0 dropped mcp.server.fastmcp (the server API is now
     # mcp.server.mcpserver). pyproject pins mcp<2, so this only fires when the
@@ -74,9 +75,38 @@ from pbix_mcp.models.responses import DAXEvalResponse, DAXResult, ToolResponse
 # MCP Server
 # ---------------------------------------------------------------------------
 mcp = FastMCP(
-    "PowerBI-PBIX-Editor",
-    instructions="Full read/write editor for Power BI .pbix/.pbit files",
+    "pbix-mcp",
+    instructions="Full read/write editor for .pbix/.pbit report files",
 )
+
+
+# What each tool does, for MCP clients deciding what to ask a person about. Edits
+# go to the open file's working copy until pbix_save, but they are still changes:
+# a removed page is gone from what the next save writes.
+
+
+def _reads(title: str) -> ToolAnnotations:
+    """Changes no file and nothing an open file will save."""
+    return ToolAnnotations(title=title, readOnlyHint=True, destructiveHint=False, idempotentHint=True,
+                           openWorldHint=False)
+
+
+def _adds(title: str) -> ToolAnnotations:
+    """Adds, without replacing what is there."""
+    return ToolAnnotations(title=title, readOnlyHint=False, destructiveHint=False, idempotentHint=False,
+                           openWorldHint=False)
+
+
+def _changes(title: str) -> ToolAnnotations:
+    """Replaces, removes or overwrites; the same call again changes nothing more."""
+    return ToolAnnotations(title=title, readOnlyHint=False, destructiveHint=True, idempotentHint=True,
+                           openWorldHint=False)
+
+
+def _changes_each_call(title: str) -> ToolAnnotations:
+    """Replaces, removes or overwrites, and the same call again does it again."""
+    return ToolAnnotations(title=title, readOnlyHint=False, destructiveHint=True, idempotentHint=False,
+                           openWorldHint=False)
 
 # ---------------------------------------------------------------------------
 # State: track open files
@@ -1823,7 +1853,7 @@ def _build_format_objects(fmt: dict, visual_type: str = "",
 
 # ---- Section 3: File Management ----
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Open a report file"))
 def pbix_open(file_path: str, alias: str = "") -> str:
     """Open a PBIX or PBIT file for editing.
 
@@ -1930,7 +1960,7 @@ def pbix_open(file_path: str, alias: str = "") -> str:
     ).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Save the report file"))
 def pbix_save(alias: str, output_path: str = "", overwrite: bool = False, backup: bool = True,
               strip_sensitivity_label: bool = False) -> str:
     """Save/repack the modified PBIX/PBIT file.
@@ -1987,7 +2017,7 @@ def pbix_save(alias: str, output_path: str = "", overwrite: bool = False, backup
         raise SessionError(f"Save failed: {e}")
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Close a report file"))
 def pbix_close(alias: str, force: bool = False) -> str:
     """Close an open file and clean up temporary files.
 
@@ -2019,7 +2049,7 @@ def pbix_close(alias: str, force: bool = False) -> str:
         raise SessionError(f"Close failed: {e}")
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Show the report's layout format"))
 def pbix_report_format(alias: str) -> str:
     """Report which layout format the open file uses, and whether it is writable.
 
@@ -2068,7 +2098,7 @@ def pbix_report_format(alias: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List open files"))
 def pbix_list_open() -> str:
     """List all currently open PBIX/PBIT files."""
     if not _open_files:
@@ -2083,7 +2113,7 @@ def pbix_list_open() -> str:
 
 # ---- Section 4: Report Layout tools ----
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List pages"))
 def pbix_get_pages(alias: str) -> str:
     """List all pages in the report with visual counts.
 
@@ -2112,7 +2142,7 @@ def pbix_get_pages(alias: str) -> str:
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List a page's visuals"))
 def pbix_get_page_visuals(alias: str, page_index: int = 0) -> str:
     """List all visuals on a specific page.
 
@@ -2151,7 +2181,7 @@ def pbix_get_page_visuals(alias: str, page_index: int = 0) -> str:
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Show a visual's configuration"))
 def pbix_get_visual_detail(alias: str, page_index: int, visual_index: int) -> str:
     """Get the full configuration JSON for a specific visual.
 
@@ -2203,7 +2233,7 @@ def pbix_get_visual_detail(alias: str, page_index: int, visual_index: int) -> st
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Set a visual property"))
 def pbix_set_visual_property(
     alias: str, page_index: int, visual_index: int,
     property_path: str, value: str
@@ -2257,7 +2287,7 @@ def pbix_set_visual_property(
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Replace a visual's configuration"))
 def pbix_update_visual_json(
     alias: str, page_index: int, visual_index: int, config_json: str
 ) -> str:
@@ -2340,7 +2370,7 @@ def _recompile_classic_binding(info: dict, vc: dict, config: dict) -> bool:
         return False
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Add a page"))
 def pbix_add_page(alias: str, display_name: str, width: int = 1280, height: int = 720) -> str:
     """Add a new blank page to the report.
 
@@ -2382,7 +2412,7 @@ def pbix_add_page(alias: str, display_name: str, width: int = 1280, height: int 
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes_each_call("Remove a page"))
 def pbix_remove_page(alias: str, page_index: int) -> str:
     """Remove a page from the report.
 
@@ -2428,7 +2458,7 @@ def _resolve_page(sections: list, page: str) -> int:
     return idx
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Rename a page"))
 def pbix_rename_page(alias: str, page: str, new_name: str) -> str:
     """Rename a report page.
 
@@ -2463,7 +2493,7 @@ def pbix_rename_page(alias: str, page: str, new_name: str) -> str:
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Reorder pages"))
 def pbix_reorder_pages(alias: str, page_order: str) -> str:
     """Reorder the report's pages.
 
@@ -2511,7 +2541,7 @@ def pbix_reorder_pages(alias: str, page_order: str) -> str:
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Show or hide a page"))
 def pbix_set_page_visibility(alias: str, page: str, hidden: bool) -> str:
     """Show or hide a report page (hidden pages are not shown in view mode).
 
@@ -2553,7 +2583,7 @@ def pbix_set_page_visibility(alias: str, page: str, hidden: bool) -> str:
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Duplicate a page"))
 def pbix_duplicate_page(alias: str, page: str, new_name: str = "") -> str:
     """Duplicate a page and all of its visuals.
 
@@ -2614,7 +2644,7 @@ def pbix_duplicate_page(alias: str, page: str, new_name: str = "") -> str:
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Move or resize a visual"))
 def pbix_move_visual(alias: str, page: str, visual_index: int,
                      x: float = -1, y: float = -1,
                      width: float = -1, height: float = -1,
@@ -2689,7 +2719,7 @@ def pbix_move_visual(alias: str, page: str, visual_index: int,
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Duplicate a visual"))
 def pbix_duplicate_visual(alias: str, page: str, visual_index: int,
                           target_page: str = "",
                           offset_x: float = 20, offset_y: float = 20) -> str:
@@ -2789,7 +2819,7 @@ def _read_ndjson_rows(path: str) -> list[dict]:
     return rows
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes_each_call("Create a report file"))
 def pbix_create(
     file_path: str,
     alias: str = "",
@@ -3062,7 +3092,7 @@ def _report_type_resolver(info: dict):
     return resolve
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Add a visual"))
 def pbix_add_visual(
     alias: str,
     page_index: int,
@@ -3320,7 +3350,7 @@ def pbix_add_visual(
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Set a visual's sort"))
 def pbix_set_visual_sort(
     alias: str,
     page_index: int,
@@ -3400,7 +3430,7 @@ def pbix_set_visual_sort(
                                   getattr(e, "code", None)).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Bind a field parameter to a visual"))
 def pbix_bind_field_parameter(
     alias: str,
     page_index: int,
@@ -3740,7 +3770,7 @@ def pbix_bind_field_parameter(
                                       "PBIX_MCP_ERROR")).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Format a visual"))
 def pbix_format_visual(
     alias: str, page_index: int, visual_index: int, format_json: str
 ) -> str:
@@ -4061,7 +4091,7 @@ def pbix_format_visual(
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes_each_call("Remove a visual"))
 def pbix_remove_visual(alias: str, page_index: int, visual_index: int) -> str:
     """Remove a visual from a report page.
 
@@ -4098,7 +4128,7 @@ def pbix_remove_visual(alias: str, page_index: int, visual_index: int) -> str:
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Show the raw layout"))
 def pbix_get_layout_raw(alias: str) -> str:
     """Get the raw Report/Layout JSON.
 
@@ -4117,7 +4147,7 @@ def pbix_get_layout_raw(alias: str) -> str:
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Replace the raw layout"))
 def pbix_set_layout_raw(alias: str, layout_json: str) -> str:
     """Write raw layout JSON back to Report/Layout.
 
@@ -4140,7 +4170,7 @@ def pbix_set_layout_raw(alias: str, layout_json: str) -> str:
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Show filters"))
 def pbix_get_filters(alias: str, page_index: int = -1) -> str:
     """Get report-level or page-level filters.
 
@@ -4179,7 +4209,7 @@ def pbix_get_filters(alias: str, page_index: int = -1) -> str:
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Set filters"))
 def pbix_set_filters(alias: str, filters_json: str, page_index: int = -1) -> str:
     """Set report-level or page-level filters.
 
@@ -4218,7 +4248,7 @@ def pbix_set_filters(alias: str, filters_json: str, page_index: int = -1) -> str
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Show report settings"))
 def pbix_get_settings(alias: str) -> str:
     """Get report settings.
 
@@ -4253,7 +4283,7 @@ def pbix_get_settings(alias: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Set report settings"))
 def pbix_set_settings(alias: str, settings_json: str) -> str:
     """Write report settings.
 
@@ -4292,7 +4322,7 @@ def pbix_set_settings(alias: str, settings_json: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List bookmarks"))
 def pbix_get_bookmarks(alias: str) -> str:
     """Get report bookmarks, with the internal name beside the display name.
 
@@ -4620,7 +4650,7 @@ def _bookmark_report_filters(report_filter_json: str, layout: dict,
     return out, added_cards
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Add a bookmark"))
 def pbix_add_bookmark(
     alias: str,
     display_name: str,
@@ -4826,7 +4856,7 @@ def pbix_add_bookmark(
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes_each_call("Remove a bookmark"))
 def pbix_remove_bookmark(alias: str, bookmark_index: int) -> str:
     """Remove a bookmark by index.
 
@@ -4874,7 +4904,7 @@ def pbix_remove_bookmark(alias: str, bookmark_index: int) -> str:
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Show file contents and sizes"))
 def pbix_get_metadata(alias: str) -> str:
     """Get file metadata — component inventory and sizes.
 
@@ -4903,7 +4933,7 @@ def pbix_get_metadata(alias: str) -> str:
 
 # ---- Section 5: Resources & Theme tools ----
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List static resources"))
 def pbix_list_resources(alias: str) -> str:
     """List all static resources (images, custom visuals, themes).
 
@@ -5392,7 +5422,7 @@ def _resolve_image_source(image_path: str, image_base64: str,
     return data, ext
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Register a static resource"))
 def pbix_register_resource(
     alias: str, name: str, image_path: str = "", image_base64: str = "",
     resource_type: str = "image",
@@ -5505,7 +5535,7 @@ def _page_bg_props(info: dict, layout: dict, spec, card: str) -> dict:
     return props
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Format a page"))
 def pbix_format_page(alias: str, page_index: int, format_json: str) -> str:
     """Format a report PAGE — canvas background and wallpaper.
 
@@ -5622,7 +5652,7 @@ def pbix_format_page(alias: str, page_index: int, format_json: str) -> str:
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Add an image"))
 def pbix_add_image(
     alias: str, page_index: int = 0, image_path: str = "",
     image_base64: str = "", name: str = "", x: int = 40, y: int = 40,
@@ -5729,7 +5759,7 @@ def pbix_add_image(
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Change an image"))
 def pbix_set_image(
     alias: str, page_index: int, visual_index: int, image_path: str = "",
     image_base64: str = "", item_name: str = "", name: str = "",
@@ -5949,7 +5979,7 @@ def _embed_custom_visual(work_dir: str, layout: dict, pbiviz_path: str) -> dict:
     return meta
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Import a custom visual"))
 def pbix_add_custom_visual(alias: str, pbiviz_path: str) -> str:
     """Import a custom visual (.pbiviz) into the report.
 
@@ -5994,7 +6024,7 @@ def pbix_add_custom_visual(alias: str, pbiviz_path: str) -> str:
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Reference a public custom visual"))
 def pbix_reference_public_visual(alias: str, guid: str) -> str:
     """Reference a public (AppSource) custom visual by GUID — no file payload.
 
@@ -6075,7 +6105,7 @@ def pbix_reference_public_visual(alias: str, guid: str) -> str:
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Remove a custom visual"))
 def pbix_remove_custom_visual(alias: str, visual_name: str) -> str:
     """Remove a custom visual package from the report.
 
@@ -6221,7 +6251,7 @@ def _html_measure_ref(single_visual: dict) -> tuple[str | None, str | None]:
     return None, None
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Add an HTML visual"))
 def pbix_add_html_visual(
     alias: str,
     page_index: int = 0,
@@ -6453,7 +6483,7 @@ def pbix_add_html_visual(
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List HTML visuals"))
 def pbix_get_html_visual(alias: str, page_index: int = -1) -> str:
     """List the HTML custom visuals in the report and their content.
 
@@ -6507,7 +6537,7 @@ def pbix_get_html_visual(alias: str, page_index: int = -1) -> str:
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Edit an HTML visual"))
 def pbix_set_html_visual(
     alias: str,
     page_index: int = 0,
@@ -6599,7 +6629,7 @@ def pbix_set_html_visual(
         raise LayoutParseError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Render an HTML visual template"))
 def pbix_html_template(kind: str = "", spec_json: str = "") -> str:
     """Render a professional, escaping-safe HTML/SVG snippet for an HTML visual.
 
@@ -6646,7 +6676,7 @@ def pbix_html_template(kind: str = "", spec_json: str = "") -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Generate an SVG image measure"))
 def pbix_svg_measure(kind: str = "", spec_json: str = "", alias: str = "",
                      measure_table: str = "", measure_name: str = "") -> str:
     """Generate DAX for an SVG data-URI image measure — optionally add it.
@@ -6741,7 +6771,7 @@ _BUILTIN_BASE_THEME = "CY24SU10"
 _BUILTIN_BASE_VERSION = "5.63"
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Show the theme"))
 def pbix_get_theme(alias: str) -> str:
     """Get the current report theme JSON.
 
@@ -6784,7 +6814,7 @@ def pbix_get_theme(alias: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Set the theme"))
 def pbix_set_theme(alias: str, theme_json: str, filename: str = "CY24SU11.json") -> str:
     """Set the report theme JSON.
 
@@ -6959,7 +6989,7 @@ def _resolve_theme_color(data_colors: list[str], color_id: int, percent: float) 
     return _shade_color(picker[color_id], percent)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List the report's colors"))
 def pbix_extract_colors(alias: str) -> str:
     """Extract all colors from the report — theme, visuals, and page backgrounds.
 
@@ -7057,7 +7087,7 @@ def pbix_extract_colors(alias: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes_each_call("Replace colors across the report"))
 def pbix_recolor(alias: str, color_map_json: str) -> str:
     """Global find-and-replace of colors across the entire report.
 
@@ -7655,7 +7685,7 @@ def pbix_recolor(alias: str, color_map_json: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Show the linguistic schema"))
 def pbix_get_linguistic_schema(alias: str) -> str:
     """Get the Q&A linguistic schema XML.
 
@@ -7677,7 +7707,7 @@ def pbix_get_linguistic_schema(alias: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Replace the linguistic schema"))
 def pbix_set_linguistic_schema(alias: str, schema_xml: str) -> str:
     """Set (replace) the Q&A linguistic schema XML.
 
@@ -7703,7 +7733,7 @@ def pbix_set_linguistic_schema(alias: str, schema_xml: str) -> str:
 
 # ---- Section 6: DataMashup (M Code) tools ----
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Show the M code"))
 def pbix_get_m_code(alias: str) -> str:
     """Get the Power Query M code from the DataMashup.
 
@@ -7722,7 +7752,7 @@ def pbix_get_m_code(alias: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Replace the M code"))
 def pbix_set_m_code(alias: str, m_code: str) -> str:
     """Set the Power Query M code in the DataMashup.
 
@@ -7745,7 +7775,7 @@ def pbix_set_m_code(alias: str, m_code: str) -> str:
 
 # ---- Section 7: DataModel READ tools (native ABF/VertiPaq) ----
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Show the model schema"))
 def pbix_get_model_schema(alias: str) -> str:
     """Get the data model schema — all tables, columns, and data types.
 
@@ -7764,7 +7794,7 @@ def pbix_get_model_schema(alias: str) -> str:
         return ToolResponse.error(str(e), DataModelCompressionError.code).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List measures"))
 def pbix_get_model_measures(alias: str) -> str:
     """Get all DAX measures from the data model.
 
@@ -7783,7 +7813,7 @@ def pbix_get_model_measures(alias: str) -> str:
         return ToolResponse.error(str(e), DataModelCompressionError.code).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List relationships"))
 def pbix_get_model_relationships(alias: str) -> str:
     """Get all relationships in the data model.
 
@@ -7802,7 +7832,7 @@ def pbix_get_model_relationships(alias: str) -> str:
         return ToolResponse.error(str(e), DataModelCompressionError.code).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List query expressions"))
 def pbix_get_model_power_query(alias: str) -> str:
     """Get Power Query expressions from the model.
 
@@ -7824,7 +7854,7 @@ def pbix_get_model_power_query(alias: str) -> str:
         return ToolResponse.error(str(e), DataModelCompressionError.code).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List data sources"))
 def pbix_list_data_sources(alias: str) -> str:
     """List all data sources with connection details for each table.
 
@@ -7941,7 +7971,7 @@ def pbix_list_data_sources(alias: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Change a table's data source"))
 def pbix_update_data_source(
     alias: str, table_name: str, new_source_json: str
 ) -> str:
@@ -8117,7 +8147,7 @@ def pbix_update_data_source(
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Set a partition's M expression"))
 def pbix_set_partition_m(alias: str, table_name: str, m_expression: str) -> str:
     """Set a table partition's raw Power Query M expression.
 
@@ -8173,7 +8203,7 @@ def pbix_set_partition_m(alias: str, table_name: str, m_expression: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List calculated columns"))
 def pbix_get_model_columns(alias: str) -> str:
     """Get all DAX calculated columns from the model.
 
@@ -8192,7 +8222,7 @@ def pbix_get_model_columns(alias: str) -> str:
         return ToolResponse.error(str(e), DataModelCompressionError.code).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Show a table's rows"))
 def pbix_get_table_data(alias: str, table_name: str, max_rows: int = 50) -> str:
     """Get sample data from a table in the data model.
 
@@ -8243,7 +8273,7 @@ def _is_system_table(name: str) -> bool:
     return name.startswith(("H$", "R$", "U$", "LocalDateTable", "DateTableTemplate"))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Export a table to CSV"))
 def pbix_export_table_csv(
     alias: str, table_name: str, output_path: str, delimiter: str = ","
 ) -> str:
@@ -8295,7 +8325,7 @@ def pbix_export_table_csv(
         return ToolResponse.error(str(e), "CSV_EXPORT_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Export all tables to CSV"))
 def pbix_export_all_tables_csv(alias: str, output_dir: str) -> str:
     """Export every data table in the model to separate CSV files.
 
@@ -8349,7 +8379,7 @@ def pbix_export_all_tables_csv(alias: str, output_dir: str) -> str:
         return ToolResponse.error(str(e), "CSV_EXPORT_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Find a value in the model"))
 def pbix_find_value(
     alias: str, search_value: str, case_sensitive: bool = False, max_matches: int = 100
 ) -> str:
@@ -8498,7 +8528,7 @@ def _eval_condition(row_val, op: str, value) -> bool:
     return False
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Filter a table's rows"))
 def pbix_query_table(
     alias: str,
     table_name: str,
@@ -8614,7 +8644,7 @@ def pbix_query_table(
         return ToolResponse.error(str(e), "QUERY_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Profile a table"))
 def pbix_table_stats(alias: str, table_name: str) -> str:
     """Profile a table — per-column stats (min/max/avg/distinct/nulls).
 
@@ -8698,7 +8728,7 @@ def pbix_table_stats(alias: str, table_name: str) -> str:
         return ToolResponse.error(str(e), "STATS_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Compare a table's rows in two files"))
 def pbix_data_diff(alias_a: str, alias_b: str, table_name: str, key_columns: str) -> str:
     """Diff row data between the same table in two PBIX files.
 
@@ -8809,7 +8839,7 @@ def pbix_data_diff(alias_a: str, alias_b: str, table_name: str, key_columns: str
         return ToolResponse.error(str(e), "DIFF_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Replace a value in a column"))
 def pbix_replace_value(
     alias: str,
     table_name: str,
@@ -10582,7 +10612,7 @@ def _apply_table_source(alias: str, table_name: str,
     return "\n  Source updated: " + str(res.get("message", "")).split("\n")[0]
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Replace a table's rows"))
 def pbix_set_table_data(alias: str, table_name: str, data_json: str,
                         source_json: str = "") -> str:
     """Write/replace actual row data in a table in the DataModel (VertiPaq).
@@ -10709,7 +10739,7 @@ def pbix_set_table_data(alias: str, table_name: str, data_json: str,
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Update a table's rows"))
 def pbix_update_table_rows(alias: str, table_name: str, rows_json: str) -> str:
     """Update row data in an existing table, inferring column types from current schema.
 
@@ -10802,7 +10832,7 @@ def pbix_update_table_rows(alias: str, table_name: str, rows_json: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Append rows to a table"))
 def pbix_append_table_rows(alias: str, table_name: str, rows_json: str = "",
                            rows_path: str = "") -> str:
     """APPEND rows to an existing table (issue #46 — the batching load).
@@ -10934,7 +10964,7 @@ def pbix_append_table_rows(alias: str, table_name: str, rows_json: str = "",
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List tables"))
 def pbix_list_tables(alias: str) -> str:
     """List all tables in the data model with row/column counts.
 
@@ -11193,7 +11223,7 @@ def _modify_metadata_sqlite(
     return dm_bytes, new_dm, None
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Query the model metadata"))
 def pbix_datamodel_query_metadata(alias: str, sql_query: str) -> str:
     """Run a read-only SQL query on the DataModel's metadata SQLite.
 
@@ -11269,7 +11299,7 @@ def pbix_datamodel_query_metadata(alias: str, sql_query: str) -> str:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes_each_call("Run SQL on the model metadata"))
 def pbix_datamodel_modify_metadata(alias: str, sql_statement: str) -> str:
     """Execute a SQL DDL/DML statement on the DataModel's metadata SQLite.
 
@@ -11306,7 +11336,7 @@ def pbix_datamodel_modify_metadata(alias: str, sql_statement: str) -> str:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Change a measure"))
 def pbix_datamodel_modify_measure(
     alias: str, measure_name: str, new_expression: str = "",
     new_format_string: str = "", new_data_category: str = "",
@@ -11422,7 +11452,7 @@ def pbix_datamodel_modify_measure(
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Set a measure's data category"))
 def pbix_datamodel_set_measure_category(
     alias: str, measure_name: str, data_category: str = ""
 ) -> str:
@@ -11469,7 +11499,7 @@ def pbix_datamodel_set_measure_category(
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Add a measure"))
 def pbix_datamodel_add_measure(
     alias: str, table_name: str, measure_name: str, expression: str,
     format_string: str = "", description: str = "", data_category: str = "",
@@ -11631,7 +11661,7 @@ def pbix_datamodel_add_measure(
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Remove a measure"))
 def pbix_datamodel_remove_measure(alias: str, measure_name: str) -> str:
     """Delete a DAX measure from the DataModel.
 
@@ -11680,7 +11710,7 @@ def pbix_datamodel_remove_measure(alias: str, measure_name: str) -> str:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Add a relationship"))
 def pbix_datamodel_add_relationship(
     alias: str,
     from_table: str,
@@ -11775,7 +11805,7 @@ def pbix_datamodel_add_relationship(
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Remove a relationship"))
 def pbix_datamodel_remove_relationship(
     alias: str,
     from_table: str,
@@ -11813,7 +11843,7 @@ def pbix_datamodel_remove_relationship(
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Change a relationship"))
 def pbix_datamodel_modify_relationship(
     alias: str,
     from_table: str,
@@ -12006,7 +12036,7 @@ def pbix_datamodel_modify_relationship(
             f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Remove a table"))
 def pbix_datamodel_remove_table(alias: str, table_name: str) -> str:
     """Remove a table and its measures/relationships from the DataModel.
 
@@ -12038,7 +12068,7 @@ def pbix_datamodel_remove_table(alias: str, table_name: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Add a field parameter"))
 def pbix_datamodel_add_field_parameter(
     alias: str, parameter_name: str, fields_json: str
 ) -> str:
@@ -12169,7 +12199,7 @@ def pbix_datamodel_add_field_parameter(
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Add a calculation group"))
 def pbix_datamodel_add_calculation_group(
     alias: str, group_name: str, items_json: str, precedence: int = 0
 ) -> str:
@@ -12298,7 +12328,7 @@ def pbix_datamodel_add_calculation_group(
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Change a column property"))
 def pbix_datamodel_modify_column(
     alias: str, table_name: str, column_name: str,
     property_name: str, new_value: str
@@ -12363,7 +12393,7 @@ def pbix_datamodel_modify_column(
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Sort a column by another"))
 def pbix_set_sort_by_column(
     alias: str, table_name: str, column_name: str, sort_by_column: str = ""
 ) -> str:
@@ -12446,7 +12476,7 @@ def pbix_set_sort_by_column(
         return ToolResponse.error(str(e)).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List sort-by columns"))
 def pbix_get_sort_by_columns(alias: str) -> str:
     """List every column that is sorted by another column.
 
@@ -12683,7 +12713,7 @@ def _materialize_table_calc_columns(
     return columns_out, rows_out, restamp
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Add a calculated column"))
 def pbix_datamodel_add_calculated_column(
     alias: str, table_name: str, column_name: str, dax: str, data_type: str = ""
 ) -> str:
@@ -12863,7 +12893,7 @@ def _calc_column_dependents(conn, tid: int, table_name: str,
     return out
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Remove a calculated column"))
 def pbix_datamodel_remove_calculated_column(
     alias: str, table_name: str, column_name: str
 ) -> str:
@@ -13427,7 +13457,7 @@ def _rebuild_preserving_calc(alias: str, info: dict, **rebuild_kwargs):
     return old_size, new_size
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Add a calculated table"))
 def pbix_datamodel_add_calculated_table(
     alias: str, table_name: str, dax: str
 ) -> str:
@@ -13551,7 +13581,7 @@ def pbix_datamodel_add_calculated_table(
             f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Decompress the data model"))
 def pbix_datamodel_decompress(alias: str) -> str:
     """Decompress the DataModel from a PBIX into raw ABF format.
 
@@ -13594,7 +13624,7 @@ def pbix_datamodel_decompress(alias: str) -> str:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", DataModelCompressionError.code).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Recompress the data model"))
 def pbix_datamodel_recompress(alias: str, abf_path: str = "") -> str:
     """Recompress a modified ABF file back into the DataModel.
 
@@ -13668,7 +13698,7 @@ def pbix_datamodel_recompress(alias: str, abf_path: str = "") -> str:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", ABFRebuildError.code).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Replace a file in the data model"))
 def pbix_datamodel_replace_file(alias: str, internal_path: str, new_content_path: str) -> str:
     """Replace a specific file inside the ABF (decompressed DataModel).
 
@@ -13732,7 +13762,7 @@ def pbix_datamodel_replace_file(alias: str, internal_path: str, new_content_path
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", ABFRebuildError.code).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Extract a file from the data model"))
 def pbix_datamodel_extract_file(alias: str, internal_path: str, output_path: str = "") -> str:
     """Extract a specific file from inside the ABF (decompressed DataModel).
 
@@ -13779,7 +13809,7 @@ def pbix_datamodel_extract_file(alias: str, internal_path: str, output_path: str
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", DataModelCompressionError.code).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List the data model's files"))
 def pbix_datamodel_list_abf_files(alias: str) -> str:
     """List all files inside the ABF (decompressed DataModel).
 
@@ -14444,7 +14474,7 @@ def _evaluate_dax_for_context(ctx: dict, alias: str, measure_names: list[str],
         return _unexpected_error_text(e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Evaluate DAX measures"))
 def pbix_evaluate_dax(
     alias: str,
     measures: str,
@@ -14588,7 +14618,7 @@ def _batch_context_problem(item) -> str | None:
     return None
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Evaluate DAX across filter contexts"))
 def pbix_evaluate_dax_batch(
     alias: str,
     measures: str,
@@ -14719,7 +14749,7 @@ def pbix_evaluate_dax_batch(
         return _unexpected_error_text(e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Evaluate DAX per dimension value"))
 def pbix_evaluate_dax_per_dimension(
     alias: str,
     measures: str,
@@ -14863,7 +14893,7 @@ def pbix_evaluate_dax_per_dimension(
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Evaluate DAX by group"))
 def pbix_evaluate_dax_grouped(
     alias: str,
     measures: str,
@@ -16206,7 +16236,7 @@ def _get_default_filters_current(ctx: dict) -> dict:
     return df
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Show a page's default filters"))
 def pbix_get_default_filters(alias: str, page_index: int = 0) -> str:
     """Extract default slicer filter selections from a report page.
 
@@ -16247,7 +16277,7 @@ def pbix_get_default_filters(alias: str, page_index: int = 0) -> str:
         raise LayoutParseError(f"{str(e)}\n{traceback.format_exc()}")
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Show visual positions"))
 def pbix_get_visual_positions(alias: str, page_index: int = 0) -> str:
     """Get all visual positions with parent group offset resolution.
 
@@ -16304,7 +16334,7 @@ def pbix_get_visual_positions(alias: str, page_index: int = 0) -> str:
         raise LayoutParseError(f"{str(e)}\n{traceback.format_exc()}")
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Clear the DAX cache"))
 def pbix_clear_dax_cache(alias: str = "") -> str:
     """Clear the DAX engine data cache.
 
@@ -16324,7 +16354,7 @@ def pbix_clear_dax_cache(alias: str = "") -> str:
 
 # ---- Section 10: Calculated Columns ----
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Evaluate calculated columns"))
 def pbix_evaluate_calculated_columns(alias: str) -> str:
     """Evaluate all calculated columns in the data model.
 
@@ -16410,7 +16440,7 @@ def pbix_evaluate_calculated_columns(alias: str) -> str:
 
 # ---- Section 11: RLS (Row-Level Security) ----
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List row-level security roles"))
 def pbix_get_rls_roles(alias: str) -> str:
     """Get all Row-Level Security roles and their table filter expressions.
 
@@ -16492,7 +16522,7 @@ def pbix_get_rls_roles(alias: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Set a row-level security role"))
 def pbix_set_rls_role(
     alias: str,
     role_name: str,
@@ -16582,7 +16612,7 @@ def pbix_set_rls_role(
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Evaluate a row-level security role"))
 def pbix_evaluate_rls(
     alias: str,
     role_name: str,
@@ -16742,7 +16772,7 @@ def _read_metadata_db(alias: str):
     return info, conn, tmp_path
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List perspectives"))
 def pbix_get_perspectives(alias: str) -> str:
     """Get all perspectives with their included tables, columns, and measures.
 
@@ -16805,7 +16835,7 @@ def pbix_get_perspectives(alias: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Add a perspective"))
 def pbix_add_perspective(
     alias: str,
     name: str,
@@ -16916,7 +16946,7 @@ def pbix_add_perspective(
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Remove a perspective"))
 def pbix_remove_perspective(alias: str, name: str) -> str:
     """Remove a perspective and all its included table/column/measure references.
 
@@ -16962,7 +16992,7 @@ def pbix_remove_perspective(alias: str, name: str) -> str:
 # ---- Section 10c: User Hierarchies ----
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List hierarchies"))
 def pbix_get_hierarchies(alias: str) -> str:
     """Get all user hierarchies with their levels and columns.
 
@@ -17016,7 +17046,7 @@ def pbix_get_hierarchies(alias: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Add a hierarchy"))
 def pbix_add_hierarchy(
     alias: str,
     table_name: str,
@@ -17162,7 +17192,7 @@ def pbix_add_hierarchy(
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Remove a hierarchy"))
 def pbix_remove_hierarchy(alias: str, table_name: str, hierarchy_name: str) -> str:
     """Remove a user hierarchy and all its levels.
 
@@ -17208,7 +17238,7 @@ def pbix_remove_hierarchy(alias: str, table_name: str, hierarchy_name: str) -> s
 # ---- Section 10d: Cultures & Translations ----
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List cultures"))
 def pbix_get_cultures(alias: str) -> str:
     """Get all cultures (languages) with translation counts.
 
@@ -17280,7 +17310,7 @@ def pbix_get_cultures(alias: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Set the model's culture"))
 def pbix_set_model_culture(alias: str, culture_name: str) -> str:
     """Set the MODEL's own culture (Model.Culture / SourceQueryCulture).
 
@@ -17335,7 +17365,7 @@ def pbix_set_model_culture(alias: str, culture_name: str) -> str:
         raise DataModelCompressionError(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Add a culture"))
 def pbix_add_culture(alias: str, culture_name: str) -> str:
     """Add a culture (language) for translations.
 
@@ -17376,7 +17406,7 @@ def pbix_add_culture(alias: str, culture_name: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Add translations"))
 def pbix_add_translations(alias: str, culture_name: str, translations_json: str) -> str:
     """Add translated names/descriptions for model objects in a culture.
 
@@ -17499,7 +17529,7 @@ def pbix_add_translations(alias: str, culture_name: str, translations_json: str)
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Remove a culture"))
 def pbix_remove_culture(alias: str, culture_name: str) -> str:
     """Remove a culture and all its translations.
 
@@ -17533,7 +17563,7 @@ def pbix_remove_culture(alias: str, culture_name: str) -> str:
 # ---- Section 10e: Partition Management ----
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List partitions"))
 def pbix_get_partitions(alias: str) -> str:
     """Get all partitions with table, type, mode, and M expression.
 
@@ -17582,7 +17612,7 @@ def pbix_get_partitions(alias: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_adds("Add a partition"))
 def pbix_add_partition(
     alias: str,
     table_name: str,
@@ -17653,7 +17683,7 @@ def pbix_add_partition(
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Remove a partition"))
 def pbix_remove_partition(alias: str, table_name: str, partition_name: str) -> str:
     """Remove a partition from a table.
 
@@ -17709,7 +17739,7 @@ def pbix_remove_partition(alias: str, table_name: str, partition_name: str) -> s
 
 # ---- Section 11: Diagnostics ----
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Find password-gate values"))
 def pbix_get_password(alias: str) -> str:
     """Extract embedded passwords from a PBIX file.
 
@@ -17801,7 +17831,7 @@ def pbix_get_password(alias: str) -> str:
         return ToolResponse.error(str(e), "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Analyze report performance"))
 def pbix_performance(alias: str) -> str:
     """Analyze report for performance issues and optimization opportunities.
 
@@ -17972,7 +18002,7 @@ def pbix_performance(alias: str) -> str:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Compare two files"))
 def pbix_diff(alias_a: str, alias_b: str) -> str:
     """Compare two open PBIX files and show what changed.
 
@@ -18204,7 +18234,7 @@ def pbix_diff(alias_a: str, alias_b: str) -> str:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Generate report documentation"))
 def pbix_document(alias: str, output_path: str = "") -> str:
     """Auto-generate a comprehensive report documentation summary.
 
@@ -18512,7 +18542,7 @@ def pbix_document(alias: str, output_path: str = "") -> str:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", "INTERNAL_ERROR").to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Run file diagnostics"))
 def pbix_doctor(alias: str) -> str:
     """Run comprehensive diagnostics on an open PBIX/PBIT file.
 
@@ -19881,7 +19911,7 @@ def _export_tmdl_from_sqlite(conn: sqlite3.Connection, output_dir: str) -> dict:
     return stats
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Set an incremental refresh policy"))
 def pbix_set_incremental_refresh(
     alias: str,
     table_name: str,
@@ -20059,7 +20089,7 @@ def pbix_set_incremental_refresh(
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("List incremental refresh policies"))
 def pbix_get_incremental_refresh(alias: str) -> str:
     """Get incremental refresh policies for all tables.
 
@@ -20141,7 +20171,7 @@ def pbix_get_incremental_refresh(alias: str) -> str:
         return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Export the model as TMDL"))
 def pbix_export_tmdl(alias: str, output_path: str = "") -> str:
     """Export the data model as TMDL (Tabular Model Definition Language) files.
 
@@ -20506,7 +20536,7 @@ def _build_pbix_from_tmdl_model(model: dict, output_path: str) -> dict:
     return stats
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Build a report file from TMDL"))
 def pbix_import_tmdl(tmdl_path: str, output_path: str = "", alias: str = "") -> str:
     """Import a TMDL model (folder or single .tmdl file) into a new PBIX.
 
@@ -20652,7 +20682,7 @@ def _resolve_pbip_project(path: str) -> tuple[str, str, str, str]:
     return root, base_name, report_dir, tmdl_def
 
 
-@mcp.tool()
+@mcp.tool(annotations=_reads("Open a PBIP project"))
 def pbix_open_pbip(path: str, alias: str = "") -> str:
     """Open a PBIP project folder (TMDL model half + report half) as a live
     document — the same session every other tool operates on. pbix_save
@@ -20950,7 +20980,7 @@ def _pbix_config_to_pbir_visual(config: dict, x: float, y: float, w: float, h: f
     return result
 
 
-@mcp.tool()
+@mcp.tool(annotations=_changes("Export as a PBIP project"))
 def pbix_export_pbip(alias: str, output_dir: str = "") -> str:
     """Convert a PBIX to PBIP (Power BI Project) folder structure.
 

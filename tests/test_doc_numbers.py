@@ -160,7 +160,7 @@ def test_readme_tools_section_is_complete():
     path = os.path.join(_ROOT, "src", "pbix_mcp", "server.py")
     with open(path, encoding="utf-8") as fh:
         src = fh.read()
-    actual = set(re.findall(r"@mcp\.tool\(\)\s*\ndef (\w+)\(", src))
+    actual = set(re.findall(r"@mcp\.tool\([^\n]*\)\s*\ndef (\w+)\(", src))
     n = len(actual)
 
     readme = _read("README.md")

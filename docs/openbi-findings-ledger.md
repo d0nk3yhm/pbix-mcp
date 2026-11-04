@@ -40,8 +40,12 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-28 (0.9.152): docs 1-66 and GitHub issues/PRs #1-#361 are
-closed.** 0.9.152 closes #361 (@allanon2: a measure reference in a model
+**Updated 2026-11-04 (0.9.153): docs 1-66 and GitHub issues/PRs #1-#361 and
+#364-#368 are closed; PRs #362 and #363 are open.** 0.9.153 adds tool annotations (#366),
+our own server names (#368) and a privacy section (#367). No DAX answer changes.
+
+As of 0.9.152 (2026-10-28): docs 1-66 and GitHub issues/PRs #1-#361 were
+closed. 0.9.152 closes #361 (@allanon2: a measure reference in a model
 table's rows looked its name up per row since #358).
 
 As of 0.9.151 (2026-10-28): docs 1-66 and GitHub issues/PRs #1-#360 were

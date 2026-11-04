@@ -106,7 +106,7 @@ as `tests/test_pbir_schema_conformance.py` (marked `integration`).
 
 ## Adding a New MCP Tool
 
-1. Add `@mcp.tool()` function in `server.py`
+1. Add an `@mcp.tool(annotations=_reads("Title"))` function in `server.py`: `_reads`, `_adds`, `_changes` or `_changes_each_call`, by what the tool does. A `_reads` tool also goes in `tests/test_issue366_tool_annotations.py`, which runs it and checks that nothing changed
 2. Return `ToolResponse.ok(...)` or `ToolResponse.error(...)`
 3. Catch `PBIXMCPError` before `Exception`
 4. Add `logger.info(...)` at entry point

@@ -40,7 +40,7 @@ The quickest way in Claude Code. You need [uv](https://docs.astral.sh/uv/getting
 /plugin install pbix-mcp@pbix-mcp
 ```
 
-Check with `/mcp` that `plugin:pbix-mcp:powerbi-editor` is connected. See [the plugin's README](plugins/pbix-mcp/README.md).
+Check with `/mcp` that `plugin:pbix-mcp:pbix-mcp` is connected. See [the plugin's README](plugins/pbix-mcp/README.md).
 
 ### Claude Desktop / Claude Code
 
@@ -55,7 +55,7 @@ Add to your MCP config file:
 ```json
 {
   "mcpServers": {
-    "powerbi-editor": {
+    "pbix-mcp": {
       "command": "pbix-mcp-server"
     }
   }
@@ -66,7 +66,7 @@ Add to your MCP config file:
 > ```json
 > {
 >   "mcpServers": {
->     "powerbi-editor": {
+>     "pbix-mcp": {
 >       "command": "python",
 >       "args": ["-m", "pbix_mcp.cli"]
 >     }
@@ -79,7 +79,7 @@ Add to your MCP config file:
 1. `pip install git+https://github.com/d0nk3yhm/pbix-mcp.git`
 2. Open Codex Desktop → Settings → MCP → Add Server
 3. Configure:
-   - **Name**: `powerbi-editor`
+   - **Name**: `pbix-mcp`
    - **Command**: `pbix-mcp-server`
    - **Arguments**: *(leave empty)*
 
