@@ -257,7 +257,7 @@ wheels = [
 
 [[package]]
 name = "pbix-mcp"
-version = "0.9.152"
+version = "0.9.153"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apsw" },
@@ -266,21 +266,21 @@ dependencies = [
     { name = "xmhuffman" },
     { name = "xpress9" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d7/e8/484e8a3d239900272f30036596d6494ce2ddedcaefa3770e0732161f2d73/pbix_mcp-0.9.152.tar.gz", hash = "sha256:fff6bedd20977cbb1fb99f584141ccbd832acec01440a87577fe97e8c65f03d8", size = 2746218, upload-time = "2026-10-28T21:03:51.276Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/cf/af/75c84ecd0f5c592f998d1ea9deb69bef2640419d060918065b96c7c58bff/pbix_mcp-0.9.153.tar.gz", hash = "sha256:09387b9b7f5fa3860afb8846078838e1bcb03256f4b1beb2996783ecc28c3144", size = 2866543, upload-time = "2026-11-04T02:19:56.036Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e2/9b/6216326c58df930fa13fdd2a42ea2125e9f11c4660da5de853f3bd426423/pbix_mcp-0.9.152-py3-none-any.whl", hash = "sha256:9bb6f610ed5df3f67cd144776af93c14d62c0d9f2e4f722bb4edf68940fa053d", size = 952844, upload-time = "2026-10-28T21:03:49.098Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/9c/57a39dda8556771e84bce18df92749cd753c3073dcfc4cc9a0776c197aff/pbix_mcp-0.9.153-py3-none-any.whl", hash = "sha256:25688dda8fe1fb98c78e2dcb09bc489821c3c2b4353d62be47670638b4646fd8", size = 954431, upload-time = "2026-11-04T02:19:53.777Z" },
 ]
 
 [[package]]
 name = "pbix-mcp-plugin"
-version = "0.9.152"
+version = "0.9.153"
 source = { virtual = "." }
 dependencies = [
     { name = "pbix-mcp" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pbix-mcp", specifier = "==0.9.152" }]
+requires-dist = [{ name = "pbix-mcp", specifier = "==0.9.153" }]
 
 [[package]]
 name = "pycparser"

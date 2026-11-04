@@ -154,6 +154,15 @@ def test_the_manifests_icon_is_a_png_in_the_plugin(manifest):
     assert icon.read_bytes()[1:4] == b"PNG"
 
 
+def test_the_privacy_link_points_at_the_readmes_privacy_section(manifest):
+    # #367: the directory's compliance step has the submitter vouch for it
+    prefix = "https://github.com/d0nk3yhm/pbix-mcp/blob/main/plugins/pbix-mcp/"
+    assert manifest["privacyPolicyUrl"] == prefix + "README.md#privacy"
+    section = (PLUGIN / "README.md").read_text(encoding="utf-8").split("## Privacy")[1].split("\n## ")[0]
+    for said in ("What it reads", "Where it goes", "What it keeps"):
+        assert said in section
+
+
 def test_the_plugin_folder_has_a_readme_the_directory_accepts():
     assert len((PLUGIN / "README.md").read_text(encoding="utf-8").split()) >= 40
 

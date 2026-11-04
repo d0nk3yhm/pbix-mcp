@@ -156,7 +156,7 @@ uv lock --upgrade --project plugins/pbix-mcp
 claude plugin validate ./plugins/pbix-mcp
 ```
 
-It warns about `icon`, `documentationUrl` and `supportUrl`, which Claude Code ignores and the plugin directory reads; anything else needs a look. `--strict` fails on those three.
+It warns about `icon`, `documentationUrl`, `supportUrl` and `privacyPolicyUrl`, which Claude Code ignores and the plugin directory reads; anything else needs a look. `--strict` fails on those four.
 
 `--upgrade` also takes the dependencies' current releases, which is how their fixes reach plugin users.
 
