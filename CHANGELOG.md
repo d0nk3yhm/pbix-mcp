@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Reported by @allanon2 in #362 and #363, measured on Microsoft's MIT sample `2026 Power BI Samples Revamp/AdventureWorks Sales.pbix`.
+
+### Fixed — a date table filter reaches a table two hops away (issue #369; reported by @allanon2 in #362)
+
+A filter on the date table did not reach a table with no direct relationship to it, even with a relationship path, so the measure answered its grand total without a warning. On that sample, `Orders = DISTINCTCOUNT('Sales Order'[Sales Order])` (`Date -> Sales -> Sales Order`, the last relationship filtering both ways) answered 31455 for 2018. It now answers 3748, the count from the table rows. The date table's route by date-column name had run before the path search and found nothing on `Sales Order`. The path now comes first, in `_source_cross_filters_uncached` and `_se_join_column`, and the by-name route remains for a table no path reaches. Tests: `tests/test_issue369_date_two_hops.py`.
+
+### Fixed — calculation groups whose item column has no SourceColumn (issue #370; reported by @allanon2 in #363)
+
+`ModelReader.calculation_groups` found a group's item column only by `SourceColumn = "Name"`. Both groups in that sample leave it empty, so they were skipped and `Sales by Due Date` / `Sales by Ship Date` answered the order-date figure. With no column sourced from `Name`, the item column is now the one data column that isn't the `Ordinal`, and two such columns leave the group undecided as before. For 2018 they now answer 29892677.7569 and 29998861.1604, the sums from the table rows by each date key. Tests: `tests/test_issue370_calc_group_item_column.py`.
+
 ## [0.9.153] - 2026-11-04
 
 For Anthropic's plugin directory: its policy's tool annotations, a privacy link, and names of our own. No answer of the DAX engine and no file the package writes changes.

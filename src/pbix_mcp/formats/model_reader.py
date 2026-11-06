@@ -274,7 +274,8 @@ class ModelReader:
 
         ``column`` is the group's item column, the one whose SourceColumn is
         "Name" (Desktop names it after the group, e.g. 'Time Intelligence'
-        [Time]). ``format_string`` is the item's dynamic format-string
+        [Time]), or else the one data column that isn't the Ordinal (#370).
+        ``format_string`` is the item's dynamic format-string
         expression, or None.
         """
         if "calculation_groups" in self._metadata_cache:
@@ -292,7 +293,16 @@ class ModelReader:
                 name_col = next((c["ColumnName"] for c in cols
                                  if str(c.get("SourceColumn") or "").lower() == "name"), None)
                 if name_col is None:
-                    continue
+                    # #370: a file may leave SourceColumn empty on the item
+                    # column (Microsoft's 2026 AdventureWorks Sales sample:
+                    # one data column per group, SourceColumn NULL). It is
+                    # then the one data column that isn't the Ordinal; with
+                    # two such columns the group stays undecided.
+                    candidates = [c["ColumnName"] for c in cols
+                                  if str(c.get("SourceColumn") or "").lower() != "ordinal"]
+                    if len(candidates) != 1:
+                        continue
+                    name_col = candidates[0]
                 try:
                     items = self._query_metadata(
                         "SELECT ci.Name, ci.Expression, ci.Ordinal, f.Expression AS FormatString "

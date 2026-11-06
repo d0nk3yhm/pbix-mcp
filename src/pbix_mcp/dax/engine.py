@@ -8301,12 +8301,12 @@ class DAXContext:
         # ...) restricts Date, [Actives] = 32,401).
         rel = self._rel_dir.get((table_name, src_table))
         if not rel:
-            # Try via date table special handling (for Year/Month filters on date dim)
-            if src_table == self.date_table:
-                return list(self._get_date_cross_filter(table_name, src_tbl, col_filters))
             # No direct relationship: try a multi-hop (snowflake) path so a
             # filter on a dimension 2+ hops from the fact is not silently
-            # dropped (e.g. Regions -> Customers -> Orders).
+            # dropped (e.g. Regions -> Customers -> Orders). The date table
+            # takes the path too (#369: Date -> Sales -> Sales Order, where
+            # Sales Order has no date column); its by-column-name route below
+            # is only for a table no path reaches.
             path = self._find_rel_path(src_table, table_name)
             if path:
                 res = self._propagate_filter_path(src_tbl, col_filters, path, table_name)
@@ -8315,6 +8315,10 @@ class DAXContext:
                 # rows rather than falling back to the grand total.
                 if res is not None:
                     return [res]
+            if src_table == self.date_table:
+                # The date table's own handling, for Year/Month filters on a
+                # table with no path to it but a date column.
+                return list(self._get_date_cross_filter(table_name, src_tbl, col_filters))
             return []
 
         # Direct relationship exists: filter source dim table, get join key values
@@ -9870,19 +9874,21 @@ class DAXContext:
         rel = self._rel_dir.get((table_name, src))
         if rel:
             out = self._se_own_column(cols, rel['from_col'])
-        elif src == self.date_table:
-            rel = self._rel_index.get((table_name, self.date_table))
-            if rel:
-                out = self._se_own_column(cols, rel['from_col'])
-            if out is None:
-                for dcn in self._DATE_FALLBACK_COLUMNS:
-                    out = self._se_own_column(cols, dcn)
-                    if out is not None:
-                        break
         else:
+            # The same order as _source_cross_filters_uncached (#369): a
+            # path first, the date table's by-name route only without one.
             path = self._find_rel_path(src, table_name)
             if path:
                 out = self._se_own_column(cols, path[-1][3])
+            elif src == self.date_table:
+                rel = self._rel_index.get((table_name, self.date_table))
+                if rel:
+                    out = self._se_own_column(cols, rel['from_col'])
+                if out is None:
+                    for dcn in self._DATE_FALLBACK_COLUMNS:
+                        out = self._se_own_column(cols, dcn)
+                        if out is not None:
+                            break
         cache[key] = out
         return out
 
