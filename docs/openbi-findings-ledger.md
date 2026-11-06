@@ -592,6 +592,14 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **GH #369, #370** (PRs #362 / #363 by @allanon2, solved on our side) --
+  CLOSED (unreleased, f4d194f). A date table filter reaches a table two hops
+  away, Date -> Sales -> Sales Order (#369); a calculation group whose item
+  column has no SourceColumn takes its one non-Ordinal data column (#370).
+  Measured on Microsoft's 2026 AdventureWorks Sales sample against counts from
+  the table rows (Orders 2018 31455 -> 3748; by due / ship date 29892677.7569 /
+  29998861.1604). Regression: tests/test_issue369_*.py, test_issue370_*.py.
+
 - **GH #361** (@allanon2) -- CLOSED (0.9.152). A measure reference in a model
   table's rows looks its name up once per table and name, not per row.
   Regression: tests/test_issue361_*.py.
