@@ -17,6 +17,21 @@ A filter on the date table did not reach a table with no direct relationship to 
 
 `ModelReader.calculation_groups` found a group's item column only by `SourceColumn = "Name"`. Both groups in that sample leave it empty, so they were skipped and `Sales by Due Date` / `Sales by Ship Date` answered the order-date figure. With no column sourced from `Name`, the item column is now the one data column that isn't the `Ordinal`, and two such columns leave the group undecided as before. For 2018 they now answer 29892677.7569 and 29998861.1604, the sums from the table rows by each date key. Tests: `tests/test_issue370_calc_group_item_column.py`.
 
+### Fixed — FORMAT's named date formats follow the culture; the AMPM token; "General Date" drops a zero part
+
+Measured on Power BI Desktop 2.157 with an en-US model, `FORMAT(v, fmt)` and `FORMAT(v, fmt, c)` for en-US, en-AU, en-GB, en-NZ, en-IE and en-CA; the connection's locale changed no answer.
+
+- "Short Date", "Long Date", "Long Time" and "General Date" render in FORMAT's third argument, else the model's culture, else en-US. They rendered en-US whatever the culture. On 2026-01-06 13:30:05, "Short Date" is `6/01/2026` (en-AU, en-NZ), `06/01/2026` (en-GB, en-IE), `2026-01-06` (en-CA); "Long Date" `Tuesday, 6 January 2026` (en-AU, en-NZ), `06 January 2026` (en-GB), `Tuesday 6 January 2026` (en-IE), `January 6, 2026` (en-CA), with English names; "Long Time" is 24-hour in en-GB and en-IE (`13:30:05`). The cultures were measured through the third argument; a model's culture is presumed to act the same, as the model's culture decides on an en-US model.
+- "Medium Date", "Medium Time" and "Short Time" are the same in all six cultures but for the designators: `06-Jan-26`, `01:30 PM` and `13:30`. "Medium Time" padded no hour (`1:30 PM`).
+- "General Date" prints the date alone at midnight (`1/6/2026`) and the time alone on 1899-12-30 (`9:05:00 AM`, en-GB `09:05:00`); it always printed both. Both zero (1899-12-30 at midnight) is not measured; the time alone is printed.
+- The `AMPM` token (`AMPM` and `ampm` measured) prints the culture's designators, case included: `PM` in en-US, en-AU, en-GB and en-CA, `pm` in en-NZ and en-IE; noon is `12:00 PM`. At 13:30 it printed `A1P1`.
+- A named date format or the `AMPM` token in a culture the fork holds no date data for is reported unsupported instead of printing en-US's. Desktop prints de-DE in German (`06.01.2026`) and an unknown name ("zz-ZZ") in a fallback culture of its own; neither is ported. FORMAT's number separators keep their en-US fallback for an unknown culture. An empty third argument is read as none (Desktop prints the invariant culture there; not ported).
+- A picture ignores the culture's separators: `d/MM/yyyy h:mm:ss AMPM` prints `6/01/2026 1:30:05 PM` in en-US and en-AU alike, as before.
+- Calculated columns and tables format in the model's culture, as measures do; they formatted en-US. Not measured on Desktop for columns and tables: presumed the model's culture.
+- A calculation item's format-string expression whose FORMAT is refused gives no format string, and the measure names the refusal; it printed the text before the refused call.
+
+Tests: `tests/test_format_named_dates_by_culture.py`, `tests/test_format_culture_calculated.py`.
+
 ## [0.9.153] - 2026-11-04
 
 For Anthropic's plugin directory: its policy's tool annotations, a privacy link, and names of our own. No answer of the DAX engine and no file the package writes changes.

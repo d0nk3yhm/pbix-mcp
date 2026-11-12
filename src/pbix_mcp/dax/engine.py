@@ -19837,22 +19837,72 @@ class DAXEngine:
         self._note_unsupported(f"DATEDIFF interval {interval}")
         return None
 
-    # DAX date format tokens -> strftime. Ordered longest-first so "MMMM" isn't
-    # eaten by "MM" (dict preserves insertion order).
-    # Named pictures, matched case-insensitively before the token scan.
-    # Desktop: FORMAT(DATE(2021,7,19), "Long Date")  -> "Monday, July 19, 2021"
-    #          FORMAT(DATE(2021,7,19), "Short Date") -> "7/19/2021"
-    _NAMED_DATE_FMTS = {
-        'long date': 'dddd, mmmm d, yyyy',
+    # Named date and time formats, matched case-insensitively before the token
+    # scan, by culture (FORMAT's third argument, else the model's, else en-US),
+    # each written as a DAX picture: (Short Date, Long Date, Long Time, the AM
+    # and PM designators the AMPM token prints). Power BI Desktop 2.157,
+    # FORMAT(DATE(2026,1,6) + TIME(13,30,5), <name>, <culture>):
+    #   en-US  1/6/2026    Tuesday, January 6, 2026   1:30:05 PM
+    #   en-AU  6/01/2026   Tuesday, 6 January 2026    1:30:05 PM
+    #   en-GB  06/01/2026  06 January 2026            13:30:05
+    #   en-NZ  6/01/2026   Tuesday, 6 January 2026    1:30:05 pm
+    #   en-IE  06/01/2026  Tuesday 6 January 2026     13:30:05
+    #   en-CA  2026-01-06  January 6, 2026            1:30:05 PM
+    # Day and month names are English in all six. "General Date" is the short
+    # date and the long time, less a zero part (_named_date_picture). Medium
+    # Date, Medium Time and Short Time are the same in all six but for the
+    # designators: 06-Jan-26, 01:30 PM (the hour padded), 13:30.
+    _NAMED_DATE_FMTS_BY_CULTURE = {
+        'en-us': ('m/d/yyyy', 'dddd, mmmm d, yyyy', 'h:nn:ss AMPM', ('AM', 'PM')),
+        'en-au': ('d/mm/yyyy', 'dddd, d mmmm yyyy', 'h:nn:ss AMPM', ('AM', 'PM')),
+        'en-gb': ('dd/mm/yyyy', 'dd mmmm yyyy', 'HH:nn:ss', ('AM', 'PM')),
+        'en-nz': ('d/mm/yyyy', 'dddd, d mmmm yyyy', 'h:nn:ss AMPM', ('am', 'pm')),
+        'en-ie': ('dd/mm/yyyy', 'dddd d mmmm yyyy', 'HH:nn:ss', ('am', 'pm')),
+        'en-ca': ('yyyy-mm-dd', 'mmmm d, yyyy', 'h:nn:ss AMPM', ('AM', 'PM')),
+    }
+    _CULTURE_FREE_DATE_FMTS = {
         'medium date': 'dd-mmm-yy',
-        'short date': 'm/d/yyyy',
-        'general date': 'm/d/yyyy h:nn:ss AM/PM',
-        'long time': 'h:nn:ss AM/PM',
-        'medium time': 'h:nn AM/PM',
+        'medium time': 'hh:nn AMPM',
         'short time': 'HH:nn',
     }
+    _NAMED_DATE_FMTS = frozenset(('long date', 'medium date', 'short date', 'general date',
+                                  'long time', 'medium time', 'short time'))
 
-    def _format_datetime_pattern(self, val, fmt_str: str) -> str:
+    @staticmethod
+    def _named_date_culture(culture):
+        """The key of ``culture``'s date data: en-US when no culture is given,
+        None for any culture the fork holds none for -- its named formats and
+        AMPM token are refused there rather than printed in en-US's (Desktop
+        prints de-DE in German, and an unknown name in a fallback culture of
+        its own)."""
+        if not culture or not str(culture).strip():
+            return 'en-us'
+        key = str(culture).strip().lower().replace('_', '-')
+        return key if key in DAXEngine._NAMED_DATE_FMTS_BY_CULTURE else None
+
+    def _named_date_picture(self, val, name: str, key: str):
+        """The picture a named format stands for on ``val`` in culture ``key``."""
+        if name in self._CULTURE_FREE_DATE_FMTS:
+            return self._CULTURE_FREE_DATE_FMTS[name]
+        short, long_date, long_time, _ampm = self._NAMED_DATE_FMTS_BY_CULTURE[key]
+        if name == 'short date':
+            return short
+        if name == 'long date':
+            return long_date
+        if name == 'long time':
+            return long_time
+        # Desktop 2.157 drops a zero part: FORMAT(DATE(2026,1,6), "General
+        # Date") is "1/6/2026", FORMAT(DATE(1899,12,30) + TIME(9,5,0), ...) is
+        # "9:05:00 AM" (day zero; en-GB "09:05:00"), in all six cultures. Both
+        # parts zero (day zero at midnight) is not measured; the time alone is
+        # printed.
+        if (val.year, val.month, val.day) == (1899, 12, 30):
+            return long_time
+        if not isinstance(val, datetime) or (val.hour, val.minute, val.second) == (0, 0, 0):
+            return short
+        return short + ' ' + long_time
+
+    def _format_datetime_pattern(self, val, fmt_str: str, culture=None):
         """Render a DAX/VBA date picture.
 
         The old table was .NET-cased -- `MM` month, `mm` MINUTES -- but DAX
@@ -19866,10 +19916,19 @@ class DAXEngine:
         `m` means minutes only when it FOLLOWS an hour token, which is what
         Desktop's "mm hh:mm" -> "07 12:00" pins: the first is a month, the one
         after `hh:` is minutes. `nn` is always minutes.
+
+        A named format ("Short Date", ...) renders in ``culture`` (None for
+        en-US), and the AMPM token prints its designators; None is returned
+        where the fork holds no data for the culture and either is asked. A
+        picture ignores the culture's separators: Power BI Desktop 2.157 prints
+        "d/MM/yyyy h:mm:ss AMPM" as "6/01/2026 1:30:05 PM" in en-US and en-AU.
         """
-        named = self._NAMED_DATE_FMTS.get(fmt_str.strip().lower())
-        if named:
-            fmt_str = named
+        key = self._named_date_culture(culture)
+        name = fmt_str.strip().lower()
+        if name in self._NAMED_DATE_FMTS:
+            if key is None:
+                return None
+            fmt_str = self._named_date_picture(val, name, key)
         if isinstance(val, datetime):
             hh24, mi, ss = val.hour, val.minute, val.second
         else:
@@ -19880,6 +19939,14 @@ class DAXEngine:
         i, n = 0, len(fmt_str)
         while i < n:
             low = fmt_str[i:].lower()
+            if low.startswith('ampm'):
+                # Desktop 2.157: "AMPM" and "ampm" both print the culture's
+                # designators, case included: "PM" in en-US, "pm" in en-NZ
+                if key is None:
+                    return None
+                am, pm = self._NAMED_DATE_FMTS_BY_CULTURE[key][3]
+                out.append(am if hh24 < 12 else pm)
+                i += 4; prev = 'ampm'; continue
             if low.startswith('am/pm') or low.startswith('a/p'):
                 tok = 'am/pm' if low.startswith('am/pm') else 'a/p'
                 src = fmt_str[i:i + len(tok)]
@@ -19955,7 +20022,7 @@ class DAXEngine:
             _f = str(fmt).strip().lower()
             if (_f in self._NAMED_DATE_FMTS
                     or any(t in _f for t in ('yy', 'mm', 'dd', 'hh', 'nn',
-                                             'ss', 'am/pm'))):
+                                             'ss', 'am/pm', 'ampm'))):
                 coerced = _as_datetime(val)
                 if coerced is not None:
                     val = coerced
@@ -19966,7 +20033,11 @@ class DAXEngine:
             val = _as_number(val)
         # Datetime formatting (NOW()/TODAY()/date columns).
         if isinstance(val, (datetime, date)) and fmt:
-            return self._format_datetime_pattern(val, str(fmt))
+            out = self._format_datetime_pattern(val, str(fmt), culture)
+            if out is None:
+                # a named format whose pattern in this culture is not known
+                self._note_unsupported(f'FORMAT "{str(fmt).strip()}" in {culture}')
+            return out
         if fmt and isinstance(val, (int, float)) and not isinstance(val, bool):
             group_sep, dec_sep = _culture_seps(culture)
             # a Currency formats its exact decimal (issue #248,
@@ -31463,9 +31534,21 @@ def evaluate_format_strings(measure_names: list, tables: dict, measures: dict,
     _attach_model_shield_memo(ctx)
     out = {}
     for name in measure_names:
+        # What the expression notes unsupported, on its own: a refused FORMAT
+        # inside it is BLANK, so "x " & FORMAT(...) would be the truncated "x ".
+        # Such a measure gets no item format, and the refusal is its own.
+        seen = _engine.unsupported_functions
+        _engine.unsupported_functions = set()
         try:
             fmt = _engine.item_format_string(name, ctx)
         except Exception:      # noqa: BLE001 -- a broken expression formats nothing
+            continue
+        finally:
+            noted = _engine.unsupported_functions
+            seen.update(noted)
+            _engine.unsupported_functions = seen
+        if noted:
+            _engine.unsupported_by_measure.setdefault(name, set()).update(noted)
             continue
         if fmt is not DAXEngine._NO_ITEM_FORMAT:
             out[name] = None if fmt is None else str(fmt)
