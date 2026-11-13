@@ -18,10 +18,29 @@ from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
 
 
+def model_culture(conn) -> Optional[str]:
+    """``Model.Culture`` from a metadata SQLite connection, or None."""
+    try:
+        row = conn.execute("SELECT Culture FROM Model LIMIT 1").fetchone()
+    except Exception:  # noqa: BLE001 - an older metadata shape states none
+        return None
+    val = row[0] if row is not None else None
+    return str(val) if val else None
+
+
+def _context(dax_engine, tables, relationships, culture, measures=None):
+    """A DAXContext for a calculated column or table: the model's culture is
+    its FORMAT's, as a measure's (presumed; Desktop's columns not measured)."""
+    ctx = dax_engine.DAXContext(tables, measures or {}, None, None, None, relationships or [])
+    ctx.culture = culture
+    return ctx
+
+
 def load_calculated_tables(
     pbix_path: str,
     existing_tables: Dict[str, dict],
     relationships: Optional[List[dict]] = None,
+    culture: Optional[str] = None,
 ) -> Dict[str, dict]:
     """
     Read ABF metadata from a PBIX file, find all calculated tables,
@@ -31,6 +50,7 @@ def load_calculated_tables(
         pbix_path: Path to the .pbix file
         existing_tables: Already-loaded tables {name: {columns, rows}}
         relationships: Model relationships list
+        culture: The model's culture (Model.Culture), for FORMAT
 
     Returns:
         Updated tables dict with calculated tables added
@@ -100,7 +120,8 @@ def load_calculated_tables(
                 try:
                     tdef = calc_defs[tname]
                     expr = tdef['expression']
-                    result = _evaluate_table_expression(expr, tname, tdef, tables, relationships)
+                    result = _evaluate_table_expression(expr, tname, tdef, tables, relationships,
+                                                        culture)
 
                     if result:
                         tables[tname] = result
@@ -114,7 +135,7 @@ def load_calculated_tables(
     # Calculated columns have DAX expressions that are evaluated per-row
     # and added as new columns to existing tables.
     try:
-        tables = _evaluate_calculated_columns(tables, db_bytes, relationships)
+        tables = _evaluate_calculated_columns(tables, db_bytes, relationships, culture)
     except Exception:
         pass
 
@@ -125,6 +146,7 @@ def _evaluate_calculated_columns(
     tables: Dict[str, dict],
     db_bytes: bytes,
     relationships: List[dict],
+    culture: Optional[str] = None,
 ) -> Dict[str, dict]:
     """Evaluate calculated columns and add them to their parent tables.
 
@@ -209,7 +231,7 @@ def _evaluate_calculated_columns(
                             else:
                                 row_expr = row_expr.replace(pat, str(val))
 
-                ctx = dax_engine.DAXContext(tables, {}, None, None, None, relationships or [])
+                ctx = _context(dax_engine, tables, relationships, culture)
                 result = engine._eval_expr(row_expr, ctx)
                 # a model table's rows hold floats, a Currency too (the
                 # schema marks the column; issue #248)
@@ -1571,7 +1593,7 @@ def _build_calculate_resolver(spec, columns, rows, outer_fns):
 
 
 def _outer_value_fn(rhs: str, target_table: str, columns, engine, dax_engine,
-                    all_tables, relationships):
+                    all_tables, relationships, culture=None):
     """A function of the outer row for a predicate's right-hand side.
 
     A bare column reference reads the column directly. Anything else is
@@ -1594,7 +1616,7 @@ def _outer_value_fn(rhs: str, target_table: str, columns, engine, dax_engine,
     m_da = _DATEADD_DAY_RE.match(rhs.strip())
     if m_da:
         inner = _outer_value_fn(m_da.group(1), target_table, columns, engine,
-                               dax_engine, all_tables, relationships)
+                               dax_engine, all_tables, relationships, culture)
         delta = int(m_da.group(2))
 
         def shift(row_data):
@@ -1622,8 +1644,7 @@ def _outer_value_fn(rhs: str, target_table: str, columns, engine, dax_engine,
             raise ValueError(
                 "FILTER value references a column this engine cannot resolve "
                 "in row context: " + ", ".join(sorted(stray)))
-        ctx = dax_engine.DAXContext(all_tables, {}, None, None, None,
-                                    relationships or [])
+        ctx = _context(dax_engine, all_tables, relationships, culture)
         got = engine._eval_expr(sub, ctx)
         # A filter value MUST be a scalar. The engine represents the
         # time-intelligence functions as marker tuples and tables as lists;
@@ -1642,7 +1663,7 @@ _MASK_TOKEN_RE = re.compile(r"__(?:AGG|CALC|REL|LV)\d+__")
 
 
 def _lv_row_value(spec, idx, row_data, target_table, engine, dax_engine,
-                  all_tables, relationships):
+                  all_tables, relationships, culture=None):
     """One row's LOOKUPVALUE result as a VALUE -- (value, error).
 
     Same semantics as the old text-splicing resolver: several matching rows
@@ -1660,8 +1681,7 @@ def _lv_row_value(spec, idx, row_data, target_table, engine, dax_engine,
                 "LOOKUPVALUE search value references a column this engine "
                 "cannot resolve in row context: " + ", ".join(sorted(stray)))
         try:
-            ctx = dax_engine.DAXContext(
-                all_tables, {}, None, None, None, relationships or [])
+            ctx = _context(dax_engine, all_tables, relationships, culture)
             key.append(_lv_key(engine._eval_expr(sub, ctx)))
         except Exception as exc:  # noqa: BLE001 - refuse, don't guess
             return None, f"LOOKUPVALUE search value failed to evaluate: {exc}"
@@ -1675,8 +1695,7 @@ def _lv_row_value(spec, idx, row_data, target_table, engine, dax_engine,
                     "references a column this engine cannot resolve in row "
                     "context: " + ", ".join(sorted(stray)))
             try:
-                ctx = dax_engine.DAXContext(
-                    all_tables, {}, None, None, None, relationships or [])
+                ctx = _context(dax_engine, all_tables, relationships, culture)
                 return engine._eval_expr(sub, ctx), None
             except Exception as exc:  # noqa: BLE001
                 return None, f"row evaluation failed: {exc}"
@@ -1696,8 +1715,10 @@ def evaluate_row_context_column(
     target_table: str,
     all_tables: Dict[str, dict],
     relationships: Optional[List[dict]] = None,
+    culture: Optional[str] = None,
 ):
     """Evaluate a row-context calc-column expression against a table's rows.
+    ``culture`` is the model's, for FORMAT.
 
     Returns ``(values, error)``. ``error`` is None on success; otherwise a
     string and ``values`` is None. The caller MUST have already cleared
@@ -1741,11 +1762,11 @@ def evaluate_row_context_column(
     calc_resolvers = []
     for spec in calc_specs:
         outer = {"eq": [_outer_value_fn(rhs, target_table, columns, engine,
-                                        dax_engine, all_tables, relationships)
+                                        dax_engine, all_tables, relationships, culture)
                         for _c, rhs in spec["eq"]],
                  "ineq": (_outer_value_fn(spec["ineq"][2], target_table,
                                           columns, engine, dax_engine,
-                                          all_tables, relationships)
+                                          all_tables, relationships, culture)
                           if spec["ineq"] else None)}
         built = _build_calculate_resolver(spec, columns, rows, outer)
         if isinstance(built, str):
@@ -1780,8 +1801,7 @@ def evaluate_row_context_column(
     base_scope: dict = {}
     for n, call in enumerate(agg_spans):
         try:
-            actx = dax_engine.DAXContext(
-                all_tables, {}, None, None, None, relationships or [])
+            actx = _context(dax_engine, all_tables, relationships, culture)
             base_scope[_AGG_MASK.format(n)] = engine._eval_expr(call, actx)
         except Exception as e:  # noqa: BLE001 - refuse, don't store garbage
             return None, f"row evaluation failed: {e}"
@@ -1858,13 +1878,12 @@ def evaluate_row_context_column(
             for n, spec in enumerate(lv_specs):
                 val, lv_err = _lv_row_value(
                     spec, lv_index[n], row_data, target_table, engine,
-                    dax_engine, all_tables, relationships)
+                    dax_engine, all_tables, relationships, culture)
                 if lv_err:
                     return None, lv_err
                 scope[_LV_MASK.format(n)] = val
         try:
-            ctx = dax_engine.DAXContext(
-                all_tables, {}, None, None, None, relationships or [])
+            ctx = _context(dax_engine, all_tables, relationships, culture)
             # Column refs resolve through the engine's own row context, so the
             # SAME text evaluates on every row and its plan is parsed once.
             ctx._current_row = {'__table__': target_table, **row_data}
@@ -2082,8 +2101,10 @@ def evaluate_calc_table_expression(
     tables: Dict[str, dict],
     measures: Optional[Dict[str, str]] = None,
     relationships: Optional[List[dict]] = None,
+    culture: Optional[str] = None,
 ):
     """Evaluate a calculated-table DAX expression to ``{columns, rows}``.
+    ``culture`` is the model's, for FORMAT.
 
     Returns ``(result, error)``; ``error`` is None on success. Refuses (rather
     than returning a partial/blank table) when the engine reports an
@@ -2095,8 +2116,7 @@ def evaluate_calc_table_expression(
 
     clean = strip_dax_comments(expression).strip()
     engine = dax_engine.DAXEngine()
-    ctx = dax_engine.DAXContext(
-        tables, measures or {}, None, None, None, relationships or [])
+    ctx = _context(dax_engine, tables, relationships, culture, measures)
     try:
         result = engine._eval_expr(clean, ctx)
     except Exception as e:  # noqa: BLE001 — refuse, never persist garbage
@@ -2198,6 +2218,7 @@ def _evaluate_table_expression(
     tdef: dict,
     tables: dict,
     relationships: list,
+    culture: Optional[str] = None,
 ) -> Optional[dict]:
     """Evaluate a single calculated table DAX expression."""
 
@@ -2237,7 +2258,7 @@ def _evaluate_table_expression(
     try:
         from pbix_mcp.dax import engine as dax_engine
         engine = dax_engine.DAXEngine()
-        ctx = dax_engine.DAXContext(tables, {}, None, None, None, relationships or [])
+        ctx = _context(dax_engine, tables, relationships, culture)
         result = engine._eval_expr(clean, ctx)
         if isinstance(result, list) and result:
             return _convert_dax_result(result, tdef)
