@@ -125,6 +125,33 @@ class TestTheAuthoringPaths:
         assert err is None
         assert result["rows"] == [[want]]
 
+    @pytest.mark.parametrize("culture,want", [("en-AU", [1]), ("en-US", [2])])
+    def test_a_lookupvalue_search_value(self, culture, want):
+        tables = {"T": {"columns": ["D"], "rows": [[datetime(2026, 1, 6)]]},
+                  "Days": {"columns": ["Label", "N"], "rows": [["6/01/2026", 1], ["1/6/2026", 2]]}}
+        vals, err = ct.evaluate_row_context_column(
+            ["D"], [[datetime(2026, 1, 6)]], f"LOOKUPVALUE('Days'[N], 'Days'[Label], {SHORT})", "T",
+            tables, [], culture=culture)
+        assert (vals, err) == (want, None)
+
+    @pytest.mark.parametrize("culture,want", [("en-AU", ["6/01/2026"]), ("en-US", ["1/6/2026"])])
+    def test_a_lookupvalue_alternate_result(self, culture, want):
+        tables = {"T": {"columns": ["D"], "rows": [[datetime(2026, 1, 6)]]},
+                  "Days": {"columns": ["Label", "N"], "rows": [["6/01/2026", 1]]}}
+        vals, err = ct.evaluate_row_context_column(
+            ["D"], [[datetime(2026, 1, 6)]], f"LOOKUPVALUE('Days'[N], 'Days'[Label], \"x\", {SHORT})", "T",
+            tables, [], culture=culture)
+        assert (vals, err) == (want, None)
+
+    @pytest.mark.parametrize("culture,want", [("en-AU", [1.0, 1.0]), ("en-US", [2.0, 2.0])])
+    def test_a_calculate_filters_outer_value(self, culture, want):
+        rows = [[datetime(2026, 1, 6), "6/01/2026", 1], [datetime(2026, 1, 6), "1/6/2026", 2]]
+        tables = {"T": {"columns": ["D", "L", "K"], "rows": rows}}
+        vals, err = ct.evaluate_row_context_column(
+            ["D", "L", "K"], rows, 'CALCULATE(SUM(T[K]), FILTER(T, T[L] = FORMAT(T[D], "Short Date")))', "T",
+            tables, [], culture=culture)
+        assert (vals, err) == (want, None)
+
     def test_a_refused_format_refuses_the_column(self):
         vals, err = ct.evaluate_row_context_column(
             ["D"], [[datetime(2026, 1, 6)]], 'FORMAT(T[D], "Short Date")', "T", _table(), [],
