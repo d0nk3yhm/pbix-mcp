@@ -7,7 +7,8 @@ own engine; the connection's locale changed none of the answers):
 - EN_US / EN_AU: ``FORMAT(v, fmt)`` on the en-US model and
   ``FORMAT(v, fmt, "en-AU")``, four named formats and four pictures.
 - MEASURED_C and NOON_MIDNIGHT: ``FORMAT(v, fmt, c)`` for en-US, en-AU, en-GB,
-  en-NZ, en-IE and en-CA, all seven named formats and ``AMPM``.
+  en-NZ, en-IE and en-CA, all seven named formats and the ``AMPM`` token
+  (``ampm`` in lower case only in en-US and en-AU).
 
 Readings: the ``AMPM`` token prints the culture's own designators, case
 included (``AM``/``PM`` in en-US, en-AU, en-GB, en-CA; ``am``/``pm`` in en-NZ
@@ -16,7 +17,8 @@ midnight prints the date alone, a value on 1899-12-30 the time alone. Short
 Date, Long Date, Long Time and General Date follow the culture; Medium Date
 (``dd-mmm-yy``), Medium Time (``hh:nn AMPM``) and Short Time (``HH:nn``) are
 the same in all six but for the designators. A picture ignores the culture's
-date and time separators: ``d/MM/yyyy`` gives ``6/01/2026`` in en-US too.
+patterns: ``d/MM/yyyy`` gives ``6/01/2026`` in en-US too (en-US and en-AU only,
+which share ``/`` and ``:``; a culture with other separators is not measured).
 
 **Not measured**, each marked where it is tested: a culture as the MODEL's
 culture rather than the third argument (presumed the same: the model's culture
@@ -199,7 +201,9 @@ class TestMeasuredSixCultures:
 
 
 class TestAmPmToken:
-    # "AMPM" and "ampm" measured; "AmPm" and "aMpM" NOT measured (presumed alike)
+    # Measured: "AMPM" and "ampm" in en-US; "AMPM" in en-NZ and en-IE. NOT
+    # measured: "ampm" in en-NZ and en-IE, "AmPm" and "aMpM" anywhere (presumed
+    # the same token, as "ampm" is in en-US and en-AU).
     @pytest.mark.parametrize("token", ["AMPM", "ampm", "AmPm", "aMpM"])
     def test_any_case_prints_the_cultures_designators(self, token):
         assert _format(AFTERNOON, token)[0] == "PM"
@@ -235,10 +239,12 @@ class TestGeneralDateZeroParts:
 
 
 class TestCulturesWithoutPatterns:
-    """Decisions, not measurements: a named date format, or the AMPM token, in
-    a culture whose data the fork does not hold is reported unsupported, never
-    printed in en-US's. (Desktop prints de-DE as German and an unknown name in
-    an unidentified fallback culture; neither is ported.)"""
+    """Decisions, not measurements: in a culture whose data the fork does not
+    hold, a named date format, and a picture holding a designator (AMPM, AM/PM,
+    a/p) or a day or month name (ddd, dddd, mmm, mmmm), are reported
+    unsupported, never printed in en-US's; a numeric picture prints as before.
+    (Desktop prints de-DE as German, an unknown name in an unidentified fallback
+    culture and "" as the invariant culture; none is ported.)"""
 
     @pytest.mark.parametrize("culture", ["de-DE", "fr-FR", "pt-BR", "zz-ZZ", "xx", "ar-SA"])
     @pytest.mark.parametrize("fmt", C_FORMATS)
@@ -254,21 +260,42 @@ class TestCulturesWithoutPatterns:
         assert got is None
         assert e.unsupported_functions
 
-    def test_a_picture_with_ampm_is_refused_there(self):
-        got, e = _format(AFTERNOON, "h:nn AMPM", locale="de-DE")
+    @pytest.mark.parametrize("culture", ["de-DE", "zz-ZZ", ""])
+    @pytest.mark.parametrize("picture", ["h:nn AMPM", "h:nn AM/PM", "h:nn am/pm", "h a/p", "ddd", "dddd",
+                                         "mmm", "MMMM yyyy", "d mmm yyyy"])
+    def test_a_picture_with_a_designator_or_a_name_is_refused(self, culture, picture):
+        got, e = _format(AFTERNOON, picture, locale=culture)
         assert got is None
         assert e.unsupported_functions
 
-    def test_a_picture_without_ampm_is_not(self):
-        # NOT measured for de-DE: the fork's existing picture rendering, kept
-        got, e = _format(AFTERNOON, "yyyy-mm-dd", locale="de-DE")
-        assert got == "2026-01-06"
+    @pytest.mark.parametrize("culture", ["de-DE", "zz-ZZ", ""])
+    @pytest.mark.parametrize("picture,want", [("yyyy-mm-dd", "2026-01-06"), ("dd/mm/yy", "06/01/26"),
+                                              ("HH:mm:ss", "13:30:05"), ("HH:nn", "13:30")])
+    def test_a_numeric_picture_is_not(self, culture, picture, want):
+        # NOT measured outside en-US and en-AU: the fork's existing rendering
+        got, e = _format(AFTERNOON, picture, locale=culture)
+        assert got == want
         assert not e.unsupported_functions
 
-    def test_an_empty_third_argument_is_the_models_culture(self):
-        # Desktop prints the invariant culture for "" (01/06/2026 13:30:05,
-        # measured); not ported: the fork reads "" as no third argument
-        assert _format(AFTERNOON, "Short Date", locale="", model="en-AU")[0] == "6/01/2026"
+    @pytest.mark.parametrize("picture,want", [("h:nn AM/PM", "1:30 PM"), ("dddd", "Tuesday"),
+                                              ("mmm", "Jan"), ("h:mm a/p", "1:30 p")])
+    def test_a_culture_with_data_prints_them(self, picture, want):
+        # en-NZ: names measured English (Long Date); AM/PM and a/p keep their
+        # literal case (the fork's existing rule, NOT measured)
+        assert _format(AFTERNOON, picture, locale="en-NZ")[0] == want
+
+    @pytest.mark.parametrize("fmt", C_FORMATS)
+    def test_an_empty_third_argument_is_refused(self, fmt):
+        # Desktop prints "" as the invariant culture (Short Date 01/06/2026,
+        # General Date 01/06/2026 13:30:05, measured); not ported
+        got, e = _format(AFTERNOON, fmt, locale="", model="en-AU")
+        assert got is None
+        assert any("FORMAT" in f for f in e.unsupported_functions)
+
+    def test_an_empty_third_argument_keeps_number_separators(self):
+        got, e = _format("1234.5", "#,##0.00", locale="", model="en-AU")
+        assert got == "1,234.50"
+        assert not e.unsupported_functions
 
     def test_numbers_keep_the_separators_fallback(self):
         # FORMAT's separators still fall back to en-US for an unknown culture

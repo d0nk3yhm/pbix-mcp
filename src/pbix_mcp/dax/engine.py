@@ -10337,6 +10337,11 @@ class DAXEngine:
         # items being evaluated apply to (SELECTEDMEASURE's measure).
         self._cg_applied: dict = {}
         self._cg_frames: list[str] = []
+        # FORMAT's refusals as (the measures SELECTEDMEASURE() is evaluating,
+        # note), for evaluate_format_strings to tell a format string's own
+        # from its measure's
+        self._format_refusals: list = []
+        self._selected_measures: list[str] = []
         # Measure errors degraded to BLANK so far: IFERROR / ISERROR compare it
         # before and after their argument (issue #135).
         self._nested_errors = 0
@@ -11292,7 +11297,12 @@ class DAXEngine:
     def _fn_selectedmeasure(self, args_str: str, ctx: DAXContext) -> Any:
         """SELECTEDMEASURE(): the measure the item applies to, with the items
         of lower precedence still to apply."""
-        return self.evaluate_measure(self._cg_measure('SELECTEDMEASURE'), ctx, propagate=True)
+        name = self._cg_measure('SELECTEDMEASURE')
+        self._selected_measures.append(name)
+        try:
+            return self.evaluate_measure(name, ctx, propagate=True)
+        finally:
+            self._selected_measures.pop()
 
     def _fn_selectedmeasurename(self, args_str: str, ctx: DAXContext) -> Any:
         return self._cg_measure('SELECTEDMEASURENAME')
@@ -19870,12 +19880,13 @@ class DAXEngine:
 
     @staticmethod
     def _named_date_culture(culture):
-        """The key of ``culture``'s date data: en-US when no culture is given,
-        None for any culture the fork holds none for -- its named formats and
-        AMPM token are refused there rather than printed in en-US's (Desktop
-        prints de-DE in German, and an unknown name in a fallback culture of
-        its own)."""
-        if not culture or not str(culture).strip():
+        """The key of ``culture``'s date data: en-US when no culture is given
+        (None), None for any culture the fork holds none for, "" included --
+        its named formats, designators and day and month names are refused
+        there rather than printed in en-US's (Desktop prints de-DE in German,
+        an unknown name in a fallback culture of its own, and "" in the
+        invariant culture)."""
+        if culture is None:
             return 'en-us'
         key = str(culture).strip().lower().replace('_', '-')
         return key if key in DAXEngine._NAMED_DATE_FMTS_BY_CULTURE else None
@@ -19918,10 +19929,13 @@ class DAXEngine:
         after `hh:` is minutes. `nn` is always minutes.
 
         A named format ("Short Date", ...) renders in ``culture`` (None for
-        en-US), and the AMPM token prints its designators; None is returned
-        where the fork holds no data for the culture and either is asked. A
-        picture ignores the culture's separators: Power BI Desktop 2.157 prints
-        "d/MM/yyyy h:mm:ss AMPM" as "6/01/2026 1:30:05 PM" in en-US and en-AU.
+        en-US), and the AMPM token prints its designators. Where the fork holds
+        no data for the culture, None is returned for a named format and for a
+        picture holding a designator (AMPM, AM/PM, a/p) or a day or month name
+        -- a decision; a numeric picture renders as elsewhere. A picture
+        ignores the culture's patterns: Power BI Desktop 2.157 prints
+        "d/MM/yyyy h:mm:ss AMPM" as "6/01/2026 1:30:05 PM" in en-US and en-AU
+        (both use / and :; other separators are not measured).
         """
         key = self._named_date_culture(culture)
         name = fmt_str.strip().lower()
@@ -19948,6 +19962,8 @@ class DAXEngine:
                 out.append(am if hh24 < 12 else pm)
                 i += 4; prev = 'ampm'; continue
             if low.startswith('am/pm') or low.startswith('a/p'):
+                if key is None:              # a designator: the culture's to give
+                    return None
                 tok = 'am/pm' if low.startswith('am/pm') else 'a/p'
                 src = fmt_str[i:i + len(tok)]
                 ampm = 'AM' if hh24 < 12 else 'PM'
@@ -19963,6 +19979,8 @@ class DAXEngine:
                 out.append(f"{val.year % 100:02d}" if run <= 2
                            else f"{val.year:04d}")
             elif ch == 'd':
+                if run >= 3 and key is None:          # a day name
+                    return None
                 out.append({1: str(val.day), 2: f"{val.day:02d}"}.get(
                     run, calendar.day_abbr[val.weekday()] if run == 3
                     else calendar.day_name[val.weekday()]))
@@ -19982,6 +20000,8 @@ class DAXEngine:
                     out.append(str(val.month))
                 elif run == 2:
                     out.append(f"{val.month:02d}")
+                elif key is None:                     # a month name
+                    return None
                 elif run == 3:
                     out.append(calendar.month_abbr[val.month])
                 else:
@@ -20005,12 +20025,20 @@ class DAXEngine:
         # wins over the model's own culture; the model's culture is the
         # fallback; en-US when neither states one.
         culture = None
+        date_culture = None
         if len(args) > 2:
             loc = self._eval_expr(args[2].strip(), ctx)
             if isinstance(loc, str) and loc.strip():
-                culture = loc.strip()
+                culture = date_culture = loc.strip()
+            elif isinstance(loc, str):
+                # "" -- Desktop 2.157 prints the invariant culture's dates
+                # (01/06/2026 13:30:05), not ported: refused for dates; numbers
+                # keep the model's separators as before
+                date_culture = ''
         if culture is None:
             culture = getattr(ctx, 'culture', None)
+        if date_culture is None:
+            date_culture = culture
         if val is None:
             return ''
         # A date can reach here as an ISO STRING rather than a datetime (row
@@ -20033,10 +20061,13 @@ class DAXEngine:
             val = _as_number(val)
         # Datetime formatting (NOW()/TODAY()/date columns).
         if isinstance(val, (datetime, date)) and fmt:
-            out = self._format_datetime_pattern(val, str(fmt), culture)
+            out = self._format_datetime_pattern(val, str(fmt), date_culture)
             if out is None:
-                # a named format whose pattern in this culture is not known
-                self._note_unsupported(f'FORMAT "{str(fmt).strip()}" in {culture}')
+                # a named format, designator or name the culture's data would
+                # give, which the fork does not hold
+                why = f'FORMAT "{str(fmt).strip()}" in "{date_culture}"'
+                self._note_unsupported(why)
+                self._format_refusals.append((tuple(self._selected_measures), why))
             return out
         if fmt and isinstance(val, (int, float)) and not isinstance(val, bool):
             group_sep, dec_sep = _culture_seps(culture)
@@ -31534,21 +31565,22 @@ def evaluate_format_strings(measure_names: list, tables: dict, measures: dict,
     _attach_model_shield_memo(ctx)
     out = {}
     for name in measure_names:
-        # What the expression notes unsupported, on its own: a refused FORMAT
-        # inside it is BLANK, so "x " & FORMAT(...) would be the truncated "x ".
-        # Such a measure gets no item format, and the refusal is its own.
-        seen = _engine.unsupported_functions
-        _engine.unsupported_functions = set()
+        # A FORMAT the format-string expression refuses is BLANK, so "x " &
+        # FORMAT(...) would be the truncated "x ": such a measure gets no item
+        # format, and the refusal is its own. What SELECTEDMEASURE() notes
+        # evaluating the measure itself is the measure's, and keeps the format;
+        # another measure the expression reads is the format string's (the
+        # item applies to it too, through its own SELECTEDMEASURE()).
+        depth = len(_engine._selected_measures)
+        _engine._format_refusals = []
         try:
             fmt = _engine.item_format_string(name, ctx)
         except Exception:      # noqa: BLE001 -- a broken expression formats nothing
             continue
-        finally:
-            noted = _engine.unsupported_functions
-            seen.update(noted)
-            _engine.unsupported_functions = seen
-        if noted:
-            _engine.unsupported_by_measure.setdefault(name, set()).update(noted)
+        own = {why for under, why in _engine._format_refusals
+               if len(under) <= depth or under[depth].lower() != name.lower()}
+        if own:
+            _engine.unsupported_by_measure.setdefault(name, set()).update(own)
             continue
         if fmt is not DAXEngine._NO_ITEM_FORMAT:
             out[name] = None if fmt is None else str(fmt)

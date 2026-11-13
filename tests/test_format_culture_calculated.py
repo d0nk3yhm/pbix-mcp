@@ -168,11 +168,11 @@ class TestTheAuthoringPaths:
 class TestItemFormatStrings:
     T = {"columns": ["v"], "rows": [[1.0]]}
 
-    def _run(self, culture):
-        m = {"S": "SUM(T[v])"}
+    def _run(self, culture, measure="SUM(T[v])", fmt=f'"0 x " & {SHORT}'):
+        m = {"S": measure}
         group = {"table": "CG", "column": "Name", "precedence": 0,
                  "items": [{"name": "Dated", "expression": "SELECTEDMEASURE()", "ordinal": 0,
-                            "format_string": f'"0 x " & {SHORT}'}]}
+                            "format_string": fmt}]}
         tables = {"T": self.T, "CG": {"columns": ["Name", "Ordinal"], "rows": [["Dated", 0]]}}
         de.set_calculation_groups(m, [group], {})
         de._engine.unsupported_functions.clear()
@@ -180,9 +180,31 @@ class TestItemFormatStrings:
         return de.evaluate_format_strings(["S"], tables, m, {"CG.Name": ["Dated"]}, culture=culture)
 
     def test_a_known_culture_formats(self):
+        # a control: it passes without the fix too
         assert self._run("en-AU") == {"S": "0 x 6/01/2026"}
 
     def test_a_refused_format_gives_no_item_format(self):
         got = self._run("de-DE")
         assert "S" not in got
         assert any("FORMAT" in f for f in de._engine.unsupported_by_measure.get("S", ()))
+
+    def test_a_measure_referenced_by_the_format_string_is_its_own(self):
+        m = {"S": "SUM(T[v])", "Label": 'FORMAT(DATE(2026,1,6), "Short Date", "de-DE")'}
+        group = {"table": "CG", "column": "Name", "precedence": 0,
+                 "items": [{"name": "Dated", "expression": "SELECTEDMEASURE()", "ordinal": 0,
+                            "format_string": '"0 x " & [Label]'}]}
+        tables = {"T": self.T, "CG": {"columns": ["Name", "Ordinal"], "rows": [["Dated", 0]]}}
+        de.set_calculation_groups(m, [group], {})
+        got = de.evaluate_format_strings(["S"], tables, m, {"CG.Name": ["Dated"]})
+        assert "S" not in got
+
+    @pytest.mark.parametrize("measure", [
+        "COALESCE(NOSUCHFN(1), 7)",
+        'LEN(FORMAT(DATE(2026,1,6), "Short Date", "de-DE")) + 7',
+    ])
+    def test_what_the_measure_notes_keeps_the_format(self, measure):
+        # SELECTEDMEASURE()'s own unsupported notes are the measure's, not the
+        # format string's: the format string still decides
+        got = self._run(None, measure=measure, fmt='IF(SELECTEDMEASURE() > 5, "#,0.00", "0")')
+        assert got == {"S": "#,0.00"}
+        assert de._engine.unsupported_functions          # the measure's note stands
