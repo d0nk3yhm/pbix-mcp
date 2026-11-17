@@ -2448,6 +2448,25 @@ def _bool_number_clash(a, b, fn: Optional[str] = None) -> None:
         + ". Consider using the VALUE or FORMAT function to convert one of the values.")
 
 
+def _containsrow_clash(hay, needle) -> None:
+    """Raise for CONTAINSROW comparing a table's value with a needle of
+    another kind: text against a number (Power BI Desktop 2.157,
+    2026-11-17: "Function 'CONTAINSROW' does not support comparing values of
+    type Integer with values of type Text. ..."), TRUE / FALSE against a
+    number (_bool_number_clash, as IN's)."""
+    _bool_number_clash(hay, needle, 'CONTAINSROW')
+    th, tn = type(hay), type(needle)
+    if (th is str) is (tn is str):
+        return
+    other = tn if th is str else th
+    if other not in _CMP_TYPE_NAMES or other is bool:
+        return
+    names = [('Text' if t is str else _CMP_TYPE_NAMES[t]) for t in (th, tn)]
+    raise _DAXEvaluationError(
+        f"Function 'CONTAINSROW' does not support comparing values of type {names[0]} with values of "
+        f"type {names[1]}. Consider using the VALUE or FORMAT function to convert one of the values.")
+
+
 def _table_as_scalar(v):
     """Raise for a table where a value is needed (_scalarize left it): several
     columns cannot be a value at all (_ScalarColumnsError); several rows fail
@@ -3417,6 +3436,41 @@ def _var_block_keywords(text: str) -> list:
     return out
 
 
+_DECL_HEAD_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\s*=')
+
+
+def _var_block_own_keywords(text: str, kws: list) -> list:
+    """The keywords of ``kws`` (_var_block_keywords) that are the outer
+    block's own. A VAR block may be a declaration's value or follow a RETURN:
+    VAR a = VAR b = 1 RETURN b + 1 RETURN a is a = 2 (DAX's grammar). Every
+    VAR / RETURN at depth 0 was the outer block's, so the inner RETURN ended
+    the outer block and a read as "VAR b = 1" (BLANK, or the wrong number).
+
+    A VAR that starts a declaration's value (nothing but `name =` since the
+    VAR before it) or a RETURN's value (nothing since the RETURN) opens a
+    block inside it; a VAR or RETURN after a returned inner block's value
+    closes that block first."""
+    out: list = []
+    returned = [False]              # per open block: its RETURN has been read
+    prev = None                     # (kw, end) of the keyword before
+    for pos, kw, end in kws:
+        gap = text[prev[1]:pos].strip() if prev is not None else ''
+        opens = prev is not None and kw == 'VAR' and (
+            (prev[0] == 'VAR' and _DECL_HEAD_RE.fullmatch(gap) is not None)
+            or (prev[0] == 'RETURN' and gap == ''))
+        if opens:
+            returned.append(False)
+        else:
+            if len(returned) > 1 and returned[-1] and gap:
+                returned.pop()      # the inner block's value ends here
+            if kw == 'RETURN':
+                returned[-1] = True
+        if len(returned) == 1 and not opens:
+            out.append((pos, kw, end))
+        prev = (kw, end)
+    return out
+
+
 def _var_block_parts(text: str):
     """([(name or None, expression)], RETURN expression or None) of a VAR
     block (_var_block_keywords); the RETURN expression runs to the end. A
@@ -3436,7 +3490,7 @@ def _var_block_split(text: str) -> tuple:
     """_var_block_parts' answer with the declarations as a tuple, memoized."""
     found: list = []
     returned: Optional[str] = None
-    kws = _var_block_keywords(text)
+    kws = _var_block_own_keywords(text, _var_block_keywords(text))
     for k, (_pos, kw, end) in enumerate(kws):
         if kw == 'RETURN':
             returned = text[end:].strip()
@@ -4931,6 +4985,59 @@ def _to_column_type(v, target):
     elif target is _Currency and t is int:
         return _cur_from_value(v)
     return v
+
+
+def _heading_name(heading: str) -> str:
+    """The column name of a _headed_cells heading, 'Table'[Name] or [Name]."""
+    start = heading.index("'[", 1) + 1 if heading.startswith("'") else 0
+    return heading[start + 1:-1]
+
+
+def _ctor_text_columns(rows: list) -> list:
+    """A table constructor's column that holds text beside numbers is a
+    Text column: its numbers become their text, as `&` writes them
+    (_concat_str). Power BI Desktop 2.157 (2026-11-12): {1, "a"} is one
+    String column, "1" and "a"; the number 1 stayed a number beside the
+    text. 2026-11-17: {2.5, "a"} "2.5", {DATE(2026, 1, 6), "a"} "1/6/2026",
+    {TRUE(), "a"} "TRUE", {CURRENCY(1.5), "a"} "1.5"; a BLANK stays BLANK. A
+    time part or a large number is written as & writes it (not measured).
+    Rows are rebuilt only when a value changes."""
+    if len(rows) < 2:
+        return rows
+    width = max(len(r.get('__tuple__') or ()) or 1 for r in rows)
+
+    def cell(r, i):
+        t = r.get('__tuple__')
+        return t[i] if t is not None and i < len(t) else (r.get('__value__') if t is None and i == 0 else None)
+
+    text_cols = []
+    for i in range(width):
+        vals = [cell(r, i) for r in rows]
+        if any(isinstance(v, str) for v in vals) and any(
+                v is not None and not isinstance(v, str) and not isinstance(v, list) for v in vals):
+            text_cols.append(i)
+    if not text_cols:
+        return rows
+    out = []
+    for r in rows:
+        t = r.get('__tuple__')
+        if t is None:
+            v = r.get('__value__')
+            if v is None or isinstance(v, str):
+                out.append(r)
+                continue
+            nv = _concat_str(v)
+            out.append({**r, '__value__': nv, 'Value': nv})
+            continue
+        tv = tuple(_concat_str(v) if i in text_cols and v is not None and not isinstance(v, str) else v
+                   for i, v in enumerate(t))
+        if tv == t:
+            out.append(r)
+            continue
+        nr = {**r, '__tuple__': tv}
+        nr.update({f'Value{i}': v for i, v in enumerate(tv, 1)})
+        out.append(nr)
+    return out
 
 
 def _unify_number_columns(rows: list, static: Optional[tuple] = None) -> list:
@@ -12527,7 +12634,7 @@ class DAXEngine:
                 # a column of Int64 and Double values is a Double column
                 # (#326: MAXX({9007199254740993,
                 # 9007199254740992.0}, [Value]) is the Double 2**53)
-                return _unify_number_columns(rows)
+                return _unify_number_columns(_ctor_text_columns(rows))
             if kind == _P_IN:
                 result = self._eval_in(data[0], data[1], ctx, var_scope)
                 if result is not None:
@@ -12617,6 +12724,16 @@ class DAXEngine:
                     _mt = ctx.model_table(table_name)
                     if _mt != table_name:
                         return self._exec_plan(((_P_TCOL, (_mt, col_name)),), ctx, var_scope)
+                    # A model table with no rows is in no ``tables`` (the
+                    # model's column list and the measures' homes name it):
+                    # 'T'[M] of a measure is that measure, as on a table
+                    # with rows below. It leaked the (table, name) marker,
+                    # a BLANK in arithmetic.
+                    _mn = self._qualified_measure(table_name, col_name, ctx)
+                    if _mn is not None and (ctx.measure_tables or {}).get(_mn) is not None:
+                        # only its known home: a table in no ``tables`` and
+                        # home of no measure may be no table at all
+                        return self.evaluate_measure(_mn, ctx)
                 if _t is not None and ctx._find_col_idx(_t['columns'], col_name) < 0:
                     # `Table[Name]` where Name is not a column is DAX's
                     # fully-qualified MEASURE reference. Agents_Performance reads
@@ -12625,12 +12742,10 @@ class DAXEngine:
                     # TOPN(10, ...) returns 10 rows and the middle-bar test is
                     # `1 IN {11, 12}` -> FALSE -> 0. Treating it as BLANK made the
                     # test `1 IN {1, 2}` -> TRUE and the measure returned 1.
-                    if col_name in ctx.measures:
-                        return self.evaluate_measure(col_name, ctx)
-                    for _mn in ctx.measures:
-                        if _mn.lower() == col_name.lower():
-                            return self.evaluate_measure(_mn, ctx)
-                    # Neither a column of that table nor a measure: the
+                    _mn = self._qualified_measure(table_name, col_name, ctx)
+                    if _mn is not None:
+                        return self.evaluate_measure(_mn, ctx)
+                    # Neither a column of that table nor its measure: the
                     # reference cannot be resolved AT ALL, and Desktop refuses
                     # the whole expression rather than evaluating around it
                     # ("Column 'X' in table 'Y' cannot be found or may not be
@@ -12847,6 +12962,11 @@ class DAXEngine:
                  **{cols[i]: row[i] for i in range(min(len(cols), len(row)))}}
                 for row in filtered_rows
             ]
+        if tbl is not None:
+            # a table with no rows is a table, with none: Power BI Desktop
+            # 2.157 (2026-11-17), EVALUATE '_M' of a table holding no rows is
+            # its column and no row; it was BLANK, no table at all
+            return []
         return None
 
     def _se_probe_rows(self, probe: tuple, table_name: str, tbl: dict, ctx: DAXContext) -> list:
@@ -13676,6 +13796,11 @@ class DAXEngine:
         sides are numbers, date-aware when both parse as dates, else text), so
         ``1 IN {1}`` and ``"1" IN {1}`` both hold, matching Desktop.
         """
+        lt = left.strip()
+        if lt.startswith('(') and lt.endswith(')') and self._wraps_whole(lt):
+            items = self._split_top_level(lt[1:-1], ',')
+            if len(items) > 1:
+                return self._eval_in_tuple(items, right, ctx, var_scope)
         values = self._in_set_values(right, ctx, var_scope)
         if values is None:
             return None
@@ -13697,6 +13822,73 @@ class DAXEngine:
                 # build_b255d.py d11)
                 _bool_number_clash(v, lval, 'CONTAINSROW')
         return any(v is not None and _compare(lval, '=', v) for v in values)
+
+    @staticmethod
+    def _qualified_measure(table_name: str, name: str, ctx: DAXContext) -> Optional[str]:
+        """The measure ``'table_name'[name]`` names, in the model's spelling,
+        or None. A measure is qualified by its own table: Power BI Desktop
+        2.157 (2026-11-17), with Total homed on _M, '_M'[Total] is Total --
+        _M holds no rows, so it is in no ``tables`` and the reference leaked
+        its (table, name) marker, a BLANK -- and 'Opp'[Total] is "Column
+        'Total' in table 'Opp' cannot be found or may not be used in this
+        expression.", where it answered Total. A measure whose home the
+        context doesn't know (no measure_tables) is taken under any table,
+        as before."""
+        m = name if name in ctx.measures else next(
+            (k for k in ctx.measures if k.lower() == name.lower()), None)
+        if m is None:
+            return None
+        home = (ctx.measure_tables or {}).get(m)
+        if home is not None and str(home).lower() != table_name.lower():
+            return None
+        return m
+
+    def _eval_in_tuple(self, items: list, right: str, ctx: DAXContext,
+                       var_scope: dict | None = None) -> Any:
+        """``(a, b, ...) IN <table>``: TRUE when a row of the table holds the
+        values, column by column -- CONTAINSROW(<table>, a, b, ...), which
+        Microsoft Learn documents IN to be, compared as _fn_containsrow
+        compares (a BLANK only with a BLANK). The tuple was evaluated as one
+        value, so FILTER(T, (T[a], T[b]) IN {(1, "x")}) kept no row."""
+        rows = self._eval_expr(right.strip(), ctx, var_scope)
+        if not isinstance(rows, list):
+            return None
+        needle = tuple(_scalarize(self._eval_expr(x.strip(), ctx, var_scope)) for x in items)
+        return self._containsrow_match(rows, needle)
+
+    def _containsrow_match(self, rows: list, needle: tuple) -> bool:
+        """Does a row of ``rows`` hold ``needle``'s values, column by column:
+        CONTAINSROW's test, and IN's with a tuple. Power BI Desktop 2.157
+        (2026-11-17): case-insensitive text, a BLANK only with a BLANK;
+        (1, 2) IN {1, 2} is "The number of arguments is invalid. Function
+        CONTAINSROW must have a value for each column in the table
+        expression." and ("1", "a") IN {(1, "a")} is "Function 'CONTAINSROW'
+        does not support comparing values of type Integer with values of type
+        Text. Consider using the VALUE or FORMAT function to convert one of
+        the values." (the table's type first: one case measured). Both
+        answered FALSE. CONTAINSROW itself reads alike (not measured apart:
+        Desktop's texts for IN name CONTAINSROW)."""
+        for r in rows:
+            # the row's cells, one per column, as DISTINCT and EXCEPT read
+            # them (_row_cells): ADDCOLUMNS(VALUES(T[a]), "x", 1) is two
+            # columns wide, a CROSSJOIN row its parts' columns
+            hay = tuple(self._row_cells(r)) if isinstance(r, dict) else (r,)
+            if len(hay) != len(needle):
+                raise _DAXEvaluationError(
+                    "The number of arguments is invalid. Function CONTAINSROW must have a value for "
+                    "each column in the table expression.")
+            match = True
+            for a, b in zip(hay, needle):
+                if a is None or b is None:
+                    if not (a is None and b is None):
+                        match = False
+                    continue
+                _containsrow_clash(a, b)
+                if match and not _dax_equal(a, b):
+                    match = False
+            if match:
+                return True
+        return False
 
     def _eval_comparison(self, expr: str, ctx: DAXContext, var_scope: dict | None = None) -> Any:
         """Evaluate comparison operators.
@@ -20529,7 +20721,16 @@ class DAXEngine:
         """MEDIAN(column) — return median value."""
         ref = self._column_arg(args_str, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
-            values = sorted(v for v in ctx.get_column_data(ref[0], ref[1]) if isinstance(v, (int, float)))
+            data = ctx.get_column_data(ref[0], ref[1])
+            # Power BI Desktop 2.157 (2026-11-12): over a text column MEDIAN is
+            # an error, "MEDIAN does not support expressions of type
+            # string/Boolean/date." (it was a BLANK); a model column holds one
+            # type, so its first value tells it
+            first = next((v for v in data if v is not None), None)
+            if isinstance(first, (str, bool, date, datetime)):
+                raise _DAXEvaluationError(
+                    "MEDIAN does not support expressions of type string/Boolean/date.")
+            values = sorted(v for v in data if isinstance(v, (int, float)))
             if not values:
                 return None
             if self._currency_column(ref, ctx):
@@ -20562,6 +20763,12 @@ class DAXEngine:
                 result = self._resolve_row_result(result, row_item, row_ctx)
             else:
                 result = self._eval_expr(row_expr, ctx)
+            if isinstance(result, (str, bool, date, datetime)):
+                # Power BI Desktop 2.157 (2026-11-17): MEDIANX('Opp',
+                # 'Opp'[Name]) is "MEDIANX does not support expressions of
+                # type string/Boolean/date." (it was a BLANK)
+                raise _DAXEvaluationError(
+                    "MEDIANX does not support expressions of type string/Boolean/date.")
             if isinstance(result, (int, float)) and not isinstance(result, bool):
                 values.append(result)
         # MEDIANX over no rows is BLANK, so ISBLANK fires.
@@ -22037,6 +22244,27 @@ class DAXEngine:
         # build_b243c.py f_sc_two; alone 0.541100263595581; #339)
         row_scope = (self._se_extensions_scope([(None, args[k + 1]) for k in range(1, len(args) - 1, 2)], ctx)
                      if len(args) >= 5 and ctx._se_fuse is not None else None)
+        # Power BI Desktop 2.157 (2026-11-12): a new column of a name the
+        # table has (names compare case-insensitively) is an error, "Function
+        # 'ADDCOLUMNS' cannot add column [Probability] since it already
+        # exists." -- ADDCOLUMNS('Sales stage', "Probability", 1) replaced the
+        # model column's values with 1.
+        # Two new columns of one name: "Function 'ADDCOLUMNS' cannot add
+        # column [X], as it has the same name with an existing column." (2026-11-17).
+        if table_ref and isinstance(table_ref[0], dict):
+            taken = {_heading_name(h).lower() for h, _v in DAXEngine._headed_cells(table_ref[0], ctx)}
+            new: set = set()
+            for k in range(1, len(args) - 1, 2):
+                nm = self._eval_expr(args[k].strip(), ctx)
+                nm = str(nm) if nm else ''
+                if nm.lower() in taken:
+                    raise _DAXEvaluationError(
+                        f"Function 'ADDCOLUMNS' cannot add column [{nm}] since it already exists.")
+                if nm.lower() in new:
+                    raise _DAXEvaluationError(
+                        f"Function 'ADDCOLUMNS' cannot add column [{nm}], as it has the same name with an "
+                        "existing column.")
+                new.add(nm.lower())
         for row_item in table_ref:
             # a copy of the same kind: ADDCOLUMNS keeps SUMMARIZE's rows rows of columns
             new_item = type(row_item)(row_item) if isinstance(row_item, dict) else row_item
@@ -22048,12 +22276,18 @@ class DAXEngine:
                 row_ctx = ctx
             # Process name/expression pairs
             i = 1
+            added = []
             while i + 1 < len(args):
                 col_name = self._eval_expr(args[i].strip(), ctx)
                 col_val = self._eval_expr(args[i + 1].strip(), row_ctx)
                 if isinstance(new_item, dict):
                     new_item[str(col_name)] = col_val
+                    added.append(str(col_name))
                 i += 2
+            if added and isinstance(new_item, dict):
+                # columns of its own, whatever their names: headed [Name],
+                # not as a column of the row's table (_headed_cells)
+                new_item['__added__'] = frozenset(added) | new_item.get('__added__', frozenset())
             extended.append(new_item)
         return extended
 
@@ -22281,6 +22515,10 @@ class DAXEngine:
                 group_ctx._se_fuse = (group_ctx, scope)
             for ext_name, ext_expr in extensions:
                 row_dict[ext_name] = self._eval_expr(ext_expr, group_ctx)
+            # its own columns, headed [Name] (_headed_cells): Power BI
+            # Desktop 2.157 (2026-11-17), SUMMARIZE(Opp, Opp[Name], "Rank", 1)
+            # is Opp[Name], [Rank] though Opp has a column Rank
+            row_dict['__added__'] = frozenset(n for n, _e in extensions)
 
     @staticmethod
     def _se_merge_scopes(a: dict, b: dict) -> dict:
@@ -22467,6 +22705,10 @@ class DAXEngine:
                 group_ctx._se_fuse = (group_ctx, scope)
             for ext_name, ext_expr in extensions:
                 row_dict[ext_name] = self._eval_expr(ext_expr, group_ctx)
+            # its own columns, headed [Name] (_headed_cells): Power BI
+            # Desktop 2.157 (2026-11-17), SUMMARIZE(Opp, Opp[Name], "Rank", 1)
+            # is Opp[Name], [Rank] though Opp has a column Rank
+            row_dict['__added__'] = frozenset(n for n, _e in extensions)
         return result
 
     @staticmethod
@@ -23334,11 +23576,34 @@ class DAXEngine:
         if len(args) >= 4 and prev is not None and ctx._current_row is None:
             ctx._se_fuse = (ctx, self._se_joined_scope(
                 [(None, args[k + 1]) for k in range(0, len(args) - 1, 2)], ctx))
+        # Power BI Desktop 2.157 (2026-11-12): ROW("x", ) is "Argument '2'
+        # in ROW function is required." (it was a BLANK), and two names that
+        # differ only in case are an error (one silently replaced the
+        # other): ROW("AMPM", 1, "ampm", 2) is "Function 'ROW' cannot add
+        # column [ampm], as it has the same name with an existing column."
+        if len(args) < 2:
+            # Power BI Desktop 2.157 (2026-11-17): ROW("x")
+            raise _DAXEvaluationError(
+                "Too few arguments were passed to the ROW function. The minimum argument count for the "
+                "function is 2.")
+        if len(args) % 2:
+            # a name with no expression after it: the missing argument's
+            # error, as ROW("x", ) (ROW("a", 1, "b") not measured)
+            args = args + ['']
+        for k, a in enumerate(args):
+            if not a.strip():
+                raise _DAXEvaluationError(f"Argument '{k + 1}' in ROW function is required.")
+        seen: set = set()
         try:
             while i + 1 < len(args):
                 col_name = self._eval_expr(args[i].strip(), ctx)
                 col_val = self._eval_expr(args[i + 1].strip(), ctx)
                 col_name_str = str(col_name) if col_name else f"col_{i}"
+                if col_name_str.lower() in seen:
+                    raise _DAXEvaluationError(
+                        f"Function 'ROW' cannot add column [{col_name_str}], as it has the same "
+                        "name with an existing column.")
+                seen.add(col_name_str.lower())
                 row[col_name_str] = col_val
                 if first_name is None:
                     first_name = col_name_str
@@ -25158,19 +25423,8 @@ class DAXEngine:
         rows = self._eval_expr(parts[0].strip(), ctx)
         if not isinstance(rows, list):
             return None
-        needle = tuple(self._eval_expr(x.strip(), ctx) for x in parts[1:])
-        for r in rows:
-            if isinstance(r, dict) and '__value__' in r:
-                hay = (r['__value__'],)
-            elif isinstance(r, dict):
-                hay = tuple(self._row_cols(r).values())
-            else:
-                hay = (r,)
-            if len(hay) == len(needle) and all(
-                    a == b if a is None or b is None else _dax_equal(a, b)
-                    for a, b in zip(hay, needle)):
-                return True
-        return False
+        needle = tuple(_scalarize(self._eval_expr(x.strip(), ctx)) for x in parts[1:])
+        return self._containsrow_match(rows, needle)
 
     def _fn_allnoblankrow(self, args_str: str, ctx: DAXContext):
         # ALL over the stored rows: the blank row is left out, a stored BLANK
@@ -26898,6 +27152,10 @@ class DAXEngine:
         # added beside it is its own, whatever its name
         model_cols: Any = (({cell_of} if lone else set(tbl.get('columns') or ()))
                            if tbl is not None else ())
+        if model_cols and row.get('__added__'):
+            # ADDCOLUMNS' own columns: ADDCOLUMNS(SUMMARIZE(T, T[Name]),
+            # "Rank", 1) heads [Rank], though T has a column Rank
+            model_cols = model_cols - row['__added__']
 
         def heading(name):
             return f"'{t}'[{name}]" if name in model_cols else f"[{name}]"

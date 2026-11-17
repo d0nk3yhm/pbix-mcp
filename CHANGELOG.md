@@ -17,6 +17,31 @@ A filter on the date table did not reach a table with no direct relationship to 
 
 `ModelReader.calculation_groups` found a group's item column only by `SourceColumn = "Name"`. Both groups in that sample leave it empty, so they were skipped and `Sales by Due Date` / `Sales by Ship Date` answered the order-date figure. With no column sourced from `Name`, the item column is now the one data column that isn't the `Ordinal`, and two such columns leave the group undecided as before. For 2018 they now answer 29892677.7569 and 29998861.1604, the sums from the table rows by each date key. Tests: `tests/test_issue370_calc_group_item_column.py`.
 
+### Fixed — answers that were silently wrong, measured on Power BI Desktop 2.157
+
+Every case was run in Power BI Desktop 2.157 (2026-11-12 and 2026-11-17) against its own engine over its loopback connection: on Microsoft's MIT sample `2026 Power BI Samples Revamp/Revenue Opportunities.pbix`, and on a synthetic model with a table holding no rows. On the second batch's 42 queries the engine matched Desktop on 9 before this change and on all 42 after it. Black-box observation only.
+
+Where Desktop errors, the engine answered a value (BLANK unless said):
+
+- `ROW("x", )` is `Argument '2' in ROW function is required.`; `ROW("x")` is `Too few arguments were passed to the ROW function. The minimum argument count for the function is 2.`
+- Two ROW names that differ only in case: `ROW("a", 1, "A", 2)` is `Function 'ROW' cannot add column [A], as it has the same name with an existing column.` One column took the other's place.
+- ADDCOLUMNS over a column its table has (names compare without case): `Function 'ADDCOLUMNS' cannot add column [Probability] since it already exists.` It replaced the column's values. Two new columns of one name: `Function 'ADDCOLUMNS' cannot add column [X], as it has the same name with an existing column.`
+- MEDIAN over a text, TRUE / FALSE or date column: `MEDIAN does not support expressions of type string/Boolean/date.`; MEDIANX over text alike, `MEDIANX does not support ...`.
+- A measure qualified by a table that isn't its home, `'Opp'[Total]` with Total on `_M`: `Column 'Total' in table 'Opp' cannot be found or may not be used in this expression.` It answered Total. A measure whose home isn't known is taken under any table, as before.
+- A row constructor before IN, compared as CONTAINSROW: text against a number, `("1", "a") IN {(1, "a")}`, is `Function 'CONTAINSROW' does not support comparing values of type Integer with values of type Text. Consider using the VALUE or FORMAT function to convert one of the values.`; a tuple of another width than the table, `(1, 2) IN {1, 2}`, is `The number of arguments is invalid. Function CONTAINSROW must have a value for each column in the table expression.` CONTAINSROW itself reads the same way (not measured apart: Desktop's texts for IN name CONTAINSROW).
+
+Where Desktop answers, the engine answered otherwise:
+
+- A row constructor before IN: `FILTER('Opp', ('Opp'[Rank], 'Opp'[Name]) IN {(1, "a"), (3, "a")})` keeps the two rows that match; it kept none. Text compares without case; a BLANK matches only a BLANK. CONTAINSROW and the tuple read every column of a row, as DISTINCT does: over `ADDCOLUMNS(VALUES(T[a]), "x", 1)` or a CROSSJOIN (reasoned, not measured).
+- A VAR block as a VAR's value: `VAR a = VAR b = 1 RETURN b + 1 RETURN a` is 2; it was 1 (the inner RETURN ended the outer block). `VAR a = 1 VAR b = VAR c = 2 RETURN c RETURN a + b` is 3; it was BLANK. City Sustainability's public measure `Alt Text - Page 2 Card Baseline` is written so: it answered FALSE, and now Desktop's text, to the character.
+- A model table with no rows is a table with none: `EVALUATE '_M'` is its column and no row. The model loader left such a table out, so a reference to it was BLANK and `'_M'[Total]`, a measure homed on it, BLANK where Desktop answers 6. A table whose data fails to load is still left out.
+- The columns ADDCOLUMNS and SUMMARIZE add are their own, whatever their names: `TOCSV(ADDCOLUMNS(SUMMARIZE('Opp', 'Opp'[Name]), "Rank", 1))` heads `'Opp'[Name],[Rank]`; it headed `'Opp'[Rank]` because Opp has a column Rank. Over GROUPBY and SUMMARIZECOLUMNS alike, and SUMMARIZE's own extension.
+- A table constructor's column with text beside other values is a Text column: `{1, "a"}` is `"1"` and `"a"`, `{2.5, "a"}` `"2.5"`, `{DATE(2026, 1, 6), "a"}` `"1/6/2026"`, `{TRUE(), "a"}` `"TRUE"`; a BLANK stays BLANK. The numbers stayed numbers. A row constructor's column alike.
+
+Every measure of 50 public sample files (426) answers as before but the City Sustainability measure above.
+
+Tests: `tests/test_silent_wrong_answers_desktop_2157.py`, 56 cases, 48 of which fail before this change (the other 8 guard answers that must not change). `test_issue357`'s refusal now expects Desktop's text.
+
 ## [0.9.153] - 2026-11-04
 
 For Anthropic's plugin directory: its policy's tool annotations, a privacy link, and names of our own. No answer of the DAX engine and no file the package writes changes.

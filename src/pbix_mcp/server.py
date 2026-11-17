@@ -13907,10 +13907,15 @@ def _get_dax_context(alias: str) -> dict:
             # with the columns' runs: Desktop's storage engine adds a Double
             # column along them (issue #243, pbix_mcp.dax.se_scan)
             td = model.get_table(tname, with_storage=True)
-            if td and td.get('columns') and td.get('rows'):
+            if td and td.get('columns'):
+                # a table with no rows too: it is a table, with none (Power BI
+                # Desktop 2.157: EVALUATE of one is its columns and no row;
+                # '_M'[Total], a measure on one, is the measure). Left out, a
+                # reference to it was BLANK, and could not be told from a
+                # table whose decode failed, which stays out.
                 tables[tname] = {
                     'columns': td['columns'],
-                    'rows': td['rows'],
+                    'rows': td.get('rows') or [],
                 }
                 if td.get('storage'):
                     tables[tname]['storage'] = td['storage']
