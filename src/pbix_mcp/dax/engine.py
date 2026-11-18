@@ -657,9 +657,14 @@ def _arith_type(op: str, a, b):
     if a is None or b is None:
         return None
     if a == 'B':
+        # BLANK takes the other side's type, a TRUE / FALSE as an Int64 and a
+        # text as a Double (#344: "3" + BLANK() typed as text made a false
+        # type error of "3" + BLANK() = 3)
+        b = 'I' if b == 'L' else 'D' if b == 'S' else b
         return b if op in ('+', '-') else ('B' if op in ('*', '/') else None)
     if b == 'B':
-        return a if op in ('+', '-') else ('B' if op == '*' else ('D' if a in ('I', 'D', 'L', 'S') else None))
+        a2 = 'I' if a == 'L' else 'D' if a == 'S' else a
+        return a2 if op in ('+', '-') else ('B' if op == '*' else ('D' if a in ('I', 'D', 'L', 'S') else None))
     if 'T' in (a, b):
         return 'T' if op in ('+', '-') and a == 'T' or (op == '+' and b == 'T') else None
     a = 'I' if a == 'L' else 'D' if a == 'S' else a
@@ -2506,6 +2511,14 @@ def _in_kind(v) -> str:
 # a static type code (DAXEngine._static_type) as a kind of value; Variant,
 # BLANK and unknown are no kind
 _STATIC_KIND = {'S': 'text', 'I': 'number', 'D': 'number', 'C': 'number', 'L': 'bool', 'T': 'date'}
+
+# a model column's declared DataType name -> _static_type's code (#344)
+_DECLARED_TYPE_CODE = {'string': 'S', 'int64': 'I', 'double': 'D', 'decimal': 'C', 'datetime': 'T', 'boolean': 'L'}
+
+# a bracketed name with no table before it ([Value], not T[Value] or 'T'[Value]); string literals blanked first
+_BARE_BRACKET_RE = re.compile(r"(?<![\w'\]])\[([^\]]+)\]")
+_STRING_LITERAL_RE = re.compile(r'"(?:[^"]|"")*"')
+_TABLE_COLUMN_RE = re.compile(r"(?:'((?:[^']|'')+)'|\b([A-Za-z_][\w.]*))\[([^\]]+)\]")
 
 _STATIC_TYPE_NAME = {'S': 'Text', 'I': 'Integer', 'D': 'Number', 'C': 'Currency', 'L': 'True/False', 'T': 'Date'}
 
@@ -7347,6 +7360,10 @@ class DAXContext:
         # "unknown", and an unresolvable-reference check must then refuse
         # nothing rather than everything.
         self.model_columns: dict = {}
+        # (table, column) -> the model's declared DataType name, where the
+        # caller knows it: a column's type for _static_type when it holds no
+        # value (a table with no rows, #344)
+        self.column_types: dict = {}
         # Filter-context KEYS ("Table.Column") that came from GROUPED
         # evaluation (the visual's row/column grouping), as opposed to the
         # caller's explicit slicer selection. ALLSELECTED removes exactly
@@ -10132,6 +10149,7 @@ class DAXContext:
                                 else dict(self.selected_filters))
         ctx.measure_tables = self.measure_tables
         ctx.model_columns = self.model_columns
+        ctx.column_types = self.column_types
         # Share the measure memo by REFERENCE across the derivation family. Its
         # key already carries a filter-context fingerprint, so entries are
         # scoped to the context that produced them and cannot leak between
@@ -10196,6 +10214,7 @@ class DAXContext:
                                 else dict(self.selected_filters))
         ctx.measure_tables = self.measure_tables
         ctx.model_columns = self.model_columns
+        ctx.column_types = self.column_types
         return ctx
 
 
@@ -11289,6 +11308,13 @@ class DAXEngine:
                 # Desktop refuses the measure before evaluating any of it
                 # (#284, _static_refusal)
                 raise _bind
+            if _cg is None:
+                _typed = self._static_type_error(expr, ctx)
+                if _typed is not None and not self._unbound_column_ref(expr, ctx):
+                    # Desktop's type check, before any of it runs: in a branch
+                    # never taken too, and no IFERROR catches it (#344); after
+                    # the names are bound, so a missing name is its own error
+                    raise _uncatchable(_DAXEvaluationError(_typed))
             _ord = _orderby_definition_error(expr)
             if _ord is None and _has_partitionby(expr):
                 _ord = self._partitionby_definition_error(expr, ctx)
@@ -14367,6 +14393,7 @@ class DAXEngine:
                          ctx.date_column, dict(outer), ctx.relationships)
         sel.measure_tables = ctx.measure_tables
         sel.model_columns = ctx.model_columns
+        sel.column_types = ctx.column_types
         return sel
 
     def _selected_on_columns(self, ctx: DAXContext, table: str, columns) -> DAXContext:
@@ -14416,6 +14443,7 @@ class DAXEngine:
                          ctx.date_column, keep, ctx.relationships)
         sel.measure_tables = ctx.measure_tables
         sel.model_columns = ctx.model_columns
+        sel.column_types = ctx.column_types
         return sel
 
     def _multi_column_all(self, ref: str, ctx: DAXContext, selected: bool,
@@ -15341,6 +15369,11 @@ class DAXEngine:
             hit = ('L' if t is bool else 'I' if t is int else 'D' if t is float else 'S' if t is str
                    else 'T' if isinstance(v, (datetime, date)) else None)
             cache[key] = hit
+        if hit is None:
+            # no value to read it from (a table with no rows): the model's
+            # declared type, where the caller gave it (#344)
+            declared = (getattr(ctx, 'column_types', None) or {}).get((table, cols[i]))
+            hit = _DECLARED_TYPE_CODE.get(str(declared).lower()) if declared is not None else None
         return hit
 
     def _unify_entry(self, kind: str, args_str: str, args: list, ctx: DAXContext) -> tuple:
@@ -19041,6 +19074,13 @@ class DAXEngine:
         key = ('static-code', text)
         if key in cache:
             return cache[key]
+        if self._bare_column_ref(text, ctx):
+            # a bare [Name] that is no measure is a column of whatever row
+            # context the expression sits in (a constructor's [Value], an
+            # iterated table's or a virtual table's column), which the text
+            # alone doesn't say: no declared type to check by (#344)
+            cache[key] = None
+            return None
         try:
             code = self._static_type(text, ctx)
         except Exception:
@@ -19072,6 +19112,180 @@ class DAXEngine:
             f"DAX comparison operations do not support comparing values of type {_STATIC_TYPE_NAME[lc]} with "
             f"values of type {_STATIC_TYPE_NAME[rc]}. Consider using the VALUE or FORMAT function to convert one "
             f"of the values."))
+
+    def _unbound_column_ref(self, text: str, ctx: DAXContext) -> bool:
+        """Does ``text`` name a column its table lacks ('T'[C] or T[C], T a
+        table here, C no column of it and no measure)? Desktop binds names
+        before it checks types: such a text's error is the name's, which
+        the evaluation reports (#344)."""
+        bare_text = _STRING_LITERAL_RE.sub('""', text)
+        for m in _TABLE_COLUMN_RE.finditer(bare_text):
+            t = (m.group(1) or m.group(2) or '').strip()
+            tbl = ctx.tables.get(ctx.model_table(t)) if t else None
+            if tbl is None:
+                continue
+            c = m.group(3).strip()
+            if ctx._find_col_idx(tbl['columns'], c) < 0 and not self._measure_exists(c, ctx):
+                return True
+        # a bare [Name] nothing could give: no measure, no column of any
+        # table, no name the text introduces ("Name" in ADDCOLUMNS and the
+        # like) and no constructor's Value / ValueN
+        introduced = {m.group(0)[1:-1].replace('""', '"').lower() for m in _STRING_LITERAL_RE.finditer(text)}
+        for m in _BARE_BRACKET_RE.finditer(bare_text):
+            n = m.group(1).strip()
+            low = n.lower()
+            if low in introduced or re.fullmatch(r'value\d*', low) or self._measure_exists(n, ctx):
+                continue
+            if any(ctx._find_col_idx(tb.get('columns') or [], n) >= 0 for tb in ctx.tables.values()
+                   if isinstance(tb, dict)):
+                continue
+            if any(n.lower() in (str(c).lower() for c in cols) for cols in (ctx.model_columns or {}).values()):
+                continue
+            return True
+        return False
+
+    def _bare_column_ref(self, text: str, ctx: DAXContext) -> bool:
+        """Does ``text`` hold a bare [Name] (no table before it) that is no
+        measure, outside its string literals?"""
+        if '[' not in text:
+            return False
+        for m in _BARE_BRACKET_RE.finditer(_STRING_LITERAL_RE.sub('""', text)):
+            if not self._measure_exists(m.group(1), ctx):
+                return True
+        return False
+
+    def _static_type_error(self, expr: str, ctx: DAXContext) -> Optional[str]:
+        """Desktop's type error for ``expr``, found from its text and the
+        model's declared types before anything is evaluated, or None: a
+        comparison operator between kinds it refuses (_static_cmp_clash's
+        rule) or an IN whose value's kind isn't the table's (CONTAINSROW's
+        rule), anywhere in it -- in an IF branch never taken too. Power BI
+        Desktop 2.157 (2026-11-18, #344): IF(FALSE(), CALCULATE([Total],
+        Opp[Rank] IN {"a"}), 7) is "Function 'CONTAINSROW' does not support
+        comparing values of type Text with values of type Integer. ...", and
+        on a table with no rows MAX('_M'[Column1]) = 1 is "DAX comparison
+        operations ... Text with values of type Integer" by the column's
+        declared type. Measures it references are checked as each is
+        evaluated. Memoized per model and text (_shield_cache)."""
+        cache = ctx._shield_cache
+        key = ('static-type-error', expr)
+        if key in cache:
+            return cache[key]
+        cache[key] = None                       # a cycle reads no error
+        try:
+            msg = self._static_walk(expr, ctx, 0)
+        except Exception:
+            msg = None                          # a text the walk can't read is checked as it runs
+        cache[key] = msg
+        return msg
+
+    def _static_walk(self, expr: str, ctx: DAXContext, depth: int) -> Optional[str]:
+        if depth > 60:
+            return None
+        expr = expr.strip()
+        if not expr:
+            return None
+        kind, data = (_PLAN_CACHE.get(expr) or _analyze_expr(expr))[0]
+        walk = lambda t: self._static_walk(t, ctx, depth + 1)   # noqa: E731
+        if kind == _P_CMP:
+            split = DAXEngine._cmp_split(expr)
+            if not split:
+                return None
+            _op, left, right = split
+            # the operands are typed before the operator: an error inside
+            # them is the one Desktop gives (1 = 1 IN {TRUE()}: CONTAINSROW's,
+            # build_b255d.py d11)
+            inner = walk(left) or walk(right)
+            if inner:
+                return inner
+            lc, rc = self._static_code(left.strip(), ctx), self._static_code(right.strip(), ctx)
+            if lc is not None and rc is not None and {_STATIC_KIND[lc], _STATIC_KIND[rc]} in _CMP_CLASH_PAIRS:
+                return (f"DAX comparison operations do not support comparing values of type {_STATIC_TYPE_NAME[lc]} "
+                        f"with values of type {_STATIC_TYPE_NAME[rc]}. Consider using the VALUE or FORMAT function to "
+                        f"convert one of the values.")
+            return None
+        if kind == _P_IN:
+            left, right = data
+            inner = walk(left) or walk(right)
+            if inner:
+                return inner
+            vc = self._static_code(left.strip(), ctx)
+            tc = self._static_table_code(right, ctx)
+            if vc is not None and tc is not None:
+                vk, tk = _STATIC_KIND[vc], _STATIC_KIND[tc]
+                if vk != tk and {vk, tk} != {'date', 'number'}:
+                    return (f"Function 'CONTAINSROW' does not support comparing values of type "
+                            f"{_STATIC_TYPE_NAME[tc]} with values of type {_STATIC_TYPE_NAME[vc]}. Consider using the "
+                            f"VALUE or FORMAT function to convert one of the values.")
+            return None
+        if kind == _P_FUNC:
+            for a in self._split_args(data[1]):
+                m = walk(a)
+                if m:
+                    return m
+            return None
+        if kind == _P_TABLECTOR:
+            inner = expr[1:-1] if expr.startswith('{') and expr.endswith('}') else ''
+            for a in self._split_top_level(inner, ','):
+                m = walk(a)
+                if m:
+                    return m
+            return None
+        if kind in (_P_LOGICAL, _P_BINARY):
+            for part in data[1]:
+                m = walk(part)
+                if m:
+                    return m
+            return None
+        if kind in (_P_CONCAT, _P_POW):
+            for part in data:
+                m = walk(part)
+                if m:
+                    return m
+            return None
+        if kind in (_P_NOT, _P_NEG, _P_PAREN):
+            return walk(data)
+        if kind == _P_VARRET:
+            decls, tail = _var_block_parts(expr)
+            for _name, value in decls:
+                m = walk(value)
+                if m:
+                    return m
+            return walk(tail) if tail else None
+        return None
+
+    def _static_table_code(self, table_text: str, ctx: DAXContext) -> Optional[str]:
+        """The declared type code of IN's one-column table, or None: a
+        constructor's (text beside other kinds makes it Text, as
+        _in_text_column reads it; a row constructor is not read) or one
+        column's (VALUES, DISTINCT, ALL, ALLNOBLANKROW of a column)."""
+        t = table_text.strip()
+        if t.startswith('{') and t.endswith('}'):
+            codes = []
+            for a in self._split_top_level(t[1:-1], ','):
+                a = a.strip()
+                if not a or a.startswith('('):
+                    return None
+                c = self._static_type(a, ctx)
+                if c == 'B':
+                    continue
+                if c not in _STATIC_KIND:
+                    return None
+                codes.append(c)
+            if not codes:
+                return None
+            kinds = {_STATIC_KIND[c] for c in codes}
+            if 'text' in kinds:
+                return 'S'
+            if len(kinds) != 1:
+                return None
+            return 'D' if 'D' in codes else codes[0]
+        kind, data = (_PLAN_CACHE.get(t) or _analyze_expr(t))[0]
+        if kind == _P_FUNC and data[0] in ('VALUES', 'DISTINCT', 'ALL', 'ALLNOBLANKROW'):
+            args = self._split_args(data[1])
+            if len(args) == 1:
+                return self._static_code(args[0].strip(), ctx)
+        return None
 
     def _mixed_column(self, text: str, ctx: DAXContext) -> bool:
         """Is ``text`` a reference to a model column holding values of more
@@ -31982,7 +32196,7 @@ def _model_parts(ctx: 'DAXContext') -> tuple | None:
         return (reg, ctx.date_table, ctx.date_column, ctx.culture,
                 tuple(ctx.measures.items()), tuple(ctx.relationships),
                 tuple(ctx.date_tables.items()), tuple(ctx.measure_tables.items()),
-                tuple(ctx.model_columns.items()))
+                tuple(ctx.model_columns.items()), tuple(ctx.column_types.items()))
     except (AttributeError, TypeError):
         return None
 
@@ -32029,7 +32243,10 @@ def _attach_query_memo(ctx: 'DAXContext', cache: dict) -> None:
                 _canonical([(g.table, g.column, g.precedence, g.items) for g in groups]),
                 _canonical(formats), _canonical(ctx.relationships),
                 ctx.date_table, ctx.date_column, _canonical(ctx.date_tables),
-                ctx.culture, _canonical(ctx.measure_tables), _canonical(ctx.model_columns))
+                ctx.culture, _canonical(ctx.measure_tables), _canonical(ctx.model_columns),
+                # the declared types decide a type error (#344): a memo of the
+                # model without them is another memo
+                tuple(sorted((str(t), str(c), str(v)) for (t, c), v in (ctx.column_types or {}).items())))
         if parts is not None:
             cache[('memo-name',)] = (ctx.tables, parts, name)
     entry = cache.get(name)
@@ -32118,6 +32335,7 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
                             date_tables: dict | None = None,
                             measure_tables: dict | None = None,
                             model_columns: dict | None = None,
+                            column_types: dict | None = None,
                             calculation_groups: list | None = None,
                             measure_formats: dict | None = None,
                             cache: dict | None = None) -> dict:
@@ -32165,6 +32383,7 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
     ctx.culture = culture
     ctx.measure_tables = measure_tables or {}
     ctx.model_columns = model_columns or {}
+    ctx.column_types = column_types or {}
     if cache is not None:
         _attach_query_memo(ctx, cache)
     else:
@@ -32184,7 +32403,8 @@ def evaluate_format_strings(measure_names: list, tables: dict, measures: dict,
                             culture: str | None = None,
                             date_tables: dict | None = None,
                             measure_tables: dict | None = None,
-                            model_columns: dict | None = None) -> dict:
+                            model_columns: dict | None = None,
+                            column_types: dict | None = None) -> dict:
     """``{name: format string}`` for the measures whose format a selected
     calculation item decides, through its format-string expression (issue
     #121). A measure no such item applies to is left out: it keeps its own
@@ -32203,6 +32423,7 @@ def evaluate_format_strings(measure_names: list, tables: dict, measures: dict,
     ctx.culture = culture
     ctx.measure_tables = measure_tables or {}
     ctx.model_columns = model_columns or {}
+    ctx.column_types = column_types or {}
     _attach_model_shield_memo(ctx)
     out = {}
     for name in measure_names:
@@ -32470,6 +32691,7 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
                             simulate_row_context: bool = True,
                             measure_tables: dict | None = None,
                             model_columns: dict | None = None,
+                            column_types: dict | None = None,
                             culture: str | None = None,
                             group_by: set | None = None,
                             selected_filters: dict | None = None,
@@ -32524,6 +32746,7 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
     # unqualified [Column] several tables share -- see _resolve_bare_column.
     ctx.measure_tables = measure_tables or {}
     ctx.model_columns = model_columns or {}
+    ctx.column_types = column_types or {}
     ctx.culture = culture
     if cache is not None:
         _attach_query_memo(ctx, cache)

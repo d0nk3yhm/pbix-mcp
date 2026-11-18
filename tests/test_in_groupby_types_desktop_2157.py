@@ -338,3 +338,65 @@ def test_union_unifies_each_column(union, cells):
 def test_intersect_of_text_with_numbers():
     assert error('COUNTROWS(INTERSECT(UNION({1}, {"a"}), VALUES(Opp[Rank])))').endswith(
         "Function 'INTERSECT' does not support joining a column of type Text with a column of type Integer.")
+
+
+# ---------------------------------------------------------------------------
+# Refused before anything runs, by declared types (Power BI Desktop 2.157, 2026-11-18)
+# ---------------------------------------------------------------------------
+
+def _ev_static(expr: str, extra: dict | None = None, home: str = "_M", types: dict | None = None):
+    t = dict(TABLES, _M={"columns": ["Column1"], "rows": []}, **(extra or {}))
+    c = DAXContext(t, dict(MEASURES, Probe=expr))
+    c.measure_tables = dict(HOMES, Probe=home)
+    c.column_types = dict(types or {})
+    e = DAXEngine()
+    return e.evaluate_measure("Probe", c), e.eval_errors.get("Probe")
+
+
+def test_an_if_branch_never_taken_is_checked_too():
+    v, err = _ev_static('IF(FALSE(), CALCULATE([Total], Opp[Rank] IN {"a"}), 7)')
+    assert v is None and err.endswith(_clash("Text", "Integer"))
+
+
+def test_operands_are_typed_before_their_operator():
+    # 1 = (1 IN {TRUE()}): the IN's error, not the comparison's
+    v, err = _ev_static("IF(1 = 1 IN {TRUE()}, 1, 0)")
+    assert err.endswith(_clash("True/False", "Integer"))
+
+
+def test_a_column_with_no_value_is_typed_by_its_declared_type():
+    v, err = _ev_static("IF(MAX('_M'[Column1]) = 1, 1, 0)", types={("_M", "Column1"): "String"})
+    assert v is None and err.endswith(_cmp("Text", "Integer"))
+    assert _ev_static("IF(MAX('_M'[Column1]) = 1, 1, 0)") == (0, None)      # no declared type: nothing to check by
+
+
+ATTR = {"Attr": {"columns": ["Value"], "rows": [["x"], ["y"]]}}
+AB = {"A": {"columns": ["Key", "W"], "rows": [[1, 5]]}, "B": {"columns": ["Key", "W"], "rows": [["x", 1], ["y", 2]]}}
+
+
+@pytest.mark.parametrize("expr, extra, home, want", [
+    # not measured on Desktop: row-context and arithmetic rules; the check refuses no valid DAX
+    ("COUNTROWS(FILTER({1, 2, 3}, [Value] >= 2))", ATTR, "_M", 2),
+    ("IF([Total] > 100, COUNTROWS(FILTER({1, 2, 3}, [Value] >= 2)), -1)", ATTR, "_M", -1),
+    ("SUMX({1, 2, 3}, IF([Value] > 1, [Value], 0))", ATTR, "_M", 5),
+    ('COUNTROWS(FILTER(B, [Key] = "x"))', AB, "A", 1),
+    ('SUMX(B, IF([Key] = "x", [W], 0))', AB, "A", 1),
+    ('IF("3" + BLANK() = 3, 1, 0)', None, "_M", 1),
+    ('IF(BLANK() + "3" = 3, 1, 0)', None, "_M", 1),
+    ('IF(BLANK() - TRUE() = -1, 1, 0)', None, "_M", 1),
+    ('IF(FALSE(), IF("3" + BLANK() = 3, 1, 0), 5)', None, "_M", 5),
+])
+def test_valid_dax_is_not_refused(expr, extra, home, want):
+    assert _ev_static(expr, extra, home) == (want, None)
+
+
+def test_the_batch_memo_keeps_declared_types_apart():
+    from pbix_mcp.dax.engine import evaluate_measures_batch
+    t = dict(TABLES, _M={"columns": ["Column1"], "rows": []})
+    ms = {"Probe": "IF(MAX('_M'[Column1]) = 1, 1, 0)", "Total": "SUM(Opp[Rank])"}
+    homes = {"Probe": "_M", "Total": "_M"}
+    cache: dict = {}
+    typed = evaluate_measures_batch(["Probe"], t, ms, measure_tables=homes, cache=cache,
+                                    column_types={("_M", "Column1"): "String"})
+    plain = evaluate_measures_batch(["Probe"], t, ms, measure_tables=homes, cache=cache)
+    assert typed == {"Probe": None} and plain == {"Probe": 0}

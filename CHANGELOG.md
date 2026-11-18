@@ -51,7 +51,16 @@ Measured on Desktop 2.157 over its loopback connection (66 EVALUATE queries on a
 
 **INTERSECT** of a Text column with a number column is `Function 'INTERSECT' does not support joining a column of type Text with a column of type Integer.`
 
-**Not done:** Desktop also refuses a mismatched comparison in an IF branch never taken, and one on an empty table's declared column type. The engine checks only what it evaluates, and reads a column's type from its values (strict xfails).
+**Checked before anything runs (#344).** A comparison or IN whose operands' declared types clash is refused before the measure is evaluated, as Desktop refuses it:
+- in an IF branch never taken: `IF(FALSE(), CALCULATE([Total], Opp[Rank] IN {"a"}), 7)` is CONTAINSROW's error;
+- with operands typed before their operator: `1 = 1 IN {TRUE()}` is CONTAINSROW's error.
+
+A column holding no value is typed by the model's declared type, which the server now passes (`DAXContext.column_types`): `MAX('_M'[Column1]) = 1` on a table with no rows is Text with Integer.
+
+Not typed, so never refused:
+- a Variant;
+- a bare `[Name]` that is no measure (it is whatever row context's column);
+- a text that names a missing column (its error is the name's).
 
 ### Fixed — CALCULATE's filters compare types as Desktop does (Power BI Desktop 2.157, 2026-11-18)
 
