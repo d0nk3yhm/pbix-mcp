@@ -17,6 +17,20 @@ A filter on the date table did not reach a table with no direct relationship to 
 
 `ModelReader.calculation_groups` found a group's item column only by `SourceColumn = "Name"`. Both groups in that sample leave it empty, so they were skipped and `Sales by Due Date` / `Sales by Ship Date` answered the order-date figure. With no column sourced from `Name`, the item column is now the one data column that isn't the `Ordinal`, and two such columns leave the group undecided as before. For 2018 they now answer 29892677.7569 and 29998861.1604, the sums from the table rows by each date key. Tests: `tests/test_issue370_calc_group_item_column.py`.
 
+### Fixed — IN with one value, GROUPBY's own columns, a measure under a table in no `tables` (Power BI Desktop 2.157, 2026-11-18)
+
+Measured on a synthetic model over Desktop's loopback connection (EVALUATE only); tests in `tests/test_in_groupby_types_desktop_2157.py`.
+
+- `<value> IN <table>` compares as CONTAINSROW does: a value of another type than the table's is `Function 'CONTAINSROW' does not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.` (`1 IN {1, "a"}`, a Text table; `"1" IN {1}` names Integer then Text; `TRUE() IN {1}` Integer then True/False; `DATE(2026,1,5) IN {"1/5/2026"}` Text then Date), whether or not a row would match. It answered TRUE or FALSE. `"a" IN {1, "a"}` and `"A" IN {1, "a"}` are TRUE; `BLANK() IN {1, "a"}` FALSE. A table of mixed kinds (`UNION({1}, {"a"})`) and a CALCULATE filter compare as before (not measured).
+- GROUPBY's own columns are headed `[Name]`, not as a column of the grouped table (`[Rank]` though Opp has Rank). Two of one name in any case: `Function 'GROUPBY' cannot add column [X], as it has the same name with an existing column.` One named exactly as a group column, which Desktop shows beside it, is refused as unsupported: it overwrote the group column.
+- `'T'[Measure]` where T is in no `tables` and the measure's home is unknown leaked a `(table, name)` marker, a silent BLANK: it is now the measure when the model names T (or there is no column list), an error otherwise; a column of T by that name stays the column.
+
+### Fixed — CALCULATE's filters compare types as Desktop does (Power BI Desktop 2.157, 2026-11-18)
+
+- `CALCULATE(..., T[c] IN <set>)` with a set of another type than the column is `Function 'CONTAINSROW' does not support comparing values of type <the set's> with values of type <the column's>. ...`, which IFERROR around the CALCULATE does not catch; KEEPFILTERS, NOT and CALCULATETABLE alike (`Opp[Rank] IN {1, "a"}`, `Opp[Name] IN {1}`, `Opp[Flag] IN {"a"}`). It answered as if each value compared. A date column against numbers compares them as date serials (`Opp[When] IN {46027}` keeps 2026-01-05; it kept nothing); a serial past any date matches nothing.
+- `CALCULATE(..., T[c] = <value>)` of text against a number is `DAX comparison operations do not support comparing values of type Text with values of type Integer. ...` (measured for `=`). It answered BLANK.
+- IN: TRUE / FALSE against text is CONTAINSROW's error (`TRUE() IN {"a"}`); a UNION mixing text with other values is a Text column, as a constructor is (`"a" IN UNION({1}, {"a"})` TRUE, `1 IN` the error). A model's own dates (`DAXDateTime`) are checked as dates.
+
 ### Fixed — answers that were silently wrong, measured on Power BI Desktop 2.157
 
 Every case was run in Power BI Desktop 2.157 (2026-11-12 and 2026-11-17) against its own engine over its loopback connection: on Microsoft's MIT sample `2026 Power BI Samples Revamp/Revenue Opportunities.pbix`, and on a synthetic model with a table holding no rows. On the second batch's 42 queries the engine matched Desktop on 9 before this change and on all 42 after it. Black-box observation only.

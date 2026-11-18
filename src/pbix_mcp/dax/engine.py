@@ -2448,20 +2448,77 @@ def _bool_number_clash(a, b, fn: Optional[str] = None) -> None:
         + ". Consider using the VALUE or FORMAT function to convert one of the values.")
 
 
+_TEXT_TABLE_HEAD_RE = re.compile(r'(?is)^\s*(?:\{|UNION\s*\()')
+
+
+def _in_text_column(values: list, table_text: str = '') -> list:
+    """IN's table as one column: a constructor's or UNION's text beside
+    values of other kinds makes a Text column, each of them as `&` writes it
+    (_ctor_text_columns). Power BI Desktop 2.157 (2026-11-18): {1, "a"},
+    UNION({1}, {"a"}) and UNION(VALUES(Opp[Rank]), VALUES(Opp[Name])) are
+    String columns ("1", "a"); "a" IN each is TRUE, 1 IN each "Function
+    'CONTAINSROW' does not support comparing values of type Text with values
+    of type Integer.". Any other table of mixed kinds (an expression's
+    Variant column) is not measured and compares as before."""
+    if not _TEXT_TABLE_HEAD_RE.match(table_text):
+        return values
+    if any(isinstance(v, str) for v in values) and any(
+            v is not None and not isinstance(v, str) for v in values):
+        return [v if v is None or isinstance(v, str) else _concat_str(v) for v in values]
+    return values
+
+
+def _kind_type_name(v) -> str:
+    """Desktop's name for a value's type in a comparison error, by kind (a
+    model's dates are DAXDateTime, a datetime subclass)."""
+    if isinstance(v, bool):
+        return 'True/False'
+    if isinstance(v, str):
+        return 'Text'
+    if isinstance(v, (datetime, date)):
+        return 'Date'
+    if isinstance(v, _Currency):
+        return 'Currency'
+    if isinstance(v, float):
+        return 'Number'
+    return 'Integer'
+
+
+def _in_kind(v) -> str:
+    """The kind of value a table column holds, for IN's type check:
+    numbers of any kind are one kind (_containsrow_clash)."""
+    if isinstance(v, bool):
+        return 'bool'
+    if isinstance(v, (int, float, _Currency)):
+        return 'number'
+    if isinstance(v, (datetime, date)):
+        return 'date'
+    if isinstance(v, str):
+        return 'text'
+    return type(v).__name__
+
+
+
+
 def _containsrow_clash(hay, needle) -> None:
-    """Raise for CONTAINSROW comparing a table's value with a needle of
-    another kind: text against a number (Power BI Desktop 2.157,
-    2026-11-17: "Function 'CONTAINSROW' does not support comparing values of
-    type Integer with values of type Text. ..."), TRUE / FALSE against a
-    number (_bool_number_clash, as IN's)."""
-    _bool_number_clash(hay, needle, 'CONTAINSROW')
-    th, tn = type(hay), type(needle)
-    if (th is str) is (tn is str):
+    """Raise for CONTAINSROW (and IN, which is CONTAINSROW) comparing a
+    table's value with a needle of another kind, the table's type named
+    first. Power BI Desktop 2.157 (2026-11-17, 2026-11-18): text against a
+    number, "Function 'CONTAINSROW' does not support comparing values of
+    type Integer with values of type Text. ..." ("1" IN {1}); TRUE / FALSE
+    against a number, "... values of type Integer with values of type
+    True/False. ..." (TRUE() IN {1}); a date against text, "... values of
+    type Text with values of type Date. ..." (DATE(2026,1,5) IN
+    {"1/5/2026"}); TRUE / FALSE against text, "... values of type Text with
+    values of type True/False. ..." (TRUE() IN {"a"}, #340). Numbers of any
+    kind compare, and so does a date against a number (DATE(2026,1,5) IN
+    {46027} is TRUE, #340)."""
+    kinds = [_in_kind(hay), _in_kind(needle)]
+    if any(k not in ('text', 'bool', 'number', 'date') for k in kinds):
         return
-    other = tn if th is str else th
-    if other not in _CMP_TYPE_NAMES or other is bool:
+    if kinds[0] == kinds[1] or set(kinds) == {'date', 'number'}:
         return
-    names = [('Text' if t is str else _CMP_TYPE_NAMES[t]) for t in (th, tn)]
+    names = [_kind_type_name(v) for v in (hay, needle)]
     raise _DAXEvaluationError(
         f"Function 'CONTAINSROW' does not support comparing values of type {names[0]} with values of "
         f"type {names[1]}. Consider using the VALUE or FORMAT function to convert one of the values.")
@@ -12734,6 +12791,29 @@ class DAXEngine:
                         # only its known home: a table in no ``tables`` and
                         # home of no measure may be no table at all
                         return self.evaluate_measure(_mn, ctx)
+                    _known = ctx.model_columns or {}
+                    _kcols = next((c for k, c in _known.items() if str(k).lower() == table_name.lower()), None)
+                    if _kcols and any(str(c).lower() == col_name.lower() for c in _kcols):
+                        # a column of a table with no rows: the column, as
+                        # before, whatever measure shares its name
+                        return (table_name, col_name)
+                    if _mn is not None and (not _known or any(
+                            str(k).lower() == table_name.lower() for k in _known)):
+                        # a measure whose home the context doesn't know is
+                        # taken under any table (_qualified_measure), here one
+                        # the model names or with no list to say otherwise:
+                        # it leaked the (table, name) marker, a BLANK (#339)
+                        return self.evaluate_measure(_mn, ctx)
+                    if next((m for m in ctx.measures if m.lower() == col_name.lower()), None) is not None:
+                        # a measure of that name, under a table that is not
+                        # its home (Power BI Desktop 2.157, 2026-11-17:
+                        # 'Opp'[Total] of a measure homed on _M) or that the
+                        # model doesn't name (not measured): an error, never
+                        # the marker's BLANK (#339)
+                        from pbix_mcp.errors import DAXEvaluationError
+                        raise DAXEvaluationError(
+                            f"Column '{col_name}' in table '{table_name}' cannot be "
+                            f"found or may not be used in this expression")
                 if _t is not None and ctx._find_col_idx(_t['columns'], col_name) < 0:
                     # `Table[Name]` where Name is not a column is DAX's
                     # fully-qualified MEASURE reference. Agents_Performance reads
@@ -13792,9 +13872,10 @@ class DAXEngine:
                  var_scope: dict | None = None) -> Any:
         """``<scalar> IN <set>`` -- TRUE when the left value is in the set.
 
-        Membership uses the engine's usual value comparison (numeric when both
-        sides are numbers, date-aware when both parse as dates, else text), so
-        ``1 IN {1}`` and ``"1" IN {1}`` both hold, matching Desktop.
+        IN is CONTAINSROW: a value of another type than the table's is
+        CONTAINSROW's error (_containsrow_clash), so ``"1" IN {1}`` fails as
+        Power BI Desktop 2.157 does; values of one kind compare as the
+        engine's ``=`` does (numbers of any kind, text without case).
         """
         lt = left.strip()
         if lt.startswith('(') and lt.endswith(')') and self._wraps_whole(lt):
@@ -13815,12 +13896,25 @@ class DAXEngine:
         lval = _scalarize(lval)
         if lval is None:
             return any(_scalarize(v) is None for v in values)
-        lbool = type(lval) is bool
+        # IN is CONTAINSROW: a value of another type than the table's is an
+        # error, whether or not a row would have matched. Power BI Desktop
+        # 2.157 (2026-11-18): 1 IN {1, "a"} (a Text table, #338) and 2 IN
+        # {1, "a"} are "Function 'CONTAINSROW' does not support comparing
+        # values of type Text with values of type Integer. ...", "1" IN {1}
+        # "... Integer with values of type Text ..."; both answered TRUE or
+        # FALSE. TRUE / FALSE against a number as before (#279), in 2.157's
+        # words.
+        values = _in_text_column(values, right)
+        # the check runs on a table of one kind of value (a constructor's or
+        # UNION's text beside other kinds was made Text above); a table of
+        # mixed kinds compares as before (not measured). One value of each
+        # kind stands for the rest.
+        kinds = {}
         for v in values:
-            if v is not None and (type(v) is bool) is not lbool:
-                # TRUE / FALSE against a number (#279;
-                # build_b255d.py d11)
-                _bool_number_clash(v, lval, 'CONTAINSROW')
+            if v is not None:
+                kinds.setdefault(_in_kind(v), v)
+        if len(kinds) == 1:
+            _containsrow_clash(next(iter(kinds.values())), lval)
         return any(v is not None and _compare(lval, '=', v) for v in values)
 
     @staticmethod
@@ -18745,6 +18839,8 @@ class DAXEngine:
 
         if kind == 'cmp':
             val = self._eval_expr(val_text, ctx, var_scope)
+            if op == '=' and val is not None:
+                self._filter_cmp_clash(tbl, col, val, ctx)
             if negate:
                 op = {'=': '<>', '<>': '=', '>': '<=', '<=': '>',
                       '>=': '<', '<': '>='}[op]
@@ -18772,8 +18868,93 @@ class DAXEngine:
         vals = self._in_set_values(val_text, ctx, var_scope)
         if vals is None:
             return ()
+        vals = self._filter_in_values(tbl, col, vals, ctx, val_text)
         key = ctx.model_key(tbl, col)
         return (key, {"not_in" if negate else "in": vals}, keep)
+
+    @staticmethod
+    def _column_sample(tbl: str, col: str, ctx: DAXContext):
+        """A value standing for the model column ``tbl[col]``'s type, when
+        every value not BLANK is of one kind (_in_kind), else None: a filter's
+        type check needs the column's one type, and a column of mixed kinds
+        (none in a model, but a caller's tables may hold one) is not checked.
+        Memoized per model (_shield_cache: it reads no filter)."""
+        cache = ctx._shield_cache
+        key = ('column-sample', tbl, col)
+        if key in cache:
+            return cache[key]
+        sample = None
+        t = ctx.tables.get(tbl)
+        i = ctx._find_col_idx(t['columns'], col) if t is not None else -1
+        if i >= 0:
+            kind = None
+            for r in t.get('rows') or ():
+                v = r[i] if i < len(r) else None
+                if v is None:
+                    continue
+                k = _in_kind(v)
+                if kind is None:
+                    kind, sample = k, v
+                elif k != kind:
+                    sample = None
+                    break
+        cache[key] = sample
+        return sample
+
+    def _filter_in_values(self, tbl: str, col: str, vals: list, ctx: DAXContext,
+                          table_text: str = '') -> list:
+        """A CALCULATE filter's ``T[c] IN <table>`` set, checked as Desktop
+        checks it before anything runs. Power BI Desktop 2.157 (2026-11-18,
+        #340): a set of another type than the column is "Function
+        'CONTAINSROW' does not support comparing values of type <the set's>
+        with values of type <the column's>. ...", which IFERROR around the
+        CALCULATE does not catch (Opp[Rank] IN {1, "a"}, Opp[Name] IN {1},
+        Opp[Flag] IN {"a"}; KEEPFILTERS, NOT and CALCULATETABLE alike); it
+        answered as if each value compared. A date column against numbers
+        compares the numbers as date serials (Opp[When] IN {46027} keeps
+        2026-01-05; it kept nothing)."""
+        vals = _in_text_column(vals, table_text)
+        sample = self._column_sample(tbl, col, ctx)
+        if sample is None:
+            return vals
+        kinds = {}
+        for v in vals:
+            if v is not None:
+                kinds.setdefault(_in_kind(v), v)
+        if len(kinds) == 1:
+            try:
+                _containsrow_clash(next(iter(kinds.values())), sample)
+            except _DAXEvaluationError as e:
+                raise _uncatchable(e)
+            if _in_kind(sample) == 'date' and 'number' in kinds:
+                out = []
+                for v in vals:
+                    if v is not None and _in_kind(v) == 'number':
+                        try:
+                            v = _DAX_EPOCH_DT + timedelta(days=float(v))
+                        except (OverflowError, ValueError):
+                            continue        # no date: matches nothing, as FILTER's route
+                    out.append(v)
+                return out
+        return vals
+
+    def _filter_cmp_clash(self, tbl: str, col: str, val, ctx: DAXContext) -> None:
+        """A CALCULATE filter's ``T[c] = <value>`` of text against a number,
+        checked before anything runs. Power BI Desktop 2.157 (2026-11-18,
+        #340): CALCULATE([Total], Opp[Name] = 1) is "DAX comparison
+        operations do not support comparing values of type Text with values
+        of type Integer. ...", the column's type first; it answered BLANK.
+        Measured for = alone: the other operators compare as before."""
+        sample = self._column_sample(tbl, col, ctx)
+        if sample is None:
+            return
+        kinds = {_in_kind(sample), _in_kind(val)}
+        if kinds != {'text', 'number'}:
+            return
+        names = [_kind_type_name(v) for v in (sample, val)]
+        raise _uncatchable(_DAXEvaluationError(
+            f"DAX comparison operations do not support comparing values of type {names[0]} with values of "
+            f"type {names[1]}. Consider using the VALUE or FORMAT function to convert one of the values."))
 
     def _strip_parens(self, s: str) -> str:
         """``s`` without parentheses that wrap the whole of it."""
@@ -25579,6 +25760,28 @@ class DAXEngine:
             else:
                 break
         ext = parts[i:]
+        # GROUPBY's own columns are its own, whatever their names: headed
+        # [Name] (__added__, _lineage_cells), not as a column of the grouped
+        # table. Power BI Desktop 2.157 (2026-11-18): GROUPBY('Opp',
+        # 'Opp'[Name], "Rank", ...) heads Opp[Name], [Rank], though Opp has a
+        # column Rank; two of one name (case-insensitively) are "Function
+        # 'GROUPBY' cannot add column [X], as it has the same name with an
+        # existing column."; one named exactly as a group column is a column
+        # beside it ("Name" gives Opp[Name] and [Name]), which a row here
+        # can't hold by its name alone: unsupported, never one overwriting
+        # the other.
+        names = [str(self._eval_expr(ext[j].strip(), ctx)) for j in range(0, len(ext) - 1, 2)]
+        seen: set = set()
+        for nm in names:
+            if nm.lower() in seen:
+                raise _DAXEvaluationError(
+                    f"Function 'GROUPBY' cannot add column [{nm}], as it has the same name with an "
+                    "existing column.")
+            seen.add(nm.lower())
+        if set(names) & {str(c) for c in group_cols}:
+            # a row's keys are case-sensitive: "name" beside Name fits
+            self._note_unsupported('GROUPBY')
+            return []
         groups: dict = {}
         for r in rows:
             key = tuple(r.get(c) for c in group_cols)
@@ -25588,17 +25791,16 @@ class DAXEngine:
             new_row = _ColumnsRow({'__table__': rows[0]['__table__'], '__row__': True})
             for c, v in zip(group_cols, key):
                 new_row[c] = v
-            j = 0
-            while j + 1 < len(ext):
-                cname = self._eval_expr(ext[j].strip(), ctx)
+            for k, cname in enumerate(names):
                 prev_grp = getattr(ctx, '_current_group', None)
                 ctx._current_group = grp_rows
                 try:
-                    val = self._eval_expr(ext[j + 1].strip(), ctx)
+                    val = self._eval_expr(ext[2 * k + 1].strip(), ctx)
                 finally:
                     ctx._current_group = prev_grp
-                new_row[str(cname)] = val
-                j += 2
+                new_row[cname] = val
+            if names:
+                new_row['__added__'] = frozenset(names)
             out.append(new_row)
         return out
 

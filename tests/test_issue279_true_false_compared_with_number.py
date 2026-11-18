@@ -42,7 +42,10 @@ def test_d5_true_against_an_integer_fails():
 def test_d11_in_against_true_fails():
     got, err = _engine("IF(1 = 1 IN {TRUE()}, 1, 0)")
     assert got == "ERROR"
-    assert "Function CONTAINSROW does not support comparing values of type True/False" in err
+    # 2.152's text was taken from a Norwegian Desktop; 2.157's English (2026-11-18, TRUE() IN {1}) quotes the name
+    # and puts the table's type first: here the table holds TRUE, the value 1 (1 = (1 IN {TRUE()}))
+    assert "Function 'CONTAINSROW' does not support comparing values of type True/False with values of type " \
+           "Integer" in err
 
 
 @pytest.mark.parametrize("expr", [
