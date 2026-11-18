@@ -2500,6 +2500,39 @@ def _in_kind(v) -> str:
 
 
 
+# the pairs of kinds a comparison operator refuses (Power BI Desktop 2.157,
+# 2026-11-18, #343): measured each way round in CALCULATE filters, FILTER and
+# plain scalars. A date against a number compares as its serial.
+# a static type code (DAXEngine._static_type) as a kind of value; Variant,
+# BLANK and unknown are no kind
+_STATIC_KIND = {'S': 'text', 'I': 'number', 'D': 'number', 'C': 'number', 'L': 'bool', 'T': 'date'}
+
+_STATIC_TYPE_NAME = {'S': 'Text', 'I': 'Integer', 'D': 'Number', 'C': 'Currency', 'L': 'True/False', 'T': 'Date'}
+
+_CMP_CLASH_PAIRS = ({'text', 'number'}, {'text', 'bool'}, {'bool', 'number'}, {'date', 'text'})
+
+
+def _compare_clash(left, right) -> None:
+    """Raise Desktop's error for a comparison operator (=, <>, <, >, <=, >=)
+    between values of kinds it refuses, the left operand's type first. Power
+    BI Desktop 2.157 (2026-11-18, #343): "a" = 1, "1" = 1 and "a" < 1 are
+    "DAX comparison operations do not support comparing values of type Text
+    with values of type Integer. Consider using the VALUE or FORMAT function
+    to convert one of the values."; Opp[Flag] = 1 names True/False then
+    Integer, 1 = Opp[Name] Integer then Text, Opp[When] = "1/5/2026" Date then
+    Text. Desktop checks the types before anything runs: IFERROR does not
+    catch it, so neither does it here (an IF branch never taken, which
+    Desktop refuses too, is evaluated here only when taken). It answered
+    FALSE, BLANK or a number."""
+    kinds = {_in_kind(left), _in_kind(right)}
+    if kinds not in _CMP_CLASH_PAIRS:
+        return
+    raise _uncatchable(_DAXEvaluationError(
+        f"DAX comparison operations do not support comparing values of type {_kind_type_name(left)} with "
+        f"values of type {_kind_type_name(right)}. Consider using the VALUE or FORMAT function to convert one "
+        f"of the values."))
+
+
 def _containsrow_clash(hay, needle) -> None:
     """Raise for CONTAINSROW (and IN, which is CONTAINSROW) comparing a
     table's value with a needle of another kind, the table's type named
@@ -9443,10 +9476,38 @@ class DAXContext:
         (_text_filter_value_keys, #221), any other as _filter_value_keys
         reads it."""
         keys_of = _text_filter_value_keys if self._text_column(tbl, col_idx) else _filter_value_keys
+        dates = None
         keys: set = set()
         for v in values:
+            if isinstance(v, (int, float, _Currency)) and not isinstance(v, bool):
+                if dates is None:
+                    # memoized per model (_shield_cache): a filter's every
+                    # number passes here
+                    mk = ('date-column', id(tbl), col_idx)
+                    dates = self._shield_cache.get(mk)
+                    if dates is None:
+                        dates = self._shield_cache[mk] = self._date_column(tbl, col_idx)
+                if dates:
+                    # a date column filtered by a number: its date serial.
+                    # Power BI Desktop 2.157 (2026-11-18, #343): CALCULATE(..,
+                    # Opp[When] = 46027) and TREATAS({46027}, Opp[When]) keep
+                    # 2026-01-05; they kept nothing. A serial past any date
+                    # keeps nothing.
+                    try:
+                        v = _DAX_EPOCH_DT + timedelta(days=float(v))
+                    except (OverflowError, ValueError):
+                        continue
             keys |= keys_of(v)
         return keys
+
+    @staticmethod
+    def _date_column(tbl: dict, col_idx: int) -> bool:
+        """Does the column hold dates (its first value not BLANK)?"""
+        for r in tbl.get('rows') or ():
+            v = r[col_idx] if col_idx < len(r) else None
+            if v is not None:
+                return isinstance(v, (datetime, date))
+        return False
 
     def _indices_for_column_filter(self, tbl: dict, col_idx: int, allowed):
         """Row indices an In-SET filter on the column itself selects, as DAX
@@ -13914,7 +13975,12 @@ class DAXEngine:
             if v is not None:
                 kinds.setdefault(_in_kind(v), v)
         if len(kinds) == 1:
-            _containsrow_clash(next(iter(kinds.values())), lval)
+            try:
+                _containsrow_clash(next(iter(kinds.values())), lval)
+            except _DAXEvaluationError as e:
+                # checked before anything runs: IFERROR(1 IN {"a"}, -1) is the
+                # error (Desktop 2.157, 2026-11-18, #343)
+                raise _uncatchable(e)
         return any(v is not None and _compare(lval, '=', v) for v in values)
 
     @staticmethod
@@ -14017,6 +14083,7 @@ class DAXEngine:
             # build_b255c.py v15: VALUES(TM[d]) = 7 over two values
             # fails, where it was FALSE)
             _table_as_scalar(left if type(left) is list else right)
+        self._static_cmp_clash(parts[0], parts[1], left, right, ctx)
         if op_str == '==':
             # Strict: a blank equals only a blank.
             if left is None or right is None:
@@ -14026,8 +14093,6 @@ class DAXEngine:
             # takes the zero of the other operand's type. See
             # _blank_zero_of for the Desktop-verified table.
             left, right = _coerce_blanks_for_compare(left, right)
-        if left is not None and right is not None and (type(left) is bool) is not (type(right) is bool):
-            _bool_number_clash(left, right)     # #279
         if isinstance(left, str) and isinstance(right, str):
             # Text compares case-insensitively ("North" = "north",
             # "a" < "B"; issue #107).
@@ -15193,7 +15258,18 @@ class DAXEngine:
             args = self._split_args(args_text)
             if fname in self._STATIC_FN_ARG:
                 i = self._STATIC_FN_ARG[fname]
-                return rec(args[i], ctx, env, depth + 1, stack) if len(args) > i else None
+                t = rec(args[i], ctx, env, depth + 1, stack) if len(args) > i else None
+                alt = (args[1] if fname == 'SELECTEDVALUE' and len(args) > 1
+                       else args[-1] if fname == 'LOOKUPVALUE' and len(args) % 2 == 0 and len(args) > 3 else None)
+                if alt is not None and t is not None:
+                    # an alternate of another kind makes a Variant: Power BI
+                    # Desktop 2.157 (2026-11-18, #343) compares
+                    # SELECTEDVALUE(Opp[Name], 0) = 0 under Opp[Name] = "a"
+                    # (FALSE), where Text against a number is an error
+                    at = rec(alt, ctx, env, depth + 1, stack)
+                    if at not in (None, 'B') and _STATIC_KIND.get(at) != _STATIC_KIND.get(t):
+                        return 'V'
+                return t
             if fname == 'CONVERT' and len(args) == 2:
                 return {'INTEGER': 'I', 'INT64': 'I', 'DOUBLE': 'D', 'CURRENCY': 'C', 'DECIMAL': 'C',
                         'STRING': 'S', 'BOOLEAN': 'L', 'DATETIME': 'T'}.get(args[1].strip().upper())
@@ -18839,8 +18915,9 @@ class DAXEngine:
 
         if kind == 'cmp':
             val = self._eval_expr(val_text, ctx, var_scope)
-            if op == '=' and val is not None:
-                self._filter_cmp_clash(tbl, col, val, ctx)
+            if val is not None and self._static_kind(val_text, ctx) is not None:
+                # a Variant value (SELECTEDVALUE(.., 0)) is checked by no type
+                self._filter_cmp_clash(tbl, col, val, ctx, self._column_first(inner, ctx))
             if negate:
                 op = {'=': '<>', '<>': '=', '>': '<=', '<=': '>',
                       '>=': '<', '<': '>='}[op]
@@ -18938,23 +19015,87 @@ class DAXEngine:
                 return out
         return vals
 
-    def _filter_cmp_clash(self, tbl: str, col: str, val, ctx: DAXContext) -> None:
-        """A CALCULATE filter's ``T[c] = <value>`` of text against a number,
-        checked before anything runs. Power BI Desktop 2.157 (2026-11-18,
-        #340): CALCULATE([Total], Opp[Name] = 1) is "DAX comparison
-        operations do not support comparing values of type Text with values
-        of type Integer. ...", the column's type first; it answered BLANK.
-        Measured for = alone: the other operators compare as before."""
+    def _filter_cmp_clash(self, tbl: str, col: str, val, ctx: DAXContext, column_first: bool = True) -> None:
+        """A CALCULATE filter's ``T[c] <op> <value>`` of kinds a comparison
+        refuses (_compare_clash), checked before anything runs, the left
+        operand's type first. Power BI Desktop 2.157 (2026-11-18, #340,
+        #343): CALCULATE([Total], Opp[Name] = 1), <> 1 and > 1 are "DAX
+        comparison operations do not support comparing values of type Text
+        with values of type Integer. ..."; 1 = Opp[Name] names Integer first.
+        They answered BLANK or the unfiltered total."""
         sample = self._column_sample(tbl, col, ctx)
         if sample is None:
             return
-        kinds = {_in_kind(sample), _in_kind(val)}
-        if kinds != {'text', 'number'}:
+        if column_first:
+            _compare_clash(sample, val)
+        else:
+            _compare_clash(val, sample)
+
+    def _static_code(self, text: str, ctx: DAXContext) -> Optional[str]:
+        """The type code an operand's expression is declared to give
+        (_static_type) when it is one of a kind (_STATIC_KIND), else None: a
+        Variant, BLANK, a column of mixed kinds, or a type the engine can't
+        read from the text. Memoized per model (_shield_cache): a comparison
+        passes here on every row."""
+        cache = ctx._shield_cache
+        key = ('static-code', text)
+        if key in cache:
+            return cache[key]
+        try:
+            code = self._static_type(text, ctx)
+        except Exception:
+            code = None
+        if code not in _STATIC_KIND or self._mixed_column(text, ctx):
+            code = None
+        cache[key] = code
+        return code
+
+    def _static_kind(self, text: str, ctx: DAXContext) -> Optional[str]:
+        return _STATIC_KIND.get(self._static_code(text.strip(), ctx))
+
+    def _static_cmp_clash(self, ltext: str, rtext: str, left, right, ctx: DAXContext) -> None:
+        """Desktop's type check of a comparison operator: by the operands'
+        declared types, before any value is read (_CMP_CLASH_PAIRS, the left
+        operand's type first). Power BI Desktop 2.157 (2026-11-18, #343):
+        MAX('_M'[Column1]) = 1 errors on a BLANK (Text with Integer),
+        DATE(2026,1,5) = "2026-01-05" errors (Date with Text) though the text
+        reads as that date, while IF(1 = 1, "x", 1) = 1 is FALSE and
+        SELECTEDVALUE(Opp[Name], 0) = 0 compares: a Variant is checked by no
+        type. An operand whose type the engine can't read is not checked."""
+        lc = self._static_code(ltext.strip(), ctx)
+        if lc is None:
             return
-        names = [_kind_type_name(v) for v in (sample, val)]
+        rc = self._static_code(rtext.strip(), ctx)
+        if rc is None or {_STATIC_KIND[lc], _STATIC_KIND[rc]} not in _CMP_CLASH_PAIRS:
+            return
         raise _uncatchable(_DAXEvaluationError(
-            f"DAX comparison operations do not support comparing values of type {names[0]} with values of "
-            f"type {names[1]}. Consider using the VALUE or FORMAT function to convert one of the values."))
+            f"DAX comparison operations do not support comparing values of type {_STATIC_TYPE_NAME[lc]} with "
+            f"values of type {_STATIC_TYPE_NAME[rc]}. Consider using the VALUE or FORMAT function to convert one "
+            f"of the values."))
+
+    def _mixed_column(self, text: str, ctx: DAXContext) -> bool:
+        """Is ``text`` a reference to a model column holding values of more
+        than one kind (_column_sample finds no one kind)?"""
+        cm = self._model_column_match(text.strip(), ctx)
+        if not cm:
+            return False
+        if self._column_sample(cm[0], cm[1], ctx) is not None:
+            return False
+        t = ctx.tables.get(cm[0])
+        i = ctx._find_col_idx(t['columns'], cm[1]) if t else -1
+        return i >= 0 and any(r[i] is not None for r in t.get('rows') or () if i < len(r))
+
+    def _column_first(self, inner: str, ctx: DAXContext) -> bool:
+        """Is a CALCULATE comparison's column its left operand (T[c] = 1), not
+        its right (1 = T[c])?"""
+        s = self._strip_parens(inner)
+        while True:
+            wrapper, peeled = self._peel_call(s, ('NOT', 'KEEPFILTERS'))
+            if not wrapper:
+                break
+            s = self._strip_parens(peeled)
+        split = DAXEngine._cmp_split(s)
+        return not split or self._model_column_match(split[1], ctx) is not None
 
     def _strip_parens(self, s: str) -> str:
         """``s`` without parentheses that wrap the whole of it."""
@@ -23059,6 +23200,30 @@ class DAXEngine:
                 break  # Rest are name/expression pairs
         if not group_refs:
             return []
+        # Filter tables, between the group columns and the "name", expression
+        # pairs, filter the groups and the expressions alike: the call is the
+        # same one under CALCULATETABLE(..., <filter tables>). Power BI
+        # Desktop 2.157 (2026-11-18, #341): SUMMARIZECOLUMNS('Opp'[Name],
+        # TREATAS({1}, Opp[Rank]), "t", [Total]) is one row (a, 1);
+        # FILTER(VALUES(Opp[Rank]), Opp[Rank] >= 2) gives (a, 3), (b, 2);
+        # TREATAS({99}, Opp[Rank]) no row; with no expression the groups alone
+        # (a). They were ignored: every group, unfiltered.
+        n_filters = 0
+        for a in args[len(group_refs):]:
+            if a.strip().startswith('"'):
+                break
+            n_filters += 1
+        if n_filters:
+            filters = [a.strip() for a in args[len(group_refs):len(group_refs) + n_filters]]
+            unfiltered = [a.strip() for a in args[:len(group_refs)] + args[len(group_refs) + n_filters:]]
+            result = self._eval_expr("CALCULATETABLE(SUMMARIZECOLUMNS(" + ", ".join(unfiltered) + "), "
+                                     + ", ".join(filters) + ")", ctx)
+            if rollup_subtotal and isinstance(result, list):
+                sub = _ColumnsRow({'__table__': group_refs[0][0], '__row__': True})
+                for _t, _c in group_refs:
+                    sub[_c] = None
+                result = result + [sub]
+            return result
         # Use first table as base. Forward the trailing "Name", <expression>
         # extension columns too — they were dropped, so the aggregated value
         # silently disappeared from the result.
@@ -23356,7 +23521,62 @@ class DAXEngine:
             out = _StaticRows()
             out.num_kinds = static
             return out
+        if len(sides) > 1:
+            result = self._union_kinds(result)
         return _unify_number_columns(result, static)
+
+    @classmethod
+    def _union_kinds(cls, rows: list) -> list:
+        """UNION's columns, each one type, as Power BI Desktop 2.157 makes
+        them (2026-11-18, #342): text beside values of other kinds makes a
+        Text column, each as `&` writes it (UNION({DATE(2026,1,6)}, {"a"}) is
+        "1/6/2026", "a"; {TRUE()} beside {"a"} "TRUE"; {2.5} "2.5"); with no
+        text, a date beside numbers is its serial (UNION({DATE(2026,1,6)},
+        {1}) is a Double column, 46028 and 1) and TRUE / FALSE beside
+        numbers 1 / 0 (UNION({TRUE()}, {1}) an Int64 column, 1 and 1). The
+        values kept their kinds: a Variant column. A date beside TRUE /
+        FALSE is not measured and is left as it is. Rows are copied only
+        where a value changes."""
+        if not rows or not isinstance(rows[0], dict):
+            return rows
+        names = [cls._cell_keys(r) for r in rows]
+        if any(n is None for n in names):
+            return rows
+        width = len(names[0])
+        if any(len(n) != width for n in names):
+            return rows
+        convert: dict = {}
+        for i in range(width):
+            kinds = {_in_kind(r[n[i]]) for r, n in zip(rows, names) if r.get(n[i]) is not None}
+            if len(kinds) < 2:
+                continue
+            if 'text' in kinds:
+                convert[i] = lambda v: v if isinstance(v, str) else _concat_str(v)
+            elif kinds <= {'number', 'date'}:
+                convert[i] = lambda v: _as_number(v) if isinstance(v, (datetime, date)) else v
+            elif kinds <= {'number', 'bool'}:
+                convert[i] = lambda v: int(v) if isinstance(v, bool) else v
+        if not convert:
+            return rows
+        out = []
+        for r, n in zip(rows, names):
+            new = None
+            for i, f in convert.items():
+                v = r.get(n[i])
+                if v is None:
+                    continue
+                nv = f(v)
+                if nv is v or (type(nv) is type(v) and nv == v):
+                    continue
+                if new is None:
+                    new = type(r)(r)
+                new[n[i]] = nv
+                if n[i] == '__value__':
+                    for alias in ('Value', r.get('__column__')):
+                        if isinstance(alias, str) and alias in r:
+                            new[alias] = nv
+            out.append(new if new is not None else r)
+        return out
 
     @classmethod
     def _cell_names(cls, row: dict) -> Optional[list]:
@@ -23634,7 +23854,32 @@ class DAXEngine:
         t2 = self._eval_expr(args[1].strip(), ctx)
         if not isinstance(t1, list) or not isinstance(t2, list):
             return []
+        self._join_kind_clash('INTERSECT', t1, t2)
         return [item for item, found in zip(t1, self._rows_in(t1, t2)) if found]
+
+    def _join_kind_clash(self, fn: str, t1: list, t2: list) -> None:
+        """Raise when a column of ``t1`` holds text and the same column of
+        ``t2`` numbers, or the other way round. Power BI Desktop 2.157
+        (2026-11-18, #342): INTERSECT(UNION({1}, {"a"}), VALUES(Opp[Rank]))
+        is "Function 'INTERSECT' does not support joining a column of type
+        Text with a column of type Integer." (the first table's type first);
+        it answered as if the values compared. Other pairs of kinds are not
+        measured and join as before."""
+        def kinds(rows):
+            out: list = []
+            for cells in self._rows_cells(rows):    # read by layout, not row by row
+                for i, v in enumerate(cells):
+                    if i >= len(out):
+                        out.append({})
+                    if v is not None:
+                        out[i].setdefault(_in_kind(v), v)
+            return out
+        for a, b in zip(kinds(t1), kinds(t2)):
+            if len(a) == 1 and len(b) == 1 and {next(iter(a)), next(iter(b))} == {'text', 'number'}:
+                raise _DAXEvaluationError(
+                    f"Function '{fn}' does not support joining a column of type "
+                    f"{_kind_type_name(next(iter(a.values())))} with a column of type "
+                    f"{_kind_type_name(next(iter(b.values())))}.")
 
     def _fn_crossjoin(self, args_str: str, ctx: DAXContext) -> Any:
         """CROSSJOIN(table1, table2, ...) — cartesian product.
@@ -23831,10 +24076,39 @@ class DAXEngine:
                 cols, combos = list(res[1]), list(res[2])
             cols = [(ctx.model_table(t), c) for t, c in cols]
             combos = self._treatas_present(cols, combos, ctx)
+            combos = self._treatas_typed(cols, combos, ctx)
             out = _TreatasTable(self._summarize_row(cols, tuple(combo)) for combo in combos)
             out.marker = res
             return out
         return res
+
+    @staticmethod
+    def _treatas_typed(cols: list, combos: list, ctx: DAXContext) -> list:
+        """TREATAS' rows with each value of a date column as a date: a
+        number its serial, a text the date it reads as. Power BI Desktop
+        2.157 (2026-11-18, #343): EVALUATE TREATAS({46027}, Opp[When]) and
+        TREATAS({"2026-01-05"}, Opp[When]) are one row, 2026-01-05 (a
+        DateTime); the engine kept 46027 and the text."""
+        dates = []
+        for t, c in cols:
+            tbl = ctx.tables.get(t)
+            idx = ctx._find_col_idx(tbl['columns'], c) if tbl else -1
+            dates.append(idx >= 0 and DAXContext._date_column(tbl, idx))
+        if not any(dates):
+            return combos
+
+        def as_date(v):
+            if isinstance(v, (datetime, date)) or v is None:
+                return v
+            try:
+                if isinstance(v, (int, float, _Currency)) and not isinstance(v, bool):
+                    return _DAX_EPOCH_DT + timedelta(days=float(v))
+                if isinstance(v, str):
+                    return _as_datetime(v) or v
+            except (OverflowError, ValueError):
+                return v
+            return v
+        return [tuple(as_date(v) if d else v for d, v in zip(dates, combo)) for combo in combos]
 
     @staticmethod
     def _treatas_present(cols: list, combos: list, ctx: DAXContext) -> list:
@@ -27128,6 +27402,15 @@ class DAXEngine:
                     return bool(v)
                 return None
             if target == "DATETIME":
+                if isinstance(v, (int, float, _Currency)) and not isinstance(v, bool) and float(v) < 0:
+                    # an OLE date: the whole days back from 1899-12-30, the
+                    # fraction forward from that day. Power BI Desktop 2.157
+                    # (2026-11-18, #343): CONVERT(-1.25, DATETIME) is
+                    # 1899-12-29 06:00; it was 12-28 18:00. (A comparison of
+                    # a date with a number still reads the serial linearly:
+                    # DATE(1899,12,28) + TIME(18,0,0) IN {-1.25} is TRUE.)
+                    days = math.trunc(float(v))
+                    return _DAX_EPOCH_DT + timedelta(days=days) + timedelta(days=abs(float(v) - days))
                 return _as_datetime(v)
         except (ValueError, OverflowError):
             return None

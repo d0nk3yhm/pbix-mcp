@@ -244,3 +244,97 @@ def test_a_column_of_an_empty_table_sharing_a_measures_name_stays_the_column():
         v, err = _measure_of(dict(homes), "Probe", {"Opp": ["Rank"], "E": ["Amount"]},
                              {"Amount": "SUM(Opp[Rank]) * 100", "Probe": "SELECTEDVALUE('E'[Amount], -1)"})
         assert (v, err) == (-1, None)
+
+
+# ---------------------------------------------------------------------------
+# Comparisons by declared type, SUMMARIZECOLUMNS' filter tables, UNION's columns, INTERSECT
+# (Power BI Desktop 2.157, 2026-11-18)
+# ---------------------------------------------------------------------------
+
+def _cmp(first: str, second: str) -> str:
+    return (f"DAX comparison operations do not support comparing values of type {first} with values of type "
+            f"{second}. Consider using the VALUE or FORMAT function to convert one of the values.")
+
+
+@pytest.mark.parametrize("expr, first, second", [
+    ('IF("a" = 1, 1, 0)', "Text", "Integer"),
+    ('IF("1" = 1, 1, 0)', "Text", "Integer"),
+    ('IF("a" < 1, 1, 0)', "Text", "Integer"),
+    ('IF(1 == "a", 1, 0)', "Integer", "Text"),
+    ('IF(DATE(2026,1,5) = "2026-01-05", 1, 0)', "Date", "Text"),
+    ("COUNTROWS(FILTER(Opp, Opp[Name] = 1))", "Text", "Integer"),
+    ("COUNTROWS(FILTER(Opp, Opp[When] = \"1/5/2026\"))", "Date", "Text"),
+    ("IFERROR(COUNTROWS(FILTER(Opp, Opp[Name] = 1)), -1)", "Text", "Integer"),
+    ('CALCULATE([Total], Opp[Name] = 1 || Opp[Rank] = 1)', "Text", "Integer"),
+    ('CALCULATE([Total], Opp[Name] <> 1)', "Text", "Integer"),
+    ('CALCULATE([Total], Opp[Name] > 1)', "Text", "Integer"),
+    ('CALCULATE([Total], 1 = Opp[Name])', "Integer", "Text"),
+    ('CALCULATE([Total], Opp[Name] = TRUE())', "Text", "True/False"),
+    ('CALCULATE([Total], Opp[Flag] = "a")', "True/False", "Text"),
+    ('CALCULATE([Total], Opp[Flag] = 1)', "True/False", "Integer"),
+    ('CALCULATE([Total], Opp[When] = "1/5/2026")', "Date", "Text"),
+])
+def test_a_comparison_of_declared_types_that_clash(expr, first, second):
+    assert error(expr).endswith(_cmp(first, second))
+
+
+@pytest.mark.parametrize("expr, want", [
+    ('CALCULATE(IF(SELECTEDVALUE(Opp[Name], 0) == 0, "none", "one"), Opp[Name] = "a")', "one"),
+    ('CALCULATE(IF(SELECTEDVALUE(Opp[Name], 0) = 0, "none", "one"), Opp[Name] = "a")', "one"),
+    ('IF(SELECTEDVALUE(Opp[Rank], "none") = 1, 1, 0)', 0),
+    ('IF(IF(1 = 1, "x", 1) = 1, 1, 0)', 0),
+    ('IF(COALESCE(MAX(Opp[Name]), 0) = 0, 1, 2)', 2),
+    ('SUMX(Opp, IF(IF(Opp[Rank] = 1, "x", Opp[Rank]) = 2, 1, 0))', 1),
+    ('SWITCH(TRUE(), IF(1 = 1, "x", 1) = 1, 1, 0)', 0),
+    ('CALCULATE([Total], Opp[When] = 46027)', 1),                  # a date serial
+    ('CALCULATE([Total], TREATAS({46027}, Opp[When]))', 1),
+    ('CALCULATE([Total], TREATAS({"1"}, Opp[Rank]))', 1),
+    ('CONVERT(-1.25, DATETIME)', dt.datetime(1899, 12, 29, 6, 0)),
+])
+def test_what_compares_by_declared_type(expr, want):
+    assert value(expr) == want
+
+
+@pytest.mark.parametrize("filters, rows", [
+    ("FILTER(ALL(Opp[Rank]), Opp[Rank] = 1)", {"a": 1}),
+    ("TREATAS({1}, Opp[Rank])", {"a": 1}),
+    ("KEEPFILTERS(FILTER(ALL(Opp[Rank]), Opp[Rank] = 1))", {"a": 1}),
+    ("FILTER(ALL(Opp[Flag]), Opp[Flag] = TRUE())", {"a": 4}),
+    ("TREATAS({\"a\"}, Opp[Name])", {"a": 4}),
+    ("TREATAS({1, 2, 3}, Opp[Rank]), FILTER(ALL(Opp[Flag]), Opp[Flag] = TRUE())", {"a": 4}),
+    ("TREATAS({\"Lead\"}, 'Sales stage'[Sales Stage])", {"a": 4, "b": 2}),
+    ("TREATAS({99}, Opp[Rank])", {}),
+    ("FILTER(VALUES(Opp[Rank]), Opp[Rank] >= 2)", {"a": 3, "b": 2}),
+    ("FILTER(Opp, Opp[Rank] = 3)", {"a": 3}),
+])
+def test_summarizecolumns_filter_tables_apply(filters, rows):
+    sc = f"SUMMARIZECOLUMNS('Opp'[Name], {filters}, \"t\", [Total])"
+    assert value(f"COUNTROWS({sc}) + 0") == len(rows)
+    for name, total in rows.items():
+        assert value(f"SUMX(FILTER({sc}, [Name] = \"{name}\"), [t])") == total
+
+
+def test_summarizecolumns_filter_with_no_expression_keeps_the_groups_it_filters():
+    assert value("CONCATENATEX(SUMMARIZECOLUMNS('Opp'[Name], TREATAS({1}, Opp[Rank])), [Name], \",\")") == "a"
+
+
+@pytest.mark.parametrize("union, cells", [
+    ('UNION({DATE(2026,1,6)}, {"a"})', ["1/6/2026", "a"]),
+    ('UNION({TRUE()}, {"a"})', ["TRUE", "a"]),
+    ('UNION({2.5}, {"a"})', ["2.5", "a"]),
+    ('UNION({"a"}, {1})', ["a", "1"]),
+    ('UNION({DATE(2026,1,6)}, {1})', [46028.0, 1]),
+    ('UNION({TRUE()}, {1})', [1, 1]),
+])
+def test_union_unifies_each_column(union, cells):
+    _v, err, e = ev("COUNTROWS(" + union + ")")
+    assert err is None
+    c = DAXContext(TABLES, dict(MEASURES))
+    c.measure_tables = dict(HOMES)
+    rows = DAXEngine()._eval_expr(union, c)
+    assert [DAXEngine._row_cells(r)[0] for r in rows] == cells
+
+
+def test_intersect_of_text_with_numbers():
+    assert error('COUNTROWS(INTERSECT(UNION({1}, {"a"}), VALUES(Opp[Rank])))').endswith(
+        "Function 'INTERSECT' does not support joining a column of type Text with a column of type Integer.")
