@@ -593,7 +593,7 @@ Kept so the same items are not re-litigated:
 ## Recently closed
 
 - **GH #373-#383** (PRs #371 / #372 by @allanon2, solved on our side) --
-  CLOSED (unreleased). Measured with our own probe model on Desktop 2.157
+  CLOSED (0.9.154, b357e16). Measured with our own probe model on Desktop 2.157
   (build_b371.py, 186 queries, built = refreshed): FORMAT's named date formats
   by culture, the AMPM token, General Date and Medium Time (#373); ROW's
   argument errors (#374); ADDCOLUMNS / GROUPBY names and the headings of
@@ -608,7 +608,7 @@ Kept so the same items are not re-litigated:
   Regression: tests/test_issue373_383_desktop_2157.py.
 
 - **GH #369, #370** (PRs #362 / #363 by @allanon2, solved on our side) --
-  CLOSED (unreleased, f4d194f). A date table filter reaches a table two hops
+  CLOSED (0.9.154, f4d194f). A date table filter reaches a table two hops
   away, Date -> Sales -> Sales Order (#369); a calculation group whose item
   column has no SourceColumn takes its one non-Ordinal data column (#370).
   Measured on Microsoft's 2026 AdventureWorks Sales sample against counts from

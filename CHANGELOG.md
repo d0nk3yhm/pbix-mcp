@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Reported by @allanon2 in #362 and #363, measured on Microsoft's MIT sample `2026 Power BI Samples Revamp/AdventureWorks Sales.pbix`.
+## [0.9.154] - 2026-11-20
+
+DAX engine fixes, all reported by @allanon2 and solved on our side. #369 and #370 come from PRs #362 and #363 and were measured on Microsoft's MIT sample `2026 Power BI Samples Revamp/AdventureWorks Sales.pbix`. #373-#383 come from PRs #371 and #372 and were measured on Power BI Desktop 2.157.
 
 ### Fixed — a date table filter reaches a table two hops away (issue #369; reported by @allanon2 in #362)
 
