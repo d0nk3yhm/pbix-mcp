@@ -592,6 +592,21 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **GH #373-#383** (PRs #371 / #372 by @allanon2, solved on our side) --
+  CLOSED (unreleased). Measured with our own probe model on Desktop 2.157
+  (build_b371.py, 186 queries, built = refreshed): FORMAT's named date formats
+  by culture, the AMPM token, General Date and Medium Time (#373); ROW's
+  argument errors (#374); ADDCOLUMNS / GROUPBY names and the headings of
+  added columns (#375); MEDIAN / MEDIANX over text, TRUE / FALSE or dates
+  (#376); row constructors before IN and CONTAINSROW's checks (#377);
+  nested VAR blocks (#378); 'Table'[Measure] under the wrong table and
+  tables with no rows (#379); UNION's types and INTERSECT's error (#380);
+  comparisons and IN by declared type, checked before the measure runs
+  (#381); date columns against numbers and CONVERT of negatives (#382);
+  SUMMARIZECOLUMNS' filter tables (#383). Not ported: FORMAT in cultures
+  other than six English ones (de-DE prints German on Desktop).
+  Regression: tests/test_issue373_383_desktop_2157.py.
+
 - **GH #369, #370** (PRs #362 / #363 by @allanon2, solved on our side) --
   CLOSED (unreleased, f4d194f). A date table filter reaches a table two hops
   away, Date -> Sales -> Sales Order (#369); a calculation group whose item

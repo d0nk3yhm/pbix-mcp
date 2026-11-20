@@ -17,6 +17,48 @@ A filter on the date table did not reach a table with no direct relationship to 
 
 `ModelReader.calculation_groups` found a group's item column only by `SourceColumn = "Name"`. Both groups in that sample leave it empty, so they were skipped and `Sales by Due Date` / `Sales by Ship Date` answered the order-date figure. With no column sourced from `Name`, the item column is now the one data column that isn't the `Ordinal`, and two such columns leave the group undecided as before. For 2018 they now answer 29892677.7569 and 29998861.1604, the sums from the table rows by each date key. Tests: `tests/test_issue370_calc_group_item_column.py`.
 
+### Fixed — answers measured on Power BI Desktop 2.157 (issues #373-#383; reported by @allanon2 in #371 and #372)
+
+Every answer below was measured with our own probe model on Power BI Desktop 2.157: 186 EVALUATE queries, the same before and after a full refresh. The engine now matches Desktop on each of them, except in the cultures listed under #373, which keep their en-US rendering. Tests: `tests/test_issue373_383_desktop_2157.py`, 93 cases asked through `pbix_evaluate_dax`.
+
+- **FORMAT's named date formats follow the culture (#373).**
+  - `Short Date`, `Long Date`, `Long Time` and `General Date` render in en-US, en-AU, en-NZ, en-GB, en-IE and en-CA: FORMAT's third argument, else the model's culture. Every culture rendered as en-US.
+  - On 2026-01-06 13:30:05, `Short Date` is `6/01/2026` (en-AU), `06/01/2026` (en-GB) and `2026-01-06` (en-CA). `Long Date` in en-GB is `06 January 2026`, and `Long Time` in en-GB is `13:30:05`.
+  - A picture's `/` prints the culture's date separator: `d/MM/yyyy` in en-CA is `6-01-2026`.
+  - The `AMPM` token prints the culture's designator (`PM`; `pm` in en-NZ and en-IE). It printed `A1P1`.
+  - `Medium Time` pads its hour (`01:30 PM`).
+  - `General Date` prints the date alone at midnight and the time alone on 1899-12-30.
+  - Other cultures keep en-US rendering rather than being refused. Desktop prints de-DE in German, and that isn't ported.
+- **ROW (#374).** A missing value, a single argument, and two names that differ only in case are Desktop's errors. The engine answered a table instead.
+- **ADDCOLUMNS / GROUPBY (#375).**
+  - ADDCOLUMNS over a column its table already has, in any case, is Desktop's error ("cannot add column [X] since it already exists."). It replaced the column's values.
+  - Two new names that differ only in case are an error in ADDCOLUMNS and GROUPBY.
+  - Columns that ADDCOLUMNS, SUMMARIZE, SUMMARIZECOLUMNS and GROUPBY add are headed `[Rank]` in TOCSV, even when the table has a column `Rank`.
+  - A GROUPBY column named like one of its group columns is refused as unsupported. Desktop keeps both columns, and the engine overwrote the group column.
+- **MEDIAN / MEDIANX (#376).** Over text, TRUE / FALSE or dates they are Desktop's error ("MEDIAN does not support expressions of type string/Boolean/date."). They answered BLANK or TRUE.
+- **Row constructors before IN, and CONTAINSROW (#377).**
+  - `(Opp[Rank], Opp[Name]) IN {(1, "a"), (3, "a")}` matches row by row: text compares without case, and a BLANK matches only a BLANK. It matched nothing.
+  - A tuple of another width than the table is CONTAINSROW's argument error.
+- **Nested VAR blocks (#378).** A VAR block can be a VAR's value: `VAR a = VAR b = 1 RETURN b + 1 RETURN a` is 2, where it was 1, because the inner RETURN ended the outer block.
+- **Measures by table, and tables with no rows (#379).**
+  - `'Opp'[Total]`, with Total homed on another table, is Desktop's "Column 'Total' in table 'Opp' cannot be found ..." error. It answered Total.
+  - The server keeps a model table that holds no rows, so `'_M'[Total]` on it is 6. It leaked a marker.
+- **UNION and INTERSECT (#380).**
+  - In UNION, a date beside numbers is its serial (`1`, `46028`), and TRUE / FALSE beside Int64s is 1 / 0.
+  - INTERSECT of a Text column with a number column is Desktop's error. It answered an empty table.
+- **Comparisons and IN by declared type (#381).**
+  - Text against a number, TRUE / FALSE against a number or text, and a date against text are Desktop's "DAX comparison operations do not support comparing values of type Text with values of type Integer. ..." error.
+  - For IN, the error is CONTAINSROW's "... values of type <the table's> with values of type <the value's>."
+  - The check runs before the measure does, as Desktop's does. It fires in an IF branch that is never taken, IFERROR doesn't catch it, and FILTER and CALCULATE filters are checked alike.
+  - A column with no values is typed by its declared type, which the server now passes (`mark_declared_types`).
+  - A Variant (IF of mixed kinds, SELECTEDVALUE with an alternate result of another type), a bare `[name]` that is no measure, and a column whose values are of several kinds are never refused.
+  - These answered FALSE, BLANK or the unfiltered value.
+- **Dates against numbers, and CONVERT (#382).**
+  - A date column compared with a number compares its serial, in `=`, `IN` and TREATAS, so `Opp[When] = 46027` keeps 2026-01-05. It kept nothing.
+  - TREATAS as a table gives the column's dates.
+  - `CONVERT(-1.25, DATETIME)` is 1899-12-29 06:00, an OLE date. It was a day early.
+- **SUMMARIZECOLUMNS' filter tables (#383).** They filter its groups and expressions, as CALCULATETABLE's filters do. They were ignored.
+
 ## [0.9.153] - 2026-11-04
 
 For Anthropic's plugin directory: its policy's tool annotations, a privacy link, and names of our own. No answer of the DAX engine and no file the package writes changes.

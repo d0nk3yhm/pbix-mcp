@@ -732,6 +732,26 @@ def _currency_tcols(tables, cache) -> frozenset:
     return found
 
 
+_DECLARED_CODES = {'String': 'S', 'Int64': 'I', 'Double': 'D', 'DateTime': 'T',
+                   'Decimal': 'C', 'Boolean': 'L'}
+
+
+def mark_declared_types(tables: dict, types: dict) -> None:
+    """Record each column's declared type, ``types`` = ``{table: {column:
+    'String' | 'Int64' | ...}}`` as the model's schema names them, as
+    ``declared_types`` (``{column: code}``, the codes of _static_type).
+    _col_num_type reads it for a column with no value to type it by: the
+    type checks of comparisons (#381) need the type of a Text column on a
+    table with no rows, which no cell gives."""
+    for tname, cols in (types or {}).items():
+        tbl = tables.get(tname)
+        if not isinstance(tbl, dict):
+            continue
+        codes = {c: _DECLARED_CODES[t] for c, t in cols.items() if t in _DECLARED_CODES}
+        if codes:
+            tbl['declared_types'] = codes
+
+
 def mark_currency_columns(tables: dict, columns: dict) -> int:
     """Record which columns of ``tables`` are Fixed Decimal (Currency),
     ``columns`` = ``{table: [column, ...]}`` as the model's schema types
@@ -3417,6 +3437,48 @@ def _var_block_keywords(text: str) -> list:
     return out
 
 
+_EMPTY_DECL_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\s*=')
+
+
+def _var_block_own(text: str, kws: list) -> list:
+    """The keywords of ``kws`` that are the outer block's own. A VAR block
+    can be a declaration's value -- ``VAR a = VAR b = 1 RETURN b + 1 RETURN
+    a`` -- and its VARs and RETURN are then the inner block's: Power BI
+    Desktop 2.157 answers 2, and 3 for ``VAR a = 1 VAR b = VAR c = 2 RETURN
+    c RETURN a + b`` (build_b371.py var_nested*, #378). Every keyword cut
+    the outer block, so the inner RETURN ended it (1, BLANK). A declaration
+    whose text up to the next keyword is ``name =`` alone, followed by a
+    VAR, holds such a block; the block runs to its own RETURN, nested
+    blocks inside it skipped alike, and its RETURN expression to the next
+    keyword."""
+    n = len(kws)
+
+    def block_end(k: int) -> int:
+        # kws[k] is the VAR opening a block: the index of its RETURN, or n
+        while k < n:
+            if kws[k][1] == 'RETURN':
+                return k
+            if (k + 1 < n and kws[k + 1][1] == 'VAR'
+                    and _EMPTY_DECL_RE.fullmatch(text[kws[k][2]:kws[k + 1][0]].strip())):
+                k = block_end(k + 1) + 1
+            else:
+                k += 1
+        return n
+
+    own: list = []
+    k = 0
+    while k < n:
+        own.append(kws[k])
+        if kws[k][1] == 'RETURN':
+            break
+        if (k + 1 < n and kws[k + 1][1] == 'VAR'
+                and _EMPTY_DECL_RE.fullmatch(text[kws[k][2]:kws[k + 1][0]].strip())):
+            k = block_end(k + 1) + 1
+        else:
+            k += 1
+    return own
+
+
 def _var_block_parts(text: str):
     """([(name or None, expression)], RETURN expression or None) of a VAR
     block (_var_block_keywords); the RETURN expression runs to the end. A
@@ -3436,7 +3498,7 @@ def _var_block_split(text: str) -> tuple:
     """_var_block_parts' answer with the declarations as a tuple, memoized."""
     found: list = []
     returned: Optional[str] = None
-    kws = _var_block_keywords(text)
+    kws = _var_block_own(text, _var_block_keywords(text))
     for k, (_pos, kw, end) in enumerate(kws):
         if kw == 'RETURN':
             returned = text[end:].strip()
@@ -4503,6 +4565,15 @@ def _filter_value_keys_uncached(v) -> frozenset:
             if type(v) is float and fv.is_integer() and abs(fv) >= _FLOAT_EXACT_INTS:
                 # the Int64 cells whose Double it is (#325, _value_keys)
                 keys.add(('i2d', fv))
+    if type(v) in (int, float) and -657434 <= v <= 2958465:
+        # a date cell compares with a number as its serial: Power BI Desktop
+        # 2.157 (build_b371.py date_col_eq_serial, date_col_in_serial,
+        # treatas_serial) keeps 2026-01-05 for Opp[When] = 46027, IN {46027}
+        # and TREATAS({46027}, Opp[When]); a serial past any date
+        # (99999999) keeps nothing. They kept nothing (#382). Only a moment
+        # cell holds a 'moment' key a number could meet here: a text column
+        # reads _text_filter_value_keys.
+        keys.add(('moment', datetime(1899, 12, 30) + timedelta(days=v)))
     return frozenset(keys)
 
 
@@ -4931,6 +5002,28 @@ def _to_column_type(v, target):
     elif target is _Currency and t is int:
         return _cur_from_value(v)
     return v
+
+
+def _value_type_name(v) -> Optional[str]:
+    """A value's type as Power BI Desktop's type errors name it (Text,
+    Integer, True/False, Date, as measured: build_b371.py, #380, #381);
+    None for BLANK. A Double is 'Number' and a Currency 'Currency'."""
+    t = type(v)
+    if v is None:
+        return None
+    if t is bool:
+        return 'True/False'
+    if t is int:
+        return 'Integer'
+    if t is _Currency:
+        return 'Currency'
+    if t is float:
+        return 'Number'
+    if t is str:
+        return 'Text'
+    if isinstance(v, (datetime, date)):
+        return 'Date'
+    return None
 
 
 def _unify_number_columns(rows: list, static: Optional[tuple] = None) -> list:
@@ -11060,6 +11153,10 @@ class DAXEngine:
             ctx._se_fuse = _se_in[0]
         try:
             _bind = self._static_refusal(expr, ctx)
+            if _bind is None:
+                # a comparison or IN of clashing declared types (#381,
+                # _type_clash), refused as _static_refusal's errors are
+                _bind = self._type_clash_error(expr, ctx)
             if _bind is not None:
                 # Desktop refuses the measure before evaluating any of it
                 # (#284, _static_refusal)
@@ -12617,6 +12714,13 @@ class DAXEngine:
                     _mt = ctx.model_table(table_name)
                     if _mt != table_name:
                         return self._exec_plan(((_P_TCOL, (_mt, col_name)),), ctx, var_scope)
+                    # a table in no ``tables`` (one with no rows, left out by
+                    # a caller): its own measure is still the measure; it
+                    # leaked a (table, name) marker (#379)
+                    _mn = col_name if col_name in ctx.measures else next(
+                        (m for m in ctx.measures if m.lower() == col_name.lower()), None)
+                    if _mn is not None and (ctx.measure_tables.get(_mn) or '').lower() == table_name.lower():
+                        return self.evaluate_measure(_mn, ctx)
                 if _t is not None and ctx._find_col_idx(_t['columns'], col_name) < 0:
                     # `Table[Name]` where Name is not a column is DAX's
                     # fully-qualified MEASURE reference. Agents_Performance reads
@@ -12625,10 +12729,16 @@ class DAXEngine:
                     # TOPN(10, ...) returns 10 rows and the middle-bar test is
                     # `1 IN {11, 12}` -> FALSE -> 0. Treating it as BLANK made the
                     # test `1 IN {1, 2}` -> TRUE and the measure returned 1.
-                    if col_name in ctx.measures:
-                        return self.evaluate_measure(col_name, ctx)
-                    for _mn in ctx.measures:
-                        if _mn.lower() == col_name.lower():
+                    _mn = col_name if col_name in ctx.measures else next(
+                        (m for m in ctx.measures if m.lower() == col_name.lower()), None)
+                    if _mn is not None:
+                        # qualified by a table that isn't its home, it is no
+                        # reference at all: Power BI Desktop 2.157 refuses
+                        # 'Opp'[Total] with Total on _M (build_b371.py
+                        # measure_wrong_table, #379); it answered Total. A
+                        # measure whose home isn't known is taken as before.
+                        _home = ctx.measure_tables.get(_mn)
+                        if _home is None or _home.lower() == table_name.lower():
                             return self.evaluate_measure(_mn, ctx)
                     # Neither a column of that table nor a measure: the
                     # reference cannot be resolved AT ALL, and Desktop refuses
@@ -13311,7 +13421,7 @@ class DAXEngine:
         the row, as an iterated (in-scope) value. ``shadow`` is the iteration's
         rows, which ALLSELECTED restores (issue #118)."""
         meta_keys = {'__table__', '__column__', '__value__', '__row__',
-                     '__blank_row__', '__parts__', '__tuple__', '__joined__'}
+                     '__blank_row__', '__parts__', '__tuple__', '__joined__', '__added__'}
         table_name = row_item.get('__table__', '')
         filters: dict[str, list] = {}
 
@@ -13676,6 +13786,11 @@ class DAXEngine:
         sides are numbers, date-aware when both parse as dates, else text), so
         ``1 IN {1}`` and ``"1" IN {1}`` both hold, matching Desktop.
         """
+        lt = left.strip()
+        if lt[:1] == '(' and lt[-1:] == ')' and _P_PAREN == (_PLAN_CACHE.get(lt) or _analyze_expr(lt))[0][0]:
+            items = self._split_args(lt[1:-1])
+            if len(items) > 1:
+                return self._eval_in_tuple(items, right, ctx, var_scope)
         values = self._in_set_values(right, ctx, var_scope)
         if values is None:
             return None
@@ -13697,6 +13812,46 @@ class DAXEngine:
                 # build_b255d.py d11)
                 _bool_number_clash(v, lval, 'CONTAINSROW')
         return any(v is not None and _compare(lval, '=', v) for v in values)
+
+    def _eval_in_tuple(self, items: list, right: str, ctx: DAXContext,
+                       var_scope: dict | None = None) -> Any:
+        """``(v1, v2, ..) IN <table>``: CONTAINSROW of the row constructor --
+        TRUE when a row of the table holds each value in its column, in
+        order. Power BI Desktop 2.157 (build_b371.py tuple_in_*, #377):
+        FILTER(Opp, (Opp[Rank], Opp[Name]) IN {(1, "a"), (3, "a")}) keeps
+        both rows (it kept none), text compares without case, a BLANK
+        matches only a BLANK; a tuple of another width than the table is
+        "The number of arguments is invalid. Function CONTAINSROW must have
+        a value for each column in the table expression."."""
+        rows = self._eval_expr(right.strip(), ctx, var_scope)
+        if not isinstance(rows, list):
+            return None
+        vals = [_scalarize(self._eval_expr(x.strip(), ctx, var_scope)) for x in items]
+        return self._containsrow_match(rows, vals)
+
+    def _containsrow_match(self, rows: list, vals: list) -> bool:
+        """Whether a row of ``rows`` holds ``vals``, one per column, compared
+        as IN compares (strictly: a BLANK only with a BLANK)."""
+        if not rows:
+            return False
+        cells = self._rows_cells(rows)
+        if any(len(c) != len(vals) for c in cells[:1]):
+            raise _DAXEvaluationError(
+                "The number of arguments is invalid. Function CONTAINSROW must have a value "
+                "for each column in the table expression.")
+        for c in cells:
+            if len(c) != len(vals):
+                continue
+            for a, b in zip(vals, c):
+                b = _scalarize(b)
+                if a is None or b is None:
+                    if not (a is None and b is None):
+                        break
+                elif not _compare(a, '=', b):
+                    break
+            else:
+                return True
+        return False
 
     def _eval_comparison(self, expr: str, ctx: DAXContext, var_scope: dict | None = None) -> Any:
         """Evaluate comparison operators.
@@ -14828,6 +14983,285 @@ class DAXEngine:
     _STATIC_FN_KEEP = frozenset({'ABS', 'ROUND', 'ROUNDUP', 'ROUNDDOWN', 'TRUNC', 'FLOOR', 'CEILING',
                                  'MROUND'})
 
+    # the type names of Desktop's comparison errors, by _static_type code
+    # (Text, Integer, True/False, Date measured: build_b371.py, #381)
+    _TYPE_NAMES = {'S': 'Text', 'I': 'Integer', 'D': 'Number', 'C': 'Currency',
+                   'L': 'True/False', 'T': 'Date'}
+    _NUM_CODES = frozenset('IDC')
+
+    @classmethod
+    def _codes_clash(cls, a, b) -> bool:
+        """Whether values typed ``a`` and ``b`` (_static_type codes) can't be
+        compared: text against anything but text, TRUE / FALSE against a
+        number or text (Power BI Desktop 2.157, build_b371.py cmp_*,
+        in_*). A date meets a number as its serial (date_col_eq_serial);
+        a date against TRUE / FALSE is not measured and passes."""
+        if a not in cls._TYPE_NAMES or b not in cls._TYPE_NAMES or a == b:
+            return False
+        if 'S' in (a, b):
+            return True
+        if 'L' in (a, b):
+            return (b if a == 'L' else a) in cls._NUM_CODES
+        return False
+
+    def _clash_col_type(self, ctx: DAXContext, table, column):
+        """A model column's type for _type_clash: its declared type
+        (mark_declared_types), else the one kind every value has; None for
+        a column of values of several kinds, which no model column holds (a
+        caller's own tables can), and for an unknown column."""
+        tbl = ctx.tables.get(table)
+        if tbl is None and isinstance(table, str):
+            table = ctx.model_table(table)
+            tbl = ctx.tables.get(table)
+        if not isinstance(tbl, dict):
+            return None
+        cols = tbl.get('columns') or []
+        i = ctx._find_col_idx(cols, column)
+        if i < 0:
+            return None
+        declared = (tbl.get('declared_types') or {}).get(cols[i])
+        if declared is not None:
+            return 'C' if declared == 'C' or (table, cols[i]) in ctx._cur_tcols else declared
+        cache = ctx._filter_idx_cache
+        key = (id(tbl), 'clash-type', i)
+        hit = cache.get(key, _MISSING)
+        if hit is _MISSING:
+            kinds = {('T' if isinstance(v, (datetime, date)) else type(v))
+                     for r in (tbl.get('rows') or ()) if len(r) > i
+                     for v in (r[i],) if v is not None}
+            hit = None
+            if len(kinds) == 1:
+                hit = self._col_num_type(ctx, table, cols[i])
+            cache[key] = hit
+        return hit
+
+    def _type_clash_error(self, expr: str, ctx: DAXContext) -> Optional[_DAXEvaluationError]:
+        """_type_clash's error for the measure expression ``expr``, kept in
+        the model-wide cache per expression and measures dict."""
+        key = ('type-clash', expr, id(ctx.measures))
+        hit = ctx._shield_cache.get(key, _MISSING)
+        if hit is _MISSING:
+            try:
+                hit = self._type_clash(expr, ctx, None, 0)
+            except RecursionError:
+                hit = None
+            ctx._shield_cache[key] = hit
+        return None if hit is None else _bind_error(hit)
+
+    def _clash_operand(self, text: str, ctx: DAXContext, env: Optional[dict]):
+        """An operand's type for _type_clash: _static_type's, but None for a
+        bare [name] that is no measure (a row context's column, whichever
+        it is when the call runs) and for a Variant -- SELECTEDVALUE or
+        LOOKUPVALUE with an alternate result of another type (Desktop:
+        SELECTEDVALUE(Opp[Name], 1) = 1 is TRUE, sel_alt_variant)."""
+        t = text.strip()
+        if not t:
+            return None
+        plan = _PLAN_CACHE.get(t) or _analyze_expr(t)
+        kind, data = plan[0]
+        if kind in (_P_BRACKET1, _P_BRACKET2) and not self._measure_exists(data, ctx):
+            return None
+        if kind == _P_PAREN:
+            return self._clash_operand(data, ctx, env)
+        if kind == _P_TCOL:
+            return self._clash_col_type(ctx, data[0], data[1])
+        if kind == _P_FUNC and data[0] in ('SELECTEDVALUE', 'LOOKUPVALUE'):
+            args = self._split_args(data[1])
+            alt = (args[1] if data[0] == 'SELECTEDVALUE' and len(args) == 2
+                   else args[-1] if data[0] == 'LOOKUPVALUE' and len(args) % 2 == 0 else None)
+            if alt is not None:
+                ta = self._clash_operand(args[0], ctx, env)
+                tb = self._clash_operand(alt, ctx, env)
+                return ta if ta == tb else None
+        try:
+            return self._static_type(t, ctx, env)
+        except Exception:  # noqa: BLE001 -- a type the reader can't give is no type
+            return None
+
+    def _clash_table_types(self, text: str, ctx: DAXContext, env: Optional[dict]) -> Optional[list]:
+        """The column types of the table expression ``text`` for IN /
+        CONTAINSROW, or None when unknown: a table constructor's columns
+        (text beside other values is a Text column, as Desktop types it:
+        build_b371.py ctor_text_*), VALUES / DISTINCT / ALL of a column,
+        UNION of such tables (union_in_num)."""
+        t = text.strip()
+        if not t:
+            return None
+        plan = _PLAN_CACHE.get(t) or _analyze_expr(t)
+        kind, data = plan[0]
+        if kind == _P_TABLECTOR:
+            rows = []
+            for el in self._split_args(data):
+                el = el.strip()
+                ep = _PLAN_CACHE.get(el) or _analyze_expr(el)
+                if ep[0][0] == _P_PAREN and len(self._split_args(ep[0][1])) > 1:
+                    rows.append([self._clash_operand(x, ctx, env) for x in self._split_args(ep[0][1])])
+                else:
+                    rows.append([self._clash_operand(el, ctx, env)])
+            if not rows or len({len(r) for r in rows}) != 1:
+                return None
+            return [self._unify_clash_codes(col) for col in zip(*rows)]
+        if kind == _P_FUNC:
+            fname, args_text = data
+            args = self._split_args(args_text)
+            if fname in ('VALUES', 'DISTINCT', 'ALL', 'ALLNOBLANKROW') and len(args) == 1:
+                ref = self._parse_column_ref(args[0])
+                if ref is not None:
+                    return [self._clash_col_type(ctx, ref[0], ref[1])]
+                return None
+            if fname == 'UNION' and len(args) >= 2:
+                sides = [self._clash_table_types(a, ctx, env) for a in args]
+                if any(sd is None for sd in sides) or len({len(sd) for sd in sides}) != 1:
+                    return None
+                return [self._unify_clash_codes(col) for col in zip(*sides)]
+        return None
+
+    @classmethod
+    def _unify_clash_codes(cls, codes) -> Optional[str]:
+        """One column's type from its values' types: Text when any is text
+        (and every type is known), one type when all agree, a Double over
+        numbers (or dates beside numbers, as UNION's serials); None when
+        unknown."""
+        cs = set(codes)
+        known = set(cls._TYPE_NAMES)
+        if None in cs or not cs <= known:
+            return None
+        if 'S' in cs:
+            return 'S'
+        if len(cs) == 1:
+            return next(iter(cs))
+        if cs <= {'I', 'D', 'C', 'T'}:
+            return 'D'
+        return None
+
+    def _type_clash(self, expr: str, ctx: DAXContext, env: Optional[dict], depth: int) -> Optional[str]:
+        """Power BI Desktop 2.157's error for a comparison or IN in
+        ``expr`` whose operands' declared types clash, or None (#381;
+        build_b371.py cmp_*, in_*, calc_*). Desktop refuses the whole
+        measure before evaluating any of it -- IF(FALSE(), "a" = 1, 7) fails
+        (if_never_taken_cmp), IFERROR doesn't catch it (cmp_iferror) -- in
+        FILTER and CALCULATE filters alike (calc_name_eq_1,
+        cmp_blank_textcol):
+
+        - a comparison: "DAX comparison operations do not support comparing
+          values of type <left> with values of type <right>. ...";
+        - IN / CONTAINSROW: "Function CONTAINSROW does not support
+          comparing values of type <the table's> with values of type <the
+          value's>. ..." (in_text_int, calc_rank_in_text, tuple_in_clash).
+
+        Operands are typed by _static_type (a model column by its values,
+        or its declared type when it holds none: empty_max_eq_1); a bare
+        [name] that is no measure and a Variant are typed by nothing and
+        never refused (cmp_variant, sel_alt_variant). Parts are checked
+        before the operator that joins them: 1 = 1 IN {TRUE()} is IN's
+        error (cmp_chain_in). The engine answered FALSE, BLANK or the
+        unfiltered value."""
+        if depth > 60:
+            return None
+        e = expr.strip()
+        if not e:
+            return None
+        plan = _PLAN_CACHE.get(e) or _analyze_expr(e)
+        rec = self._type_clash
+        for kind, data in plan:
+            if kind == _P_VARRET:
+                decls, ret = _var_block_parts(_collapse_ws_outside_strings(data))
+                env2 = dict(env or {})
+                for name, vexpr in decls:
+                    msg = rec(vexpr, ctx, env2, depth + 1)
+                    if msg:
+                        return msg
+                    if name is not None:
+                        env2[name.strip().lower()] = self._clash_operand(vexpr, ctx, env2)
+                return rec(ret, ctx, env2, depth + 1) if ret else None
+            if kind in (_P_PAREN, _P_NEG, _P_NOT):
+                return rec(data, ctx, env, depth + 1)
+            if kind in (_P_LOGICAL, _P_BINARY):
+                for part in data[1]:
+                    msg = rec(part, ctx, env, depth + 1)
+                    if msg:
+                        return msg
+                return None
+            if kind in (_P_CONCAT, _P_POW):
+                for part in data:
+                    msg = rec(part, ctx, env, depth + 1)
+                    if msg:
+                        return msg
+                return None
+            if kind == _P_TABLECTOR:
+                for el in self._split_args(data):
+                    msg = rec(el, ctx, env, depth + 1)
+                    if msg:
+                        return msg
+                return None
+            if kind == _P_IN:
+                left, right = data
+                msg = rec(left, ctx, env, depth + 1) or rec(right, ctx, env, depth + 1)
+                if msg:
+                    return msg
+                return self._in_clash(left, right, ctx, env)
+            if kind == _P_CMP:
+                split = DAXEngine._cmp_split(data)
+                if not split:
+                    continue
+                _op, left, right = split
+                msg = rec(left, ctx, env, depth + 1) or rec(right, ctx, env, depth + 1)
+                if msg:
+                    return msg
+                ta = self._clash_operand(left, ctx, env)
+                tb = self._clash_operand(right, ctx, env)
+                if self._codes_clash(ta, tb):
+                    return ("DAX comparison operations do not support comparing values of type "
+                            f"{self._TYPE_NAMES[ta]} with values of type {self._TYPE_NAMES[tb]}. "
+                            "Consider using the VALUE or FORMAT function to convert one of the values.")
+                return None
+            if kind == _P_FUNC:
+                fname, args_text = data
+                args = self._split_args(args_text)
+                for a in args:
+                    msg = rec(a, ctx, env, depth + 1)
+                    if msg:
+                        return msg
+                if fname == 'CONTAINSROW' and len(args) >= 2:
+                    cols = self._clash_table_types(args[0], ctx, env)
+                    if cols is not None and len(cols) == len(args) - 1:
+                        for tc, v in zip(cols, args[1:]):
+                            msg = self._contains_msg(tc, self._clash_operand(v, ctx, env))
+                            if msg:
+                                return msg
+                return None
+            return None
+        return None
+
+    def _contains_msg(self, table_code, value_code) -> Optional[str]:
+        """CONTAINSROW's type error for a table column typed ``table_code``
+        searched for a value typed ``value_code``, or None."""
+        if self._codes_clash(table_code, value_code):
+            return ("Function CONTAINSROW does not support comparing values of type "
+                    f"{self._TYPE_NAMES[table_code]} with values of type {self._TYPE_NAMES[value_code]}. "
+                    "Consider using the VALUE or FORMAT function to convert one of the values.")
+        return None
+
+    def _in_clash(self, left: str, right: str, ctx: DAXContext, env: Optional[dict]) -> Optional[str]:
+        """IN's type error (see _type_clash), a row constructor's per
+        column, or its width error (tuple_in_arity)."""
+        cols = self._clash_table_types(right, ctx, env)
+        if cols is None:
+            return None
+        lt = left.strip()
+        lp = _PLAN_CACHE.get(lt) or _analyze_expr(lt)
+        items = self._split_args(lp[0][1]) if lp[0][0] == _P_PAREN else [lt]
+        if len(items) == 1:
+            items = [lt]
+        if len(items) != len(cols):
+            return ("The number of arguments is invalid. Function CONTAINSROW must have a value "
+                    "for each column in the table expression.")
+        for tc, item in zip(cols, items):
+            msg = self._contains_msg(tc, self._clash_operand(item, ctx, env))
+            if msg:
+                return msg
+        return None
+
     def _static_type(self, expr: str, ctx: DAXContext, env: Optional[dict] = None,
                      depth: int = 0, stack: frozenset = frozenset()):
         """The number type ``expr`` has, read from its text and the model
@@ -14978,6 +15412,9 @@ class DAXEngine:
             t = type(v)
             hit = ('L' if t is bool else 'I' if t is int else 'D' if t is float else 'S' if t is str
                    else 'T' if isinstance(v, (datetime, date)) else None)
+            if v is None:
+                # no value to type it by: the model's declared type (#381)
+                hit = (tbl.get('declared_types') or {}).get(cols[i])
             cache[key] = hit
         return hit
 
@@ -19846,13 +20283,27 @@ class DAXEngine:
         'long date': 'dddd, mmmm d, yyyy',
         'medium date': 'dd-mmm-yy',
         'short date': 'm/d/yyyy',
-        'general date': 'm/d/yyyy h:nn:ss AM/PM',
-        'long time': 'h:nn:ss AM/PM',
-        'medium time': 'h:nn AM/PM',
+        'general date': 'm/d/yyyy h:nn:ss AMPM',
+        'long time': 'h:nn:ss AMPM',
+        'medium time': 'hh:nn AMPM',
         'short time': 'HH:nn',
     }
+    # The cultures whose dates Power BI Desktop 2.157 was measured in
+    # (build_b371.py fmt_*, #373): Short Date, Long Date, Long Time (General
+    # Date is the two joined), the AM / PM designators and the date
+    # separator a picture's "/" prints. Medium Date, Medium Time and Short
+    # Time are the same pictures in all six. Any other culture prints as
+    # en-US, as before (Desktop prints de-DE in German: not ported).
+    _DATE_CULTURES = {
+        'en-us': ('m/d/yyyy', 'dddd, mmmm d, yyyy', 'h:nn:ss AMPM', 'AM', 'PM', '/'),
+        'en-au': ('d/mm/yyyy', 'dddd, d mmmm yyyy', 'h:nn:ss AMPM', 'AM', 'PM', '/'),
+        'en-nz': ('d/mm/yyyy', 'dddd, d mmmm yyyy', 'h:nn:ss AMPM', 'am', 'pm', '/'),
+        'en-gb': ('dd/mm/yyyy', 'dd mmmm yyyy', 'HH:nn:ss', 'AM', 'PM', '/'),
+        'en-ie': ('dd/mm/yyyy', 'dddd d mmmm yyyy', 'HH:nn:ss', 'am', 'pm', '/'),
+        'en-ca': ('yyyy-mm-dd', 'mmmm d, yyyy', 'h:nn:ss AMPM', 'AM', 'PM', '-'),
+    }
 
-    def _format_datetime_pattern(self, val, fmt_str: str) -> str:
+    def _format_datetime_pattern(self, val, fmt_str: str, culture: Optional[str] = None) -> str:
         """Render a DAX/VBA date picture.
 
         The old table was .NET-cased -- `MM` month, `mm` MINUTES -- but DAX
@@ -19866,20 +20317,53 @@ class DAXEngine:
         `m` means minutes only when it FOLLOWS an hour token, which is what
         Desktop's "mm hh:mm" -> "07 12:00" pins: the first is a month, the one
         after `hh:` is minutes. `nn` is always minutes.
+
+        ``culture`` picks the named pictures, the designators and the date
+        separator (_DATE_CULTURES; Power BI Desktop 2.157, build_b371.py
+        fmt_*, #373): "Short Date" is 6/01/2026 in en-AU, 2026-01-06 in
+        en-CA, "Long Time" 13:30:05 in en-GB; "General Date" prints the date
+        alone at midnight and the time alone on 1899-12-30 (fmt_gd_*);
+        "Medium Time" pads its hour (01:30 PM); the AMPM token prints the
+        culture's designator as it is spelled (PM; pm in en-NZ, en-IE),
+        AM/PM and a/p as written; a picture's "/" prints the culture's date
+        separator (d/MM/yyyy is 6-01-2026 in en-CA). All rendered en-US
+        before, and AMPM printed A1P1.
         """
-        named = self._NAMED_DATE_FMTS.get(fmt_str.strip().lower())
-        if named:
-            fmt_str = named
+        cd = self._DATE_CULTURES.get((culture or '').strip().lower()) or self._DATE_CULTURES['en-us']
+        short, long_d, long_t, am_d, pm_d, date_sep = cd
         if isinstance(val, datetime):
             hh24, mi, ss = val.hour, val.minute, val.second
         else:
             hh24 = mi = ss = 0
+        key = fmt_str.strip().lower()
+        if key == 'general date':
+            day = (val.year, val.month, val.day)
+            if day == (1899, 12, 30):
+                fmt_str = long_t
+            elif hh24 == mi == ss == 0 and not (isinstance(val, datetime) and val.microsecond):
+                fmt_str = short
+            else:
+                fmt_str = short + ' ' + long_t
+        elif key == 'short date':
+            fmt_str = short
+        elif key == 'long date':
+            fmt_str = long_d
+        elif key == 'long time':
+            fmt_str = long_t
+        else:
+            named = self._NAMED_DATE_FMTS.get(key)
+            if named:
+                fmt_str = named
         h12 = hh24 % 12 or 12
         out: list = []
         prev = ''          # last TOKEN emitted, separators ignored
         i, n = 0, len(fmt_str)
         while i < n:
             low = fmt_str[i:].lower()
+            if low.startswith('ampm'):
+                # the culture's designator, as the culture spells it
+                out.append(am_d if hh24 < 12 else pm_d)
+                i += 4; prev = 'ampm'; continue
             if low.startswith('am/pm') or low.startswith('a/p'):
                 tok = 'am/pm' if low.startswith('am/pm') else 'a/p'
                 src = fmt_str[i:i + len(tok)]
@@ -19920,7 +20404,8 @@ class DAXEngine:
                 else:
                     out.append(calendar.month_name[val.month])
             else:
-                out.append(fmt_str[i:i + run])
+                lit = fmt_str[i:i + run]
+                out.append(lit.replace('/', date_sep) if date_sep != '/' else lit)
                 i += run
                 continue                              # separators keep `prev`
             i += run
@@ -19955,7 +20440,7 @@ class DAXEngine:
             _f = str(fmt).strip().lower()
             if (_f in self._NAMED_DATE_FMTS
                     or any(t in _f for t in ('yy', 'mm', 'dd', 'hh', 'nn',
-                                             'ss', 'am/pm'))):
+                                             'ss', 'am/pm', 'ampm'))):
                 coerced = _as_datetime(val)
                 if coerced is not None:
                     val = coerced
@@ -19966,7 +20451,7 @@ class DAXEngine:
             val = _as_number(val)
         # Datetime formatting (NOW()/TODAY()/date columns).
         if isinstance(val, (datetime, date)) and fmt:
-            return self._format_datetime_pattern(val, str(fmt))
+            return self._format_datetime_pattern(val, str(fmt), culture)
         if fmt and isinstance(val, (int, float)) and not isinstance(val, bool):
             group_sep, dec_sep = _culture_seps(culture)
             # a Currency formats its exact decimal (issue #248,
@@ -20526,9 +21011,14 @@ class DAXEngine:
         return None
 
     def _fn_median(self, args_str: str, ctx: DAXContext) -> Any:
-        """MEDIAN(column) — return median value."""
+        """MEDIAN(column) — return median value. A text, TRUE / FALSE or
+        date column is Power BI Desktop 2.157's error (build_b371.py
+        median_*, #376); it answered BLANK or TRUE."""
         ref = self._column_arg(args_str, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
+            if self._col_num_type(ctx, ref[0], ref[1]) in ('S', 'L', 'T'):
+                raise _DAXEvaluationError(
+                    "MEDIAN does not support expressions of type string/Boolean/date.")
             values = sorted(v for v in ctx.get_column_data(ref[0], ref[1]) if isinstance(v, (int, float)))
             if not values:
                 return None
@@ -20550,8 +21040,13 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return None
-        table_ref = self._eval_expr(args[0].strip(), ctx)
         row_expr = args[1].strip()
+        # an expression typed text, TRUE / FALSE or a date is Desktop 2.157's
+        # error, as MEDIAN's (build_b371.py medianx_*, #376)
+        if self._static_type(row_expr, ctx) in ('S', 'L', 'T'):
+            raise _DAXEvaluationError(
+                "MEDIANX does not support expressions of type string/Boolean/date.")
+        table_ref = self._eval_expr(args[0].strip(), ctx)
         if not isinstance(table_ref, list):
             return None
         values = []
@@ -22025,6 +22520,9 @@ class DAXEngine:
             return table_ref
         if not table_ref and isinstance(table_ref, _StaticRows):
             return self._static_columns(args[2::2], ctx, table_ref.num_kinds)
+        names = [str(self._eval_expr(args[i].strip(), ctx)) for i in range(1, len(args) - 1, 2)]
+        self._added_names_check('ADDCOLUMNS', names, table_ref[0] if table_ref else None)
+        added = frozenset(names)
 
         # Parse name/expression pairs
         extended = []
@@ -22047,15 +22545,49 @@ class DAXEngine:
             else:
                 row_ctx = ctx
             # Process name/expression pairs
-            i = 1
-            while i + 1 < len(args):
-                col_name = self._eval_expr(args[i].strip(), ctx)
+            for col_name, i in zip(names, range(1, len(args) - 1, 2)):
                 col_val = self._eval_expr(args[i + 1].strip(), row_ctx)
                 if isinstance(new_item, dict):
-                    new_item[str(col_name)] = col_val
-                i += 2
+                    new_item[col_name] = col_val
+            if isinstance(new_item, dict):
+                new_item['__added__'] = new_item.get('__added__', frozenset()) | added
             extended.append(new_item)
         return extended
+
+    @staticmethod
+    def _row_column_names(row) -> list:
+        """The names of a row's columns (not its __ markers); a row of one
+        column (VALUES) names it under ``__column__``."""
+        if not isinstance(row, dict):
+            return ['Value']
+        out = [k for k in row if not k.startswith('__')]
+        c = row.get('__column__')
+        if isinstance(c, str) and c not in out:
+            out.append(c)
+        return out
+
+    def _added_names_check(self, fn: str, names: list, first_row, group: tuple = ()) -> None:
+        """Power BI Desktop 2.157's errors for the names a table function
+        adds (build_b371.py addcol_*, groupby_dup, #375): two that differ
+        only in case are "cannot add column [the second], as it has the same
+        name with an existing column."; for ADDCOLUMNS one its table has
+        already, in any case, "cannot add column [X] since it already
+        exists.". The engine replaced the column's values, or kept both.
+        GROUPBY's group columns may share a name with one it adds
+        (groupby_same_as_group keeps both)."""
+        seen: set = set()
+        for nm in names:
+            if nm.lower() in seen:
+                raise _DAXEvaluationError(
+                    f"Function {fn} cannot add column [{nm}], as it has the same "
+                    "name with an existing column.")
+            seen.add(nm.lower())
+        if fn == 'ADDCOLUMNS' and first_row is not None:
+            have = {c.lower() for c in self._row_column_names(first_row)}
+            for nm in names:
+                if nm.lower() in have:
+                    raise _DAXEvaluationError(
+                        f"Function ADDCOLUMNS cannot add column [{nm}] since it already exists.")
 
     def _fn_summarize_rollup(self, args_str: str, ctx: DAXContext):
         """SUMMARIZE with ROLLUP(...)/ROLLUPGROUP(...) group columns: group as
@@ -22114,6 +22646,29 @@ class DAXEngine:
         return base
 
     def _fn_summarize(self, args_str: str, ctx: DAXContext, rows_filter: bool = True) -> Any:
+        """SUMMARIZE (_fn_summarize_rows), its extension columns marked as
+        its own (_mark_added_literals, #375)."""
+        return self._mark_added_literals(
+            self._fn_summarize_rows(args_str, ctx, rows_filter), args_str)
+
+    def _mark_added_literals(self, out, args_str: str):
+        """``out``'s rows with the columns named by the string literals among
+        ``args_str``'s arguments -- SUMMARIZE's and SUMMARIZECOLUMNS' own
+        columns -- marked ``__added__``: they are headed [Name] whatever
+        their names (Power BI Desktop 2.157, build_b371.py
+        summarize_ext_head, sumcols_head: SUMMARIZE(Opp, Opp[Name], "Rank",
+        1) heads [Rank] though Opp has Rank; #375)."""
+        if not isinstance(out, list) or not out:
+            return out
+        names = frozenset(a.strip()[1:-1].replace('""', '"') for a in self._split_args(args_str)
+                          if _FULL_STRING_LITERAL.match(a.strip()))
+        if names:
+            for r in out:
+                if isinstance(r, dict):
+                    r['__added__'] = r.get('__added__', frozenset()) | names
+        return out
+
+    def _fn_summarize_rows(self, args_str: str, ctx: DAXContext, rows_filter: bool = True) -> Any:
         """SUMMARIZE(table, groupBy..., [name, expression]...) — group + aggregate.
 
         The trailing ``"Name", <expression>`` EXTENSION columns used to be
@@ -22553,6 +23108,42 @@ class DAXEngine:
         return row
 
     def _fn_summarizecolumns(self, args_str: str, ctx: DAXContext) -> Any:
+        """SUMMARIZECOLUMNS (_fn_summarizecolumns_rows), its own columns
+        marked (_mark_added_literals, #375).
+
+        Its filter tables -- the arguments after the group columns, before
+        the first name -- filter its groups and expressions, as
+        CALCULATETABLE's filters do: Power BI Desktop 2.157
+        (build_b371.py sumcols_treatas) answers one row (a, 6) for
+        SUMMARIZECOLUMNS(Opp[Name], TREATAS({1}, Opp[Rank]), "t", [Total]),
+        and (a, 3), (b, 2) for a FILTER(ALL(Opp[Rank]), ..) filter
+        (sumcols_filter). They were ignored (#383). NONVISUAL's filter is
+        applied by _fn_summarizecolumns_rows itself."""
+        args = self._split_args(args_str)
+        filters: list = []
+        rest: list = []
+        k = 0
+        while k < len(args) and (self._parse_column_ref(args[k]) is not None
+                                 or args[k].strip().upper().startswith(('ROLLUPADDISSUBTOTAL', 'ROLLUPGROUP'))):
+            rest.append(args[k])
+            k += 1
+        while k and k < len(args):
+            st = args[k].strip()
+            if st.startswith('"'):
+                rest.extend(args[k:])
+                break
+            if st.upper().startswith(('NONVISUAL', 'IGNORE')):
+                rest.append(args[k])
+            else:
+                filters.append(st)
+            k += 1
+        if filters:
+            inner = ", ".join(x.strip() for x in rest)
+            return self._eval_expr(
+                f"CALCULATETABLE(SUMMARIZECOLUMNS({inner}), {', '.join(filters)})", ctx)
+        return self._mark_added_literals(self._fn_summarizecolumns_rows(args_str, ctx), args_str)
+
+    def _fn_summarizecolumns_rows(self, args_str: str, ctx: DAXContext) -> Any:
         """SUMMARIZECOLUMNS(groupBy1, ..., name, expression) — summarize with measures.
         Simplified: treats it like SUMMARIZE for the group-by columns."""
         args = self._split_args(args_str)
@@ -22933,7 +23524,69 @@ class DAXEngine:
             out = _StaticRows()
             out.num_kinds = static
             return out
+        if len(sides) > 1:
+            result = self._union_dates_bools(result)
         return _unify_number_columns(result, static)
+
+    def _union_dates_bools(self, rows: list) -> list:
+        """UNION's dates and TRUE / FALSE beside numbers, as Power BI
+        Desktop 2.157 types such a column (build_b371.py union_date_num,
+        union_bool_num; #380): a date beside numbers is its serial, a
+        Double (UNION({1}, {DATE(2026, 1, 6)}) is 1, 46028), TRUE / FALSE
+        beside Int64s is 1 / 0, an Int64, beside Doubles a Double. They kept
+        their kinds. A column holding text is left as it is (text is the
+        column's type there, as before). Rows are copied where a value
+        changes, never written in place."""
+        # nothing to change without a date or TRUE / FALSE beside a number:
+        # told by the types of every value, before any row is read
+        try:
+            present = set(map(type, itertools.chain.from_iterable(map(dict.values, rows))))
+        except TypeError:           # a row that is no dict
+            present = {bool, datetime}
+        if not (present & {int, float, _Currency}) or not (
+                bool in present or any(issubclass(t, date) for t in present)):
+            return rows
+        cells = self._rows_cells(rows)
+        width = max(map(len, cells), default=0)
+        kinds: list = [set() for _ in range(width)]
+        for c in cells:
+            for i, v in enumerate(c):
+                if v is not None:
+                    kinds[i].add(datetime if isinstance(v, (datetime, date)) else type(v))
+        conv: dict = {}
+        for i, k in enumerate(kinds):
+            if str in k:
+                continue
+            nums = k & {int, float, _Currency}
+            if datetime in k and nums:
+                conv[i] = 'date'
+            elif bool in k and nums:
+                conv[i] = 'bool-float' if (float in nums or _Currency in nums) else 'bool-int'
+        if not conv:
+            return rows
+        out = []
+        for r, c in zip(rows, cells):
+            keys = self._cell_keys(r) if isinstance(r, dict) else None
+            if keys is None or len(keys) != len(c):
+                out.append(r)
+                continue
+            new = None
+            for i, how in conv.items():
+                v = c[i] if i < len(c) else None
+                if how == 'date' and isinstance(v, (datetime, date)):
+                    nv = float(_as_number(v))
+                elif how.startswith('bool') and type(v) is bool:
+                    nv = float(v) if how == 'bool-float' else int(v)
+                else:
+                    continue
+                if new is None:
+                    new = type(r)(r)
+                k = keys[i]
+                new[k] = nv
+                if k == '__value__' and isinstance(new.get('__column__'), str) and new['__column__'] in new:
+                    new[new['__column__']] = nv
+            out.append(new if new is not None else r)
+        return out
 
     @classmethod
     def _cell_names(cls, row: dict) -> Optional[list]:
@@ -23211,7 +23864,26 @@ class DAXEngine:
         t2 = self._eval_expr(args[1].strip(), ctx)
         if not isinstance(t1, list) or not isinstance(t2, list):
             return []
+        if t1 and t2:
+            # a Text column joined with a number column is Power BI Desktop
+            # 2.157's error (build_b371.py intersect_clash, #380); it was an
+            # empty table. Typed by the first row of each side.
+            for a, b in zip(self._first_cells(t1[0]), self._first_cells(t2[0])):
+                ka, kb = _value_type_name(a), _value_type_name(b)
+                if 'Text' in (ka, kb) and {ka, kb} & {'Integer', 'Number'}:
+                    raise _DAXEvaluationError(
+                        f"Function 'INTERSECT' does not support joining a column of type {ka} "
+                        f"with a column of type {kb}.")
         return [item for item, found in zip(t1, self._rows_in(t1, t2)) if found]
+
+    @classmethod
+    def _first_cells(cls, row) -> list:
+        """A flat row's cells in order (_cell_keys), [] for a row it does
+        not read; a value that is no row is its own cell."""
+        if not isinstance(row, dict):
+            return [row]
+        keys = cls._cell_keys(row)
+        return [row.get(k) for k in keys] if keys else []
 
     def _fn_crossjoin(self, args_str: str, ctx: DAXContext) -> Any:
         """CROSSJOIN(table1, table2, ...) — cartesian product.
@@ -23320,8 +23992,29 @@ class DAXEngine:
         return rows
 
     def _fn_row(self, args_str: str, ctx: DAXContext) -> Any:
-        """ROW(name, expression, ...) — single row table."""
+        """ROW(name, expression, ...) — single row table.
+
+        Its argument errors are Power BI Desktop 2.157's (build_b371.py
+        row_*, #374): a missing expression, one argument alone, and two
+        names that differ only in case (the second is named). The engine
+        answered a column of no value, an empty table, or kept both."""
         args = self._split_args(args_str)
+        if len(args) < 2:
+            raise _DAXEvaluationError(
+                "Too few arguments were passed to the ROW function. "
+                "The minimum argument count for the function is 2.")
+        seen: set = set()
+        for k in range(0, len(args), 2):
+            if k + 1 >= len(args) or not args[k + 1].strip():
+                raise _DAXEvaluationError(f"Argument '{k + 2}' in ROW function is required.")
+            m = _FULL_STRING_LITERAL.match(args[k].strip())
+            if m:
+                nm = args[k].strip()[1:-1].replace('""', '"')
+                if nm.lower() in seen:
+                    raise _DAXEvaluationError(
+                        f"Function ROW cannot add column [{nm}], as it has the same "
+                        "name with an existing column.")
+                seen.add(nm.lower())
         row = {'__table__': '__row__'}
         i = 0
         first_name = None
@@ -23385,6 +24078,14 @@ class DAXEngine:
                 cols, combos = list(res[1]), list(res[2])
             cols = [(ctx.model_table(t), c) for t, c in cols]
             combos = self._treatas_present(cols, combos, ctx)
+            dated = [self._col_num_type(ctx, t, c) == 'T' for t, c in cols]
+            if any(dated):
+                # a number given a date column is that date: TREATAS({46027},
+                # Opp[When]) is 2026-01-05 (Power BI Desktop 2.157,
+                # build_b371.py treatas_table, #382)
+                combos = [tuple(datetime(1899, 12, 30) + timedelta(days=v)
+                                if d and type(v) in (int, float) else v
+                                for d, v in zip(dated, combo)) for combo in combos]
             out = _TreatasTable(self._summarize_row(cols, tuple(combo)) for combo in combos)
             out.marker = res
             return out
@@ -25325,6 +26026,15 @@ class DAXEngine:
             else:
                 break
         ext = parts[i:]
+        names = [str(self._eval_expr(ext[j].strip(), ctx)) for j in range(0, len(ext) - 1, 2)]
+        self._added_names_check('GROUPBY', names, None)
+        if any(nm in group_cols for nm in names):
+            # Desktop keeps both, the group column and its own [Name]
+            # (build_b371.py groupby_same_as_group, #375); a row here holds
+            # one value per name, and the added one overwrote the group's
+            raise _DAXEvaluationError(
+                "GROUPBY adding a column named as one of its group columns is not supported.")
+        added = frozenset(names)
         groups: dict = {}
         for r in rows:
             key = tuple(r.get(c) for c in group_cols)
@@ -25334,17 +26044,16 @@ class DAXEngine:
             new_row = _ColumnsRow({'__table__': rows[0]['__table__'], '__row__': True})
             for c, v in zip(group_cols, key):
                 new_row[c] = v
-            j = 0
-            while j + 1 < len(ext):
-                cname = self._eval_expr(ext[j].strip(), ctx)
+            for cname, j in zip(names, range(0, len(ext) - 1, 2)):
                 prev_grp = getattr(ctx, '_current_group', None)
                 ctx._current_group = grp_rows
                 try:
                     val = self._eval_expr(ext[j + 1].strip(), ctx)
                 finally:
                     ctx._current_group = prev_grp
-                new_row[str(cname)] = val
-                j += 2
+                new_row[cname] = val
+            # its own columns are headed [Name] (#375)
+            new_row['__added__'] = added
             out.append(new_row)
         return out
 
@@ -26672,6 +27381,15 @@ class DAXEngine:
                     return bool(v)
                 return None
             if target == "DATETIME":
+                if type(v) in (int, float, _Currency) and v < 0:
+                    # an OLE date: the whole days toward zero, then the
+                    # fraction forward from that day (Power BI Desktop 2.157,
+                    # build_b371.py convert_neg: CONVERT(-1.25, DATETIME) is
+                    # 1899-12-29 06:00, -0.5 1899-12-30 12:00; it was a day
+                    # early, #382)
+                    days = math.trunc(v)
+                    return (datetime(1899, 12, 30) + timedelta(days=days)
+                            + timedelta(days=abs(float(v) - days)))
                 return _as_datetime(v)
         except (ValueError, OverflowError):
             return None
@@ -26899,8 +27617,14 @@ class DAXEngine:
         model_cols: Any = (({cell_of} if lone else set(tbl.get('columns') or ()))
                            if tbl is not None else ())
 
+        # a column a table function added is its own, whatever its name:
+        # ADDCOLUMNS(SUMMARIZE(Opp, Opp[Name]), "Rank", 1) heads [Rank]
+        # though Opp has a column Rank (Power BI Desktop 2.157,
+        # build_b371.py tocsv_addcol_head, #375)
+        added = row.get('__added__') or ()
+
         def heading(name):
-            return f"'{t}'[{name}]" if name in model_cols else f"[{name}]"
+            return f"'{t}'[{name}]" if name in model_cols and name not in added else f"[{name}]"
 
         generate = '_inner___table__' in row     # every GENERATE level has it
         inner: Optional[dict] = None

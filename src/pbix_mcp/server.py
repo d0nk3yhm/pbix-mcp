@@ -13907,7 +13907,12 @@ def _get_dax_context(alias: str) -> dict:
             # with the columns' runs: Desktop's storage engine adds a Double
             # column along them (issue #243, pbix_mcp.dax.se_scan)
             td = model.get_table(tname, with_storage=True)
-            if td and td.get('columns') and td.get('rows'):
+            # a table with no rows is kept, a table with none: EVALUATE '_M'
+            # is its columns and no row, and a measure homed on it resolves
+            # (Power BI Desktop 2.157, build_b371.py empty_table,
+            # measure_home_table; #379). A table whose data fails to load is
+            # still left out.
+            if td and td.get('columns') and isinstance(td.get('rows'), list):
                 tables[tname] = {
                     'columns': td['columns'],
                     'rows': td['rows'],
@@ -13924,12 +13929,18 @@ def _get_dax_context(alias: str) -> dict:
     # Recorded before the calculated tables and columns are evaluated, so what
     # they compute from a Currency column adds as Desktop adds it, and again
     # after, for the Currency columns they add.
-    from pbix_mcp.dax.engine import mark_currency_columns
+    from pbix_mcp.dax.engine import mark_currency_columns, mark_declared_types
     currency_columns: dict = {}
+    declared_types: dict = {}
     for r in schema_list:
         if r.get('DataType') == 'Decimal' and r.get('ColumnName'):
             currency_columns.setdefault(r['TableName'], []).append(r['ColumnName'])
+        if r.get('ColumnName'):
+            declared_types.setdefault(r['TableName'], {})[r['ColumnName']] = r.get('DataType')
     mark_currency_columns(tables, currency_columns)
+    # the declared types type a column holding no value for the comparison
+    # checks (#381: MAX('_M'[Column1]) = 1 on a Text column with no rows)
+    mark_declared_types(tables, declared_types)
 
     # --- Load calculated tables from ABF metadata ---
     # Uses calc_tables.py as the single source of truth for evaluating
