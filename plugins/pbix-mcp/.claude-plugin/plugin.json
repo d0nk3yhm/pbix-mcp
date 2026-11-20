@@ -1,7 +1,7 @@
 {
   "name": "pbix-mcp",
   "displayName": "pbix-mcp",
-  "version": "0.9.153",
+  "version": "0.9.154",
   "description": "Create, read, edit and evaluate Power BI .pbix / .pbit files and PBIP projects from Claude Code, without Power BI Desktop: reports, visuals, data models, measures, RLS and DAX evaluation.",
   "author": {
     "name": "d0nk3yhm",
